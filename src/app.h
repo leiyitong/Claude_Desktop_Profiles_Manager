@@ -89,7 +89,10 @@ C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
 #define LONG_PATH_CCH      1024
 #define SIGNIN_MAX_AGE_MINUTES 15   /* a sign-in started longer ago claims no link */
 #define TICKS_PER_SECOND   10000000ULL   /* FILETIME units */
-#define PALETTE_SIZE       8
+#define PALETTE_SIZE       20   /* the first 8 are the colors of release 1.1, kept at their index */
+#define MAX_BADGE          2    /* characters (code points) a badge's own text shows */
+#define BADGE_CCH          8
+#define PICTURE_SIZE       256  /* a profile's own picture is kept at PICTURE_SIZE x PICTURE_SIZE */
 #define SESSION_TITLE_CCH  256
 #define SESSION_ID_CCH     64
 
@@ -101,6 +104,8 @@ typedef struct Profile {
     WCHAR dataDir[MAX_PATH];   /* %APPDATA%\<folder>, as Claude sees it */
     WCHAR storageDir[MAX_PATH]; /* file access outside the package; empty when unresolved */
     int   color;               /* palette index */
+    WCHAR badge[BADGE_CCH];    /* the badge's own text; empty: the name's initial */
+    DWORD picture;             /* the stamp of its own picture, which replaces the Claude icon; 0: none */
     BOOL  isStock;             /* the folder the regular Claude icon opens */
     BOOL  running;
     DWORD pid;                 /* main process when running */
@@ -191,6 +196,10 @@ typedef enum SessionEntryKind { ENTRY_NOT_SESSION, ENTRY_LOCAL, ENTRY_ELSEWHERE 
 BOOL         Core_ValidateNewName(const WCHAR *raw, WCHAR *name, size_t nameCch,
                                   WCHAR *folder, size_t folderCch, const WCHAR **error);
 BOOL         Core_ValidateLabel(const WCHAR *raw, WCHAR *label, size_t cch, const WCHAR **error);
+/* A badge's own text: `raw` without the spaces around it, cut after MAX_BADGE
+ * characters (a surrogate pair is one); FALSE when it holds a control
+ * character. An empty result is valid: the badge shows the name's initial. */
+BOOL         Core_CleanBadge(const WCHAR *raw, WCHAR *badge, size_t cch);
 BOOL         Core_IsProfileFolder(const WCHAR *folder);
 BOOL         Core_SanitizeUrl(const WCHAR *in, WCHAR *out, size_t cch);
 BOOL         Core_IsSignInUrl(const WCHAR *url);
@@ -312,7 +321,8 @@ BOOL         Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, cons
 int          Profiles_Find(const ProfileList *list, const WCHAR *folder);
 int          Profiles_DefaultIndex(const ProfileList *list);
 BOOL         Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t folderCch, WCHAR *error, size_t errorCch);
-BOOL         Profiles_Update(const WCHAR *folder, const WCHAR *label, int color);
+/* The name, color, badge text (empty: the initial) and picture stamp (0: none). */
+BOOL         Profiles_Update(const WCHAR *folder, const WCHAR *label, int color, const WCHAR *badge, DWORD picture);
 BOOL         Profiles_SetDefault(const WCHAR *folder);
 void         Profiles_CopySettings(const Profile *from, const Profile *to);
 RemoveResult Profiles_Delete(HWND owner, const Profile *profile);
@@ -323,9 +333,21 @@ BOOL         Profiles_LinkTarget(const Profile *profile, WCHAR *out, size_t cch)
 /* --------------------------------------------------------------- icons.c */
 
 extern const WCHAR *const g_ColorNames[PALETTE_SIZE];
+COLORREF Icons_PaletteColor(int index);
 BOOL  Icons_Ensure(const ClaudePackage *pkg, const Profile *profile, WCHAR *out, size_t cch);
 HICON Icons_Create(const ClaudePackage *pkg, const Profile *profile, int size);
+/* As Icons_Create, with `picture` (PICTURE_SIZE squared pixels, 0xAARRGGBB;
+ * NULL: the Claude icon and the badge) in place of the profile's own. */
+HICON Icons_CreateWith(const ClaudePackage *pkg, const Profile *profile, const DWORD *picture, int size);
 WCHAR Icons_ProfileInitial(const WCHAR *name);
+void  Icons_BadgeText(const Profile *profile, WCHAR *out, size_t cch);   /* its own text, else the initial */
+/* Pictures: any image Windows reads (WIC: PNG, JPEG, GIF's first frame, BMP,
+ * TIFF, ICO, and WebP or HEIF with their extensions), cut to its middle square
+ * and scaled to PICTURE_SIZE. A heap block the caller frees with HeapFree. */
+DWORD *Icons_ReadPicture(const WCHAR *path, HRESULT *hr);
+DWORD *Icons_LoadPicture(const Profile *profile);   /* the profile's own, NULL when it has none or it cannot be read */
+BOOL   Icons_SavePicture(const WCHAR *folder, const DWORD *pixels, DWORD *stamp);
+void   Icons_DeletePicture(const WCHAR *folder);
 HICON Icons_CreateBadge(int color, int size);
 HICON Icons_CreateTray(const ClaudePackage *pkg, const Profile *profile, int size, BOOL darkTaskbar);
 BOOL  Icons_IsStale(const ClaudePackage *pkg, const Profile *profile);
@@ -672,6 +694,13 @@ typedef enum ThemeColor {
 #define THEME_MAIN_GAP_DIPS           9       /* between its neighboring buttons */
 #define THEME_MAIN_READING_WIDTH_DIPS 1200    /* a wider manager window centers its content */
 #define THEME_PROFILE_COLUMN_DIPS     180     /* the profile list's first column */
+
+/* A drop-down list item's data (CB_SETITEMDATA) can show a color swatch
+ * beside its label, in the closed box and in its menu: the color in the low
+ * 24 bits, with THEME_CHOICE_SWATCH; THEME_CHOICE_SEPARATED draws a line
+ * above the item in the menu. */
+#define THEME_CHOICE_SWATCH    0x01000000
+#define THEME_CHOICE_SEPARATED 0x02000000
 
 #define THEME_BUTTON_HOT      0x1
 #define THEME_BUTTON_PRESSED  0x2

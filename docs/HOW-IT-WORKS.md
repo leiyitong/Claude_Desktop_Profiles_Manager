@@ -66,6 +66,8 @@ A profile is pinned while Windows' pin list holds an active pin whose shortcut o
 
 The manager writes its pins in the form Windows itself writes them, so Windows keeps them, and leaves other applications' pins as they are. It never writes over a list in a form it does not know, nor over a change Windows made meanwhile: it starts again from the new list, three times at most. A new pin takes the place of the profile's pin, active or retired, else goes last; the profile's other active pins are dropped, since Windows would unpin them and delete the shortcut they share. When the manager opens, after it changes one of its pins' shortcuts, and when a profile is pinned again, damaged pins of its own are repaired; a pin that is fine is left exactly as it is, and an unpinned profile stays unpinned. At uninstall, the active pins of the manager and its profiles leave the list, then their shortcuts are deleted.
 
+A profile's icon is the installed Claude icon with a badge: a disc in one of twenty colors (the first eight are the colors of release 1.1, at the same index), with the name's initial or a text of one or two characters of the user's own. A picture of the user's own can replace it: Windows' codecs (WIC) read it, so PNG, JPEG, GIF, BMP, TIFF and ICO always work and WebP or HEIF once their extension is installed; a GIF shows its first frame, since Windows' icons do not move. The picture is cut to its middle square, scaled to 256 pixels and kept as `pictures\<folder>.png` in the manager's folder, so the file chosen can go; the profile records its stamp (a hash of its pixels), and a picture whose pixels do not match is not shown. The icon file's name encodes the name, color, badge text and picture stamp, so a change makes a new file (a profile without a badge text or a picture keeps the name release 1.1 gave it). The color menu lists the colors no other profile uses first, then, under a line, the others with the profiles that use them; a new profile starts with the first free one. The notification-area icon keeps the profile's color.
+
 The taskbar part is the Taskbar Module, under its own license (see `LICENSE`); the notification-area icon (`tray.c`) is not.
 
 ### Claude updates
@@ -173,8 +175,8 @@ A link reaches a running window through a second activation with the same `--use
 |---|---|
 | Program | `%LOCALAPPDATA%\Programs\Claude Desktop Profiles Manager\ClaudeDesktopProfilesManager.exe` |
 | Start menu folder | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Claude Desktop Profiles Manager` (the manager, and the profiles added to the Start menu) |
-| Settings | `HKCU\Software\Claude Desktop Profiles Manager`: `Profiles\<folder>` (name, color), `DefaultProfile`, `Language`, `InstallPath`, `Shortcuts` (the profile shortcuts made, which follow renames), `Update` (the last release check), `Capabilities` (the `claude://` link handler as Windows lists it) |
-| Profile icons, log, session changes and sessions waiting for a profile to close, backups of what sending sessions replaced | `%LOCALAPPDATA%\Claude Desktop Profiles Manager` |
+| Settings | `HKCU\Software\Claude Desktop Profiles Manager`: `Profiles\<folder>` (name, color, badge text, picture stamp), `DefaultProfile`, `Language`, `InstallPath`, `Shortcuts` (the profile shortcuts made, which follow renames), `Update` (the last release check), `Capabilities` (the `claude://` link handler as Windows lists it) |
+| Profile icons and pictures, log, session changes and sessions waiting for a profile to close, backups of what sending sessions replaced | `%LOCALAPPDATA%\Claude Desktop Profiles Manager` |
 | A downloaded update, until it has installed itself | `%TEMP%\update-ClaudeDesktopProfilesManager.exe` |
 | Taskbar pins | Windows' own pin list |
 | Apps & features entry | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ClaudeDesktopProfilesManager` |

@@ -88,7 +88,8 @@ NONLITERAL_CALLS = {
 # titles and roles (theme.c measures them, gui.c shows them) and the name
 # errors of Core_ValidateNewName and Core_ValidateLabel.
 TRANSLATED_THROUGH_VARIABLES = {
-    "icons.c": ["Blue", "Green", "Orange", "Pink", "Purple", "Red", "Slate", "Teal"],
+    "icons.c": ["Blue", "Green", "Orange", "Pink", "Purple", "Red", "Slate", "Teal", "Amber", "Gold", "Lime", "Forest", "Sky",
+                "Indigo", "Fuchsia", "Crimson", "Brown", "Navy", "Plum", "Graphite"],
     "core.c": ["Claude uses this name itself. Pick another one.", "Enter a name.", "Name too long.",
                "The name cannot start or end with a dot.", "The name contains an invalid character.",
                "Use 32 characters or fewer.", "Use 48 characters or fewer.",
@@ -113,8 +114,8 @@ ACCESS_KEY_GROUPS = {
                       "Merge &all sessions\u2026", "Ove&rwrite sessions\u2026", "Set as de&fault", "Create shortcut on des&ktop",
                       "Create s&hortcut\u2026", "Pin to &taskbar", "Add to Start &menu", "Remove from Start &menu", "&Uninstall\u2026", "U&pdate"] + STATUS_ACTIONS,
     "sessions view": ["<  &Back", "&Language\u2026", "Show &archived", "&Uninstall\u2026", "U&pdate"] + STATUS_ACTIONS,
-    "profile dialog": ["&Name:", "&Color:", "Open at &Windows sign-in", "Copy &settings from \u201c%s\u201d",
-                       "&Open it now to sign in"],
+    "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "Open at &Windows sign-in",
+                       "Copy &settings from \u201c%s\u201d", "&Open it now to sign in"],
     "Actions menu of a profile without the session": ["&Share with\u2026", "&Copy to\u2026"],
     "Actions menu of a profile with the session": ["&Open in %s", "&Rename\u2026", "S&tar", "Uns&tar",
                                                    "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s"],

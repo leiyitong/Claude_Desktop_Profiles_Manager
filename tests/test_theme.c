@@ -2600,6 +2600,74 @@ static void TestDropDownList(void)
     DeleteObject(font);
 }
 
+/* A drop-down list's own pixels, its only choice `text` with item data `data`. */
+static BOOL CaptureChoice(HWND host, HFONT font, const WCHAR *text, LPARAM data, Canvas *canvas, int *width, int *height)
+{
+    HWND combo = CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+                                 10, 10, 160, 200, host, NULL, GetModuleHandleW(NULL), NULL);
+    RECT window, box;
+    BOOL ok = FALSE;
+    if (!combo) return FALSE;
+    SendMessageW(combo, WM_SETFONT, (WPARAM)font, FALSE);
+    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)text);
+    SendMessageW(combo, CB_SETITEMDATA, 0, data);
+    SendMessageW(combo, CB_SETCURSEL, 0, 0);
+    Theme_Apply(host);
+    ShowWindow(host, SW_SHOWNOACTIVATE);
+    RedrawWindow(host, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    GetWindowRect(combo, &window);
+    *width = window.right - window.left;
+    *height = window.bottom - window.top;
+    SetRect(&box, 0, 0, *width, *height);
+    ok = CanvasOpen(canvas, *width, *height, RGB(0, 0, 0)) && CopyFromWindow(combo, TRUE, &box, canvas, 0, 0) &&
+         HasImage(canvas, "drop-down list with a swatch");
+    ShowWindow(host, SW_HIDE);
+    DestroyWindow(combo);
+    return ok;
+}
+
+/* A choice whose item data asks for a swatch (THEME_CHOICE_SWATCH) shows a
+ * disc of that color at the start of its label, the label after it; its
+ * text after a tab shows only in the menu. */
+static void TestDropDownSwatch(void)
+{
+    const COLORREF blue = RGB(0x25, 0x63, 0xEB);
+    HWND host = ThemedHost();
+    HFONT font = DialogFont();
+    Canvas plain = { 0 }, swatched = { 0 }, noted = { 0 };
+    RECT box, label;
+    int width = 0, height = 0, x, y, differ = 0, center, size, found = 0;
+    BOOL ok = CaptureChoice(host, font, L"Blue", 0, &plain, &width, &height) &&
+              CaptureChoice(host, font, L"Blue", (LPARAM)blue | THEME_CHOICE_SWATCH, &swatched, &width, &height) &&
+              CaptureChoice(host, font, L"Blue\tused by Work", (LPARAM)blue | THEME_CHOICE_SWATCH, &noted, &width, &height);
+    Check("drop-down swatch: captured", ok);
+    if (ok) {
+        SetRect(&box, 0, 0, width, height);
+        Theme_DropDownLabel(host, &box, &label);
+        size = MulDiv(12, (int)GetDpiForWindow(host), 96);
+        center = label.left + size / 2;
+        /* The disc's middle, its own color; without the flag, no such pixel. */
+        for (y = height / 2 - 1; y <= height / 2 + 1; y++)
+            for (x = center - 1; x <= center + 1; x++) found += PixelAt(&swatched, x, y) == blue;
+        Check("drop-down swatch: the disc shows the choice's color at the start of the label", found > 0);
+        found = 0;
+        for (y = 0; y < height; y++)
+            for (x = 0; x < width; x++) found += PixelAt(&plain, x, y) == blue;
+        Check("drop-down swatch: a choice without the flag shows no swatch", found == 0);
+        for (y = 0; y < height; y++)
+            for (x = 0; x < width; x++) differ += PixelAt(&swatched, x, y) != PixelAt(&noted, x, y);
+        Check("drop-down swatch: the text after a tab does not show in the box", differ == 0);
+        differ = 0;
+        for (y = 0; y < height; y++)
+            for (x = label.left + size; x < width; x++) differ += PixelAt(&swatched, x, y) != PixelAt(&plain, x, y);
+        Check("drop-down swatch: the label moves right to make room for the disc", differ > 0);
+    }
+    CanvasClose(&plain);
+    CanvasClose(&swatched);
+    CanvasClose(&noted);
+    DeleteObject(font);
+}
+
 typedef struct ChoiceProbe {
     HWND combo;
     int confirmed, cancelled, changes, opened, closed;
@@ -4912,6 +4980,7 @@ int wmain(void)
     TestDropDownButton();
     TestDropDownWidth();
     TestDropDownList();
+    TestDropDownSwatch();
     TestComboInput();
     TestScrollBarEdges();
     TestScrollBarColors();

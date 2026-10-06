@@ -1050,9 +1050,9 @@ static BOOL FixtureRefuseProfileCreation(const WCHAR *name, int color, WCHAR *fo
     return FALSE;
 }
 
-static BOOL FixtureRefuseProfileChange(const WCHAR *folder, const WCHAR *label, int color)
+static BOOL FixtureRefuseProfileChange(const WCHAR *folder, const WCHAR *label, int color, const WCHAR *badge, DWORD picture)
 {
-    (void)folder; (void)label; (void)color;
+    (void)folder; (void)label; (void)color; (void)badge; (void)picture;
     return FALSE;
 }
 
