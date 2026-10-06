@@ -16,9 +16,20 @@
 #include "app.h"
 #include <appmodel.h>
 #include <shobjidl.h>
+/* restartmanager.h declares a nameless union (C4201 at /W4) */
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4201)
+#endif
+#include <restartmanager.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+#include <tlhelp32.h>
 #include <string.h>
 
 #define LAUNCH_ARGS_CCH (URL_CCH + 2 * MAX_PATH)   /* --user-data-dir="<folder>" "<link>" */
+#define QUIT_WAIT_MS    10000   /* the most Claude's processes get to end once told to */
 
 /* Sideloaded (claude.ai/download) and Microsoft Store package families. */
 static const WCHAR *const kFamilies[] = {
@@ -355,4 +366,122 @@ BOOL Claude_ClosedForUpdate(const ClaudePackage *pkg, const Profile *profile)
     BOOL forUpdate = FALSE;
     ULONGLONG latest = LatestInLogs(pkg, profile, Core_LastQuit, &forUpdate);
     return forUpdate && latest + QUIT_RECENT_TICKS >= Util_LocalNowTicks();
+}
+
+/* ------------------------------------------------------------------ quit */
+
+static ULONGLONG ProcessStart(HANDLE process)
+{
+    FILETIME created, exited, kernel, user;
+    if (!process || !GetProcessTimes(process, &created, &exited, &kernel, &user)) return 0;
+    return ((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime;
+}
+
+/* Every process running now with its parent and start; NULL when none could be read. */
+static CoreProcess *ProcessSnapshot(int *count)
+{
+    PROCESSENTRY32W entry;
+    CoreProcess *processes = NULL;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    int capacity = 0;
+    *count = 0;
+    if (snapshot == INVALID_HANDLE_VALUE) return NULL;
+    entry.dwSize = sizeof entry;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            HANDLE process;
+            if (*count == capacity) {
+                int grown = capacity ? 2 * capacity : 512;
+                CoreProcess *larger = processes ? (CoreProcess *)HeapReAlloc(GetProcessHeap(), 0, processes, (size_t)grown * sizeof *larger)
+                                                : (CoreProcess *)HeapAlloc(GetProcessHeap(), 0, (size_t)grown * sizeof *larger);
+                if (!larger) break;
+                processes = larger;
+                capacity = grown;
+            }
+            processes[*count].pid = entry.th32ProcessID;
+            processes[*count].parent = entry.th32ParentProcessID;
+            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+            processes[*count].started = ProcessStart(process);
+            if (process) CloseHandle(process);
+            (*count)++;
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return processes;
+}
+
+/* Restart Manager asks the process's windows to end the session (WM_QUERYENDSESSION,
+ * WM_ENDSESSION), as Windows does before installing an update, and ends the process
+ * when it is still there after Windows' time for it. */
+static BOOL AskToQuit(DWORD pid, ULONGLONG started)
+{
+    WCHAR key[CCH_RM_SESSION_KEY + 1];
+    RM_UNIQUE_PROCESS process;
+    DWORD session = 0;
+    BOOL ok;
+    if (RmStartSession(&session, 0, key) != ERROR_SUCCESS) return FALSE;
+    process.dwProcessId = pid;
+    process.ProcessStartTime.dwLowDateTime = (DWORD)started;
+    process.ProcessStartTime.dwHighDateTime = (DWORD)(started >> 32);
+    ok = RmRegisterResources(session, 0, NULL, 1, &process, 0, NULL) == ERROR_SUCCESS &&
+         RmShutdown(session, RmForceShutdown, NULL) == ERROR_SUCCESS;
+    RmEndSession(session);
+    return ok;
+}
+
+/* The process `pid` ended, if it is still the one that started at `started`. */
+static BOOL EndProcess(DWORD pid, ULONGLONG started, DWORD *error)
+{
+    HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    BOOL ended;
+    if (!process) {
+        DWORD code = GetLastError();
+        if (code == ERROR_INVALID_PARAMETER) return TRUE;   /* gone already */
+        *error = code;
+        return FALSE;
+    }
+    if (ProcessStart(process) != started || WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
+        CloseHandle(process);
+        return TRUE;
+    }
+    ended = TerminateProcess(process, 1) || WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+    if (!ended) *error = GetLastError();
+    else WaitForSingleObject(process, QUIT_WAIT_MS);
+    CloseHandle(process);
+    return ended;
+}
+
+BOOL Claude_Quit(const Profile *profile, DWORD *error)
+{
+    HWND window = InstanceWindowOf(profile);
+    CoreProcess *processes;
+    HANDLE claude;
+    BOOL *chosen, ok = TRUE;
+    DWORD pid = 0;
+    int count = 0, root = -1, i;
+    *error = ERROR_SUCCESS;
+    if (!window || (GetWindowThreadProcessId(window, &pid), !pid)) return TRUE;
+    /* The programs it started, read before it ends: their parent is gone after. */
+    processes = ProcessSnapshot(&count);
+    chosen = processes ? (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *chosen) : NULL;
+    for (i = 0; i < count; i++)
+        if (processes[i].pid == pid) root = i;
+    if (chosen && root >= 0) Core_ProcessDescendants(processes, count, root, chosen);
+    claude = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (claude) {
+        ULONGLONG started = ProcessStart(claude);
+        if (!AskToQuit(pid, started) || WaitForSingleObject(claude, QUIT_WAIT_MS) != WAIT_OBJECT_0) ok = EndProcess(pid, started, error);
+        CloseHandle(claude);
+    } else if (GetLastError() != ERROR_INVALID_PARAMETER) {
+        *error = GetLastError();
+        ok = FALSE;
+    }
+    /* Claude ends the programs it started as it quits; the ones still there now
+     * (a Claude Code session, a tool) are ended too. */
+    for (i = 0; ok && chosen && i < count; i++)
+        if (chosen[i]) EndProcess(processes[i].pid, processes[i].started, error);
+    if (chosen) HeapFree(GetProcessHeap(), 0, chosen);
+    if (processes) HeapFree(GetProcessHeap(), 0, processes);
+    Util_Log(L"quit %s: %s (error %lu)", profile->folder, ok ? L"done" : L"failed", *error);
+    return ok && !Claude_IsRunning(profile);
 }

@@ -262,6 +262,16 @@ DWORD        Core_Crc32(DWORD crc, const void *data, size_t size);
 size_t       Core_DeflateBound(size_t size);
 BOOL         Core_Deflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
 BOOL         Core_Inflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
+/* A process of a snapshot: its id, its parent's, and when it started (0: unknown). */
+typedef struct CoreProcess {
+    DWORD     pid, parent;
+    ULONGLONG started;
+} CoreProcess;
+/* Marks in `chosen` every process `processes[root]` started, at any depth: a
+ * process is a child only when it started after its parent, since Windows
+ * gives a gone process's id to later ones. The root is not marked. Returns
+ * how many are. */
+int          Core_ProcessDescendants(const CoreProcess *processes, int count, int root, BOOL *chosen);
 BOOL         Core_ArchiveNameSafe(const char *name, size_t length);
 BOOL         Core_ConversationFileName(const WCHAR *relative);
 int          Core_ScrollStep(int pending, int elapsedMs);
@@ -322,6 +332,11 @@ BOOL    Claude_IsRunning(const Profile *profile);
 BOOL    Claude_LastSignInStart(const ClaudePackage *pkg, const Profile *profile, ULONGLONG *ticks);
 BOOL    Claude_ClosedForUpdate(const ClaudePackage *pkg, const Profile *profile);
 int     Claude_TopmostProfile(const ProfileList *list);
+/* Quits the profile's Claude: asked to close as Windows does before an
+ * update (Restart Manager), ended when it does not within Windows' time, and
+ * then the programs it started that still run. TRUE when none runs any more;
+ * blocks for seconds, so it runs off the window's thread. */
+BOOL    Claude_Quit(const Profile *profile, DWORD *error);
 
 /* ------------------------------------------------------------ profiles.c */
 

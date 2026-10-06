@@ -530,7 +530,7 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT,
+    static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT,
                                             IDC_NOTE, IDC_SC_GROUP, IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
     static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
     size_t i;
@@ -1946,7 +1946,7 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
  * is on screen meanwhile: messages are handled between steps (PumpMessages). */
 static void CheckMainFrameMessages(void)
 {
-    static const int kActions[] = { IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT };
+    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT };
     LayoutFixture fixture = MainFixture(Language(L"fr"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];

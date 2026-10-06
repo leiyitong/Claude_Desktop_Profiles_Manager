@@ -38,6 +38,7 @@
 #define IDC_LANGUAGE      1018
 #define IDC_MERGE         1019
 #define IDC_OVERWRITE        1020
+#define IDC_STOP          1021
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
