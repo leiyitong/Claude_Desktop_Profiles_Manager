@@ -1,10 +1,33 @@
 name: build
 
+# Only what goes into the exe or its checks starts a build: a change to the documents
+# alone (README, docs, BUILD.md...) builds nothing. A tag always builds: GitHub does
+# not apply path filters to tags.
 on:
   push:
     branches: [main]
     tags: ['v*']
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'tools/check-localization.py'
+      - 'build.cmd'
+      - '.gitattributes'
+      - '.github/workflows/build.yml'
   pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'tools/check-localization.py'
+      - 'build.cmd'
+      - '.gitattributes'
+      - '.github/workflows/build.yml'
+
+# A newer push to a pull request stops the build of the older one; main's builds all
+# finish, each publishing its pre-release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

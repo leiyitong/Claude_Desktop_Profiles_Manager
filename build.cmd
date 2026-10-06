@@ -48,7 +48,8 @@ rc /nologo /fo "%OUT%\obj\app.res" app.rc
 if errorlevel 1 (popd & exit /b 1)
 popd
 
-cl %CFLAGS% /Fo"%OUT%\obj\\" /Fe"%OUT%\obj\%EXE_NAME%" "%ROOT%src\*.c" "%OUT%\obj\app.res" ^
+rem /MP: the sources compile in parallel, one per processor.
+cl %CFLAGS% /MP /Fo"%OUT%\obj\\" /Fe"%OUT%\obj\%EXE_NAME%" "%ROOT%src\*.c" "%OUT%\obj\app.res" ^
    /link /SUBSYSTEM:WINDOWS /GUARD:CF /DYNAMICBASE /NXCOMPAT /DEPENDENTLOADFLAG:0x800 /OPT:REF /OPT:ICF %LIBS% || exit /b 1
 
 rem Every interface text has its twelve translations. Needs Python 3.6 or later, which GitHub Actions has;
