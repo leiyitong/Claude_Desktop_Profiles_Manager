@@ -16,7 +16,15 @@
 #include "app.h"
 #include <appmodel.h>
 #include <shobjidl.h>
+/* restartmanager.h declares a nameless union (C4201 at /W4) */
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4201)
+#endif
 #include <restartmanager.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #include <tlhelp32.h>
 #include <string.h>
 
