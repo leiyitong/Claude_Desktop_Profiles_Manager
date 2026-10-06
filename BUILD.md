@@ -61,7 +61,7 @@ if ($LASTEXITCODE -eq 0) { gh release create v1.1.0 build\ClaudeDesktopProfilesM
 
 > The asset name never changes: the README download link points to `releases/latest/download/ClaudeDesktopProfilesManager.exe`.
 
-`gh release create` fails when the tag already has a release: tag a new version. Every push to `main` and every pull request also builds the exe, unsigned, as a workflow artifact; a build of `main` that passes is also published as a pre-release `build-<run number>`. Pre-releases are never "latest", so the download link and the update check still find the signed release only.
+`gh release create` fails when the tag already has a release: tag a new version. Every push to `main` and every pull request that changes the sources, the tests or the build (`paths` in the workflow) also builds the exe, unsigned, as a workflow artifact; a build of `main` that passes is also published as a pre-release `build-<run number>`. Pre-releases are never "latest", so the download link and the update check still find the signed release only.
 
 ## Project structure
 
