@@ -16,6 +16,10 @@ Unofficial tool, not affiliated with Anthropic.
 - **Open at sign-in** - Any profile can open when you sign in to Windows, not only the one the regular Claude icon opens
 - **Claude Code sessions** - The manager shows each profile's Code sessions by folder and where each one is listed; open a session in any profile, share it with another one or copy it there, rename it, star it or remove it per profile, or delete it everywhere. Ctrl+click and Shift+click select several sessions, and a folder's or Starred's menu acts on all it shows: share, copy, export, star or remove them together. Changes to a profile that is open are made when it closes
 - **Session sync** - **Merge all sessions…** gives every profile the sessions the others list, **Overwrite sessions…** writes one profile's sessions over the profiles you check, and sessions can be exported to a .zip archive and imported into other profiles. What a change replaces or removes is kept in a backup
+- **Quit** - **Quit** closes the Claude of the profiles selected, as its own Quit in the notification area does, and stops what runs in it
+- **Right-click menu** - Right-click a profile for every action of the buttons and its shortcuts, without selecting it first
+- **Shared session folders** - Right-click a profile, **Link sessions folder to** another profile or any folder: both list the same Code sessions. The column on the right shows where each profile's session folder is
+- **Backups** - Right-click a profile, **Back up…** saves the parts you check (Code sessions, Cowork sessions, settings, sign-in) to one .zip; **Restore from backup…** puts them into the same or another profile
 - **Twelve languages** - The manager follows your Windows language, or the one you pick in its Language menu
 - **Settings copy** - A new profile can start with the MCP servers, notification-area icon, hardware acceleration setting, language and theme of another one
 - **Updates** - Tells you when a new version is out and installs it in one click, once Windows has checked its signature

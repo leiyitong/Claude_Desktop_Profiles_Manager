@@ -1095,6 +1095,27 @@ static void TestDrawingMath(void)
     }
 }
 
+static void TestProcessTree(void)
+{
+    /* Claude (10) started 11 and 12; 12 started 13; 20 is another program; 30 has
+     * the id of Claude's gone parent; 14 claims 10 as parent but started before it
+     * (an older process whose parent's id Claude got). */
+    static const CoreProcess kProcesses[] = {
+        { 10, 1, 1000 }, { 11, 10, 1100 }, { 12, 10, 1200 }, { 13, 12, 1300 }, { 20, 1, 900 }, { 14, 10, 500 },
+        { 15, 14, 600 }, { 16, 13, 0 }, { 17, 17, 1400 },
+    };
+    BOOL chosen[ARRAYSIZE(kProcesses)];
+    int n = Core_ProcessDescendants(kProcesses, ARRAYSIZE(kProcesses), 0, chosen);
+    Check("process tree: children and grandchildren", chosen[1] && chosen[2] && chosen[3]);
+    Check("process tree: the root and other programs left", !chosen[0] && !chosen[4]);
+    Check("process tree: an older process with a reused parent id left, and its children",
+          !chosen[5] && !chosen[6]);
+    Check("process tree: a process whose start is unknown left", !chosen[7]);
+    Check("process tree: a process its own parent left", !chosen[8]);
+    Check("process tree: the count", n == 3);
+    Check("process tree: a root out of range marks none", Core_ProcessDescendants(kProcesses, ARRAYSIZE(kProcesses), 9, chosen) == 0 && !chosen[1]);
+}
+
 int wmain(void)
 {
     TestSessionEntries();
@@ -1102,6 +1123,7 @@ int wmain(void)
     TestSessionSync();
     TestDrawingMath();
     TestDeflate();
+    TestProcessTree();
     TestLaunchArgs();
     TestSanitizeUrl();
     TestNames();

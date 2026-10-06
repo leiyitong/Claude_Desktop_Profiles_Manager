@@ -82,7 +82,7 @@ src/localize_catalog.inc      the twelve embedded interface catalogs
 src/theme.c                   the look of every window (light, dark, high contrast): palette, fonts, rows,
                               off-screen drawing, buttons, lists, edits, smooth scrolling; dialog fitting,
                               the main window's layout and captions, the themed message box
-src/claude.c                  package discovery, ActivateApplication launch, running profiles, main.log reading
+src/claude.c                  package discovery, ActivateApplication launch, running profiles, quitting one, main.log reading
 src/profiles.c                profile detection, create, rename, delete, Recycle Bin, settings copy
 src/icons.c                   badged profile icons (hand-written .ico), badge, pictures (WIC), notification-area icon
 src/shortcuts.c               profile shortcuts: create, find, remove, refresh (IShellLink, AppUserModelID)

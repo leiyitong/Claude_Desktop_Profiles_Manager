@@ -1695,3 +1695,27 @@ BOOL Core_Inflate(const void *input, size_t size, void *output, size_t capacity,
     *written = reader.used;
     return TRUE;
 }
+
+int Core_ProcessDescendants(const CoreProcess *processes, int count, int root, BOOL *chosen)
+{
+    int i, j, marked = 0;
+    BOOL grew = TRUE;
+    for (i = 0; i < count; i++) chosen[i] = FALSE;
+    if (root < 0 || root >= count) return 0;
+    /* Each pass takes the children of the processes taken so far: as many passes as the tree is deep. */
+    while (grew) {
+        grew = FALSE;
+        for (i = 0; i < count; i++) {
+            if (i == root || chosen[i] || !processes[i].started || processes[i].pid == processes[i].parent) continue;
+            for (j = 0; j < count; j++) {
+                if ((j == root || chosen[j]) && processes[j].pid == processes[i].parent && processes[j].started &&
+                    processes[i].started >= processes[j].started) {
+                    chosen[i] = grew = TRUE;
+                    marked++;
+                    break;
+                }
+            }
+        }
+    }
+    return marked;
+}
