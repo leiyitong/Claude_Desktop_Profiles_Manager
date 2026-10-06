@@ -17,6 +17,7 @@
 
 #define REDACTED_URL_CCH 160   /* the start of a link, enough to tell it in the log */
 #define LINK_ICON_DIPS   24    /* a profile's icon in the list, as in the manager's */
+#define WM_APP_KEEP_CHOICE (WM_APP + 1)   /* the list's selection changed: one row stays chosen */
 
 /* The link without its query or fragment, which can hold a sign-in code. */
 static void Redact(const WCHAR *url, WCHAR *out, size_t cch)
@@ -48,7 +49,7 @@ typedef struct LinkChoice {
     const WCHAR         *shown;     /* the link without its query or fragment */
     BOOL                 signIn;
     int                  starter;   /* the profile whose window started the sign-in; -1: not known */
-    int                  chosen;    /* selected at first; once closed with OK, the profile chosen */
+    int                  chosen;    /* selected at first, then the last row selected; once closed with OK, the profile chosen */
     HWND                 rows;      /* one per profile, in the list's order (in the view it scrolls in, which has its id) */
 } LinkChoice;
 
@@ -120,19 +121,31 @@ static INT_PTR CALLBACK LinkProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
                 return TRUE;
             }
             if (header->code == LVN_ITEMCHANGED) {
-                EnableWindow(GetDlgItem(dialog, IDOK), ListView_GetNextItem(choice->rows, -1, LVNI_SELECTED) >= 0);
+                /* Checked once the list is done: a click on another row
+                 * clears the selection before it sets the new one. */
+                PostMessageW(dialog, WM_APP_KEEP_CHOICE, 0, 0);
                 return TRUE;
             }
         }
         break;
+
+    /* A profile is always chosen: a click beside the rows or Ctrl+Space (the
+     * input language switch of some layouts, typed while the dialog took the
+     * focus) would clear the selection and leave Open with nothing to open. */
+    case WM_APP_KEEP_CHOICE:
+        if (choice) {
+            int row = ListView_GetNextItem(choice->rows, -1, LVNI_SELECTED);
+            if (row >= 0 && row < choice->list->count) choice->chosen = row;
+            else ListView_SetItemState(choice->rows, choice->chosen, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        }
+        return TRUE;
 
     case WM_COMMAND:
         if (!choice) break;
         switch (LOWORD(wp)) {
         case IDOK: {
             int row = ListView_GetNextItem(choice->rows, -1, LVNI_SELECTED);
-            if (row < 0 || row >= choice->list->count) return TRUE;
-            choice->chosen = row;
+            if (row >= 0 && row < choice->list->count) choice->chosen = row;
             EndDialog(dialog, IDOK);
             return TRUE;
         }
