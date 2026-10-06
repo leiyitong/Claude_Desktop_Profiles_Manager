@@ -340,7 +340,7 @@ static void PopulateBackupParts(HWND dialog)
     ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
     ZeroMemory(&column, sizeof column);
     ListView_InsertColumn(list, 0, &column);
-    for (i = 0; i < ARRAYSIZE(kParts); i++) {
+    for (i = 0; i < (int)ARRAYSIZE(kParts); i++) {
         StringCchPrintfW(text, ARRAYSIZE(text), TR(kParts[i]), 1234);
         ZeroMemory(&item, sizeof item);
         item.mask = LVIF_TEXT;
@@ -1119,6 +1119,17 @@ static void CheckProfileTable(HWND dialog, const LayoutFixture *fixture)
     Check(fixture, table, "default Sessions folder column consumes exactly the remaining client width",
           ListView_GetColumnWidth(table, 3) == client.right - first - second - third);
     Check(fixture, table, "default columns do not introduce a horizontal scroll bar", !(GetWindowLongW(table, GWL_STYLE) & WS_HSCROLL));
+    if (ListView_GetColumnWidth(table, 3) != client.right - first - second - third) {
+        RECT dialogClient;
+        SIZE minimum = { 0, 0 };
+        int sessionsMinimum = 0;
+        GetClientRect(dialog, &dialogClient);
+        Theme_MainMinimum(dialog, &minimum);
+        Theme_ProfileColumnWidths(table, &profileWidth, &roleWidth, &dataMinimum, &sessionsMinimum);
+        printf("        client=%ld columns=%d,%d,%d,%d budget=%d,%d,%d,%d dialog=%ldx%ld minimum=%ldx%ld\n", client.right, first, second,
+               third, ListView_GetColumnWidth(table, 3), profileWidth, roleWidth, dataMinimum, sessionsMinimum, dialogClient.right,
+               dialogClient.bottom, minimum.cx, minimum.cy);
+    }
     CheckNativeRoles(fixture);
     CheckShortcutHeading(dialog, fixture);
 }
