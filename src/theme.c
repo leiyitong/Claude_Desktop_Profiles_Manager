@@ -4683,7 +4683,7 @@ static int ShortcutRows(const MainBudget *budget, int rowWidth)
     return budget->shortcutTotal + ((int)ARRAYSIZE(kMainShortcuts) - 1) * budget->gap <= rowWidth ? 1 : 2;
 }
 
-#define LIST_FRAME_PX    2       /* the profile list's frame, a pixel on each side */
+#define LIST_FRAME_PX    2       /* the least of the profile list's frame, a pixel on each side */
 #define NOTE_SAMPLE_NAME L"WW"   /* a name the note shows cut to one character: its shortest text */
 
 /* Every button of the window: the side bar's width, each shortcut's, the
@@ -4738,6 +4738,16 @@ static int MeasureSessionsPanes(HWND dialog, const DialogBase *base, MainBudget 
     return searchWidth + budget->gap + budget->archivedWidth + MulDiv(ARCHIVED_INSET_DIPS, (int)dpi, 96);
 }
 
+/* What the profile list's frames take of its width: the view's and the
+ * list's own edges, as Windows draws them; at least LIST_FRAME_PX. */
+static int ListFramePx(HWND dialog, HWND list)
+{
+    HWND view = GetDlgItem(dialog, IDC_LIST);
+    RECT outer, inner;
+    if (!view || !GetWindowRect(view, &outer) || !GetClientRect(list, &inner) || outer.right - outer.left <= inner.right) return LIST_FRAME_PX;
+    return max(LIST_FRAME_PX, (int)(outer.right - outer.left - inner.right));
+}
+
 static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
 {
     HWND list = MainViewContent(dialog, IDC_LIST);
@@ -4760,7 +4770,7 @@ static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
     /* As wide as the list's columns and the side bar, the sessions' panes,
      * and the header's buttons with room for the status; never narrower than
      * the resource. */
-    budget->minimum.cx = max(budget->profileWidth + budget->roleWidth + budget->dataMinimum + budget->sessionsMinimum + LIST_FRAME_PX +
+    budget->minimum.cx = max(budget->profileWidth + budget->roleWidth + budget->dataMinimum + budget->sessionsMinimum + ListFramePx(dialog, list) +
                                  budget->sidebar + budget->sideGap,
                              budget->profilesPane + treePane + budget->detailsPane + 2 * budget->gap) + 2 * budget->margin;
     budget->minimum.cx = max(budget->minimum.cx, budget->sessionsWidth + budget->languageWidth + budget->statusActionWidth + 3 * budget->gap +
