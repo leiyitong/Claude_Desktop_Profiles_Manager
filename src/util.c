@@ -59,15 +59,35 @@ BOOL Util_StateDir(WCHAR *out, size_t cch)
            SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_NAME, base));
 }
 
+/* `path` as the file functions take it past MAX_PATH: \\?\C:\... or
+ * \\?\UNC\server\share\.... Windows then leaves the path as it is, so it
+ * must be a full path with backslashes only; any other is copied as it is. */
+BOOL Util_ExtendedPath(const WCHAR *path, WCHAR *out, size_t cch)
+{
+    if (path[0] == L'\\' && path[1] == L'\\' && path[2] != L'?' && path[2] != L'.')
+        return SUCCEEDED(StringCchPrintfW(out, cch, L"\\\\?\\UNC\\%s", path + 2));
+    if (((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) && path[1] == L':' && path[2] == L'\\')
+        return SUCCEEDED(StringCchPrintfW(out, cch, L"\\\\?\\%s", path));
+    return SUCCEEDED(StringCchCopyW(out, cch, path));
+}
+
+/* GetFileAttributesW at any path length. */
+static DWORD Attributes(const WCHAR *path)
+{
+    WCHAR extended[LONG_PATH_CCH];
+    if (wcslen(path) >= MAX_PATH && Util_ExtendedPath(path, extended, ARRAYSIZE(extended))) return GetFileAttributesW(extended);
+    return GetFileAttributesW(path);
+}
+
 BOOL Util_FileExists(const WCHAR *path)
 {
-    DWORD attributes = GetFileAttributesW(path);
+    DWORD attributes = Attributes(path);
     return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 BOOL Util_DirExists(const WCHAR *path)
 {
-    DWORD attributes = GetFileAttributesW(path);
+    DWORD attributes = Attributes(path);
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
@@ -107,13 +127,46 @@ BOOL Util_ExistingDir(const WCHAR *path, WCHAR *out, size_t cch)
     return TRUE;
 }
 
+/* Every missing folder of `path` made. SHCreateDirectoryEx stops short of
+ * MAX_PATH; past it, each folder is made in the \\?\ form. */
 BOOL Util_EnsureDir(const WCHAR *path)
 {
-    int rc = SHCreateDirectoryExW(NULL, path, NULL);
-    if (rc == ERROR_SUCCESS || ((rc == ERROR_ALREADY_EXISTS || rc == ERROR_FILE_EXISTS) && Util_DirExists(path)))
-        return TRUE;
-    SetLastError((DWORD)rc);   /* it returns its error rather than setting it */
-    return FALSE;
+    WCHAR extended[LONG_PATH_CCH];
+    size_t length, i, start = 7;   /* past \\?\C:\ */
+    if (wcslen(path) < MAX_PATH - 12) {
+        int rc = SHCreateDirectoryExW(NULL, path, NULL);
+        if (rc == ERROR_SUCCESS || ((rc == ERROR_ALREADY_EXISTS || rc == ERROR_FILE_EXISTS) && Util_DirExists(path)))
+            return TRUE;
+        SetLastError((DWORD)rc);   /* it returns its error rather than setting it */
+        return FALSE;
+    }
+    if (!Util_ExtendedPath(path, extended, ARRAYSIZE(extended)) || wcsncmp(extended, L"\\\\?\\", 4) != 0) {
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return FALSE;
+    }
+    length = wcslen(extended);
+    while (length > start && extended[length - 1] == L'\\') extended[--length] = 0;
+    if (wcsncmp(extended, L"\\\\?\\UNC\\", 8) == 0) {   /* past \\?\UNC\server\share\ */
+        const WCHAR *share = wcschr(extended + 8, L'\\'), *end = share ? wcschr(share + 1, L'\\') : NULL;
+        if (!end) return Util_DirExists(path);
+        start = (size_t)(end - extended) + 1;
+    }
+    for (i = start; i <= length; i++) {
+        WCHAR saved = extended[i];
+        DWORD attributes, error;
+        if (saved != L'\\' && saved != 0) continue;
+        extended[i] = 0;
+        if (!CreateDirectoryW(extended, NULL)) {
+            error = GetLastError();
+            attributes = GetFileAttributesW(extended);
+            if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                SetLastError(error);
+                return FALSE;
+            }
+        }
+        extended[i] = saved;
+    }
+    return TRUE;
 }
 
 /* --------------------------------------------------------------- registry */
@@ -326,18 +379,6 @@ BOOL Util_Spawn(const WCHAR *exe, const WCHAR *args, DWORD *pid)
     return TRUE;
 }
 
-/* `path` as the file functions take it past MAX_PATH: \\?\C:\... or
- * \\?\UNC\server\share\.... Windows then leaves the path as it is, so it
- * must be a full path with backslashes only; any other is copied as it is. */
-BOOL Util_ExtendedPath(const WCHAR *path, WCHAR *out, size_t cch)
-{
-    if (path[0] == L'\\' && path[1] == L'\\' && path[2] != L'?' && path[2] != L'.')
-        return SUCCEEDED(StringCchPrintfW(out, cch, L"\\\\?\\UNC\\%s", path + 2));
-    if (((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) && path[1] == L':' && path[2] == L'\\')
-        return SUCCEEDED(StringCchPrintfW(out, cch, L"\\\\?\\%s", path));
-    return SUCCEEDED(StringCchCopyW(out, cch, path));
-}
-
 /* FindFirstFileExW on `pattern` inside `dir`, at any path length. */
 HANDLE Util_FindFiles(const WCHAR *dir, const WCHAR *pattern, WIN32_FIND_DATAW *found, BOOL foldersOnly)
 {
@@ -349,6 +390,87 @@ HANDLE Util_FindFiles(const WCHAR *dir, const WCHAR *pattern, WIN32_FIND_DATAW *
     }
     return FindFirstFileExW(extended, FindExInfoBasic, found, foldersOnly ? FindExSearchLimitToDirectories : FindExSearchNameMatch,
                             NULL, FIND_FIRST_EX_LARGE_FETCH);
+}
+
+/* Every file of `from` into `to` (folders made), at any path length; one
+ * already there kept unless `replace`. A link inside is not followed: its
+ * own folder is not this one's to copy. FALSE (`*error` set) when one could
+ * not be copied. */
+BOOL Util_CopyTree(const WCHAR *from, const WCHAR *to, BOOL replace, DWORD *error)
+{
+    WCHAR source[LONG_PATH_CCH], target[LONG_PATH_CCH], extendedSource[LONG_PATH_CCH], extendedTarget[LONG_PATH_CCH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    BOOL ok = TRUE;
+    if (!Util_EnsureDir(to)) {
+        *error = GetLastError();
+        return FALSE;
+    }
+    find = Util_FindFiles(from, L"*", &found, FALSE);
+    if (find == INVALID_HANDLE_VALUE) return TRUE;   /* empty */
+    do {
+        if (wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0) continue;
+        if (FAILED(StringCchPrintfW(source, ARRAYSIZE(source), L"%s\\%s", from, found.cFileName)) ||
+            FAILED(StringCchPrintfW(target, ARRAYSIZE(target), L"%s\\%s", to, found.cFileName)) ||
+            !Util_ExtendedPath(source, extendedSource, ARRAYSIZE(extendedSource)) ||
+            !Util_ExtendedPath(target, extendedTarget, ARRAYSIZE(extendedTarget))) {
+            *error = ERROR_FILENAME_EXCED_RANGE;
+            ok = FALSE;
+            continue;
+        }
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!(found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) ok = Util_CopyTree(source, target, replace, error) && ok;
+            continue;
+        }
+        if (!CopyFileW(extendedSource, extendedTarget, !replace) && (replace || GetLastError() != ERROR_FILE_EXISTS)) {
+            *error = GetLastError();
+            ok = FALSE;
+        }
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    return ok;
+}
+
+/* `path` and all it holds deleted for good, at any path length (for what
+ * has a copy elsewhere). A junction or directory symlink inside is removed
+ * as a link, never followed. One already gone counts as done. */
+BOOL Util_DeleteTree(const WCHAR *path, DWORD *error)
+{
+    WCHAR child[LONG_PATH_CCH], extended[LONG_PATH_CCH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    DWORD attributes;
+    BOOL ok = TRUE;
+    if (!Util_ExtendedPath(path, extended, ARRAYSIZE(extended))) {
+        *error = ERROR_FILENAME_EXCED_RANGE;
+        return FALSE;
+    }
+    if ((attributes = GetFileAttributesW(extended)) == INVALID_FILE_ATTRIBUTES) {
+        DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return TRUE;
+        *error = code;
+        return FALSE;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        (find = Util_FindFiles(path, L"*", &found, FALSE)) != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0) continue;
+            if (FAILED(StringCchPrintfW(child, ARRAYSIZE(child), L"%s\\%s", path, found.cFileName))) {
+                *error = ERROR_FILENAME_EXCED_RANGE;
+                ok = FALSE;
+                continue;
+            }
+            ok = Util_DeleteTree(child, error) && ok;
+        } while (FindNextFileW(find, &found));
+        FindClose(find);
+    }
+    if (!ok) return FALSE;
+    if ((attributes & FILE_ATTRIBUTE_READONLY) && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) SetFileAttributesW(extended, FILE_ATTRIBUTE_NORMAL);
+    if (!((attributes & FILE_ATTRIBUTE_DIRECTORY) ? RemoveDirectoryW(extended) : DeleteFileW(extended))) {
+        *error = GetLastError();
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /* A file's content, zero-terminated (free it with HeapFree): all of it when

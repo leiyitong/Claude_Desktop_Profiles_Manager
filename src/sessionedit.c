@@ -82,7 +82,7 @@ static BOOL SaveFile(const WCHAR *path, const char *data, size_t length, const P
     HANDLE file;
     DWORD error = ERROR_SUCCESS;
     BOOL ok;
-    if (profile && Claude_IsRunning(profile)) return FALSE;
+    if (profile && SessionLink_Busy(profile)) return FALSE;
     if (!Util_ExtendedPath(path, target, ARRAYSIZE(target)) ||
         FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" TEMPORARY_SUFFIX, target))) {
         Util_Log(L"could not write %s: its path is too long", path);
@@ -96,7 +96,7 @@ static BOOL SaveFile(const WCHAR *path, const char *data, size_t length, const P
     ok = WriteWhole(file, data, length) && FlushFileBuffers(file);
     if (!ok) error = GetLastError();
     CloseHandle(file);
-    if (ok && profile && Claude_IsRunning(profile)) {
+    if (ok && profile && SessionLink_Busy(profile)) {
         DeleteFileW(temporary);
         Util_Log(L"%s left as it was: its profile started", path);
         return FALSE;
@@ -429,7 +429,7 @@ BOOL SessionEdit_Change(HWND owner, const Profile *p, const SessionEntry *entry,
         UnlockEdits(mutex);
         return FALSE;
     }
-    if (!entry || !entry->file[0] || Claude_IsRunning(p)) {
+    if (!entry || !entry->file[0] || SessionLink_Busy(p)) {
         UnlockEdits(mutex);
         *waiting = TRUE;
         return TRUE;
@@ -440,10 +440,10 @@ BOOL SessionEdit_Change(HWND owner, const Profile *p, const SessionEntry *entry,
     if (row >= 0) keys = SessionKeys(&entries, row, 0, edit->op, &keyCount);
     if (edit->op == PENDING_REMOVE) {
         UnlockEdits(mutex);   /* Windows may ask before deleting what the Recycle Bin cannot hold */
-        if (row >= 0) removed = Claude_IsRunning(p) ? REMOVE_FAILED : RemoveSessionEntries(owner, &entries, row, error, errorCch);
+        if (row >= 0) removed = SessionLink_Busy(p) ? REMOVE_FAILED : RemoveSessionEntries(owner, &entries, row, error, errorCch);
         else if (PathMissing(entry->file)) removed = REMOVE_DONE;   /* gone already */
         /* A Claude started while Windows asked keeps the session: it goes once that Claude closes. */
-        made = removed == REMOVE_DONE && !Claude_IsRunning(p);
+        made = removed == REMOVE_DONE && !SessionLink_Busy(p);
         if (made && row >= 0) MarkDeleted(&entries, row, 0);
         mutex = LockEdits(p);
     } else if (row >= 0) {
@@ -451,7 +451,7 @@ BOOL SessionEdit_Change(HWND owner, const Profile *p, const SessionEntry *entry,
     }
     Util_Log(L"session %s in %s: %s%s", edit->key, p->folder, ChangeName(edit->op),
              made ? L"" : removed == REMOVE_CANCELLED ? L" CANCELLED" : row < 0 ? L" FAILED (not listed)" : L" FAILED");
-    if (made || !Claude_IsRunning(p)) {
+    if (made || !SessionLink_Busy(p)) {
         /* Made, or impossible while the profile is closed: it waits no more, under any key of its session. */
         if (!mutex || !RewritePending(p, NULL, keys ? keys : edit, keys ? keyCount : 1, edit->op == PENDING_REMOVE))
             Util_Log(L"session %s in %s: the change could not be taken off the queue", edit->key, p->folder);
@@ -482,7 +482,7 @@ static int ApplyWaitingChanges(HWND owner, const Profile *p, BOOL afterRun)
     BOOL complete, queueWritable = FALSE;
     if ((mutex = LockEdits(p)) == NULL) return 0;
     queued = (PendingEdit *)HeapAlloc(GetProcessHeap(), 0, 3 * SESSION_PENDING_MAX * sizeof *queued);
-    if (queued && !Claude_IsRunning(p)) n = SessionStore_LoadPending(p, queued, SESSION_PENDING_MAX);
+    if (queued && !SessionLink_Busy(p)) n = SessionStore_LoadPending(p, queued, SESSION_PENDING_MAX);
     if (n <= 0) {
         if (n < 0) Util_Log(L"session changes waiting for %s: their file cannot be read", p->folder);
         if (queued) HeapFree(GetProcessHeap(), 0, queued);
@@ -492,7 +492,7 @@ static int ApplyWaitingChanges(HWND owner, const Profile *p, BOOL afterRun)
     finished = queued + SESSION_PENDING_MAX;
     removals = finished + SESSION_PENDING_MAX;
     complete = SessionStore_LoadEntries(&entries, p);
-    for (i = 0; i < n && !Claude_IsRunning(p); i++) {
+    for (i = 0; i < n && !SessionLink_Busy(p); i++) {
         const PendingEdit *edit = &queued[i];
         BOOL made;
         if (SessionStore_FindEntry(&entries, 0, edit->key, &row) < 0) {
@@ -512,7 +512,7 @@ static int ApplyWaitingChanges(HWND owner, const Profile *p, BOOL afterRun)
         }
         made = SetInEntries(p, &entries, row, edit);
         Util_Log(L"session %s in %s: %s%s", edit->key, p->folder, ChangeName(edit->op), made ? L"" : L" FAILED");
-        if (!made && Claude_IsRunning(p)) break;   /* its Claude started: the rest waits */
+        if (!made && SessionLink_Busy(p)) break;   /* its Claude started: the rest waits */
         finished[finishedCount++] = *edit;
     }
     /* Removals leave the queue before they are made: whatever Windows asks
@@ -526,8 +526,8 @@ static int ApplyWaitingChanges(HWND owner, const Profile *p, BOOL afterRun)
     for (i = 0; i < removalCount; i++) {
         RemoveResult result = REMOVE_FAILED;
         if (SessionStore_FindEntry(&entries, 0, removals[i].key, &row) < 0) continue;
-        if (!Claude_IsRunning(p)) result = RemoveSessionEntries(owner, &entries, row, NULL, 0);
-        if (Claude_IsRunning(p) && result != REMOVE_CANCELLED) {
+        if (!SessionLink_Busy(p)) result = RemoveSessionEntries(owner, &entries, row, NULL, 0);
+        if (SessionLink_Busy(p) && result != REMOVE_CANCELLED) {
             /* Its Claude started meanwhile and keeps the session: removed when it closes. */
             if (RewritePendingLocked(p, &removals[i], NULL, 0, FALSE)) queuedAgain++;
             Util_Log(L"session %s in %s: removal waits again, its Claude started", removals[i].key, p->folder);
@@ -948,8 +948,38 @@ static const SessionItem kSessionItems[] = {
     { L"startup-perf", L".json", FALSE, FALSE },
 };
 
+/* `path`'s volume and file index, links followed. */
+static BOOL FileIdentity(const WCHAR *path, BY_HANDLE_FILE_INFORMATION *info)
+{
+    WCHAR extended[LONG_PATH_CCH];
+    HANDLE file;
+    BOOL ok;
+    if (!Util_ExtendedPath(path, extended, ARRAYSIZE(extended))) return FALSE;
+    file = CreateFileW(extended, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                       FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    ok = GetFileInformationByHandle(file, info);
+    CloseHandle(file);
+    return ok;
+}
+
+/* The same file under two paths: profiles sharing their entries folder
+ * (sessionlink.c) list one entry each, which is one file. */
+static BOOL SameFile(const WCHAR *a, const WCHAR *b)
+{
+    const WCHAR *leafA = wcsrchr(a, L'\\'), *leafB = wcsrchr(b, L'\\');
+    BY_HANDLE_FILE_INFORMATION one, other;
+    if (Core_PathEquals(a, b)) return TRUE;
+    if (!leafA || !leafB || !Core_EqualsI(leafA, leafB)) return FALSE;
+    return FileIdentity(a, &one) && FileIdentity(b, &other) && one.dwVolumeSerialNumber == other.dwVolumeSerialNumber &&
+           one.nFileIndexHigh == other.nFileIndexHigh && one.nFileIndexLow == other.nFileIndexLow;
+}
+
 static BOOL AddSessionFile(WCHAR (**paths)[LONG_PATH_CCH], int *count, int *capacity, const WCHAR *file)
 {
+    int i;
+    for (i = 0; i < *count; i++)
+        if (SameFile((*paths)[i], file)) return TRUE;
     if (*count == *capacity) {
         WCHAR (*grown)[LONG_PATH_CCH];
         int larger;

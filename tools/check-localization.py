@@ -78,7 +78,8 @@ COMMAND_FAMILIES = [
 # TR() calls whose argument is no literal, by file: the variable or the
 # function giving the key (an entry followed by "(" matches any call of it).
 NONLITERAL_CALLS = {
-    "gui.c": ["error", "g_ColorNames[i]", "title", "Theme_MainCaption", "Theme_ProfileRole", "Theme_MainFooter", "Theme_MainNote"],
+    "gui.c": ["error", "g_ColorNames[i]", "title", "Theme_MainCaption", "Theme_ProfileRole", "Theme_MainFooter", "Theme_MainNote",
+              "Theme_SessionsFolderState"],
     "sessions.c": ["Theme_SessionsCaption"],
     "localize.c": ["key"],
     "profiles.c": ["invalid"],
@@ -99,7 +100,8 @@ TRANSLATED_THROUGH_VARIABLES = {
                 "Set as de&fault", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar", "Pinned",
                 "Add to Start &menu", "Remove from Start &menu", "&Sessions  >", "<  &Back", "&Language\u2026",
                 "&Get Claude", "Set up l&inks", "&Uninstall\u2026", "U&pdate", "Close",
-                "Profile", "Role", "Data folder", "Claude icon, default", "Claude icon", "Default",
+                "Profile", "Role", "Data folder", "Sessions folder", "This profile", "Not signed in", "No sessions yet", "Link broken",
+"Claude icon, default", "Claude icon", "Default",
                 "Version %s \u00b7 by <a href=\"%s\">Freenitial</a>, not affiliated with Anthropic",
                 "Version %s \u00b7 version %s is available", "Downloading version %s\u2026", "Installing the new version\u2026",
                 "The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \u201c%s\u201d.",
@@ -123,7 +125,8 @@ ACCESS_KEY_GROUPS = {
                      "Uns&tar", "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s", "&Show folder",
                      "&Delete session everywhere\u2026"],
     "profile list menu": ["&Open", "&Edit\u2026", "&Delete\u2026", "Ove&rwrite sessions\u2026", "E&xport sessions\u2026",
-                          "&Import sessions\u2026"],
+                          "&Import sessions\u2026", "&Link sessions folder to", "U&nlink sessions folder\u2026", "&Back up\u2026",
+                          "Restore from bac&kup\u2026"],
     "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "S&tar", "Uns&tar", "Re&move\u2026%s",
                                  "&Delete sessions everywhere\u2026"],
     "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026"],

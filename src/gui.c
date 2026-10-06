@@ -182,6 +182,26 @@ static void FocusView(HWND dialog, BOOL sessions)
 
 /* ------------------------------------------------------------------ list */
 
+/* Where a profile's session entries are: its own folder, another profile's,
+ * a folder of the user's, or none yet (sessionlink.c). */
+static const WCHAR *SessionsFolderText(int i, WCHAR *text, size_t cch)
+{
+    LinkState state;
+    SessionLink_Read(&g_manager.profiles, i, &state);
+    switch (state.kind) {
+    case LINK_OWN:           return TR(Theme_SessionsFolderState(0));
+    case LINK_NOT_SIGNED_IN: return TR(Theme_SessionsFolderState(1));
+    case LINK_NO_SESSIONS:   return TR(Theme_SessionsFolderState(2));
+    case LINK_BROKEN:        return TR(Theme_SessionsFolderState(3));
+    case LINK_PROFILE:
+        StringCchPrintfW(text, cch, L"\x2192 %s", g_manager.profiles.items[state.profile].name);
+        return text;
+    default:
+        StringCchPrintfW(text, cch, L"\x2192 %s", state.target);
+        return text;
+    }
+}
+
 static void UpdateRow(int i)
 {
     const Profile *p = &g_manager.profiles.items[i];
@@ -191,6 +211,7 @@ static void UpdateRow(int i)
                          (LPWSTR)TR(Theme_ProfileRole(p->isStock, Core_EqualsI(p->folder, g_manager.profiles.defaultFolder))));
     StringCchPrintfW(text, ARRAYSIZE(text), L"%%APPDATA%%\\%s", p->folder);
     ListView_SetItemText(g_manager.list, i, 2, text);
+    ListView_SetItemText(g_manager.list, i, 3, (LPWSTR)SessionsFolderText(i, text, ARRAYSIZE(text)));
 }
 
 static int IconPixels(void)
@@ -223,15 +244,33 @@ static void RebuildImages(int *rowImages)
  * (the window's minimum size keeps it at least its own minimum). */
 void Gui_LayoutProfileColumns(HWND list)
 {
-    int profileWidth, roleWidth, dataMinimum;
+    WCHAR text[MAX_PATH];
+    int profileWidth, roleWidth, dataMinimum, sessionsMinimum, dataWidth, padding, i, count = ListView_GetItemCount(list);
     int actualProfile = ListView_GetColumnWidth(list, 0), actualRole = ListView_GetColumnWidth(list, 1);
-    Theme_ProfileColumnWidths(list, &profileWidth, &roleWidth, &dataMinimum);
+    int actualData = ListView_GetColumnWidth(list, 2);
+    Theme_ProfileColumnWidths(list, &profileWidth, &roleWidth, &dataMinimum, &sessionsMinimum);
     if (Theme_ColumnResizeIsManual(list, 0)) profileWidth = actualProfile;
     if (Theme_ColumnResizeIsManual(list, 1)) roleWidth = actualRole;
+    /* The data column: every row's folder whole, with the room the stock folder gets around its text. */
+    dataWidth = dataMinimum;
+    padding = dataMinimum - ListView_GetStringWidth(list, L"%APPDATA%\\" STOCK_FOLDER);
+    for (i = 0; i < count; i++) {
+        text[0] = 0;
+        ListView_GetItemText(list, i, 2, text, ARRAYSIZE(text));
+        dataWidth = max(dataWidth, ListView_GetStringWidth(list, text) + padding);
+    }
+    if (Theme_ColumnResizeIsManual(list, 2)) dataWidth = actualData;
+    else if (!Theme_ColumnResizeIsManual(list, 3)) {
+        /* Narrower, down to the stock folder's width, when the sessions folder would not fit otherwise: a folder cut short shows whole in its tip. */
+        RECT client;
+        GetClientRect(list, &client);
+        dataWidth = max(dataMinimum, min(dataWidth, client.right - profileWidth - roleWidth - sessionsMinimum));
+    }
     Theme_SetColumnWidth(list, 0, profileWidth);
     Theme_SetColumnWidth(list, 1, roleWidth);
-    /* The data column: the rest, never narrower than the data folder (past it, the list scrolls sideways). */
-    Theme_FitLastColumn(list, dataMinimum);
+    Theme_SetColumnWidth(list, 2, dataWidth);
+    /* The sessions folder: the rest, never narrower than what it says (past it, the list scrolls sideways). */
+    Theme_FitLastColumn(list, sessionsMinimum);
 }
 
 static void LayoutColumns(void)
@@ -1411,13 +1450,113 @@ static void DoSessions(SessionsAction action)
 #define IDM_LIST_OVERWRITE 0x6004
 #define IDM_LIST_EXPORT 0x6005
 #define IDM_LIST_IMPORT 0x6006
+#define IDM_LIST_LINK_FOLDER 0x6007
+#define IDM_LIST_UNLINK 0x6008
+#define IDM_LIST_BACKUP 0x6009
+#define IDM_LIST_RESTORE 0x600A
+#define IDM_LIST_LINK_FIRST 0x6100   /* + the index of the profile whose session folder is shared */
+
+/* A folder the user chose, in `path`; FALSE when none was (an error said). */
+static BOOL ChooseFolder(HWND owner, const WCHAR *title, WCHAR *path, size_t cch)
+{
+    IFileDialog *dialog = NULL;
+    IShellItem *result = NULL;
+    FILEOPENDIALOGOPTIONS options = 0;
+    PWSTR chosen = NULL;
+    BOOL ok = FALSE;
+    HRESULT hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileDialog, (void **)&dialog);
+    if (FAILED(hr)) {
+        Ui_Message(owner, MB_ICONERROR, TR(L"The file could not be chosen (error 0x%08lX)."), (unsigned long)hr);
+        return FALSE;
+    }
+    IFileDialog_SetTitle(dialog, title);
+    if (SUCCEEDED(IFileDialog_GetOptions(dialog, &options)))
+        IFileDialog_SetOptions(dialog, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    hr = IFileDialog_Show(dialog, owner);
+    if (SUCCEEDED(hr) && SUCCEEDED(hr = IFileDialog_GetResult(dialog, &result))) {
+        if (SUCCEEDED(hr = IShellItem_GetDisplayName(result, SIGDN_FILESYSPATH, &chosen))) {
+            ok = SUCCEEDED(StringCchCopyW(path, cch, chosen));
+            if (!ok) Ui_Message(owner, MB_ICONERROR, TR(L"The path is too long."));
+            CoTaskMemFree(chosen);
+        }
+        IShellItem_Release(result);
+    }
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        Ui_Message(owner, MB_ICONERROR, TR(L"The file could not be chosen (error 0x%08lX)."), (unsigned long)hr);
+    IFileDialog_Release(dialog);
+    return ok;
+}
+
+/* The selected profile's session folder kept in profile `other`'s (an
+ * index), or with -1 in a folder the user chooses. */
+/* TRUE (and says so) when the profile, or one sharing its session folder, runs: its sessions are in Claude's memory. */
+static BOOL LinkBusy(const Profile *p)
+{
+    if (!SessionLink_Busy(p)) return FALSE;
+    Ui_Message(g_manager.dlg, MB_ICONINFORMATION, TR(L"Close \x201C%s\x201D first, and every profile that shares its session folder."), p->name);
+    return TRUE;
+}
+
+static void DoLink(int other)
+{
+    const Profile *p = SelectedProfile();
+    WCHAR folder[LONG_PATH_CCH], text[1024 + LONG_PATH_CCH], error[512 + 2 * LONG_PATH_CCH];
+    LinkState shared;
+    int index;
+    if (!p || StateChangesBlocked() || LinkBusy(p) || (other >= 0 && LinkBusy(&g_manager.profiles.items[other]))) return;
+    index = (int)(p - g_manager.profiles.items);
+    if (other >= 0) {
+        SessionLink_Read(&g_manager.profiles, other, &shared);
+        if (shared.kind == LINK_OWN) StringCchCopyW(folder, ARRAYSIZE(folder), shared.dir);
+        else if (shared.kind == LINK_PROFILE || shared.kind == LINK_FOLDER) StringCchCopyW(folder, ARRAYSIZE(folder), shared.target);
+        else {
+            Ui_Message(g_manager.dlg, MB_ICONINFORMATION, TR(L"\x201C%s\x201D has no session folder to share yet: sign in there and open a Code session once."),
+                       g_manager.profiles.items[other].name);
+            return;
+        }
+        StringCchPrintfW(text, ARRAYSIZE(text),
+                         TR(L"Link the session folder of \x201C%s\x201D to the one of \x201C%s\x201D?\n\nBoth profiles then list the same Code sessions. "
+                            L"The sessions \x201C%s\x201D lists now are added there first, and kept in a backup. Close both profiles first."),
+                         p->name, g_manager.profiles.items[other].name, p->name);
+    } else {
+        if (!ChooseFolder(g_manager.dlg, TR(L"Choose the folder of the sessions"), folder, ARRAYSIZE(folder))) return;
+        StringCchPrintfW(text, ARRAYSIZE(text),
+                         TR(L"Keep the session folder of \x201C%s\x201D in\n%s?\n\nThe sessions it lists now are added there first, and kept in a backup. "
+                            L"A folder synchronized to another PC carries the list of sessions, not their conversations, which stay in this PC's Claude Code folder."),
+                         p->name, folder);
+    }
+    if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Link"), TR(L"Cancel"), FALSE)) return;
+    FinishShellWork();
+    if (!SessionLink_Create(g_manager.dlg, &g_manager.profiles, index, folder, error, ARRAYSIZE(error)))
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", error);
+    Refresh(FALSE);
+}
+
+static void DoUnlink(void)
+{
+    const Profile *p = SelectedProfile();
+    WCHAR text[1024], error[512 + 2 * LONG_PATH_CCH];
+    if (!p || StateChangesBlocked() || LinkBusy(p)) return;
+    StringCchPrintfW(text, ARRAYSIZE(text),
+                     TR(L"Give \x201C%s\x201D a session folder of its own again?\n\nIt keeps the sessions the shared folder lists now; "
+                        L"from then on the two lists go apart."),
+                     p->name);
+    if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Unlink"), TR(L"Cancel"), FALSE)) return;
+    FinishShellWork();
+    if (!SessionLink_Remove(&g_manager.profiles, (int)(p - g_manager.profiles.items), error, ARRAYSIZE(error)))
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", error);
+    Refresh(FALSE);
+}
 
 /* The list's menu, at the mouse or (from the keyboard) under the row with
  * the focus: the buttons' actions on the profiles selected, and their
  * sessions exported or imported. */
 static void ListMenu(LPARAM pos)
 {
-    HMENU menu;
+    HMENU menu, links;
+    const Profile *one;
+    LinkState state;
+    int index = -1;
     DWORD selected = SelectedProfiles();
     POINT pt;
     UINT cmd;
@@ -1433,6 +1572,13 @@ static void ListMenu(LPARAM pos)
         pt.y = (short)HIWORD(pos);
     }
     if ((menu = CreatePopupMenu()) == NULL) return;
+    ZeroMemory(&state, sizeof state);
+    one = SelectedProfile();
+    if (one) {
+        index = (int)(one - g_manager.profiles.items);
+        SessionLink_Read(&g_manager.profiles, index, &state);
+    }
+    links = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (selected && g_manager.pkg.found ? 0 : MF_GRAYED), IDM_LIST_OPEN, TR(Theme_MainCaption(IDC_OPEN, 0)));
     AppendMenuW(menu, MF_STRING | (SelectedProfile() ? 0 : MF_GRAYED), IDM_LIST_EDIT, TR(Theme_MainCaption(IDC_EDIT, 0)));
     AppendMenuW(menu, MF_STRING | (Deletable(selected) ? 0 : MF_GRAYED), IDM_LIST_DELETE, TR(Theme_MainCaption(IDC_DELETE, 0)));
@@ -1440,9 +1586,42 @@ static void ListMenu(LPARAM pos)
     AppendMenuW(menu, MF_STRING | (g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDM_LIST_OVERWRITE, TR(Theme_MainCaption(IDC_OVERWRITE, 0)));
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDM_LIST_EXPORT, TR(L"E&xport sessions\x2026"));
     AppendMenuW(menu, MF_STRING, IDM_LIST_IMPORT, TR(L"&Import sessions\x2026"));
+    /* Session folders: shared with another profile (one whose folder there is) or kept elsewhere. */
+    if (links) {
+        int i;
+        for (i = 0; one && i < g_manager.profiles.count; i++) {
+            LinkState other;
+            WCHAR label[2 * LABEL_CCH];
+            const WCHAR *name = g_manager.profiles.items[i].name;
+            size_t at = 0, from;
+            if (i == index) continue;
+            SessionLink_Read(&g_manager.profiles, i, &other);
+            for (from = 0; name[from] && at + 2 < ARRAYSIZE(label); from++) {
+                if (name[from] == L'&') label[at++] = L'&';   /* a name's ampersand is no access key */
+                label[at++] = name[from];
+            }
+            label[at] = 0;
+            AppendMenuW(links, MF_STRING | (other.kind == LINK_OWN || other.kind == LINK_PROFILE || other.kind == LINK_FOLDER ? 0 : MF_GRAYED),
+                        IDM_LIST_LINK_FIRST + (UINT)i, label);
+        }
+        if (GetMenuItemCount(links) > 0) AppendMenuW(links, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(links, MF_STRING, IDM_LIST_LINK_FOLDER, TR(L"Another &folder\x2026"));
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(menu, MF_POPUP | (one && (state.kind == LINK_OWN || state.kind == LINK_PROFILE || state.kind == LINK_FOLDER || state.kind == LINK_BROKEN) ? 0 : MF_GRAYED),
+                    (UINT_PTR)links, TR(L"&Link sessions folder to"));
+        AppendMenuW(menu, MF_STRING | (one && (state.kind == LINK_PROFILE || state.kind == LINK_FOLDER || state.kind == LINK_BROKEN) ? 0 : MF_GRAYED),
+                    IDM_LIST_UNLINK, TR(L"U&nlink sessions folder\x2026"));
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDM_LIST_BACKUP, TR(L"&Back up\x2026"));
+    AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDM_LIST_RESTORE, TR(L"Restore from bac&kup\x2026"));
     if (selected && g_manager.pkg.found) SetMenuDefaultItem(menu, IDM_LIST_OPEN, FALSE);
     cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | (Localize_IsRTL() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, g_manager.dlg, NULL);
-    DestroyMenu(menu);
+    DestroyMenu(menu);   /* with its submenu */
+    if (cmd >= IDM_LIST_LINK_FIRST && cmd < IDM_LIST_LINK_FIRST + MAX_PROFILES) {
+        DoLink((int)(cmd - IDM_LIST_LINK_FIRST));
+        return;
+    }
     switch (cmd) {
     case IDM_LIST_OPEN:   DoOpen(); break;
     case IDM_LIST_EDIT:   DoEdit(); break;
@@ -1450,6 +1629,18 @@ static void ListMenu(LPARAM pos)
     case IDM_LIST_OVERWRITE: DoSessions(SESSIONS_OVERWRITE); break;
     case IDM_LIST_EXPORT: DoSessions(SESSIONS_EXPORT); break;
     case IDM_LIST_IMPORT: DoSessions(SESSIONS_IMPORT); break;
+    case IDM_LIST_LINK_FOLDER: DoLink(-1); break;
+    case IDM_LIST_UNLINK: DoUnlink(); break;
+    case IDM_LIST_BACKUP:
+        if (SelectedProfile()) Backup_Create(g_manager.dlg, &g_manager.pkg, &g_manager.profiles, (int)(SelectedProfile() - g_manager.profiles.items));
+        break;
+    case IDM_LIST_RESTORE:
+        if (SelectedProfile() && !StateChangesBlocked()) {
+            FinishShellWork();
+            Backup_Restore(g_manager.dlg, &g_manager.pkg, &g_manager.profiles, (int)(SelectedProfile() - g_manager.profiles.items));
+            Refresh(FALSE);
+        }
+        break;
     }
 }
 

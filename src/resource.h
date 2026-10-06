@@ -14,6 +14,7 @@
 #define IDD_TITLE         104
 #define IDD_SYNC          105
 #define IDD_LINK          106
+#define IDD_BACKUP        107
 
 /* main window */
 #define IDC_STATUS        1000
@@ -82,6 +83,11 @@
 #define IDC_L_TEXT        1700
 #define IDC_L_LINK        1701
 #define IDC_L_LIST        1702
+
+/* a profile's backup and restore */
+#define IDC_B_TEXT        1800
+#define IDC_B_LIST        1801
+#define IDC_B_NOTE        1802
 
 /* message box */
 #define IDC_M_ICON        1300

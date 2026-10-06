@@ -3294,17 +3294,18 @@ static void PlaceHeader(HWND view, UINT quiet)
     SetWindowPos(header, HWND_TOP, r.left, viewState->native ? 0 : viewState->pos, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | quiet);
 }
 
-static BOOL CachedProfileWidths(HWND list, int *profile, int *role, int *dataMinimum);
+static BOOL CachedProfileWidths(HWND list, int *profile, int *role, int *dataMinimum, int *sessionsMinimum);
 
 /* The least a list view's last column keeps: its title, and in the
- * profile list the data folder in every language (Theme_ProfileColumnWidths). */
+ * profile list what the sessions folder column says in every language
+ * (Theme_ProfileColumnWidths). */
 static int LastColumnMinimum(HWND list, HWND header, int column)
 {
     WCHAR title[128];
     HDITEMW item;
     RECT measured = { 0 };
     HDC dc;
-    int minimum = 2 * ScaleForWindow(header, HEADER_TEXT_INSET_DIPS), profile, role, dataMinimum;
+    int minimum = 2 * ScaleForWindow(header, HEADER_TEXT_INSET_DIPS), profile, role, dataMinimum, sessionsMinimum;
     ZeroMemory(&item, sizeof item);
     item.mask = HDI_TEXT;
     item.pszText = title;
@@ -3317,7 +3318,7 @@ static int LastColumnMinimum(HWND list, HWND header, int column)
         ReleaseDC(header, dc);
         minimum += measured.right;
     }
-    if (CachedProfileWidths(list, &profile, &role, &dataMinimum)) minimum = max(minimum, dataMinimum);
+    if (CachedProfileWidths(list, &profile, &role, &dataMinimum, &sessionsMinimum)) minimum = max(minimum, sessionsMinimum);
     return minimum;
 }
 
@@ -4210,7 +4211,9 @@ static SIZE MeasureEveryLanguage(HWND control, const WCHAR *const *keys, int key
     return largest;
 }
 
-static const WCHAR *const kProfileColumnTitles[] = { L"Profile", L"Role", L"Data folder" };
+static const WCHAR *const kProfileColumnTitles[] = { L"Profile", L"Role", L"Data folder", L"Sessions folder" };
+/* What the sessions folder column says besides a link's target (sessionlink.c). */
+static const WCHAR *const kSessionsFolderStates[] = { L"This profile", L"Not signed in", L"No sessions yet", L"Link broken" };
 /* The role column's values: the profile the regular Claude icon opens, the default one, or both. */
 static const WCHAR *const kProfileRoles[] = { L"Claude icon, default", L"Claude icon", L"Default" };
 
@@ -4227,16 +4230,22 @@ const WCHAR *Theme_ProfileRole(BOOL stock, BOOL isDefault)
 
 #define PROFILE_COLUMN_PADDING_DIPS 16   /* around a profile column's widest text */
 
-void Theme_ProfileColumnWidths(HWND list, int *profile, int *role, int *dataMinimum)
+const WCHAR *Theme_SessionsFolderState(int state)
+{
+    return state >= 0 && state < (int)ARRAYSIZE(kSessionsFolderStates) ? kSessionsFolderStates[state] : NULL;
+}
+
+void Theme_ProfileColumnWidths(HWND list, int *profile, int *role, int *dataMinimum, int *sessionsMinimum)
 {
     static const WCHAR *const kStockFolder[] = { L"%APPDATA%\\" STOCK_FOLDER };
     HWND header = ListView_GetHeader(list);
     HWND titles = header && SendMessageW(header, WM_GETFONT, 0, 0) ? header : list;
     UINT format = DT_SINGLELINE | DT_NOPREFIX;
     int padding = ScaleForWindow(list, PROFILE_COLUMN_PADDING_DIPS);
-    int dataColumnMinimum;
-    if (CachedProfileWidths(list, profile, role, &dataColumnMinimum)) {
+    int dataColumnMinimum, sessionsColumnMinimum;
+    if (CachedProfileWidths(list, profile, role, &dataColumnMinimum, &sessionsColumnMinimum)) {
         if (dataMinimum) *dataMinimum = dataColumnMinimum;
+        if (sessionsMinimum) *sessionsMinimum = sessionsColumnMinimum;
         return;
     }
     *profile = ScaleForWindow(list, THEME_PROFILE_COLUMN_DIPS);
@@ -4245,6 +4254,10 @@ void Theme_ProfileColumnWidths(HWND list, int *profile, int *role, int *dataMini
     if (dataMinimum)
         *dataMinimum = max(MeasureEveryLanguage(titles, &kProfileColumnTitles[2], 1, NULL, format, 0, NULL).cx,
                            MeasureEveryLanguage(list, kStockFolder, ARRAYSIZE(kStockFolder), NULL, format, 0, NULL).cx) + padding;
+    if (sessionsMinimum)
+        *sessionsMinimum = max(MeasureEveryLanguage(titles, &kProfileColumnTitles[3], 1, NULL, format, 0, NULL).cx,
+                               MeasureEveryLanguage(list, kSessionsFolderStates, ARRAYSIZE(kSessionsFolderStates), NULL, format, 0, NULL).cx) +
+                           padding;
 }
 
 /* SysLink's native line layout includes its link runs and their wrapping. */
@@ -4506,7 +4519,7 @@ typedef struct MainBudget {
     SIZE minimum;
     int margin, gap, sideGap, sidebar, headerHeight, buttonHeight, headerRow;
     int sessionsWidth, languageWidth, statusActionWidth, uninstallWidth, updateWidth, closeWidth;
-    int profileWidth, roleWidth, dataMinimum, profilesPane, detailsPane, archivedWidth;
+    int profileWidth, roleWidth, dataMinimum, sessionsMinimum, profilesPane, detailsPane, archivedWidth;
     int shortcutWidth[ARRAYSIZE(kMainShortcuts)], shortcutTotal, noteHeight, groupHeight, minimumBody, footerHeight;
 } MainBudget;
 
@@ -4602,7 +4615,7 @@ static ULONGLONG MainFontKey(HWND dialog)
     return HashControlFont(key, ListView_GetHeader(list));
 }
 
-static BOOL CachedProfileWidths(HWND list, int *profile, int *role, int *dataMinimum)
+static BOOL CachedProfileWidths(HWND list, int *profile, int *role, int *dataMinimum, int *sessionsMinimum)
 {
     HWND dialog = GetAncestor(list, GA_ROOT);
     MainBudget *budget = (MainBudget *)GetPropW(dialog, MAIN_BUDGET_PROP);
@@ -4610,6 +4623,7 @@ static BOOL CachedProfileWidths(HWND list, int *profile, int *role, int *dataMin
     *profile = budget->profileWidth;
     *role = budget->roleWidth;
     *dataMinimum = budget->dataMinimum;
+    *sessionsMinimum = budget->sessionsMinimum;
     return TRUE;
 }
 
@@ -4734,7 +4748,7 @@ static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
     budget->gap = MulDiv(THEME_MAIN_GAP_DIPS, (int)dpi, 96);
     budget->sideGap = MulDiv(MAIN_SIDE_GAP_DIPS, (int)dpi, 96);
     budget->measuring = TRUE;
-    Theme_ProfileColumnWidths(list, &budget->profileWidth, &budget->roleWidth, &budget->dataMinimum);
+    Theme_ProfileColumnWidths(list, &budget->profileWidth, &budget->roleWidth, &budget->dataMinimum, &budget->sessionsMinimum);
     MeasureMainButtons(dialog, base, budget);
     treePane = MeasureSessionsPanes(dialog, base, budget, &searchHeight, &archivedHeight);
     LayoutTextBudget(ListView_GetHeader(list), 0, FALSE, &textWidth, &textHeight, &tallestFont);
@@ -4746,7 +4760,8 @@ static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
     /* As wide as the list's columns and the side bar, the sessions' panes,
      * and the header's buttons with room for the status; never narrower than
      * the resource. */
-    budget->minimum.cx = max(budget->profileWidth + budget->roleWidth + budget->dataMinimum + LIST_FRAME_PX + budget->sidebar + budget->sideGap,
+    budget->minimum.cx = max(budget->profileWidth + budget->roleWidth + budget->dataMinimum + budget->sessionsMinimum + LIST_FRAME_PX +
+                                 budget->sidebar + budget->sideGap,
                              budget->profilesPane + treePane + budget->detailsPane + 2 * budget->gap) + 2 * budget->margin;
     budget->minimum.cx = max(budget->minimum.cx, budget->sessionsWidth + budget->languageWidth + budget->statusActionWidth + 3 * budget->gap +
                              2 * budget->margin + MulDiv(MAIN_STATUS_MINIMUM_DIPS, (int)dpi, 96));
