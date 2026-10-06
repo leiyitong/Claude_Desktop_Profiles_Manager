@@ -24,7 +24,7 @@ The manager's **Role** column:
 |---|---|
 | Claude icon, default | Main, which the regular Claude icon opens, and also the default profile |
 | Claude icon | Main; another profile is the default one |
-| Default | The profile picked with **Set as default**: it opens `claude://` links while Claude is closed |
+| Default | The profile picked with **Set as default**: it is selected for `claude://` links while Claude is closed |
 | *(empty)* | Any other profile |
 
 ## Starting Claude
@@ -121,14 +121,14 @@ Archiving stays in Claude: its own archive also cleans up the session's worktree
 
 ### Sessions between profiles
 
-**Merge all sessions…** and **Mirror sessions…** in the main window, the menus of several sessions, and **Export sessions…** and **Import sessions…** (in the menus of the profile list and of the sessions tree) send sessions to several profiles at once. Ctrl+click and Shift+click select several profiles in the profile list too. A dialog lists the profiles checked and says what will happen; a profile not signed in to Claude yet has no entries folder and is left out.
+**Merge all sessions…** and **Overwrite sessions…** in the main window, the menus of several sessions, and **Export sessions…** and **Import sessions…** (in the menus of the profile list and of the sessions tree) send sessions to several profiles at once. Ctrl+click and Shift+click select several profiles in the profile list too. A dialog lists the profiles checked and says what will happen; a profile not signed in to Claude yet has no entries folder and is left out.
 
 - **Merge** gives each profile checked the sessions the others list, with the entry of the profile that used the session last: an older entry is replaced (the profile keeps its own entry id), a newer one stays.
-- **Mirror** gives the profiles checked every session of the source as the source lists it (title, star, archived), even one they deleted, and the source's `deleted_<id>` marks of the sessions they do not list. **Also remove** takes out of them the sessions the source does not list and the marks it does not have, and gives them its `archived-sessions.idx`.
+- **Overwrite** gives the profiles checked every session of the source as the source lists it (title, star, archived), even one they deleted, and the source's `deleted_<id>` marks of the sessions they do not list. **Also remove** takes out of them the sessions the source does not list and the marks it does not have, and gives them its `archived-sessions.idx`.
 - **Share** and **Copy** of several sessions write each entry instead of opening the session with a link, so no profile opens.
 - **Export** writes a ZIP archive, stored rather than compressed: `manifest.json`, each session's entry, and its conversation's files in the Claude Code folder (the items **Delete session everywhere** would remove there). **Import** adds the conversation files that are missing, never replacing one and only where a conversation keeps its files, then sends the entries to the profiles checked.
 
-An entry sent to a profile is written as Claude writes its own: `local_<id>.json` in the folder of the account signed in and its organization, through a temporary file put in place. A running profile's entries are not written: what is sent to it waits in `pending-sync-<folder>.txt`, with the entries in `pending-sync-<folder>\`, and is made when it closes, at the moments the waiting changes below are made. Each change is checked again then: a session used there since keeps its entry, and one Claude marked deleted there stays deleted unless it was mirrored, shared or imported on purpose. What a change replaces or removes is first copied to `backups\<time>\<folder>` in the manager's folder, which keeps the latest 20. A summary then says what was added, updated, removed, left as it was, and what waits for a profile to close.
+An entry sent to a profile is written as Claude writes its own: `local_<id>.json` in the folder of the account signed in and its organization, through a temporary file put in place. A running profile's entries are not written: what is sent to it waits in `pending-sync-<folder>.txt`, with the entries in `pending-sync-<folder>\`, and is made when it closes, at the moments the waiting changes below are made. Each change is checked again then: a session used there since keeps its entry, and one Claude marked deleted there stays deleted unless it was overwritten, shared or imported on purpose. What a change replaces or removes is first copied to `backups\<time>\<folder>` in the manager's folder, which keeps the latest 20. A summary then says what was added, updated, removed, left as it was, and what waits for a profile to close.
 
 A running Claude keeps its sessions in memory and writes them back: an entry changed under it is overwritten. A change to a running profile therefore waits in `%LOCALAPPDATA%\Claude Desktop Profiles Manager\pending-sessions-<folder>.txt` and is made when that profile closes: by its watcher, before the manager starts it again, or when the sessions view finds it closed. The session then reads "Changes made when <profile> closes", and **Keep in <profile>** cancels a removal still waiting. A newer change replaces what waited of its kind, a removal replaces everything, and any other change cancels a waiting removal; at most 256 changes wait. A pending file is written to a temporary copy, flushed, then put in place, and one that cannot be read is never written over. Entry changes and pending-file rewrites share a per-profile mutex across processes; a waiting change is made only once Claude is checked closed, and a removal overtaken by Claude's start waits again. When a profile starts while Windows asks about a removal, its Claude keeps the session, and the entry goes when that Claude closes.
 
@@ -148,7 +148,7 @@ When the manager opens, at most every 4 hours, it reads the tag of the latest re
 
 ## claude:// links
 
-A browser sign-in returns to the app through a `claude://` link, and Windows gives every such link to one program. Claude accepts a sign-in only in the window that opened the browser, so with several windows open the link must reach the right one.
+A browser sign-in returns to the app through a `claude://` link, and Windows gives every such link to one program. Claude accepts a sign-in only in the window that opened the browser, so with several windows open the link must reach the right one. With several profiles, the manager asks which one opens each link, the likely one selected.
 
 ### Which app opens them
 
@@ -161,9 +161,9 @@ The manager registers as an app for `claude://`: the ProgId `ClaudeDesktopProfil
 ### Routing a link
 
 1. Spaces around the link are trimmed; it must start with `claude:` followed by something. Quotes, backslashes, spaces and control characters inside it are percent-encoded so it stays one argument; a link holding another kind of space (no-break, ideographic, any other Unicode space) is refused.
-2. **Sign-in links** (`login`, `auth`, `magic-link`, `sso` or `callback` in the path, not in the query or fragment) go to the window that opened the browser. That window logs `[Auth] Using system browser for: /login/...` in its `main.log`; the link goes to the window with the latest such line from the last 15 minutes, else to every open window. Other windows ignore it.
-3. **Other links** go to the Claude window used last, else the default profile's window, else the first one.
-4. **No Claude window open**: the default profile starts with the link.
+2. **One profile**: the link goes to it.
+3. **Several profiles**: **Open a Claude link** lists them all, each open one said so, with the link shown without its query or fragment (they can hold a sign-in code). **Open** (or Enter, or a double click) gives the link to the profile chosen, which starts with it when it is closed; **Cancel** drops the link.
+4. **Selected at first**: for a **sign-in link** (`login`, `auth`, `magic-link`, `sso` or `callback` in the path, not in the query or fragment), the window that opened the browser. That window logs `[Auth] Using system browser for: /login/...` in its `main.log`; the window with the latest such line from the last 15 minutes is selected, and the dialog names it. A window that did not start the sign-in ignores its link. For any other link, or a sign-in no window claims: the Claude window used last, else the default profile's window, else the first open one; with no Claude window open, the default profile.
 
 A link reaches a running window through a second activation with the same `--user-data-dir`: Chromium's single-instance lock hands the link over and the new process exits.
 
@@ -203,7 +203,7 @@ Any other option, or `--launch` and `--watch` without their folder, does nothing
 - **After a Claude update** Windows opens Main again, even when only another profile was open. That Main keeps Claude's button unless it was open with its own before the update.
 - **Shared Claude Code data**: `%USERPROFILE%\.claude` (or `CLAUDE_CONFIG_DIR`: Claude Code settings and memory) is the same for every profile. A `CLAUDE_CONFIG_DIR` set in a profile's own Claude settings is not followed.
 - **Cowork** runs in one profile at a time: its VM is shared by the whole PC.
-- **One sign-in at a time**: the newest `[Auth]` line wins. A second sign-in started in another window before the first one finishes sends the first one's link to that window, which ignores it; start that sign-in again.
+- **One sign-in at a time**: the newest `[Auth]` line is the one selected. A second sign-in started in another window before the first one finishes gets the first one's link selected for it: pick the first window in the dialog, or start that sign-in again.
 - **Running profiles** cannot be deleted: quit them from the notification area first.
 - **Deleted profiles**: a shortcut or pin to one offers to open the manager instead of starting Claude.
 - **Linked folders**: deleting a profile whose folder is linked elsewhere removes the link and Claude's local files for it (`%LOCALAPPDATA%\<folder>`, `<folder>-Data`), not the folder it leads to.

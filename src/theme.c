@@ -4310,7 +4310,7 @@ typedef struct MainButton {
 static const MainButton kMainActions[] = {
     { IDC_OPEN, { L"&Open", NULL } }, { IDC_NEW, { L"&New profile\x2026", NULL } }, { IDC_EDIT, { L"&Edit\x2026", NULL } },
     { IDC_DELETE, { L"&Delete\x2026", NULL } }, { IDC_MERGE, { L"Merge &all sessions\x2026", NULL } },
-    { IDC_MIRROR, { L"Mi&rror sessions\x2026", NULL } }, { IDC_DEFAULT, { L"Set as de&fault", NULL } }
+    { IDC_OVERWRITE, { L"Ove&rwrite sessions\x2026", NULL } }, { IDC_DEFAULT, { L"Set as de&fault", NULL } }
 };
 #define MAIN_PROFILE_ACTIONS 4                               /* Open to Delete; the sessions' two below them, apart */
 #define MAIN_STACKED_ACTIONS (ARRAYSIZE(kMainActions) - 1)   /* all but "Set as default", which sits above the note */
@@ -4351,7 +4351,7 @@ static const WCHAR *const kMainFooters[MAIN_FOOTERS] = {
     L"Installing the new version\x2026"
 };
 /* The note under Set as default; its argument: the profile the regular Claude icon opens. */
-static const WCHAR kMainNote[] = L"The default profile opens claude:// links while Claude is closed.\n\nThe regular Claude icon opens \x201C%s\x201D.";
+static const WCHAR kMainNote[] = L"The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \x201C%s\x201D.";
 /* The sessions details' captions the main window's minimum keeps room for (SessionsCaption). */
 static const WCHAR *const kSessionsCaptions[SESSIONS_CAPTIONS] = { L"Actions", L"Delete session everywhere\x2026" };
 
@@ -4465,7 +4465,7 @@ static ULONGLONG HashControlFont(ULONGLONG key, HWND control)
 
 static ULONGLONG MainFontKey(HWND dialog)
 {
-    static const int kControls[] = { IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_MIRROR, IDC_DEFAULT, IDC_SC_DESKTOP,
+    static const int kControls[] = { IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT, IDC_SC_DESKTOP,
         IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START, IDC_SESSIONS, IDC_LANGUAGE, IDC_STATUS_ACTION, IDC_UNINSTALL,
         IDC_UPDATE, IDCANCEL, IDC_S_ARCHIVED, IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE, IDC_ABOUT };
     HWND list = MainViewContent(dialog, IDC_LIST);

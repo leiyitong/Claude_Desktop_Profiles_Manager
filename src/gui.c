@@ -1,6 +1,6 @@
 /*
  * The manager window: the profile list with Open / New / Edit / Delete,
- * Merge all sessions / Mirror sessions (syncui.c) and Set as default, the
+ * Merge all sessions / Overwrite sessions (syncui.c) and Set as default, the
  * shortcut, taskbar pin and Start menu buttons, and Uninstall; Sessions turns
  * the same window to the sessions view (sessions.c). Several profiles can be
  * selected (Shift, Ctrl, Ctrl+A): Open, Delete and the list's menu (Export
@@ -434,7 +434,7 @@ static void UpdateButtons(void)
     EnableControl(IDC_EDIT, p != NULL);
     EnableControl(IDC_DELETE, Deletable(selected) != 0);
     EnableControl(IDC_MERGE, g_manager.profiles.count >= 2);
-    EnableControl(IDC_MIRROR, g_manager.profiles.count >= 2);
+    EnableControl(IDC_OVERWRITE, g_manager.profiles.count >= 2);
     EnableControl(IDC_DEFAULT, p && !isDefault);
     EnableControl(IDC_SC_DESKTOP, p && !g_manager.onDesktop);
     EnableControl(IDC_SC_SAVEAS, p != NULL);
@@ -1167,7 +1167,7 @@ static ProfileList *CopyProfiles(void)
     return copy;
 }
 
-typedef enum SessionsAction { SESSIONS_MERGE, SESSIONS_MIRROR, SESSIONS_EXPORT, SESSIONS_IMPORT } SessionsAction;
+typedef enum SessionsAction { SESSIONS_MERGE, SESSIONS_OVERWRITE, SESSIONS_EXPORT, SESSIONS_IMPORT } SessionsAction;
 
 /* What the sessions buttons and the list's menu do; what changed shows in
  * the sessions view. */
@@ -1182,7 +1182,7 @@ static void DoSessions(SessionsAction action)
     if (focused) StringCchCopyW(folder, ARRAYSIZE(folder), focused->folder);
     switch (action) {
     case SESSIONS_MERGE:  changed = SyncUi_Merge(g_manager.dlg, profiles); break;
-    case SESSIONS_MIRROR: changed = SyncUi_Mirror(g_manager.dlg, profiles, folder[0] ? folder : NULL); break;
+    case SESSIONS_OVERWRITE: changed = SyncUi_Overwrite(g_manager.dlg, profiles, folder[0] ? folder : NULL); break;
     case SESSIONS_EXPORT: SyncUi_ExportProfiles(g_manager.dlg, profiles, selected); break;
     case SESSIONS_IMPORT: changed = SyncUi_Import(g_manager.dlg, profiles, selected); break;
     }
@@ -1193,7 +1193,7 @@ static void DoSessions(SessionsAction action)
 #define IDM_LIST_OPEN   0x6001
 #define IDM_LIST_EDIT   0x6002
 #define IDM_LIST_DELETE 0x6003
-#define IDM_LIST_MIRROR 0x6004
+#define IDM_LIST_OVERWRITE 0x6004
 #define IDM_LIST_EXPORT 0x6005
 #define IDM_LIST_IMPORT 0x6006
 
@@ -1222,7 +1222,7 @@ static void ListMenu(LPARAM pos)
     AppendMenuW(menu, MF_STRING | (SelectedProfile() ? 0 : MF_GRAYED), IDM_LIST_EDIT, TR(Theme_MainCaption(IDC_EDIT, 0)));
     AppendMenuW(menu, MF_STRING | (Deletable(selected) ? 0 : MF_GRAYED), IDM_LIST_DELETE, TR(Theme_MainCaption(IDC_DELETE, 0)));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDM_LIST_MIRROR, TR(Theme_MainCaption(IDC_MIRROR, 0)));
+    AppendMenuW(menu, MF_STRING | (g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDM_LIST_OVERWRITE, TR(Theme_MainCaption(IDC_OVERWRITE, 0)));
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDM_LIST_EXPORT, TR(L"E&xport sessions\x2026"));
     AppendMenuW(menu, MF_STRING, IDM_LIST_IMPORT, TR(L"&Import sessions\x2026"));
     if (selected && g_manager.pkg.found) SetMenuDefaultItem(menu, IDM_LIST_OPEN, FALSE);
@@ -1232,7 +1232,7 @@ static void ListMenu(LPARAM pos)
     case IDM_LIST_OPEN:   DoOpen(); break;
     case IDM_LIST_EDIT:   DoEdit(); break;
     case IDM_LIST_DELETE: DoDelete(); break;
-    case IDM_LIST_MIRROR: DoSessions(SESSIONS_MIRROR); break;
+    case IDM_LIST_OVERWRITE: DoSessions(SESSIONS_OVERWRITE); break;
     case IDM_LIST_EXPORT: DoSessions(SESSIONS_EXPORT); break;
     case IDM_LIST_IMPORT: DoSessions(SESSIONS_IMPORT); break;
     }
@@ -1240,7 +1240,7 @@ static void ListMenu(LPARAM pos)
 
 /* The profiles and the sessions share the window: Sessions swaps them, and
  * becomes "< Back" in the same place. */
-static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_MIRROR, IDC_DEFAULT,
+static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT,
                                         IDC_NOTE, IDC_SC_GROUP, IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
 
 static const WCHAR *SessionsButtonCaption(BOOL sessionsShown)
@@ -1970,7 +1970,7 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         case IDC_EDIT:          DoEdit(); return TRUE;
         case IDC_DELETE:        DoDelete(); return TRUE;
         case IDC_MERGE:         DoSessions(SESSIONS_MERGE); return TRUE;
-        case IDC_MIRROR:        DoSessions(SESSIONS_MIRROR); return TRUE;
+        case IDC_OVERWRITE:        DoSessions(SESSIONS_OVERWRITE); return TRUE;
         case IDC_DEFAULT:       DoSetDefault(); return TRUE;
         case IDC_SC_DESKTOP:    DoDesktopShortcut(); return TRUE;
         case IDC_SC_SAVEAS:     DoSaveShortcut(); return TRUE;

@@ -1,6 +1,6 @@
 /*
  * Sessions sent between profiles in numbers: every profile's merged, one
- * profile's mirrored into others, several shared or copied at once, and
+ * profile's written over others, several shared or copied at once, and
  * sessions exported to an archive or imported from one.
  *
  * A profile lists a session through an entry of its own (sessionstore.c), so
@@ -983,7 +983,7 @@ static ULONGLONG NowMs(void)
     return ((((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND;
 }
 
-BOOL SessionSync_Mirror(const SessionSet *set, int source, DWORD targets, BOOL exact, SyncReport *report)
+BOOL SessionSync_Overwrite(const SessionSet *set, int source, DWORD targets, BOOL exact, SyncReport *report)
 {
     Outbox box;
     WCHAR (*marks)[SESSION_ID_CCH] = NULL, (*theirs)[SESSION_ID_CCH] = NULL, path[LONG_PATH_CCH];

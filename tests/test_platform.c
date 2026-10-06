@@ -3648,9 +3648,18 @@ static BOOL g_routeProfileRunning[ROUTE_PROFILE_COUNT], g_routeLaunchSucceeds[RO
 static ULONGLONG g_routeSignInMinutesAgo[ROUTE_PROFILE_COUNT];
 static BOOL g_routeClaudeMissing, g_routeProfileWatched;
 static int g_routeAnswer = IDNO;
+/* What the link dialog answers: a profile's index, ROUTE_ACCEPT (the one
+ * selected), ROUTE_CANCEL, or ROUTE_NO_DIALOG (it cannot be shown). */
+#define ROUTE_ACCEPT    (-2)
+#define ROUTE_CANCEL    (-1)
+#define ROUTE_NO_DIALOG (-3)
+static int g_routeChoice = ROUTE_ACCEPT;
 
 static int g_routeLaunches, g_routeLaunchesOf[ROUTE_PROFILE_COUNT], g_routeWatches, g_routeWatchQueries, g_routePendingApplied;
 static int g_routeMessages, g_routePagesOpened, g_routeManagerStarts;
+static int g_routeDialogs, g_routeDialogId, g_routeSuggested, g_routeStarter;
+static BOOL g_routeDialogSignIn;
+static WCHAR g_routeDialogLink[URL_CCH];
 static UINT g_routeMessageFlags;
 static DWORD g_routeWatchedPid;
 static WCHAR g_routeLaunchedUrl[URL_CCH], g_routeMessageText[1024], g_routeOpenedPage[256], g_routeLog[4096];
@@ -3785,6 +3794,8 @@ static BOOL FixtureRouteSpawn(const WCHAR *exe, const WCHAR *args, DWORD *pid)
     return TRUE;
 }
 
+static INT_PTR FixtureRouteDialog(HWND owner, int id, DLGPROC proc, LPARAM param);
+
 #define Profiles_Load FixtureRouteProfiles
 #define Claude_FindPackage FixtureRoutePackage
 #define Claude_TopmostProfile FixtureRouteTopmost
@@ -3799,6 +3810,7 @@ static BOOL FixtureRouteSpawn(const WCHAR *exe, const WCHAR *args, DWORD *pid)
 #define Util_SelfExe FixtureRouteSelfExe
 #define Util_Spawn FixtureRouteSpawn
 #define Util_Log FixtureRouteLog
+#define Ui_Dialog FixtureRouteDialog
 #define Router_Run TestedRouter_Run
 #define Launcher_Run TestedLauncher_Run
 #define Launcher_Open TestedLauncher_Open
@@ -3817,14 +3829,37 @@ static BOOL FixtureRouteSpawn(const WCHAR *exe, const WCHAR *args, DWORD *pid)
 #undef Util_SelfExe
 #undef Util_Spawn
 #undef Util_Log
+#undef Ui_Dialog
 #undef Router_Run
 #undef Launcher_Run
 #undef Launcher_Open
+
+/* The link dialog: what it was shown is recorded, and it answers g_routeChoice. */
+static INT_PTR FixtureRouteDialog(HWND owner, int id, DLGPROC proc, LPARAM param)
+{
+    LinkChoice *choice = (LinkChoice *)param;
+    (void)owner;
+    (void)proc;
+    g_routeDialogs++;
+    g_routeDialogId = id;
+    g_routeSuggested = choice->chosen;
+    g_routeStarter = choice->starter;
+    g_routeDialogSignIn = choice->signIn;
+    StringCchCopyW(g_routeDialogLink, ARRAYSIZE(g_routeDialogLink), choice->shown);
+    if (g_routeChoice == ROUTE_NO_DIALOG) return -1;
+    if (g_routeChoice == ROUTE_CANCEL) return IDCANCEL;
+    if (g_routeChoice >= 0) choice->chosen = g_routeChoice;
+    return IDOK;
+}
 
 static void ResetRouteRecords(void)
 {
     g_routeLaunches = g_routeWatches = g_routeWatchQueries = g_routePendingApplied = g_routeMessages = 0;
     g_routePagesOpened = g_routeManagerStarts = 0;
+    g_routeDialogs = g_routeDialogId = 0;
+    g_routeSuggested = g_routeStarter = -1;
+    g_routeDialogSignIn = FALSE;
+    g_routeDialogLink[0] = 0;
     ZeroMemory(g_routeLaunchesOf, sizeof g_routeLaunchesOf);
     g_routeMessageFlags = 0;
     g_routeWatchedPid = 0;
@@ -3844,6 +3879,7 @@ static void ResetRoute(int count)
     ZeroMemory(g_routeSignInMinutesAgo, sizeof g_routeSignInMinutesAgo);
     g_routeClaudeMissing = g_routeProfileWatched = FALSE;
     g_routeAnswer = IDNO;
+    g_routeChoice = ROUTE_ACCEPT;
     ResetRouteRecords();
 }
 
@@ -3900,38 +3936,52 @@ static void CheckLauncherWatchers(void)
                                                    g_routeWatches == 0);
 }
 
-/* Which window a link goes to. */
+/* Which profile a link is suggested for, and which one opens it. */
 static void CheckRouteTargets(void)
 {
     static const WCHAR kUncleanLink[] = L"claude://resume?session=fixture\"--flag value\\end";
     WCHAR cleanLink[URL_CCH];
+    ResetRoute(1);
+    g_routeLaunchSucceeds[0] = TRUE;
+    Check("with one profile, a link goes to it without asking",
+          TestedRouter_Run(L"claude://resume?session=fixture") == 0 && g_routeDialogs == 0 && g_routeLaunches == 1 &&
+          g_routeLaunchesOf[0] == 1 && g_routeMessages == 0);
     ResetRoute(2);
     g_routeDefaultProfile = 1;
     g_routeLaunchSucceeds[1] = TRUE;
-    Check("with nothing running, a link goes to the default profile and is delivered",
-          TestedRouter_Run(L"claude://resume?session=fixture") == 0 && g_routeLaunches == 1 && g_routeLaunchesOf[1] == 1 &&
-          g_routeMessages == 0);
+    Check("with several profiles, the user is asked which one opens a link",
+          TestedRouter_Run(L"claude://resume?session=fixture") == 0 && g_routeDialogs == 1 && g_routeDialogId == IDD_LINK);
+    Check("with nothing running, the default profile is suggested and opens the link",
+          g_routeSuggested == 1 && g_routeLaunches == 1 && g_routeLaunchesOf[1] == 1 && g_routeMessages == 0);
     ResetRoute(3);
     g_routeProfileRunning[1] = g_routeProfileRunning[2] = TRUE;
     g_routeLaunchSucceeds[0] = g_routeLaunchSucceeds[1] = g_routeLaunchSucceeds[2] = TRUE;
     g_routeTopmostProfile = 2;
-    Check("any other link goes to the window used last, among the running ones",
-          TestedRouter_Run(L"claude://resume?session=fixture") == 0 && g_routeLaunches == 1 && g_routeLaunchesOf[2] == 1);
+    Check("any other link suggests the window used last, among the running ones",
+          TestedRouter_Run(L"claude://resume?session=fixture") == 0 && g_routeSuggested == 2 && !g_routeDialogSignIn &&
+          g_routeStarter == -1 && g_routeLaunches == 1 && g_routeLaunchesOf[2] == 1);
+    g_routeChoice = 0;
+    ResetRouteRecords();
+    Check("the profile chosen opens the link, even a closed one",
+          TestedRouter_Run(L"claude://resume?session=fixture") == 0 && g_routeLaunches == 1 && g_routeLaunchesOf[0] == 1);
+    Check("the log says what was suggested and what was chosen", wcsstr(g_routeLog, L"chosen; suggested Claude-C") != NULL);
     ResetRoute(2);
     g_routeProfileRunning[0] = g_routeProfileRunning[1] = TRUE;
     g_routeLaunchSucceeds[0] = g_routeLaunchSucceeds[1] = TRUE;
     g_routeTopmostProfile = 0;
     g_routeSignInMinutesAgo[0] = 10;
     g_routeSignInMinutesAgo[1] = 2;
-    Check("a sign-in link goes to the window that started the last sign-in",
-          TestedRouter_Run(L"claude://login?code=" SIGN_IN_CODE) == 0 && g_routeLaunches == 1 && g_routeLaunchesOf[1] == 1);
+    Check("a sign-in link suggests the window that started the last sign-in, named in the dialog",
+          TestedRouter_Run(L"claude://login?code=" SIGN_IN_CODE) == 0 && g_routeSuggested == 1 && g_routeStarter == 1 &&
+          g_routeDialogSignIn && g_routeLaunches == 1 && g_routeLaunchesOf[1] == 1);
     Check("the sign-in code stays out of the log", g_routeLog[0] && wcsstr(g_routeLog, SIGN_IN_CODE) == NULL);
+    Check("the sign-in code stays out of the dialog", g_routeDialogLink[0] && wcsstr(g_routeDialogLink, SIGN_IN_CODE) == NULL);
     g_routeSignInMinutesAgo[0] = SIGNIN_MAX_AGE_MINUTES + 5;
     g_routeSignInMinutesAgo[1] = 0;
     ResetRouteRecords();
-    Check("a sign-in started too long ago claims no link: every window gets it",
-          TestedRouter_Run(L"claude://login?code=" SIGN_IN_CODE) == 0 && g_routeLaunches == 2 && g_routeLaunchesOf[0] == 1 &&
-          g_routeLaunchesOf[1] == 1);
+    Check("a sign-in no window claims suggests the window used last, names no window, and goes to the one chosen only",
+          TestedRouter_Run(L"claude://login?code=" SIGN_IN_CODE) == 0 && g_routeSuggested == 0 && g_routeStarter == -1 &&
+          g_routeDialogSignIn && g_routeLaunches == 1 && g_routeLaunchesOf[0] == 1);
     ResetRoute(1);
     g_routeLaunchSucceeds[0] = TRUE;
     if (Prepared("clean a link holding a quote, a space and a backslash",
@@ -3953,14 +4003,16 @@ static void CheckRouteFailures(void)
           g_routeMessages == 1 && (g_routeMessageFlags & MB_ICONMASK) == MB_ICONERROR && wcsstr(g_routeLog, L"0x80070005") != NULL);
     ResetRoute(2);
     g_routeProfileRunning[0] = g_routeProfileRunning[1] = TRUE;
-    Check("a sign-in broadcast that reaches no window returns failure, once reported",
-          TestedRouter_Run(L"claude://login?code=fixture") == 1 && g_routeMessages == 1);
-    Check("a failed broadcast tries each running window once", g_routeLaunches == 2 && g_routeWatches == 0);
-    g_routeLaunchSucceeds[1] = TRUE;
+    g_routeLaunchSucceeds[0] = g_routeLaunchSucceeds[1] = TRUE;
+    g_routeChoice = ROUTE_CANCEL;
+    Check("a link whose dialog is cancelled opens nothing and says nothing",
+          TestedRouter_Run(L"claude://login?code=fixture") == 1 && g_routeLaunches == 0 && g_routeMessages == 0 &&
+          g_routeWatches == 0);
+    Check("a cancelled link is logged", wcsstr(g_routeLog, L"no profile chosen") != NULL);
+    g_routeChoice = ROUTE_NO_DIALOG;
     ResetRouteRecords();
-    Check("a sign-in broadcast that reaches one window returns success, without a message",
-          TestedRouter_Run(L"claude://login?code=fixture") == 0 && g_routeMessages == 0);
-    Check("a partial broadcast watches only the window it reached", g_routeLaunches == 2 && g_routeWatches == 1);
+    Check("a link whose dialog cannot be shown goes to the profile suggested",
+          TestedRouter_Run(L"claude://resume?session=fixture") == 0 && g_routeLaunches == 1 && g_routeLaunchesOf[0] == 1);
 
     ResetRoute(1);
     g_routeClaudeMissing = TRUE;

@@ -126,7 +126,6 @@ typedef enum RouteReason {
     ROUTE_NOTHING_RUNNING,  /* start the default profile */
     ROUTE_ONLY_ONE,
     ROUTE_SIGNIN,           /* the window that opened the browser */
-    ROUTE_BROADCAST,        /* sign-in link no window claims: every window checks it */
     ROUTE_LAST_USED,        /* topmost Claude window */
     ROUTE_DEFAULT,
     ROUTE_FIRST
@@ -198,9 +197,12 @@ BOOL         Core_IsSignInUrl(const WCHAR *url);
 BOOL         Core_BuildLaunchArgs(const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch);
 BOOL         Core_LatestSignInStart(const char *text, size_t len, SYSTEMTIME *latest);
 BOOL         Core_LastQuit(const char *text, size_t len, SYSTEMTIME *when, BOOL *forUpdate);
-int          Core_SelectTargets(int count, const ULONGLONG *signInTicks, ULONGLONG nowTicks,
-                                ULONGLONG signInMaxAgeTicks, BOOL signInUrl, int lastUsed,
-                                int defaultIndex, int *targets, RouteReason *reason);
+/* The running window a claude:// link is suggested for, an index below
+ * `count` (-1 when none runs): the one that started the latest sign-in for a
+ * sign-in link, else the only one, the one used last (`lastUsed`), the
+ * default profile's (`defaultIndex`) or the first. `signInTicks` may be NULL. */
+int          Core_SuggestTarget(int count, const ULONGLONG *signInTicks, ULONGLONG nowTicks, ULONGLONG signInMaxAgeTicks,
+                                BOOL signInUrl, int lastUsed, int defaultIndex, RouteReason *reason);
 BOOL         Core_ArgsSelectProfile(const WCHAR *args, const WCHAR *folder);
 BOOL         Core_ArgsReferenceDir(const WCHAR *args, const WCHAR *dir);
 BOOL         Core_NamesClaudePackage(const WCHAR *text);
@@ -575,7 +577,7 @@ void         SessionEdit_Unlock(HANDLE lock);
 
 DWORD        SessionSync_Takers(const SessionSet *set);   /* the profiles whose entries can take sessions */
 BOOL         SessionSync_Merge(const SessionSet *set, DWORD profiles, SyncReport *report);
-BOOL         SessionSync_Mirror(const SessionSet *set, int source, DWORD targets, BOOL exact, SyncReport *report);
+BOOL         SessionSync_Overwrite(const SessionSet *set, int source, DWORD targets, BOOL exact, SyncReport *report);
 BOOL         SessionSync_Share(const SessionSet *set, int from, const int *rows, int rowCount, DWORD targets, SyncReport *report);
 CopyResult   SessionSync_Copy(HWND owner, const SessionSet *set, int from, const int *rows, int rowCount, DWORD targets,
                               SyncReport *report);
@@ -590,7 +592,7 @@ BOOL         SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWO
 /* ---------------------------------------------------------------- syncui.c */
 
 BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles);
-BOOL SyncUi_Mirror(HWND owner, const ProfileList *profiles, const WCHAR *selected);
+BOOL SyncUi_Overwrite(HWND owner, const ProfileList *profiles, const WCHAR *selected);
 BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *rows, int rowCount, BOOL copy);
 BOOL SyncUi_Export(HWND owner, const SessionSet *set, int profile, const int *rows, int rowCount);
 BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen);

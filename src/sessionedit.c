@@ -8,7 +8,7 @@
  * - opening, sharing and copying one session go through Claude itself, with
  *   its own link claude://resume?session=<id>: the profile's Claude opens the
  *   session and adds it to its list when it is not there (started first when
- *   closed); several at once, merged or mirrored go through sessionsync.c,
+ *   closed); several at once, merged or overwritten go through sessionsync.c,
  *   which writes the entries of closed profiles only, as here;
  * - a new title, a star or a removal is made at once in a closed
  *   profile, else kept in a file of ours (pending-sessions-<folder>.txt) and

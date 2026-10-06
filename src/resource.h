@@ -13,6 +13,7 @@
 #define IDD_MESSAGE       103
 #define IDD_TITLE         104
 #define IDD_SYNC          105
+#define IDD_LINK          106
 
 /* main window */
 #define IDC_STATUS        1000
@@ -35,7 +36,7 @@
 #define IDC_SESSIONS      1017
 #define IDC_LANGUAGE      1018
 #define IDC_MERGE         1019
-#define IDC_MIRROR        1020
+#define IDC_OVERWRITE        1020
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -73,6 +74,11 @@
 #define IDC_Y_LIST        1604
 #define IDC_Y_EXACT       1605
 #define IDC_Y_NOTE        1606
+
+/* the profile that opens a claude:// link */
+#define IDC_L_TEXT        1700
+#define IDC_L_LINK        1701
+#define IDC_L_LIST        1702
 
 /* message box */
 #define IDC_M_ICON        1300

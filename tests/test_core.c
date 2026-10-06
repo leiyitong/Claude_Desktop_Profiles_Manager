@@ -318,57 +318,61 @@ static void TestRouting(void)
 {
     const ULONGLONG window = SIGNIN_MAX_AGE_MINUTES * 60 * TICKS_PER_SECOND;
     ULONGLONG ticks[3];
-    int targets[3], n;
+    int n;
     RouteReason why;
 
-    n = Core_SelectTargets(0, NULL, TimeOnTestDay(7, 3, 0), window, TRUE, -1, -1, targets, &why);
-    Check("nothing running -> default profile", n == 0 && why == ROUTE_NOTHING_RUNNING);
+    n = Core_SuggestTarget(0, NULL, TimeOnTestDay(7, 3, 0), window, TRUE, -1, -1, &why);
+    Check("nothing running -> the default profile, no window", n == -1 && why == ROUTE_NOTHING_RUNNING);
 
-    n = Core_SelectTargets(1, NULL, TimeOnTestDay(7, 3, 0), window, TRUE, -1, -1, targets, &why);
-    Check("one window -> it", n == 1 && targets[0] == 0 && why == ROUTE_ONLY_ONE);
+    n = Core_SuggestTarget(1, NULL, TimeOnTestDay(7, 3, 0), window, TRUE, -1, -1, &why);
+    Check("one window -> it", n == 0 && why == ROUTE_ONLY_ONE);
+
+    ticks[0] = TimeOnTestDay(7, 2, 54);
+    n = Core_SuggestTarget(1, ticks, TimeOnTestDay(7, 2, 59), window, TRUE, -1, -1, &why);
+    Check("one window that started the sign-in -> it, named as the sign-in's", n == 0 && why == ROUTE_SIGNIN);
 
     ticks[0] = TimeOnTestDay(7, 2, 54); ticks[1] = 0;
-    n = Core_SelectTargets(2, ticks, TimeOnTestDay(7, 2, 59), window, TRUE, 1, 1, targets, &why);
-    Check("sign-in -> the window that opened the browser, not the last used", n == 1 && targets[0] == 0 && why == ROUTE_SIGNIN);
+    n = Core_SuggestTarget(2, ticks, TimeOnTestDay(7, 2, 59), window, TRUE, 1, 1, &why);
+    Check("sign-in -> the window that opened the browser, not the last used", n == 0 && why == ROUTE_SIGNIN);
 
     ticks[0] = TimeOnTestDay(7, 2, 54); ticks[1] = TimeOnTestDay(7, 3, 2);
-    n = Core_SelectTargets(2, ticks, TimeOnTestDay(7, 3, 7), window, TRUE, 0, 0, targets, &why);
-    Check("sign-in -> the most recent browser opening", n == 1 && targets[0] == 1);
+    n = Core_SuggestTarget(2, ticks, TimeOnTestDay(7, 3, 7), window, TRUE, 0, 0, &why);
+    Check("sign-in -> the most recent browser opening", n == 1 && why == ROUTE_SIGNIN);
 
     ticks[0] = TimeOnTestDay(6, 30, 0); ticks[1] = TimeOnTestDay(6, 40, 0);
-    n = Core_SelectTargets(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 0, 0, targets, &why);
-    Check("stale sign-ins -> every window checks the link", n == 2 && why == ROUTE_BROADCAST);
+    n = Core_SuggestTarget(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 0, &why);
+    Check("stale sign-ins -> the window used last", n == 1 && why == ROUTE_LAST_USED);
 
     ticks[0] = TimeOnTestDay(7, 5, 0); ticks[1] = 0;
-    n = Core_SelectTargets(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 1, targets, &why);
-    Check("a sign-in stamped two minutes ahead is ignored", n == 2 && why == ROUTE_BROADCAST);
+    n = Core_SuggestTarget(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 1, &why);
+    Check("a sign-in stamped two minutes ahead is ignored", n == 1 && why == ROUTE_LAST_USED);
 
     ticks[0] = TimeOnTestDay(7, 3, 30); ticks[1] = 0;
-    n = Core_SelectTargets(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 1, targets, &why);
-    Check("a sign-in stamped seconds ahead (clock skew) still counts", n == 1 && targets[0] == 0 && why == ROUTE_SIGNIN);
+    n = Core_SuggestTarget(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 1, &why);
+    Check("a sign-in stamped seconds ahead (clock skew) still counts", n == 0 && why == ROUTE_SIGNIN);
 
-    n = Core_SelectTargets(3, NULL, TimeOnTestDay(7, 3, 0), window, TRUE, 2, 0, targets, &why);
-    Check("sign-in link, no log -> every window", n == 3 && why == ROUTE_BROADCAST);
+    n = Core_SuggestTarget(3, NULL, TimeOnTestDay(7, 3, 0), window, TRUE, 2, 0, &why);
+    Check("sign-in link, no log -> the window used last", n == 2 && why == ROUTE_LAST_USED);
 
     ticks[0] = TimeOnTestDay(7, 2, 54); ticks[1] = 0;
-    n = Core_SelectTargets(2, ticks, TimeOnTestDay(7, 3, 0), window, FALSE, 1, 0, targets, &why);
-    Check("other link -> last used window, whatever the sign-ins", n == 1 && targets[0] == 1 && why == ROUTE_LAST_USED);
+    n = Core_SuggestTarget(2, ticks, TimeOnTestDay(7, 3, 0), window, FALSE, 1, 0, &why);
+    Check("other link -> last used window, whatever the sign-ins", n == 1 && why == ROUTE_LAST_USED);
 
-    n = Core_SelectTargets(2, NULL, TimeOnTestDay(7, 3, 0), window, FALSE, -1, 1, targets, &why);
-    Check("other link, no window in front -> default profile", n == 1 && targets[0] == 1 && why == ROUTE_DEFAULT);
+    n = Core_SuggestTarget(2, NULL, TimeOnTestDay(7, 3, 0), window, FALSE, -1, 1, &why);
+    Check("other link, no window in front -> default profile", n == 1 && why == ROUTE_DEFAULT);
 
-    n = Core_SelectTargets(2, NULL, TimeOnTestDay(7, 3, 0), window, FALSE, -1, -1, targets, &why);
-    Check("other link, default not running -> first window", n == 1 && targets[0] == 0 && why == ROUTE_FIRST);
+    n = Core_SuggestTarget(2, NULL, TimeOnTestDay(7, 3, 0), window, FALSE, -1, -1, &why);
+    Check("other link, default not running -> first window", n == 0 && why == ROUTE_FIRST);
 
-    n = Core_SelectTargets(2, NULL, TimeOnTestDay(7, 3, 0), window, FALSE, 2, 5, targets, &why);
-    Check("out-of-range last used and default -> first window", n == 1 && targets[0] == 0 && why == ROUTE_FIRST);
+    n = Core_SuggestTarget(2, NULL, TimeOnTestDay(7, 3, 0), window, FALSE, 2, 5, &why);
+    Check("out-of-range last used and default -> first window", n == 0 && why == ROUTE_FIRST);
 
     ticks[0] = TimeOnTestDay(6, 48, 0); ticks[1] = 0;
-    n = Core_SelectTargets(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 1, targets, &why);
-    Check("a sign-in exactly at the age limit still counts", n == 1 && targets[0] == 0 && why == ROUTE_SIGNIN);
+    n = Core_SuggestTarget(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 1, &why);
+    Check("a sign-in exactly at the age limit still counts", n == 0 && why == ROUTE_SIGNIN);
     ticks[0] = TimeOnTestDay(6, 47, 59);
-    n = Core_SelectTargets(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 1, targets, &why);
-    Check("a sign-in a second past the age limit does not", n == 2 && why == ROUTE_BROADCAST);
+    n = Core_SuggestTarget(2, ticks, TimeOnTestDay(7, 3, 0), window, TRUE, 1, 1, &why);
+    Check("a sign-in a second past the age limit does not", n == 1 && why == ROUTE_LAST_USED);
 }
 
 static void TestShortcuts(void)

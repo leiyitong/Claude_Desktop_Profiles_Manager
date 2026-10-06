@@ -9,13 +9,13 @@ Unofficial tool, not affiliated with Anthropic.
 ## Features
 
 - **Profile manager** - Lists existing profiles; creates, renames, recolors and deletes them (to the Recycle Bin)
-- **Sign-in routing** - Browser sign-ins return to the window that started them, even with several open
+- **Link chooser** - With several profiles, Claude Desktop Profiles Manager asks which one opens a `claude://` link; for a browser sign-in, the window that started it is already selected
 - **Profile badges** - Each profile's shortcut and taskbar button show the Claude icon with its own colored badge, and its notification-area icon takes its color
 - **Taskbar pins** - Pin a profile to the taskbar in one click
 - **Start menu** - Add a profile to the Start menu, or take it out, in one click
 - **Open at sign-in** - Any profile can open when you sign in to Windows, not only the one the regular Claude icon opens
 - **Claude Code sessions** - The manager shows each profile's Code sessions by folder and where each one is listed; open a session in any profile, share it with another one or copy it there, rename it, star it or remove it per profile, or delete it everywhere. Ctrl+click and Shift+click select several sessions, and a folder's or Starred's menu acts on all it shows: share, copy, export, star or remove them together. Changes to a profile that is open are made when it closes
-- **Session sync** - **Merge all sessions…** gives every profile the sessions the others list, **Mirror sessions…** gives the profiles you check one profile's sessions, and sessions can be exported to a .zip archive and imported into other profiles. What a change replaces or removes is kept in a backup
+- **Session sync** - **Merge all sessions…** gives every profile the sessions the others list, **Overwrite sessions…** writes one profile's sessions over the profiles you check, and sessions can be exported to a .zip archive and imported into other profiles. What a change replaces or removes is kept in a backup
 - **Twelve languages** - The manager follows your Windows language, or the one you pick in its Language menu
 - **Settings copy** - A new profile can start with the MCP servers, notification-area icon, hardware acceleration setting, language and theme of another one
 - **Updates** - Tells you when a new version is out and installs it in one click, once Windows has checked its signature
@@ -40,7 +40,7 @@ To uninstall, click **Uninstall…** or use Settings → Apps: it asks which pro
 1. Click **New profile…**, enter a name, pick a color and click **OK**: the profile opens in its own window
 2. Sign in to Claude in that window
 3. Click **Create shortcut on desktop** or **Pin to taskbar**, then open the profile from there
-4. *(Optional)* Select a profile and click **Set as default**: it opens `claude://` links while Claude is closed
+4. *(Optional)* Select a profile and click **Set as default**: it is selected for `claude://` links while Claude is closed
 
 How it works: see [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
@@ -58,7 +58,7 @@ How it works: see [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
 | What you see | What to do |
 |---|---|
-| The browser sign-in finishes, but the window stays signed out | Sign in again from that window. If it still fails, click **Set up links** in Claude Desktop Profiles Manager, when shown |
+| The browser sign-in finishes, but the window stays signed out | Sign in again from that window, and open the link in the profile the dialog names. If it still fails, click **Set up links** in Claude Desktop Profiles Manager, when shown |
 | Windows asks which app opens a Claude link | Choose **Claude Desktop Profiles Manager**, then **Always** |
 | A shortcut says its profile no longer exists | The profile was deleted: delete or unpin the shortcut |
 | Something else | Read the log: `%LOCALAPPDATA%\Claude Desktop Profiles Manager\claude-desktop-profiles-manager.log` |

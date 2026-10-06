@@ -1,6 +1,6 @@
 /*
  * What the user does with sessions sent between profiles (sessionsync.c):
- * merge every profile's, mirror one profile's into others, share or copy the
+ * merge every profile's, overwrite others with one profile's, share or copy the
  * sessions chosen in the sessions view, export sessions to an archive and
  * import one. The profiles taking part are chosen in one dialog (IDD_SYNC),
  * which says what will happen; what was done is said once it is.
@@ -14,7 +14,7 @@
 #define NAMES_CCH         (MAX_PROFILES * (LABEL_CCH + 16))
 #define REPORT_CCH        (4 * LONG_PATH_CCH)
 
-typedef enum SyncKind { SYNC_UI_MERGE, SYNC_UI_MIRROR, SYNC_UI_SHARE, SYNC_UI_COPY, SYNC_UI_IMPORT } SyncKind;
+typedef enum SyncKind { SYNC_UI_MERGE, SYNC_UI_OVERWRITE, SYNC_UI_SHARE, SYNC_UI_COPY, SYNC_UI_IMPORT } SyncKind;
 
 typedef struct SyncDialog {
     SyncKind           kind;
@@ -22,12 +22,12 @@ typedef struct SyncDialog {
     DWORD              takers;          /* the profiles whose entries can take sessions */
     DWORD              chosen;          /* checked at first; once it closed, the profiles chosen */
     int                source;          /* the profile the sessions come from, never a target; -1 for none */
-    BOOL               exact;           /* mirror: what the source does not list is taken out of the others */
+    BOOL               exact;           /* overwrite: what the source does not list is taken out of the others */
     const WCHAR       *archive;         /* import: the archive's name */
     HWND               rows;            /* the profiles as check boxes (in the view it scrolls in, which has its id) */
     int                rowProfile[MAX_PROFILES];
     int                rowCount;
-    int                sourceProfile[MAX_PROFILES];   /* mirror: each item's profile in the From box */
+    int                sourceProfile[MAX_PROFILES];   /* overwrite: each item's profile in the From box */
     BOOL               filling;
 } SyncDialog;
 
@@ -58,7 +58,7 @@ static const WCHAR *Title(SyncKind kind)
 {
     switch (kind) {
     case SYNC_UI_MERGE:  return TR(L"Merge all sessions");
-    case SYNC_UI_MIRROR: return TR(L"Mirror sessions");
+    case SYNC_UI_OVERWRITE: return TR(L"Overwrite sessions");
     case SYNC_UI_SHARE:  return TR(L"Share sessions");
     case SYNC_UI_COPY:   return TR(L"Copy sessions");
     default:             return TR(L"Import sessions");
@@ -69,7 +69,7 @@ static const WCHAR *ActionCaption(SyncKind kind)
 {
     switch (kind) {
     case SYNC_UI_MERGE:  return TR(L"Merge");
-    case SYNC_UI_MIRROR: return TR(L"Mirror");
+    case SYNC_UI_OVERWRITE: return TR(L"Overwrite");
     case SYNC_UI_SHARE:  return TR(L"Share");
     case SYNC_UI_COPY:   return TR(L"Copy");
     default:             return TR(L"Import");
@@ -85,7 +85,7 @@ static void Explain(HWND dialog, const SyncDialog *state)
         StringCchCopyW(text, ARRAYSIZE(text), TR(L"Each profile checked gets the sessions the others list, in their latest state. "
                                                  L"A session deleted in a profile stays deleted there."));
         break;
-    case SYNC_UI_MIRROR:
+    case SYNC_UI_OVERWRITE:
         StringCchCopyW(text, ARRAYSIZE(text), TR(L"The profiles checked get every session of the profile chosen, in its state there, "
                                                  L"even the ones they deleted."));
         break;
@@ -141,7 +141,7 @@ static void ReadChosen(HWND dialog, SyncDialog *state)
     EnableWindow(GetDlgItem(dialog, IDOK), state->chosen != 0);
 }
 
-/* Mirror: the profiles in the From box, the source selected. */
+/* Overwrite: the profiles in the From box, the source selected. */
 static void FillSources(HWND dialog, SyncDialog *state)
 {
     HWND box = GetDlgItem(dialog, IDC_Y_FROM);
@@ -169,7 +169,7 @@ static INT_PTR CALLBACK SyncProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         SetDlgItemTextW(dialog, IDOK, ActionCaption(state->kind));
         SetDlgItemTextW(dialog, IDC_Y_TO_LABEL, state->kind == SYNC_UI_MERGE ? TR(L"&Merge these profiles:") : TR(L"&To these profiles:"));
         /* What the dialog does not offer leaves no empty row (Theme_FitDialog closes it). */
-        if (state->kind == SYNC_UI_MIRROR) {
+        if (state->kind == SYNC_UI_OVERWRITE) {
             FillSources(dialog, state);
         } else {
             ShowWindow(GetDlgItem(dialog, IDC_Y_FROM_LABEL), SW_HIDE);
@@ -214,7 +214,7 @@ static INT_PTR CALLBACK SyncProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         case IDOK:
             ReadChosen(dialog, state);
             if (!state->chosen) return TRUE;
-            state->exact = state->kind == SYNC_UI_MIRROR && IsDlgButtonChecked(dialog, IDC_Y_EXACT) == BST_CHECKED;
+            state->exact = state->kind == SYNC_UI_OVERWRITE && IsDlgButtonChecked(dialog, IDC_Y_EXACT) == BST_CHECKED;
             EndDialog(dialog, IDOK);
             return TRUE;
         case IDCANCEL:
@@ -334,7 +334,7 @@ BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles)
     return TRUE;
 }
 
-BOOL SyncUi_Mirror(HWND owner, const ProfileList *profiles, const WCHAR *selected)
+BOOL SyncUi_Overwrite(HWND owner, const ProfileList *profiles, const WCHAR *selected)
 {
     SessionSet set;
     SyncDialog dialog;
@@ -348,7 +348,7 @@ BOOL SyncUi_Mirror(HWND owner, const ProfileList *profiles, const WCHAR *selecte
     }
     SessionStore_Free(&set);
     ZeroMemory(&dialog, sizeof dialog);
-    dialog.kind = SYNC_UI_MIRROR;
+    dialog.kind = SYNC_UI_OVERWRITE;
     dialog.profiles = profiles;
     dialog.takers = takers;
     dialog.source = -1;
@@ -360,12 +360,12 @@ BOOL SyncUi_Mirror(HWND owner, const ProfileList *profiles, const WCHAR *selecte
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
     if (dialog.exact && !Ui_Ask(owner, IDI_WARNING,
                                 TR(L"The sessions the source does not list will be taken out of the profiles checked. "
-                                   L"Their entries are kept in a backup first, and their conversations stay on this PC.\n\nMirror anyway?"),
-                                TR(L"Mirror"), TR(L"Cancel"), TRUE))
+                                   L"Their entries are kept in a backup first, and their conversations stay on this PC.\n\nOverwrite anyway?"),
+                                TR(L"Overwrite"), TR(L"Cancel"), TRUE))
         return FALSE;
     if (!LoadSessions(owner, profiles, &set)) return FALSE;
     ZeroMemory(&report, sizeof report);
-    if (!SessionSync_Mirror(&set, dialog.source, dialog.chosen, dialog.exact, &report) && !report.failed) {
+    if (!SessionSync_Overwrite(&set, dialog.source, dialog.chosen, dialog.exact, &report) && !report.failed) {
         report.failed++;
         StringCchPrintfW(report.error, ARRAYSIZE(report.error), TR(L"\x201C%s\x201D is not signed in to Claude yet: sign in there first."),
                          profiles->items[dialog.source].name);
