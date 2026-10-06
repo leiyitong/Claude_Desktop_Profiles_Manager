@@ -10,6 +10,10 @@
  * tree's context menu holds the entry's actions in the profile shown,
  * opening, sharing and copying in the others, the folder and Delete
  * everywhere; the other profiles' entries change from their Actions box.
+ * Several sessions are chosen together with Ctrl and Shift (click, or Shift
+ * and the arrows) or Ctrl+A, and a folder's row or Starred stands for its
+ * sessions: their menu shares, copies (syncui.c), exports, stars, removes or
+ * deletes them all.
  * What they do is in sessionedit.c; colors, fonts, rows, buttons and boxes
  * come from theme.c, as everywhere.
  *
@@ -29,6 +33,7 @@
 #include <commctrl.h>
 #include <limits.h>
 #include <shellapi.h>
+#include <string.h>
 #include <windowsx.h>
 
 #define MAX_COLLAPSED  128
@@ -62,6 +67,12 @@ typedef enum Action {
     ACT_MENU,                           /* a profile's Actions box: its menu */
     ACTIONS
 } Action;
+
+/* What a menu of several sessions does to them all. */
+typedef enum BatchAction {
+    BATCH_NONE, BATCH_SHARE, BATCH_COPY, BATCH_EXPORT, BATCH_STAR, BATCH_REMOVE, BATCH_DELETE_ALL, BATCH_IMPORT
+} BatchAction;
+#define IDM_BATCH      0x5800           /* a menu of several sessions: IDM_BATCH + BatchAction */
 
 typedef struct Chip {                   /* a control drawn in the details */
     RECT   rc;
@@ -167,6 +178,14 @@ typedef struct SessionsView {
     WatchPlan     planned;              /* what the snapshot shown asks to watch */
     WCHAR         collapsed[MAX_COLLAPSED][MAX_PATH];   /* folders the user folded, by GroupKey */
     int           collapsedCount;
+    /* Sessions chosen together (Ctrl, Shift, Ctrl+A), by key; while `several`
+     * the tree shows them as selected instead of its own selection, which
+     * keeps the keyboard's place. */
+    BOOL          several;
+    BOOL          marking;              /* the tree's selection moves with the marks: they stay */
+    WCHAR       (*marked)[SESSION_ID_CCH];
+    int           markedCount, markedCapacity;
+    TreeNodeKey   anchor;               /* where a Shift range starts */
     ULONGLONG     waitingChangesTried[MAX_PROFILES];   /* each profile's waiting changes as last tried in vain (WaitingChangesState) */
 } SessionsView;
 
@@ -176,6 +195,7 @@ static volatile LONG g_reloadMessagePending;   /* a WM_APP_SESSIONS is posted an
 static const int kControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
 
 static void RequestLoad(BOOL restart);
+static void RedrawDetails(BOOL commit);
 
 /* ------------------------------------------------------------- formatting */
 
@@ -284,6 +304,70 @@ static BOOL RowVisibleIn(const SessionRow *row, int profile)
 static int SelectedRow(void)
 {
     return g_view.selection.key[0] && !g_view.selection.folder ? SessionStore_FindRow(&g_view.set, g_view.selection.key) : -1;
+}
+
+/* ----------------------------------------------------------------- marks */
+
+static int MarkIndex(const WCHAR *key)
+{
+    int i;
+    for (i = 0; i < g_view.markedCount; i++)
+        if (Core_EqualsI(g_view.marked[i], key)) return i;
+    return -1;
+}
+
+static BOOL IsMarked(const WCHAR *key)
+{
+    return g_view.several && MarkIndex(key) >= 0;
+}
+
+/* Session `key` among the marks (`on`), or out of them. */
+static void Mark(const WCHAR *key, BOOL on)
+{
+    int i = MarkIndex(key);
+    if (!on) {
+        if (i >= 0 && i != --g_view.markedCount)   /* the last one takes its place: the order does not matter */
+            memcpy(g_view.marked[i], g_view.marked[g_view.markedCount], sizeof *g_view.marked);
+        return;
+    }
+    if (i >= 0 || !key[0]) return;
+    if (g_view.markedCount == g_view.markedCapacity) {
+        int larger = g_view.markedCapacity ? g_view.markedCapacity * 2 : 64;
+        WCHAR (*grown)[SESSION_ID_CCH] = (WCHAR (*)[SESSION_ID_CCH])(g_view.marked
+            ? HeapReAlloc(GetProcessHeap(), 0, g_view.marked, (size_t)larger * sizeof *g_view.marked)
+            : HeapAlloc(GetProcessHeap(), 0, (size_t)larger * sizeof *g_view.marked));
+        if (!grown) return;
+        g_view.marked = grown;
+        g_view.markedCapacity = larger;
+    }
+    StringCchCopyW(g_view.marked[g_view.markedCount++], SESSION_ID_CCH, key);
+}
+
+/* Back to the tree's own selection alone. */
+static void ClearMarks(void)
+{
+    if (!g_view.several && !g_view.markedCount) return;
+    g_view.several = FALSE;
+    g_view.markedCount = 0;
+    if (g_view.tree) InvalidateRect(g_view.tree, NULL, FALSE);
+    if (g_view.details) RedrawDetails(FALSE);
+}
+
+/* The sessions marked, as rows of the snapshot shown: a heap array
+ * (HeapFree) and its length; NULL for none. */
+static int *MarkedRows(int *count)
+{
+    int *rows, i, r;
+    *count = 0;
+    if (!g_view.several || !g_view.markedCount) return NULL;
+    if ((rows = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)g_view.markedCount * sizeof *rows)) == NULL) return NULL;
+    for (i = 0; i < g_view.markedCount; i++)
+        if ((r = SessionStore_FindRow(&g_view.set, g_view.marked[i])) >= 0) rows[(*count)++] = r;
+    if (!*count) {
+        HeapFree(GetProcessHeap(), 0, rows);
+        return NULL;
+    }
+    return rows;
 }
 
 /* What a folder of the tree is remembered by (folded, on top, selected),
@@ -940,8 +1024,176 @@ static void FillTree(void)
     g_view.keepPlace = FALSE;
     g_view.topRow.key[0] = g_view.topRowNext.key[0] = 0;
     g_view.neighborsTaken = FALSE;   /* the tree's rows name the snapshot shown again */
+    /* The sessions chosen that the tree no longer shows are no longer chosen. */
+    for (r = g_view.markedCount - 1; r >= 0; r--) {
+        int row = SessionStore_FindRow(&g_view.set, g_view.marked[r]);
+        if (row < 0 || p < 0 || !RowVisibleIn(&g_view.set.rows[row], p)) Mark(g_view.marked[r], FALSE);
+    }
+    if (g_view.several && !g_view.markedCount) ClearMarks();
     InvalidateRect(g_view.tree, NULL, TRUE);
     g_view.filling = FALSE;
+}
+
+/* --------------------------------------------------------- choosing several */
+
+/* `item` selected in the tree, the sessions chosen staying chosen. */
+static void SelectMarking(HTREEITEM item)
+{
+    g_view.marking = TRUE;
+    TreeView_SelectItem(g_view.tree, item);
+    g_view.marking = FALSE;
+}
+
+/* The tree's row of `key` among the rows shown; NULL when it is not one. */
+static HTREEITEM FindShownRow(const TreeNodeKey *key)
+{
+    HTREEITEM item;
+    TreeNodeKey found;
+    if (!key->key[0]) return NULL;
+    for (item = TreeView_GetRoot(g_view.tree); item; item = TreeView_GetNextVisible(g_view.tree, item)) {
+        ItemKey(item, &found);
+        if (SameNode(&found, key)) return item;
+    }
+    return NULL;
+}
+
+/* A row shown of session `key`: in its folder, else under Starred. */
+static HTREEITEM FindShownSession(const WCHAR *key)
+{
+    TreeNodeKey node;
+    HTREEITEM item;
+    ZeroMemory(&node, sizeof node);
+    StringCchCopyW(node.key, ARRAYSIZE(node.key), key);
+    if ((item = FindShownRow(&node)) != NULL) return item;
+    node.inStarred = TRUE;
+    return FindShownRow(&node);
+}
+
+/* Choosing starts from the selection: its session is the first chosen. */
+static void StartMarks(void)
+{
+    if (g_view.several) return;
+    g_view.several = TRUE;
+    g_view.markedCount = 0;
+    if (!g_view.selection.folder) Mark(g_view.selection.key, TRUE);
+}
+
+/* The sessions shown from the anchor's row to `to` chosen; with `add`, with
+ * those chosen already. */
+static void MarkRange(HTREEITEM to, BOOL add)
+{
+    HTREEITEM from = FindShownRow(&g_view.anchor), item;
+    int edges = 0;
+    if (!from) from = TreeView_GetSelection(g_view.tree);
+    if (!from) from = to;
+    StartMarks();
+    if (!add) g_view.markedCount = 0;
+    for (item = TreeView_GetRoot(g_view.tree); item && edges < 2; item = TreeView_GetNextVisible(g_view.tree, item)) {
+        LPARAM node = NodeParam(item);
+        if (item == from) edges++;
+        if (item == to) edges++;   /* both at once when they are the same row */
+        if (edges > 0 && node >= 0 && node < g_view.set.rowCount) Mark(g_view.set.rows[node].key, TRUE);
+    }
+}
+
+static void ShowMarks(HTREEITEM selected)
+{
+    SelectMarking(selected);
+    InvalidateRect(g_view.tree, NULL, FALSE);
+    RedrawDetails(FALSE);
+}
+
+/* A click on session `item` with Ctrl (`toggle`: it is chosen or no longer
+ * is) or Shift (`range`: the sessions from the anchor to it, added to those
+ * chosen with Ctrl too). */
+static void ClickToChoose(HTREEITEM item, BOOL toggle, BOOL range)
+{
+    TreeNodeKey key;
+    ItemKey(item, &key);
+    if (range) {
+        MarkRange(item, toggle);
+    } else {
+        StartMarks();
+        Mark(key.key, MarkIndex(key.key) < 0);
+        g_view.anchor = key;
+        /* One left, or none: the tree's own selection again, on it. */
+        if (g_view.markedCount <= 1) {
+            HTREEITEM only = g_view.markedCount ? FindShownSession(g_view.marked[0]) : NULL;
+            ClearMarks();
+            TreeView_SelectItem(g_view.tree, only ? only : item);
+            return;
+        }
+    }
+    ShowMarks(item);
+}
+
+/* Shift and an arrow: the range grows or shrinks to the next session up or down. */
+static void ChooseWithKey(WPARAM key)
+{
+    HTREEITEM item = TreeView_GetSelection(g_view.tree);
+    while (item && (item = key == VK_UP ? TreeView_GetPrevVisible(g_view.tree, item) : TreeView_GetNextVisible(g_view.tree, item)) != NULL &&
+           NodeParam(item) < 0) {}
+    if (!item) return;
+    MarkRange(item, FALSE);
+    ShowMarks(item);
+    TreeView_EnsureVisible(g_view.tree, item);
+}
+
+/* Ctrl+A: every session the tree shows. */
+static void ChooseAllShown(void)
+{
+    HTREEITEM item;
+    StartMarks();
+    for (item = TreeView_GetRoot(g_view.tree); item; item = TreeView_GetNextVisible(g_view.tree, item)) {
+        LPARAM node = NodeParam(item);
+        if (node >= 0 && node < g_view.set.rowCount) Mark(g_view.set.rows[node].key, TRUE);
+    }
+    InvalidateRect(g_view.tree, NULL, FALSE);
+    RedrawDetails(FALSE);
+}
+
+static LRESULT CALLBACK TreeSubclass(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
+{
+    (void)ref;
+    switch (msg) {
+    case WM_LBUTTONDOWN: {
+        TVHITTESTINFO hit;
+        BOOL onRow;
+        ZeroMemory(&hit, sizeof hit);
+        hit.pt.x = GET_X_LPARAM(lp);
+        hit.pt.y = GET_Y_LPARAM(lp);
+        onRow = TreeView_HitTest(window, &hit) && (hit.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT | TVHT_ONITEMINDENT));
+        if (onRow && (wp & (MK_CONTROL | MK_SHIFT)) && NodeParam(hit.hItem) >= 0) {
+            SetFocus(window);
+            ClickToChoose(hit.hItem, (wp & MK_CONTROL) != 0, (wp & MK_SHIFT) != 0);
+            return 0;
+        }
+        /* A plain click on a row chooses it alone, even the one already
+         * selected (no change of selection to say so). */
+        if (onRow && !(wp & (MK_CONTROL | MK_SHIFT))) {
+            ClearMarks();
+            ItemKey(hit.hItem, &g_view.anchor);
+        }
+        break;
+    }
+    case WM_KEYDOWN:
+        if ((wp == VK_UP || wp == VK_DOWN) && GetKeyState(VK_SHIFT) < 0) {
+            ChooseWithKey(wp);
+            return 0;
+        }
+        if (wp == 'A' && GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0) {
+            ChooseAllShown();
+            return 0;
+        }
+        break;
+    case WM_CHAR:
+        if (wp == 1) return 0;   /* Ctrl+A's character: no search of the titles */
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, TreeSubclass, id);
+        break;
+    }
+    return DefSubclassProc(window, msg, wp, lp);
 }
 
 /* Drawing and tooltip measurement share the title's space, including the
@@ -980,7 +1232,10 @@ static void DrawTreeItem(const NMTVCUSTOMDRAW *customDraw)
     RECT rc = customDraw->nmcd.rc, cell, title;
     int p = ShownProfileIndex(), left, right, baseline;
 
-    if (itemState & TVIS_SELECTED) state |= THEME_ROW_SELECTED;
+    /* Several sessions chosen: they show as selected, the tree's own
+     * selection only by its focus cue. */
+    if (g_view.several ? node >= 0 && node < g_view.set.rowCount && IsMarked(g_view.set.rows[node].key) : (itemState & TVIS_SELECTED) != 0)
+        state |= THEME_ROW_SELECTED;
     if (hot) state |= THEME_ROW_HOT;
     /* A folder's room above it stays blank, out of its selection. */
     if (node < 0 && rc.bottom - rc.top > FOLDER_UNITS * g_view.unit) {
@@ -1347,6 +1602,15 @@ static void DrawDetails(const DRAWITEMSTRUCT *item)
     g_view.fixed.count = 0;
     FillRect(dc, &rc, Theme_Brush(THEME_FACE));
     SetBkMode(dc, TRANSPARENT);
+    if (g_view.several && g_view.markedCount >= 2) {
+        ShowWindow(g_view.parts, SW_HIDE);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Sessions selected: %d"), g_view.markedCount);
+        y = Paragraph(dc, THEME_FONT_HEADING, color, text, left, right, rc.top + tree.top - self.top, 1);
+        Paragraph(dc, THEME_FONT_TEXT, muted, TR(L"Right-click them to share, copy, export, star or remove them all."), left, right,
+                  y + g_view.pad, 4);
+        Theme_BufferEnd(&buffer);
+        return;
+    }
     if (!row) {
         ShowWindow(g_view.parts, SW_HIDE);
         if (TreeView_GetCount(g_view.tree))
@@ -2038,6 +2302,220 @@ static void ShowMenu(POINT pt)
     TakeHeldSnapshot();
 }
 
+/* ------------------------------------------------------- several sessions */
+
+/* The sessions under folder row `folder` (or Starred), folded or not: a
+ * heap array of rows (HeapFree) and its length; NULL for none. */
+static int *FolderRows(HTREEITEM folder, int *count)
+{
+    HTREEITEM child;
+    int *rows, capacity = 0;
+    *count = 0;
+    for (child = TreeView_GetChild(g_view.tree, folder); child; child = TreeView_GetNextSibling(g_view.tree, child)) capacity++;
+    if (!capacity || (rows = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof *rows)) == NULL) return NULL;
+    for (child = TreeView_GetChild(g_view.tree, folder); child; child = TreeView_GetNextSibling(g_view.tree, child)) {
+        LPARAM node = NodeParam(child);
+        if (node >= 0 && node < g_view.set.rowCount) rows[(*count)++] = (int)node;
+    }
+    if (*count) return rows;
+    HeapFree(GetProcessHeap(), 0, rows);
+    return NULL;
+}
+
+/* Every session the tree shows for the profile shown, folded or not, as
+ * FolderRows gives them. */
+static int *ShownRows(int *count)
+{
+    int *rows, r, p = ShownProfileIndex();
+    *count = 0;
+    if (p < 0 || !g_view.set.rowCount || (rows = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)g_view.set.rowCount * sizeof *rows)) == NULL)
+        return NULL;
+    for (r = 0; r < g_view.set.rowCount; r++)
+        if (RowVisibleIn(&g_view.set.rows[r], p)) rows[(*count)++] = r;
+    if (*count) return rows;
+    HeapFree(GetProcessHeap(), 0, rows);
+    return NULL;
+}
+
+/* How many of sessions `rows` profile `p` lists and keeps, and whether
+ * those are all starred there. */
+static int KeptIn(const int *rows, int count, int p, BOOL *allStarred)
+{
+    int i, kept = 0;
+    *allStarred = TRUE;
+    for (i = 0; i < count; i++) {
+        const SessionEntry *entry = EntryOf(&g_view.set.rows[rows[i]], p);
+        if (!ListedAndKept(entry)) continue;
+        kept++;
+        if (!StarredIn(entry)) *allStarred = FALSE;
+    }
+    return kept;
+}
+
+/* Starred in the profile shown, or unstarred when they all are. The first
+ * change that cannot be made stops the others: the user is told once. */
+static BOOL StarSeveral(const int *rows, int count)
+{
+    int i, p = ShownProfileIndex(), changed = 0;
+    BOOL allStarred;
+    KeptIn(rows, count, p, &allStarred);
+    for (i = 0; i < count; i++) {
+        const SessionEntry *entry = EntryOf(&g_view.set.rows[rows[i]], p);
+        if (!ListedAndKept(entry) || StarredIn(entry) != allStarred) continue;
+        if (!ChangeEntry(rows[i], p, PENDING_STAR, allStarred ? L"0" : L"1")) break;
+        changed++;
+    }
+    return changed > 0;
+}
+
+/* Out of the profile shown, after one question: their entries go to the
+ * Recycle Bin, once it closes when it runs. One session is asked about as
+ * Remove asks. */
+static BOOL RemoveSeveral(const int *rows, int count)
+{
+    WCHAR text[2048];
+    int i, p = ShownProfileIndex(), kept, changed = 0;
+    BOOL allStarred;
+    if ((kept = KeptIn(rows, count, p, &allStarred)) == 0) return FALSE;
+    for (i = 0; kept == 1 && i < count; i++)
+        if (ListedAndKept(EntryOf(&g_view.set.rows[rows[i]], p))) return RemoveEntry(rows[i], p);
+    StringCchPrintfW(text, ARRAYSIZE(text),
+                     ProfileAt(p)->running
+                     ? TR(L"Remove %d sessions from \x201C%s\x201D?\n\nTheir entries there go to the Recycle Bin when it closes "
+                          L"(it keeps them until then). Their conversations stay on disk: Delete sessions everywhere removes them too.")
+                     : TR(L"Remove %d sessions from \x201C%s\x201D?\n\nTheir entries there go to the Recycle Bin. "
+                          L"Their conversations stay on disk: Delete sessions everywhere removes them too."),
+                     kept, ProfileAt(p)->name);
+    if (!Ui_Ask(g_view.dlg, IDI_QUESTION, text, TR(L"Remove"), TR(L"Cancel"), FALSE)) return FALSE;
+    for (i = 0; i < count; i++) {
+        if (!ListedAndKept(EntryOf(&g_view.set.rows[rows[i]], p))) continue;
+        if (!ChangeEntry(rows[i], p, PENDING_REMOVE, L"")) break;
+        changed++;
+    }
+    return changed > 0;
+}
+
+/* Delete session everywhere for each, after one question. Those it cannot
+ * delete now (SessionEdit_CanDelete: open somewhere) are left, and said
+ * once the others are gone. */
+static BOOL DeleteSeveralEverywhere(const int *rows, int count)
+{
+    WCHAR text[1024], error[LONG_PATH_CCH + NOTE_CCH], first[LONG_PATH_CCH + NOTE_CCH];
+    int i, deletable = 0, left = 0;
+    BOOL changed = FALSE;
+    if (count == 1) return DeleteSessionEverywhere(rows[0]);
+    first[0] = 0;
+    for (i = 0; i < count; i++)
+        if (SessionEdit_CanDelete(&g_view.set, rows[i], error, ARRAYSIZE(error))) deletable++;
+        else if (!first[0]) StringCchCopyW(first, ARRAYSIZE(first), error);
+    if (!deletable) {
+        Ui_Message(g_view.dlg, MB_ICONINFORMATION, L"%s", first);
+        return FALSE;
+    }
+    StringCchPrintfW(text, ARRAYSIZE(text),
+                     TR(L"Delete %d sessions everywhere?\n\nTheir conversations, their entries in every profile and the working folders "
+                        L"of those without a folder go to the Recycle Bin."), deletable);
+    if (!Ui_Ask(g_view.dlg, IDI_WARNING, text, TR(L"Delete"), TR(L"Cancel"), TRUE)) return FALSE;
+    first[0] = 0;
+    for (i = 0; i < count; i++) {
+        RemoveResult result = REMOVE_FAILED;
+        if (SessionEdit_CanDelete(&g_view.set, rows[i], error, ARRAYSIZE(error)))
+            result = SessionEdit_DeleteEverywhere(g_view.dlg, &g_view.set, rows[i], error, ARRAYSIZE(error));
+        if (result == REMOVE_CANCELLED) break;   /* in Windows' question: the rest stays too */
+        if (result == REMOVE_DONE) changed = TRUE;
+        else if (!left++) StringCchCopyW(first, ARRAYSIZE(first), error);
+    }
+    if (left) Ui_Message(g_view.dlg, MB_ICONWARNING, TR(L"Sessions that could not be deleted: %d. %s"), left, first);
+    return changed || left;
+}
+
+/* A menu's choice for sessions `rows` of the profile shown, run; what it
+ * changed is read again at once, as RunAction does. */
+static void RunBatch(UINT cmd, const int *rows, int count)
+{
+    int p = ShownProfileIndex();
+    BOOL changed = FALSE;
+    if (p < 0) return;
+    g_view.actionDepth++;
+    switch (cmd) {
+    case IDM_BATCH + BATCH_SHARE:      changed = SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, p, rows, count, FALSE); break;
+    case IDM_BATCH + BATCH_COPY:       changed = SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, p, rows, count, TRUE); break;
+    case IDM_BATCH + BATCH_EXPORT:     SyncUi_Export(g_view.dlg, &g_view.set, p, rows, count); break;
+    case IDM_BATCH + BATCH_STAR:       changed = StarSeveral(rows, count); break;
+    case IDM_BATCH + BATCH_REMOVE:     changed = RemoveSeveral(rows, count); break;
+    case IDM_BATCH + BATCH_DELETE_ALL: changed = DeleteSeveralEverywhere(rows, count); break;
+    case IDM_BATCH + BATCH_IMPORT:     changed = SyncUi_Import(g_view.dlg, &g_view.set.profiles, 1u << p); break;
+    default: break;
+    }
+    g_view.actionDepth--;
+    if (changed) RequestLoad(TRUE);
+    TakeHeldSnapshot();
+}
+
+/* The sessions chosen, acted on together (the Del key). */
+static void RunOnMarks(UINT cmd)
+{
+    int *rows, count;
+    if ((rows = MarkedRows(&count)) == NULL) return;
+    RunBatch(cmd, rows, count);
+    HeapFree(GetProcessHeap(), 0, rows);
+}
+
+static UINT TrackMenu(HMENU menu, POINT pt)
+{
+    return (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | (Localize_IsRTL() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, g_view.dlg, NULL);
+}
+
+/* What can be done to sessions `rows` together, at `pt` (screen): share
+ * them with other profiles or copy them there (a dialog chooses which),
+ * export them, star or remove them in the profile shown, delete them
+ * everywhere. `keys`: the sessions chosen, which the Del key removes. */
+static void BatchMenu(POINT pt, const int *rows, int count, BOOL keys)
+{
+    WCHAR text[64];
+    HMENU menu;
+    int p = ShownProfileIndex(), kept;
+    UINT others = g_view.set.profiles.count > 1 ? 0 : MF_GRAYED, cmd;
+    BOOL allStarred;
+    if (p < 0 || (menu = CreatePopupMenu()) == NULL) return;
+    kept = KeptIn(rows, count, p, &allStarred);
+    AppendMenuW(menu, MF_STRING | others, IDM_BATCH + BATCH_SHARE, TR(L"&Share with\x2026"));
+    AppendMenuW(menu, MF_STRING | others, IDM_BATCH + BATCH_COPY, TR(L"&Copy to\x2026"));
+    AppendMenuW(menu, MF_STRING, IDM_BATCH + BATCH_EXPORT, TR(L"E&xport sessions\x2026"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (kept ? 0 : MF_GRAYED), IDM_BATCH + BATCH_STAR, kept && allStarred ? TR(L"Uns&tar") : TR(L"S&tar"));
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Re&move\x2026%s"), keys ? TR(L"\tDel") : L"");
+    AppendMenuW(menu, MF_STRING | (kept ? 0 : MF_GRAYED), IDM_BATCH + BATCH_REMOVE, text);
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, IDM_BATCH + BATCH_DELETE_ALL, TR(L"&Delete sessions everywhere\x2026"));
+    g_view.actionDepth++;   /* `rows` name the snapshot shown: it stays while the menu is open */
+    cmd = TrackMenu(menu, pt);
+    DestroyMenu(menu);
+    RunBatch(cmd, rows, count);
+    g_view.actionDepth--;
+    TakeHeldSnapshot();
+}
+
+/* Below the tree's rows: every session it shows exported, or an archive
+ * imported into the profile shown. */
+static void AreaMenu(POINT pt)
+{
+    HMENU menu;
+    int *rows, count;
+    UINT cmd;
+    if (ShownProfileIndex() < 0 || (menu = CreatePopupMenu()) == NULL) return;
+    g_view.actionDepth++;
+    rows = ShownRows(&count);
+    AppendMenuW(menu, MF_STRING | (count ? 0 : MF_GRAYED), IDM_BATCH + BATCH_EXPORT, TR(L"E&xport sessions\x2026"));
+    AppendMenuW(menu, MF_STRING, IDM_BATCH + BATCH_IMPORT, TR(L"&Import sessions\x2026"));
+    cmd = TrackMenu(menu, pt);
+    DestroyMenu(menu);
+    RunBatch(cmd, rows, count);
+    if (rows) HeapFree(GetProcessHeap(), 0, rows);
+    g_view.actionDepth--;
+    TakeHeldSnapshot();
+}
+
 /* --------------------------------------------------------------- watcher */
 
 #define WATCH_EVERYTHING (FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE)
@@ -2483,6 +2961,7 @@ void SessionsView_Init(HWND dlg)
     if (!g_view.parts) Util_Log(L"sessions: the details' scrolling part cannot be made (error %lu)", GetLastError());
     SetWindowSubclass(g_view.details, DetailsSubclass, 1, 0);
     if (g_view.parts) SetWindowSubclass(g_view.parts, DetailsSubclass, 1, 0);
+    SetWindowSubclass(g_view.tree, TreeSubclass, 1, 0);
     SendMessageW(g_view.search, EM_LIMITTEXT, ARRAYSIZE(g_view.filter) - 1, 0);
 }
 
@@ -2522,13 +3001,17 @@ static ULONGLONG WaitingChangesState(const SessionSet *set, int p)
     WCHAR path[MAX_PATH];
     WIN32_FILE_ATTRIBUTE_DATA file;
     ULONGLONG state = Core_HashText(CORE_HASH_START, set->profiles.items[p].folder);
-    ZeroMemory(&file, sizeof file);
-    if (!SessionStore_PendingPath(&set->profiles.items[p], path, ARRAYSIZE(path)) ||
-        !GetFileAttributesExW(path, GetFileExInfoStandard, &file))
+    int queue;
+    for (queue = 0; queue < 2; queue++) {   /* its changes, and the sessions sent to it */
         ZeroMemory(&file, sizeof file);
-    state = Core_HashBytes(state, &file.ftLastWriteTime, sizeof file.ftLastWriteTime);
-    state = Core_HashBytes(state, &file.nFileSizeHigh, sizeof file.nFileSizeHigh);
-    state = Core_HashBytes(state, &file.nFileSizeLow, sizeof file.nFileSizeLow);
+        if (!(queue ? SessionSync_PlanPath(&set->profiles.items[p], path, ARRAYSIZE(path))
+                    : SessionStore_PendingPath(&set->profiles.items[p], path, ARRAYSIZE(path))) ||
+            !GetFileAttributesExW(path, GetFileExInfoStandard, &file))
+            ZeroMemory(&file, sizeof file);
+        state = Core_HashBytes(state, &file.ftLastWriteTime, sizeof file.ftLastWriteTime);
+        state = Core_HashBytes(state, &file.nFileSizeHigh, sizeof file.nFileSizeHigh);
+        state = Core_HashBytes(state, &file.nFileSizeLow, sizeof file.nFileSizeLow);
+    }
     return Core_HashBytes(state, &set->source[p].pending, sizeof set->source[p].pending);
 }
 
@@ -2685,6 +3168,7 @@ BOOL SessionsView_Command(WPARAM wp)
             LRESULT i = SendMessageW(g_view.profiles, LB_GETCURSEL, 0, 0);
             if (i >= 0 && i < g_view.set.profiles.count) {
                 StringCchCopyW(g_view.folder, ARRAYSIZE(g_view.folder), ProfileAt((int)i)->folder);
+                ClearMarks();
                 ForgetNeighbors();
                 FillTree();
                 RedrawDetails(FALSE);
@@ -2696,21 +3180,29 @@ BOOL SessionsView_Command(WPARAM wp)
 }
 
 /* WM_CONTEXTMENU: the tree's menu, at the mouse or (from the keyboard) at
- * the selected row, kept on the view when that row is scrolled out of it. */
+ * the selected row, kept on the view when that row is scrolled out of it.
+ * A session among several chosen: the menu of them all, the choice kept; a
+ * folder's row or Starred: the menu of its sessions; below the rows: export
+ * and import. */
 BOOL SessionsView_ContextMenu(HWND from, LPARAM pos)
 {
     POINT pt;
+    HTREEITEM item;
+    LPARAM node;
+    int *rows, count;
+    BOOL several;
     if (!g_view.shown || from != g_view.tree) return FALSE;
     if (pos == (LPARAM)-1) {
         RECT rc, view;
-        HTREEITEM selected = TreeView_GetSelection(g_view.tree);
-        if (!selected || !TreeView_GetItemRect(g_view.tree, selected, &rc, TRUE)) return TRUE;
+        item = TreeView_GetSelection(g_view.tree);
+        if (!item || !TreeView_GetItemRect(g_view.tree, item, &rc, TRUE)) return TRUE;
         pt.x = rc.left;
         pt.y = rc.bottom;
         ClientToScreen(g_view.tree, &pt);
         GetWindowRect(g_view.treeArea, &view);
         pt.x = max(view.left, min(pt.x, view.right));
         pt.y = max(view.top, min(pt.y, view.bottom));
+        several = g_view.several && g_view.markedCount >= 2;
     } else {
         TVHITTESTINFO hit;
         pt.x = GET_X_LPARAM(pos);
@@ -2718,11 +3210,30 @@ BOOL SessionsView_ContextMenu(HWND from, LPARAM pos)
         ZeroMemory(&hit, sizeof hit);
         hit.pt = pt;
         ScreenToClient(g_view.tree, &hit.pt);
-        if (!TreeView_HitTest(g_view.tree, &hit) || !(hit.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT | TVHT_ONITEMINDENT | TVHT_ONITEMBUTTON)))
-            return TRUE;   /* below the rows: no session to act on */
-        TreeView_SelectItem(g_view.tree, hit.hItem);
+        if (!TreeView_HitTest(g_view.tree, &hit) || !(hit.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT | TVHT_ONITEMINDENT | TVHT_ONITEMBUTTON))) {
+            AreaMenu(pt);
+            return TRUE;
+        }
+        item = hit.hItem;
+        node = NodeParam(item);
+        several = g_view.several && g_view.markedCount >= 2 && node >= 0 && node < g_view.set.rowCount && IsMarked(g_view.set.rows[node].key);
+        if (!several) {
+            ClearMarks();
+            TreeView_SelectItem(g_view.tree, item);
+        }
     }
-    if (NodeParam(TreeView_GetSelection(g_view.tree)) >= 0) ShowMenu(pt);
+    node = NodeParam(item);
+    if (several) {
+        if ((rows = MarkedRows(&count)) != NULL) {
+            BatchMenu(pt, rows, count, TRUE);
+            HeapFree(GetProcessHeap(), 0, rows);
+        }
+    } else if (node >= 0) {
+        ShowMenu(pt);
+    } else if (node != NODE_NONE && (rows = FolderRows(item, &count)) != NULL) {
+        BatchMenu(pt, rows, count, FALSE);
+        HeapFree(GetProcessHeap(), 0, rows);
+    }
     return TRUE;
 }
 
@@ -2756,6 +3267,10 @@ BOOL SessionsView_Notify(const NMHDR *header, LRESULT *result)
         const NMTVKEYDOWN *key = (const NMTVKEYDOWN *)header;
         int r = SelectedRow();
         const SessionEntry *entry = r >= 0 ? EntryOf(&g_view.set.rows[r], ShownProfileIndex()) : NULL;
+        if (g_view.several && g_view.markedCount >= 2) {
+            if (key->wVKey == VK_DELETE) RunOnMarks(IDM_BATCH + BATCH_REMOVE);
+            return TRUE;
+        }
         if (ListedAndKept(entry) && key->wVKey == VK_F2) RunAction(ACT_RENAME, -1);
         else if (ListedAndKept(entry) && key->wVKey == VK_DELETE) RunAction(ACT_REMOVE, -1);
         return TRUE;
@@ -2765,6 +3280,10 @@ BOOL SessionsView_Notify(const NMHDR *header, LRESULT *result)
         TreeNodeKey key;
         if (!g_view.filling) {
             NodeKey(change->itemNew.lParam, NodeParam(TreeView_GetParent(g_view.tree, change->itemNew.hItem)) == NODE_STARRED, &key);
+            if (!g_view.marking) {
+                ClearMarks();
+                g_view.anchor = key;
+            }
             SetSelection(&key);
             g_view.hot.window = g_view.pressed.window = NULL;
             RedrawDetails(FALSE);
@@ -2826,6 +3345,7 @@ void SessionsView_Destroy(void)
     if (g_view.icons) ImageList_Destroy(g_view.icons);
     if (g_view.badges) ImageList_Destroy(g_view.badges);
     if (g_view.folderCount) HeapFree(GetProcessHeap(), 0, g_view.folderCount);
+    if (g_view.marked) HeapFree(GetProcessHeap(), 0, g_view.marked);
     ZeroMemory(&g_view, sizeof g_view);
     InterlockedExchange(&g_reloadMessagePending, 0);
 }

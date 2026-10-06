@@ -883,6 +883,54 @@ BOOL Core_JsonSetMember(const char *json, size_t len, const char *key, const cha
     return TRUE;
 }
 
+/* `json` without its top-level member `key` and the comma that joined it,
+ * the rest kept byte for byte; unchanged when it has no such member. `out`
+ * may be `json` itself. FALSE when `json` is not an object or `out` is too
+ * small. */
+BOOL Core_JsonRemoveMember(const char *json, size_t len, const char *key, char *out, size_t cap, size_t *outLen)
+{
+    size_t i, keyStart, keyEnd, end, next, keyLen = strlen(key), previousEnd, memberStart, from, to;
+    *outLen = 0;
+    i = SkipSpace(json, len, SkipByteOrderMark(json, len));
+    if (i >= len || json[i] != '{') return FALSE;
+    previousEnd = i + 1;
+    i = SkipSpace(json, len, i + 1);
+    while (i < len && json[i] == '"') {
+        memberStart = i;
+        keyStart = i + 1;
+        keyEnd = StringEnd(json, len, i);
+        if (!keyEnd) return FALSE;
+        i = SkipSpace(json, len, keyEnd);
+        if (i >= len || json[i] != ':') return FALSE;
+        i = SkipSpace(json, len, i + 1);
+        end = ValueEnd(json, len, i);
+        if (!end || end == i) return FALSE;
+        next = SkipSpace(json, len, end);
+        if (keyEnd - 1 - keyStart == keyLen && memcmp(json + keyStart, key, keyLen) == 0) {
+            /* The comma after it goes with it; the last member's goes before it. */
+            if (next < len && json[next] == ',') {
+                from = memberStart;
+                to = SkipSpace(json, len, next + 1);
+            } else {
+                from = previousEnd;
+                to = end;
+            }
+            if (len - (to - from) > cap) return FALSE;
+            memmove(out, json, from);
+            memmove(out + from, json + to, len - to);
+            *outLen = len - (to - from);
+            return TRUE;
+        }
+        if (next >= len || json[next] != ',') break;
+        previousEnd = end;
+        i = SkipSpace(json, len, next + 1);
+    }
+    if (len > cap) return FALSE;
+    memmove(out, json, len);
+    *outLen = len;
+    return TRUE;
+}
+
 /* `text` as a JSON string, quotes included, in UTF-8. */
 BOOL Core_JsonQuote(const WCHAR *text, char *out, size_t cap)
 {
@@ -1045,6 +1093,157 @@ BOOL Core_PendingReplaces(const PendingEdit *queued, const PendingEdit *added)
 {
     return EqualsI(queued->key, -1, added->key, -1) &&
            (queued->op == added->op || queued->op == PENDING_REMOVE || added->op == PENDING_REMOVE);
+}
+
+/* ------------------------------------------------------------- sync plans */
+
+/* A profile's plan of changes sent to it (sessionsync.c): UTF-8, one change
+ * a line, "<kind>\t<flags>\t<time>\t<seen>\t<key>\t<content>". */
+static const WCHAR *const kSyncOps[] = { L"put", L"remove", L"mark", L"unmark", L"index" };
+C_ASSERT(ARRAYSIZE(kSyncOps) == SYNC_INDEX + 1);
+
+/* A name of a file in a folder of ours: no path, no dots of its own. */
+static BOOL IsPlainContentName(const WCHAR *name)
+{
+    const WCHAR *c;
+    if (!name[0] || name[0] == L'.') return FALSE;
+    for (c = name; *c; c++)
+        if (!((*c >= L'0' && *c <= L'9') || (*c >= L'a' && *c <= L'z') || *c == L'.' || *c == L'-')) return FALSE;
+    return TRUE;
+}
+
+BOOL Core_SyncOpFormat(const SyncOp *op, WCHAR *out, size_t cch)
+{
+    if ((int)op->kind < 0 || (int)op->kind >= (int)ARRAYSIZE(kSyncOps) || !op->key[0] || wcspbrk(op->key, L"\t\r\n") ||
+        (op->content[0] && !IsPlainContentName(op->content)))
+        return FALSE;
+    return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\t%lu\t%I64u\t%I64u\t%s\t%s", kSyncOps[op->kind], op->flags, op->time, op->seen,
+                                      op->key, op->content));
+}
+
+/* A decimal number of a plan line up to `end`. */
+static BOOL ParsePlanNumber(const WCHAR *start, const WCHAR *end, ULONGLONG limit, ULONGLONG *value)
+{
+    ULONGLONG n = 0;
+    const WCHAR *c;
+    if (start == end) return FALSE;
+    for (c = start; c < end; c++) {
+        if (*c < L'0' || *c > L'9' || n > (limit - (ULONGLONG)(*c - L'0')) / 10) return FALSE;
+        n = n * 10 + (ULONGLONG)(*c - L'0');
+    }
+    *value = n;
+    return TRUE;
+}
+
+BOOL Core_SyncOpParse(const WCHAR *line, SyncOp *op)
+{
+    const WCHAR *field[6], *end[6], *at = line;
+    ULONGLONG flags;
+    size_t kind;
+    int i;
+    ZeroMemory(op, sizeof *op);
+    for (i = 0; i < 6; i++) {
+        field[i] = at;
+        end[i] = i < 5 ? wcschr(at, L'\t') : at + wcslen(at);
+        if (!end[i]) return FALSE;
+        at = end[i] + 1;
+    }
+    for (kind = 0; kind < ARRAYSIZE(kSyncOps); kind++)
+        if ((size_t)(end[0] - field[0]) == wcslen(kSyncOps[kind]) && wcsncmp(field[0], kSyncOps[kind], (size_t)(end[0] - field[0])) == 0) break;
+    if (kind == ARRAYSIZE(kSyncOps) || !ParsePlanNumber(field[1], end[1], MAXDWORD, &flags) ||
+        !ParsePlanNumber(field[2], end[2], _UI64_MAX, &op->time) || !ParsePlanNumber(field[3], end[3], _UI64_MAX, &op->seen) ||
+        end[4] == field[4] || FAILED(StringCchCopyNW(op->key, ARRAYSIZE(op->key), field[4], (size_t)(end[4] - field[4]))) ||
+        FAILED(StringCchCopyNW(op->content, ARRAYSIZE(op->content), field[5], (size_t)(end[5] - field[5]))) ||
+        (op->content[0] && !IsPlainContentName(op->content)))
+        return FALSE;
+    op->kind = (SyncOpKind)kind;
+    op->flags = (DWORD)flags;
+    return TRUE;
+}
+
+/* A change sent after `queued` replaces it: a put or a removal of the same
+ * session, a mark or its removal for the same id, a list of archived sessions. */
+BOOL Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added)
+{
+    int a = queued->kind == SYNC_PUT || queued->kind == SYNC_REMOVE ? 0 : queued->kind == SYNC_INDEX ? 2 : 1;
+    int b = added->kind == SYNC_PUT || added->kind == SYNC_REMOVE ? 0 : added->kind == SYNC_INDEX ? 2 : 1;
+    return a == b && EqualsI(queued->key, -1, added->key, -1);
+}
+
+/* ---------------------------------------------------------------- archives */
+
+/* CRC-32 (ISO 3309, as ZIP files check their content), going on from `crc`
+ * (0 to start). */
+DWORD Core_Crc32(DWORD crc, const void *data, size_t size)
+{
+    static DWORD table[256];
+    static volatile LONG made;
+    const unsigned char *p = (const unsigned char *)data;
+    if (!made) {
+        DWORD n, k, c;
+        for (n = 0; n < 256; n++) {
+            for (c = n, k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[n] = c;
+        }
+        InterlockedExchange(&made, 1);
+    }
+    crc = ~crc;
+    while (size--) crc = table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+/* An archive's file name (UTF-8, '/' between folders) that stays inside the
+ * folder it is extracted to and names one file there: relative, no empty,
+ * "." or ".." part, no backslash, drive, stream or character Windows
+ * refuses, no part ending in a dot or a space (Windows would drop it). */
+BOOL Core_ArchiveNameSafe(const char *name, size_t length)
+{
+    size_t i, partStart = 0;
+    if (length == 0 || name[0] == '/') return FALSE;
+    for (i = 0; i <= length; i++) {
+        unsigned char c = i < length ? (unsigned char)name[i] : '/';
+        if (c == '/') {
+            size_t part = i - partStart;
+            if (part == 0 || (part == 1 && name[partStart] == '.') || (part == 2 && name[partStart] == '.' && name[partStart + 1] == '.') ||
+                name[i - 1] == '.' || name[i - 1] == ' ')
+                return FALSE;
+            partStart = i + 1;
+        } else if (c < 0x20 || c == 0x7F || strchr("\\:*?\"<>|", c)) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* A path under Claude Code's folder (`relative`, '\\' between folders) that
+ * holds part of a conversation, as an archive's files may: in a project
+ * folder, a transcript (<id>.jsonl), its folder (<id>\\...) or its state
+ * before compacting (<id>.precompact.json); in file-history, uploads, tasks
+ * or image-cache, the folder of a transcript (<store>\\<id>\\...). Nothing
+ * else of Claude Code's (its settings, hooks, memory) comes from an archive. */
+BOOL Core_ConversationFileName(const WCHAR *relative)
+{
+    static const WCHAR *const kStores[] = { L"file-history", L"uploads", L"tasks", L"image-cache" };
+    WCHAR id[UUID_TEXT_CCH];
+    const WCHAR *slash = wcschr(relative, L'\\'), *part, *rest;
+    size_t i, storeLength;
+    BOOL project;
+    if (!slash) return FALSE;
+    storeLength = (size_t)(slash - relative);
+    project = storeLength == 8 && _wcsnicmp(relative, L"projects", 8) == 0;
+    part = slash + 1;
+    if (project && (part = wcschr(part, L'\\')) != NULL) part++;   /* past the project's folder */
+    if (!part || wcslen(part) < UUID_TEXT_CCH - 1 || FAILED(StringCchCopyNW(id, ARRAYSIZE(id), part, UUID_TEXT_CCH - 1)) ||
+        !Core_IsUuid(id))
+        return FALSE;
+    rest = part + UUID_TEXT_CCH - 1;
+    if (*rest == L'\\' && rest[1]) {
+        if (project) return TRUE;
+        for (i = 0; i < ARRAYSIZE(kStores); i++)
+            if (wcslen(kStores[i]) == storeLength && _wcsnicmp(relative, kStores[i], storeLength) == 0) return TRUE;
+        return FALSE;
+    }
+    return project && (_wcsicmp(rest, L".jsonl") == 0 || _wcsicmp(rest, L".precompact.json") == 0);
 }
 
 /* ------------------------------------------------------------ drawing math */

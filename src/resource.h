@@ -12,6 +12,7 @@
 #define IDD_UNINSTALL     102
 #define IDD_MESSAGE       103
 #define IDD_TITLE         104
+#define IDD_SYNC          105
 
 /* main window */
 #define IDC_STATUS        1000
@@ -33,6 +34,8 @@
 #define IDC_SC_START      1016
 #define IDC_SESSIONS      1017
 #define IDC_LANGUAGE      1018
+#define IDC_MERGE         1019
+#define IDC_MIRROR        1020
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -61,6 +64,15 @@
 #define IDC_U_LABEL       1201
 #define IDC_U_LIST        1202
 #define IDC_U_HINT        1203
+
+/* sessions sent between profiles */
+#define IDC_Y_TEXT        1600
+#define IDC_Y_FROM_LABEL  1601
+#define IDC_Y_FROM        1602
+#define IDC_Y_TO_LABEL    1603
+#define IDC_Y_LIST        1604
+#define IDC_Y_EXACT       1605
+#define IDC_Y_NOTE        1606
 
 /* message box */
 #define IDC_M_ICON        1300

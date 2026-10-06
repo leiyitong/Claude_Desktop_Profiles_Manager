@@ -789,7 +789,8 @@ int SessionStore_LoadPending(const Profile *p, PendingEdit *edits, int capacity)
 }
 
 /* What waits for each profile, shown on its entries: the latest change of
- * each kind wins. A profile's count is what its entries can take now. */
+ * each kind wins. A profile's count is what its entries can take now, with
+ * the sessions sent to it (sessionsync.c). */
 static void LoadAllPending(SessionSet *set, HANDLE cancel)
 {
     PendingEdit *edits = (PendingEdit *)HeapAlloc(GetProcessHeap(), 0, SESSION_PENDING_MAX * sizeof *edits);
@@ -797,6 +798,7 @@ static void LoadAllPending(SessionSet *set, HANDLE cancel)
     if (!edits) return;
     for (p = 0; p < set->profiles.count; p++) {
         if (Cancelled(cancel)) break;
+        set->source[p].pending += SessionSync_PendingCount(&set->profiles.items[p]);
         n = SessionStore_LoadPending(&set->profiles.items[p], edits, SESSION_PENDING_MAX);
         for (i = 0; i < n; i++) {
             SessionEntry *entry;

@@ -1,9 +1,12 @@
 /*
- * The manager window: the profile list with Open / New / Edit / Delete / Set
- * as default, the shortcut, taskbar pin and Start menu buttons, and Uninstall;
- * Sessions turns the same window to the sessions view (sessions.c). Also the
- * profile and uninstall dialogs. Everything it shows follows events (see
- * WatchOutside and WatchShortcutFolders); nothing polls.
+ * The manager window: the profile list with Open / New / Edit / Delete,
+ * Merge all sessions / Mirror sessions (syncui.c) and Set as default, the
+ * shortcut, taskbar pin and Start menu buttons, and Uninstall; Sessions turns
+ * the same window to the sessions view (sessions.c). Several profiles can be
+ * selected (Shift, Ctrl, Ctrl+A): Open, Delete and the list's menu (Export
+ * sessions) act on them all, the other buttons on a profile selected alone.
+ * Also the profile and uninstall dialogs. Everything it shows follows events
+ * (see WatchOutside and WatchShortcutFolders); nothing polls.
  */
 #include "app.h"
 #include "resource.h"
@@ -86,10 +89,41 @@ static BOOL StateChangesBlocked(void)
     return g_manager.uninstalled || g_manager.uninstallInProgress || g_manager.closing;
 }
 
+/* The profile selected alone: what Edit, Set as default and the shortcuts
+ * act on; NULL when none or several are. */
 static const Profile *SelectedProfile(void)
 {
-    int i = ListView_GetNextItem(g_manager.list, -1, LVNI_SELECTED);
+    int i;
+    if (ListView_GetSelectedCount(g_manager.list) != 1) return NULL;
+    i = ListView_GetNextItem(g_manager.list, -1, LVNI_SELECTED);
     return (i >= 0 && i < g_manager.profiles.count) ? &g_manager.profiles.items[i] : NULL;
+}
+
+/* Of the profiles selected, the one with the keyboard's focus, else the first. */
+static const Profile *FocusedProfile(void)
+{
+    int i = ListView_GetNextItem(g_manager.list, -1, LVNI_FOCUSED | LVNI_SELECTED);
+    if (i < 0) i = ListView_GetNextItem(g_manager.list, -1, LVNI_SELECTED);
+    return (i >= 0 && i < g_manager.profiles.count) ? &g_manager.profiles.items[i] : NULL;
+}
+
+/* The profiles selected, one bit each (MAX_PROFILES <= 32). */
+static DWORD SelectedProfiles(void)
+{
+    DWORD bits = 0;
+    int i = -1;
+    while ((i = ListView_GetNextItem(g_manager.list, i, LVNI_SELECTED)) >= 0)
+        if (i < g_manager.profiles.count) bits |= 1u << i;
+    return bits;
+}
+
+/* The profiles of `bits` that can be deleted: all but Claude's own. */
+static DWORD Deletable(DWORD bits)
+{
+    int i;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if (g_manager.profiles.items[i].isStock) bits &= ~(1u << i);
+    return bits;
 }
 
 static const WCHAR *StockProfileName(void)
@@ -208,12 +242,33 @@ static void UpdateNote(void);
 static void ReflowMain(void);
 static void ShowVersion(void);
 
-/* Selects the row of `folder`, else the first one: its index, -1 in an
- * empty list. */
+/* The profiles selected, by folder, and the one with the focus: what a
+ * refill of the list selects again. */
+typedef struct ListSelection {
+    WCHAR focused[FOLDER_CCH];
+    WCHAR folders[MAX_PROFILES][FOLDER_CCH];
+    int   count;
+} ListSelection;
+
+static void TakeSelection(ListSelection *selection)
+{
+    const Profile *focused = FocusedProfile();
+    DWORD bits = SelectedProfiles();
+    int i;
+    ZeroMemory(selection, sizeof *selection);
+    if (focused) StringCchCopyW(selection->focused, ARRAYSIZE(selection->focused), focused->folder);
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if (bits & (1u << i))
+            StringCchCopyW(selection->folders[selection->count++], ARRAYSIZE(selection->folders[0]), g_manager.profiles.items[i].folder);
+}
+
+/* Selects the row of `folder` alone, else the first one: its index, -1 in
+ * an empty list. */
 static int SetSelectedRow(const WCHAR *folder)
 {
     int row = Profiles_Find(&g_manager.profiles, folder);
     if (row < 0 && g_manager.profiles.count > 0) row = 0;
+    ListView_SetItemState(g_manager.list, -1, 0, LVIS_SELECTED);
     if (row >= 0) ListView_SetItemState(g_manager.list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     return row;
 }
@@ -226,12 +281,14 @@ static void SelectProfileRow(const WCHAR *folder)
 }
 
 /* A refill keeps the view where it was (the viewport follows a row brought
- * into sight even during a refill): only a selection that had to move, its
- * profile gone, comes into sight once drawing is back on. */
-static void FillList(const WCHAR *select)
+ * into sight even during a refill) and the profiles selected that are still
+ * there: only a selection that had to move, its profile gone, comes into
+ * sight once drawing is back on. */
+static void FillList(const ListSelection *selection)
 {
     LVITEMW item;
-    int rowImages[MAX_PROFILES], i, row;
+    const WCHAR *select = selection ? selection->focused : NULL;
+    int rowImages[MAX_PROFILES], i, row, other;
     BOOL selectionMoved = select && select[0] && Profiles_Find(&g_manager.profiles, select) < 0;
     SendMessageW(g_manager.list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(g_manager.list);
@@ -246,6 +303,9 @@ static void FillList(const WCHAR *select)
         UpdateRow(i);
     }
     row = SetSelectedRow(select);
+    for (i = 0; selection && i < selection->count; i++)
+        if ((other = Profiles_Find(&g_manager.profiles, selection->folders[i])) >= 0 && other != row)
+            ListView_SetItemState(g_manager.list, other, LVIS_SELECTED, LVIS_SELECTED);
     SendMessageW(g_manager.list, WM_SETREDRAW, TRUE, 0);
     if (selectionMoved && row >= 0) ListView_EnsureVisible(g_manager.list, row, FALSE);
     LayoutColumns();
@@ -357,6 +417,7 @@ static void UpdateButtons(void)
 {
     const Profile *p = SelectedProfile();
     WCHAR text[256];
+    DWORD selected = SelectedProfiles();
     BOOL isDefault = p && Core_EqualsI(p->folder, g_manager.profiles.defaultFolder);
 
     if (p && !Core_EqualsI(p->folder, g_manager.shortcutStateFolder)) {
@@ -365,10 +426,12 @@ static void UpdateButtons(void)
         g_manager.pinned = TaskbarPin_IsPinned(p);
         g_manager.inStartMenu = Shortcut_IsInStartMenu(p);
     }
-    EnableControl(IDC_OPEN, p && g_manager.pkg.found);
+    EnableControl(IDC_OPEN, selected && g_manager.pkg.found);
     EnableControl(IDC_NEW, g_manager.profiles.count < MAX_PROFILES);
     EnableControl(IDC_EDIT, p != NULL);
-    EnableControl(IDC_DELETE, p && !p->isStock);
+    EnableControl(IDC_DELETE, Deletable(selected) != 0);
+    EnableControl(IDC_MERGE, g_manager.profiles.count >= 2);
+    EnableControl(IDC_MIRROR, g_manager.profiles.count >= 2);
     EnableControl(IDC_DEFAULT, p && !isDefault);
     EnableControl(IDC_SC_DESKTOP, p && !g_manager.onDesktop);
     EnableControl(IDC_SC_SAVEAS, p != NULL);
@@ -481,18 +544,17 @@ static void UpdateRowsAndButtons(void)
 static void Refresh(BOOL rescanPackage)
 {
     ProfileList fresh;
-    WCHAR selected[FOLDER_CCH] = L"";
-    const Profile *p = SelectedProfile();
+    ListSelection selected;
     BOOL hadClaude = g_manager.pkg.found, sameRows;
 
-    if (p) StringCchCopyW(selected, ARRAYSIZE(selected), p->folder);
+    TakeSelection(&selected);
     if (rescanPackage) Claude_FindPackage(&g_manager.pkg);
     Profiles_Load(&fresh, &g_manager.pkg);
     if (rescanPackage) HealIcons(&fresh);
     sameRows = SameProfileRows(&fresh, &g_manager.profiles) && hadClaude == g_manager.pkg.found;
     g_manager.profiles = fresh;
     if (sameRows) UpdateRowsAndButtons();
-    else FillList(selected);
+    else FillList(&selected);
     SessionsView_SetProfiles(&g_manager.profiles);
     if (!StateChangesBlocked()) SessionsView_Ready(TRUE);
     UpdateStatus();
@@ -839,10 +901,15 @@ static void OpenProfile(const Profile *profile)
     Util_Log(L"opened %s from the manager%s", p.folder, identity ? L"" : L" without package identity");
 }
 
+/* Every profile selected opens; the folders are taken first, the list can
+ * be filled again while a message is open. */
 static void DoOpen(void)
 {
-    const Profile *selected = SelectedProfile();
-    if (selected) OpenProfile(selected);
+    ListSelection selection;
+    int i, p;
+    TakeSelection(&selection);
+    for (i = 0; i < selection.count && !StateChangesBlocked(); i++)
+        if ((p = Profiles_Find(&g_manager.profiles, selection.folders[i])) >= 0) OpenProfile(&g_manager.profiles.items[p]);
 }
 
 static int FreeColor(void)
@@ -958,12 +1025,60 @@ static BOOL RefuseIfRunning(const Profile *p)
     return TRUE;
 }
 
+/* Several profiles selected: one question for all of them, then each one
+ * deleted as one alone is. One whose Claude runs is not deleted, the user
+ * told. */
+static void DeleteSeveral(DWORD bits)
+{
+    ListSelection chosen;
+    WCHAR names[MAX_PROFILES * (LABEL_CCH + 8)], text[ARRAYSIZE(names) + 1024];
+    int i, p, seen = 0, total = 0;
+    ZeroMemory(&chosen, sizeof chosen);
+    names[0] = 0;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if (bits & (1u << i)) total++;
+    for (i = 0; i < g_manager.profiles.count; i++) {
+        if (!(bits & (1u << i))) continue;
+        if (RefuseIfRunning(&g_manager.profiles.items[i])) return;
+        if (seen) StringCchCatW(names, ARRAYSIZE(names), seen == total - 1 ? TR(L" and ") : TR(L", "));
+        StringCchCatW(names, ARRAYSIZE(names), g_manager.profiles.items[i].name);
+        StringCchCopyW(chosen.folders[chosen.count++], ARRAYSIZE(chosen.folders[0]), g_manager.profiles.items[i].folder);
+        seen++;
+    }
+    StringCchPrintfW(text, ARRAYSIZE(text),
+                     TR(L"Delete the profiles %s?\n\nTheir data folders (sign-in, local history, Claude Code and Cowork files) go to the Recycle Bin, "
+                        L"except a folder that is a link, which stays on disk. Their shortcuts are removed."),
+                     names);
+    if (!Ui_Ask(g_manager.dlg, IDI_WARNING, text, TR(L"Delete profiles"), TR(L"Cancel"), TRUE) || StateChangesBlocked()) return;
+    FinishShellWork();
+    for (i = 0; i < chosen.count && !StateChangesBlocked(); i++) {
+        Profile profile;
+        if ((p = Profiles_Find(&g_manager.profiles, chosen.folders[i])) < 0) continue;
+        profile = g_manager.profiles.items[p];
+        /* It may have been started while the question was open. */
+        if (RefuseIfRunning(&profile)) continue;
+        if (Profiles_Delete(g_manager.dlg, &profile) == REMOVE_FAILED)
+            Ui_Message(g_manager.dlg, MB_ICONWARNING,
+                       TR(L"\x201C%s\x201D could not be deleted completely. Make sure Claude is closed for this profile and try again."),
+                       profile.name);
+    }
+    Refresh(FALSE);
+}
+
+/* The profiles selected, Claude's own apart: one alone is asked about with
+ * what its folder holds, several together. */
 static void DoDelete(void)
 {
-    const Profile *selected = SelectedProfile();
+    DWORD chosen = Deletable(SelectedProfiles());
     Profile p;
-    if (!selected || selected->isStock) return;
-    p = *selected;
+    int i;
+    if (!chosen) return;
+    if (chosen & (chosen - 1)) {
+        DeleteSeveral(chosen);
+        return;
+    }
+    for (i = 0; !(chosen & (1u << i)); i++) {}
+    p = g_manager.profiles.items[i];
     if (RefuseIfRunning(&p)) return;
     if (!ConfirmDelete(&p) || StateChangesBlocked()) return;
     /* It may have been started while the question was open. */
@@ -1037,10 +1152,93 @@ static void DoPinTaskbar(void)
     UpdateButtons();
 }
 
+/* ------------------------------------------------------------- sessions */
+
+/* The sessions dialogs work on a copy of the profiles: the list can be
+ * read again while one is open. */
+static ProfileList *CopyProfiles(void)
+{
+    ProfileList *copy = (ProfileList *)HeapAlloc(GetProcessHeap(), 0, sizeof *copy);
+    if (copy) *copy = g_manager.profiles;
+    else Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"Sessions could not be loaded."));
+    return copy;
+}
+
+typedef enum SessionsAction { SESSIONS_MERGE, SESSIONS_MIRROR, SESSIONS_EXPORT, SESSIONS_IMPORT } SessionsAction;
+
+/* What the sessions buttons and the list's menu do; what changed shows in
+ * the sessions view. */
+static void DoSessions(SessionsAction action)
+{
+    const Profile *focused = FocusedProfile();
+    WCHAR folder[FOLDER_CCH] = L"";
+    DWORD selected = SelectedProfiles();
+    ProfileList *profiles;
+    BOOL changed = FALSE;
+    if (StateChangesBlocked() || (profiles = CopyProfiles()) == NULL) return;
+    if (focused) StringCchCopyW(folder, ARRAYSIZE(folder), focused->folder);
+    switch (action) {
+    case SESSIONS_MERGE:  changed = SyncUi_Merge(g_manager.dlg, profiles); break;
+    case SESSIONS_MIRROR: changed = SyncUi_Mirror(g_manager.dlg, profiles, folder[0] ? folder : NULL); break;
+    case SESSIONS_EXPORT: SyncUi_ExportProfiles(g_manager.dlg, profiles, selected); break;
+    case SESSIONS_IMPORT: changed = SyncUi_Import(g_manager.dlg, profiles, selected); break;
+    }
+    HeapFree(GetProcessHeap(), 0, profiles);
+    if (changed && !StateChangesBlocked()) SessionsView_Reload();
+}
+
+#define IDM_LIST_OPEN   0x6001
+#define IDM_LIST_EDIT   0x6002
+#define IDM_LIST_DELETE 0x6003
+#define IDM_LIST_MIRROR 0x6004
+#define IDM_LIST_EXPORT 0x6005
+#define IDM_LIST_IMPORT 0x6006
+
+/* The list's menu, at the mouse or (from the keyboard) under the row with
+ * the focus: the buttons' actions on the profiles selected, and their
+ * sessions exported or imported. */
+static void ListMenu(LPARAM pos)
+{
+    HMENU menu;
+    DWORD selected = SelectedProfiles();
+    POINT pt;
+    UINT cmd;
+    if (pos == (LPARAM)-1) {
+        RECT rc;
+        int focused = ListView_GetNextItem(g_manager.list, -1, LVNI_FOCUSED);
+        if (focused < 0 || !ListView_GetItemRect(g_manager.list, focused, &rc, LVIR_LABEL)) GetClientRect(g_manager.list, &rc);
+        pt.x = rc.left;
+        pt.y = rc.bottom;
+        ClientToScreen(g_manager.list, &pt);
+    } else {
+        pt.x = (short)LOWORD(pos);
+        pt.y = (short)HIWORD(pos);
+    }
+    if ((menu = CreatePopupMenu()) == NULL) return;
+    AppendMenuW(menu, MF_STRING | (selected && g_manager.pkg.found ? 0 : MF_GRAYED), IDM_LIST_OPEN, TR(Theme_MainCaption(IDC_OPEN, 0)));
+    AppendMenuW(menu, MF_STRING | (SelectedProfile() ? 0 : MF_GRAYED), IDM_LIST_EDIT, TR(Theme_MainCaption(IDC_EDIT, 0)));
+    AppendMenuW(menu, MF_STRING | (Deletable(selected) ? 0 : MF_GRAYED), IDM_LIST_DELETE, TR(Theme_MainCaption(IDC_DELETE, 0)));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDM_LIST_MIRROR, TR(Theme_MainCaption(IDC_MIRROR, 0)));
+    AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDM_LIST_EXPORT, TR(L"E&xport sessions\x2026"));
+    AppendMenuW(menu, MF_STRING, IDM_LIST_IMPORT, TR(L"&Import sessions\x2026"));
+    if (selected && g_manager.pkg.found) SetMenuDefaultItem(menu, IDM_LIST_OPEN, FALSE);
+    cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | (Localize_IsRTL() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, g_manager.dlg, NULL);
+    DestroyMenu(menu);
+    switch (cmd) {
+    case IDM_LIST_OPEN:   DoOpen(); break;
+    case IDM_LIST_EDIT:   DoEdit(); break;
+    case IDM_LIST_DELETE: DoDelete(); break;
+    case IDM_LIST_MIRROR: DoSessions(SESSIONS_MIRROR); break;
+    case IDM_LIST_EXPORT: DoSessions(SESSIONS_EXPORT); break;
+    case IDM_LIST_IMPORT: DoSessions(SESSIONS_IMPORT); break;
+    }
+}
+
 /* The profiles and the sessions share the window: Sessions swaps them, and
  * becomes "< Back" in the same place. */
-static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_NOTE,
-                                        IDC_SC_GROUP, IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
+static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_MIRROR, IDC_DEFAULT,
+                                        IDC_NOTE, IDC_SC_GROUP, IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
 
 static const WCHAR *SessionsButtonCaption(BOOL sessionsShown)
 {
@@ -1068,7 +1266,7 @@ void Gui_ShowSessions(HWND dialog, const ClaudePackage *package, BOOL showSessio
 static void ToggleSessions(void)
 {
     if (!SessionsView_Shown()) {
-        const Profile *p = SelectedProfile();
+        const Profile *p = FocusedProfile();
         Gui_ShowSessions(g_manager.dlg, &g_manager.pkg, TRUE, p ? p->folder : NULL);
     } else {
         WCHAR folder[FOLDER_CCH];
@@ -1754,7 +1952,10 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         } else if (header->code == NM_DBLCLK) {
             if (((const NMITEMACTIVATE *)lp)->iItem >= 0) DoOpen();
         } else if (header->code == LVN_KEYDOWN) {
-            if (((const NMLVKEYDOWN *)lp)->wVKey == VK_DELETE) DoDelete();
+            WORD key = ((const NMLVKEYDOWN *)lp)->wVKey;
+            if (key == VK_DELETE) DoDelete();
+            else if (key == 'A' && GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0)
+                ListView_SetItemState(g_manager.list, -1, LVIS_SELECTED, LVIS_SELECTED);   /* Ctrl+A: every profile */
         }
         break;
     }
@@ -1765,6 +1966,8 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         case IDC_NEW:           DoNew(); return TRUE;
         case IDC_EDIT:          DoEdit(); return TRUE;
         case IDC_DELETE:        DoDelete(); return TRUE;
+        case IDC_MERGE:         DoSessions(SESSIONS_MERGE); return TRUE;
+        case IDC_MIRROR:        DoSessions(SESSIONS_MIRROR); return TRUE;
         case IDC_DEFAULT:       DoSetDefault(); return TRUE;
         case IDC_SC_DESKTOP:    DoDesktopShortcut(); return TRUE;
         case IDC_SC_SAVEAS:     DoSaveShortcut(); return TRUE;
@@ -1867,6 +2070,10 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         break;
 
     case WM_CONTEXTMENU:
+        if ((HWND)wp == g_manager.list && !SessionsView_Shown()) {
+            ListMenu(lp);
+            return TRUE;
+        }
         if (SessionsView_ContextMenu((HWND)wp, lp)) return TRUE;
         break;
 
@@ -1896,12 +2103,11 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         return TRUE;
 
     case WM_APP_RELAYOUT: {
-        const Profile *p = SelectedProfile();
-        WCHAR selected[FOLDER_CCH] = L"";
-        if (p) StringCchCopyW(selected, ARRAYSIZE(selected), p->folder);
+        ListSelection selected;
+        TakeSelection(&selected);
         SetIcons(dialog);
         ReflowMain();
-        FillList(selected);
+        FillList(&selected);
         return TRUE;
     }
 

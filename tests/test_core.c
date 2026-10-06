@@ -861,6 +861,123 @@ static void TestSessionEdits(void)
     }
 }
 
+/* `json` without member `key`, as Core_JsonRemoveMember gives it ("" when it fails). */
+static BOOL RemovedIs(const char *json, const char *key, const char *expected)
+{
+    char out[256];
+    size_t length;
+    if (!Core_JsonRemoveMember(json, strlen(json), key, out, sizeof out, &length)) return expected == NULL;
+    return expected && length == strlen(expected) && memcmp(out, expected, length) == 0;
+}
+
+static void TestSessionSync(void)
+{
+    static const WCHAR kId[] = L"0b6a3a3e-1111-4222-8333-944445555666";
+    SyncOp op, back, queued, added;
+    WCHAR text[256], path[MAX_PATH];
+    char inPlace[64];
+    size_t length;
+
+    ZeroMemory(&op, sizeof op);
+    op.kind = SYNC_PUT;
+    op.flags = SYNC_UNDELETE | SYNC_REPLACE;
+    op.time = 1790639580461ULL;
+    op.seen = 1790639000000ULL;
+    StringCchCopyW(op.key, ARRAYSIZE(op.key), kId);
+    StringCchCopyW(op.content, ARRAYSIZE(op.content), L"3.json");
+    Check("sync plan: a put written", Core_SyncOpFormat(&op, text, ARRAYSIZE(text)) &&
+          wcscmp(text, L"put\t3\t1790639580461\t1790639000000\t0b6a3a3e-1111-4222-8333-944445555666\t3.json") == 0);
+    Check("sync plan: read back", Core_SyncOpParse(text, &back) && back.kind == SYNC_PUT && back.flags == op.flags &&
+          back.time == op.time && back.seen == op.seen && wcscmp(back.key, kId) == 0 && wcscmp(back.content, L"3.json") == 0);
+    Check("sync plan: a mark, with nothing to write", Core_SyncOpParse(L"mark\t0\t5\t0\tk\t", &back) && back.kind == SYNC_MARK &&
+          back.time == 5 && !back.content[0]);
+    Check("sync plan: the largest numbers", Core_SyncOpParse(L"put\t4294967295\t18446744073709551615\t0\tk\t", &back) &&
+          back.flags == MAXDWORD && back.time == _UI64_MAX);
+    Check("sync plan: broken lines are refused",
+          !Core_SyncOpParse(L"put\t0\t1\t0\tk", &back) && !Core_SyncOpParse(L"move\t0\t1\t0\tk\t", &back) &&
+          !Core_SyncOpParse(L"put\t-1\t1\t0\tk\t", &back) && !Core_SyncOpParse(L"put\t0\t1\t0\t\t", &back) &&
+          !Core_SyncOpParse(L"put\t\t1\t0\tk\t", &back) && !Core_SyncOpParse(L"put\t4294967296\t1\t0\tk\t", &back) &&
+          !Core_SyncOpParse(L"put\t0\t18446744073709551616\t0\tk\t", &back));
+    Check("sync plan: what is written is a file of ours, never a path",
+          !Core_SyncOpParse(L"put\t0\t1\t0\tk\t..\\config.json", &back) && !Core_SyncOpParse(L"put\t0\t1\t0\tk\tC:\\x", &back) &&
+          !Core_SyncOpParse(L"put\t0\t1\t0\tk\t.json", &back) && !Core_SyncOpParse(L"put\t0\t1\t0\tk\ta/b", &back));
+    StringCchCopyW(op.content, ARRAYSIZE(op.content), L"a\\b");
+    Check("sync plan: a path is not written", !Core_SyncOpFormat(&op, text, ARRAYSIZE(text)));
+    StringCchCopyW(op.content, ARRAYSIZE(op.content), L"3.json");
+    StringCchCopyW(op.key, ARRAYSIZE(op.key), L"a\tb");
+    Check("sync plan: a key with a tab is not written", !Core_SyncOpFormat(&op, text, ARRAYSIZE(text)));
+    op.kind = (SyncOpKind)9;
+    StringCchCopyW(op.key, ARRAYSIZE(op.key), kId);
+    Check("sync plan: an unknown change is not written", !Core_SyncOpFormat(&op, text, ARRAYSIZE(text)));
+
+    ZeroMemory(&queued, sizeof queued);
+    ZeroMemory(&added, sizeof added);
+    StringCchCopyW(queued.key, ARRAYSIZE(queued.key), L"Session");
+    StringCchCopyW(added.key, ARRAYSIZE(added.key), L"SESSION");
+    queued.kind = SYNC_PUT;
+    added.kind = SYNC_REMOVE;
+    Check("sync plan: a removal replaces a put of the same session", Core_SyncOpReplaces(&queued, &added));
+    queued.kind = SYNC_REMOVE;
+    added.kind = SYNC_PUT;
+    Check("sync plan: a put replaces a removal", Core_SyncOpReplaces(&queued, &added));
+    added.kind = SYNC_MARK;
+    Check("sync plan: a mark leaves the session's entry alone", !Core_SyncOpReplaces(&queued, &added));
+    queued.kind = SYNC_UNMARK;
+    Check("sync plan: a mark replaces its removal", Core_SyncOpReplaces(&queued, &added));
+    queued.kind = added.kind = SYNC_INDEX;
+    Check("sync plan: a list of archived sessions replaces the one before", Core_SyncOpReplaces(&queued, &added));
+    queued.kind = added.kind = SYNC_PUT;
+    StringCchCopyW(added.key, ARRAYSIZE(added.key), L"Other");
+    Check("sync plan: another session's change replaces nothing", !Core_SyncOpReplaces(&queued, &added));
+
+    Check("crc32: the check value", Core_Crc32(0, "123456789", 9) == 0xCBF43926u);
+    Check("crc32: goes on piece by piece", Core_Crc32(Core_Crc32(0, "1234", 4), "56789", 5) == 0xCBF43926u);
+    Check("crc32: nothing", Core_Crc32(0, "", 0) == 0);
+
+    Check("archive name: files inside the folder",
+          Core_ArchiveNameSafe("manifest.json", 13) && Core_ArchiveNameSafe("entries/1.json", 14) &&
+          Core_ArchiveNameSafe("claude/projects/C--work/a b.jsonl", 33));
+    Check("archive name: nothing outside it",
+          !Core_ArchiveNameSafe("", 0) && !Core_ArchiveNameSafe("/x", 2) && !Core_ArchiveNameSafe("a/../../x", 9) &&
+          !Core_ArchiveNameSafe("..", 2) && !Core_ArchiveNameSafe("./x", 3) && !Core_ArchiveNameSafe("a//b", 4) &&
+          !Core_ArchiveNameSafe("a/", 2) && !Core_ArchiveNameSafe("a\\..\\x", 6) && !Core_ArchiveNameSafe("C:/x", 4));
+    Check("archive name: nothing Windows would read otherwise",
+          !Core_ArchiveNameSafe("a:stream", 8) && !Core_ArchiveNameSafe("a/b.", 4) && !Core_ArchiveNameSafe("a/b ", 4) &&
+          !Core_ArchiveNameSafe("a\x01" "b", 3) && !Core_ArchiveNameSafe("a*b", 3) && !Core_ArchiveNameSafe("a?b", 3));
+    Check("archive name: its length, not its terminator", !Core_ArchiveNameSafe("ab\0/../x", 8) && Core_ArchiveNameSafe("ab/../x", 2));
+
+    StringCchPrintfW(path, ARRAYSIZE(path), L"projects\\C--work\\%s.jsonl", kId);
+    Check("conversation file: a transcript", Core_ConversationFileName(path));
+    StringCchPrintfW(path, ARRAYSIZE(path), L"projects\\C--work\\%s\\subagents\\agent-1.jsonl", kId);
+    Check("conversation file: in its folder", Core_ConversationFileName(path));
+    StringCchPrintfW(path, ARRAYSIZE(path), L"file-history\\%s\\abc@v2", kId);
+    Check("conversation file: its file history", Core_ConversationFileName(path));
+    StringCchPrintfW(path, ARRAYSIZE(path), L"TASKS\\%s\\1.json", kId);
+    Check("conversation file: its tasks", Core_ConversationFileName(path));
+    Check("conversation file: Claude Code's own files are not one",
+          !Core_ConversationFileName(L"settings.json") && !Core_ConversationFileName(L"projects\\C--work\\memory\\MEMORY.md") &&
+          !Core_ConversationFileName(L"projects\\C--work\\not-a-session-id-at-all-here-0000000.jsonl"));
+    StringCchPrintfW(path, ARRAYSIZE(path), L"projects\\%s.jsonl", kId);
+    Check("conversation file: a transcript outside a project's folder is not one", !Core_ConversationFileName(path));
+    StringCchPrintfW(path, ARRAYSIZE(path), L"plugins\\%s\\hook.ps1", kId);
+    Check("conversation file: another folder of Claude Code's is not one", !Core_ConversationFileName(path));
+    StringCchPrintfW(path, ARRAYSIZE(path), L"projects\\C--work\\%s.json", kId);
+    Check("conversation file: another extension is not one", !Core_ConversationFileName(path));
+    StringCchPrintfW(path, ARRAYSIZE(path), L"file-history\\%s", kId);
+    Check("conversation file: a store's folder alone is not one", !Core_ConversationFileName(path));
+
+    Check("json remove: a member in the middle", RemovedIs("{\"a\":1,\"b\":2,\"c\":3}", "b", "{\"a\":1,\"c\":3}"));
+    Check("json remove: the first member", RemovedIs("{ \"a\": 1, \"b\": [1,2] }", "a", "{ \"b\": [1,2] }"));
+    Check("json remove: the last member", RemovedIs("{ \"a\": 1, \"b\": [1,2] }", "b", "{ \"a\": 1 }"));
+    Check("json remove: the only member", RemovedIs("{\"a\":{\"b\":1}}", "a", "{}"));
+    Check("json remove: a nested key is no member", RemovedIs("{\"a\":{\"b\":1}}", "b", "{\"a\":{\"b\":1}}"));
+    Check("json remove: not an object", RemovedIs("[1]", "a", NULL));
+    StringCchCopyA(inPlace, sizeof inPlace, "{\"x\":\"long value\",\"y\":true}");
+    Check("json remove: in place", Core_JsonRemoveMember(inPlace, strlen(inPlace), "x", inPlace, sizeof inPlace, &length) &&
+          length == 10 && memcmp(inPlace, "{\"y\":true}", 10) == 0);
+    Check("json remove: too small", !Core_JsonRemoveMember("{\"a\":1}", 7, "b", inPlace, 3, &length));
+}
+
 static void TestDrawingMath(void)
 {
     int pending, frames, units, moved, movedAfterSixFrames = 0;
@@ -904,6 +1021,7 @@ int wmain(void)
 {
     TestSessionEntries();
     TestSessionEdits();
+    TestSessionSync();
     TestDrawingMath();
     TestLaunchArgs();
     TestSanitizeUrl();

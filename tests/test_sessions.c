@@ -3,9 +3,10 @@
  * temporary fixture: where a profile's sessions are stored and how they are
  * read (sessionstore.c); copies, changes waiting for a running profile,
  * removals and Delete session everywhere, with a stand-in for the Recycle
- * Bin (sessionedit.c); paths past MAX_PATH; reads cancelled or made at once;
- * the sessions view's background snapshots (sessions.c). Built and run by
- * build.cmd; exits non-zero when a check fails.
+ * Bin (sessionedit.c); sessions merged, mirrored, shared to a running
+ * profile, exported and imported (sessionsync.c); paths past MAX_PATH; reads
+ * cancelled or made at once; the sessions view's background snapshots
+ * (sessions.c). Built and run by build.cmd; exits non-zero when a check fails.
  */
 #include "../src/app.h"
 #include "../src/resource.h"
@@ -339,6 +340,10 @@ static int FixtureFileOperation(LPSHFILEOPSTRUCTW operation)
 #define SessionEdit_RemovesWorkingFolder TestedSessionEdit_RemovesWorkingFolder
 #define SessionEdit_ListFiles            TestedSessionEdit_ListFiles
 #define SessionEdit_DeleteEverywhere     TestedSessionEdit_DeleteEverywhere
+#define SessionEdit_ListConversation     TestedSessionEdit_ListConversation
+#define SessionEdit_CopiedCwd            TestedSessionEdit_CopiedCwd
+#define SessionEdit_Lock                 TestedSessionEdit_Lock
+#define SessionEdit_Unlock               TestedSessionEdit_Unlock
 #define Util_Recycle                     FixtureRecycle
 #define SHFileOperationW                 FixtureFileOperation
 #include "../src/sessionedit.c"
@@ -2286,6 +2291,172 @@ static void TestGroupAliases(void)
     SessionStore_Free(&set);
 }
 
+/* ------------------------------------------------------ sessionsync.c */
+
+static const WCHAR *const g_syncIds[6] = {
+    L"cccccccc-0000-4000-8000-000000000001", L"cccccccc-0000-4000-8000-000000000002",
+    L"cccccccc-0000-4000-8000-000000000003", L"cccccccc-0000-4000-8000-000000000004",
+    L"cccccccc-0000-4000-8000-000000000005", L"cccccccc-0000-4000-8000-000000000006"
+};
+
+/* An entry of session `id` named `title`, last used at `activity`. */
+static BOOL WriteSyncEntry(const WCHAR *entries, const WCHAR *id, const char *title, int activity)
+{
+    WCHAR file[MAX_PATH];
+    char json[512];
+    return SUCCEEDED(StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"cwd\":\"C:\\\\Fixture\","
+                                                         "\"title\":\"%s\",\"lastActivityAt\":%d}", id, id, title, activity)) &&
+           EntryPath(entries, id, file, ARRAYSIZE(file)) && Save(file, json);
+}
+
+static BOOL EntryThere(const WCHAR *entries, const WCHAR *id)
+{
+    WCHAR path[MAX_PATH];
+    return EntryPath(entries, id, path, ARRAYSIZE(path)) && FileThere(path);
+}
+
+static BOOL TitledAs(const WCHAR *path, const WCHAR *title)
+{
+    WCHAR found[SESSION_TITLE_CCH];
+    return ReadString(path, "title", found, ARRAYSIZE(found)) && wcscmp(found, title) == 0;
+}
+
+static BOOL EntryTitled(const WCHAR *entries, const WCHAR *id, const WCHAR *title)
+{
+    WCHAR path[MAX_PATH];
+    return EntryPath(entries, id, path, ARRAYSIZE(path)) && TitledAs(path, title);
+}
+
+/* The copy of profile `p`'s entry of `id` that `report` backed up. */
+static BOOL BackedUp(const SyncReport *report, const Profile *p, const WCHAR *id, WCHAR *out, size_t cch)
+{
+    return report->backup[0] && SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\%s\\local_%s.json", report->backup, p->folder, id)) &&
+           FileThere(out);
+}
+
+static BOOL MarkPath(const WCHAR *entries, const WCHAR *id, WCHAR *out, size_t cch)
+{
+    return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\deleted_%s", entries, id));
+}
+
+/* Merging, mirroring, sharing to a running profile, and an archive taken
+ * from one profile into another, on four profiles of their own. */
+static void TestSessionSync(const WCHAR *projects)
+{
+    static const WCHAR *const labels[4] = { L"Sync-A", L"Sync-B", L"Sync-C", L"Sync-D" };
+    static const WCHAR *const leaves[4] = { L"sync\\A", L"sync\\B", L"sync\\C", L"sync\\D" };
+    static const WCHAR *const accounts[4] = { L"sync-a", L"sync-b", L"sync-c", L"sync-d" };
+    ProfileList profiles;
+    SessionSet set;
+    SyncReport report;
+    WCHAR entries[4][MAX_PATH], path[MAX_PATH], archive[MAX_PATH], transcript[MAX_PATH], error[LONG_PATH_CCH];
+    char *before = NULL, *after = NULL;
+    DWORD beforeLength = 0, afterLength = 0;
+    HWND window;
+    int p, rows[2], exported = 0, sessions = 0;
+    BOOL ready = TRUE, loaded;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 4;
+    for (p = 0; p < profiles.count && ready; p++)
+        ready = PrepareProfile(&profiles.items[p], labels[p], leaves[p], accounts[p], L"sync-organization", entries[p], ARRAYSIZE(entries[p]));
+    ready = ready && WriteSession(entries[0], projects, g_syncIds[0], L"C:\\Fixture") &&
+            WriteSyncEntry(entries[1], g_syncIds[1], "B two", 200) && WriteSyncEntry(entries[0], g_syncIds[2], "A three", 300) &&
+            WriteSyncEntry(entries[1], g_syncIds[2], "B three", 100);
+    Check("session sync fixtures created", ready);
+    if (!ready) return;
+
+    /* Merge: each profile gets what it lacks and the latest of what it has. */
+    loaded = SessionStore_LoadProfiles(&set, &profiles);
+    Check("session sync snapshot loads", loaded && SessionSync_Takers(&set) == 0xF);
+    ZeroMemory(&report, sizeof report);
+    Check("merging three profiles succeeds", loaded && SessionSync_Merge(&set, 0x7, &report));
+    Check("merging adds each missing entry", report.added == 5 && report.failed == 0 && report.waiting == 0);
+    Check("merging brings an older entry up to date", report.updated == 1 && EntryTitled(entries[1], g_syncIds[2], L"A three"));
+    Check("a merged entry replaced is kept in the backup",
+          BackedUp(&report, &profiles.items[1], g_syncIds[2], path, ARRAYSIZE(path)) && TitledAs(path, L"B three"));
+    SessionStore_Free(&set);
+    loaded = SessionStore_LoadProfiles(&set, &profiles);
+    Check("merged profiles list every session", loaded && ProfileRows(&set, 0) == 3 && ProfileRows(&set, 1) == 3 && ProfileRows(&set, 2) == 3);
+    Check("a profile left out of the merge is unchanged", loaded && ProfileRows(&set, 3) == 0);
+    ZeroMemory(&report, sizeof report);
+    Check("merging again changes nothing",
+          loaded && SessionSync_Merge(&set, 0x7, &report) && report.added == 0 && report.updated == 0 && report.failed == 0);
+    SessionStore_Free(&set);
+
+    /* Mirror: the source's sessions and its marks of deleted ones; exact also takes the others away. */
+    ready = WriteSyncEntry(entries[1], g_syncIds[3], "B four", 50) && MarkPath(entries[0], g_syncIds[4], path, ARRAYSIZE(path)) &&
+            Save(path, "777");
+    Check("mirror fixtures created", ready);
+    if (!ready) return;
+    loaded = SessionStore_LoadProfiles(&set, &profiles);
+    ZeroMemory(&report, sizeof report);
+    Check("mirroring a profile succeeds", loaded && SessionSync_Mirror(&set, 0, 0x6, FALSE, &report) && report.failed == 0);
+    Check("mirroring keeps the targets' own sessions", report.removed == 0 && EntryThere(entries[1], g_syncIds[3]));
+    Check("mirroring carries the source's marks of deleted sessions",
+          MarkPath(entries[2], g_syncIds[4], path, ARRAYSIZE(path)) && FileThere(path));
+    SessionStore_Free(&set);
+    loaded = SessionStore_LoadProfiles(&set, &profiles);
+    ZeroMemory(&report, sizeof report);
+    Check("an exact mirror succeeds", loaded && SessionSync_Mirror(&set, 0, 0x2, TRUE, &report) && report.failed == 0);
+    Check("an exact mirror takes away what the source does not list", report.removed == 1 && !EntryThere(entries[1], g_syncIds[3]));
+    Check("a mirrored-away entry is kept in the backup", BackedUp(&report, &profiles.items[1], g_syncIds[3], path, ARRAYSIZE(path)));
+    Check("an exact mirror keeps the marks the source has",
+          MarkPath(entries[1], g_syncIds[4], path, ARRAYSIZE(path)) && FileThere(path));
+    SessionStore_Free(&set);
+
+    /* Share to a running profile: it waits for that profile to close. */
+    ready = WriteSyncEntry(entries[0], g_syncIds[5], "A six", 600);
+    loaded = ready && SessionStore_LoadProfiles(&set, &profiles);
+    window = loaded ? StartFakeClaude(&profiles.items[1]) : NULL;
+    Check("sharing fixtures created", window != NULL);
+    if (window) {
+        rows[0] = FindRow(&set, g_syncIds[5]);
+        ZeroMemory(&report, sizeof report);
+        Check("sharing to a running profile succeeds", rows[0] >= 0 && SessionSync_Share(&set, 0, rows, 1, 0x6, &report));
+        Check("a closed profile takes a shared session at once", report.added == 1 && EntryThere(entries[2], g_syncIds[5]));
+        Check("a running profile's entries are not written", (report.waiting & 0x2) && !EntryThere(entries[1], g_syncIds[5]));
+        Check("the session waits in the running profile's plan", SessionSync_PendingCount(&profiles.items[1]) == 1);
+        Check("the waiting session is not made while its Claude runs", SessionEdit_ApplyPending(NULL, &profiles.items[1]) == 0);
+        StopFakeClaude(window);
+        Check("the waiting session is made once its Claude closed",
+              SessionEdit_ApplyPending(NULL, &profiles.items[1]) == 1 && EntryTitled(entries[1], g_syncIds[5], L"A six"));
+        Check("the plan is gone once made", SessionSync_PendingCount(&profiles.items[1]) == 0 &&
+              SessionSync_PlanPath(&profiles.items[1], path, ARRAYSIZE(path)) && !FileThere(path));
+    }
+    if (loaded) SessionStore_Free(&set);
+
+    /* Export from one profile, import into another: the conversation comes back with it. */
+    loaded = SessionStore_LoadProfiles(&set, &profiles);
+    rows[0] = loaded ? FindRow(&set, g_syncIds[0]) : -1;
+    rows[1] = loaded ? FindRow(&set, g_syncIds[2]) : -1;
+    ready = rows[0] >= 0 && rows[1] >= 0 && FixturePath(L"sessions.zip", archive, ARRAYSIZE(archive)) &&
+            SUCCEEDED(StringCchPrintfW(transcript, ARRAYSIZE(transcript), L"%s\\fixture\\%s.jsonl", projects, g_syncIds[0])) &&
+            (before = Util_ReadFile(transcript, TRANSCRIPT_READ_MAX, FALSE, &beforeLength)) != NULL;
+    Check("export fixtures ready", ready);
+    if (ready) {
+        Check("exporting two sessions succeeds",
+              SessionSync_Export(&set, 0, rows, 2, archive, &exported, error, ARRAYSIZE(error)) && exported == 2 && !error[0]);
+        Check("the export is a session archive", SessionSync_IsArchive(archive));
+        Check("another file is not a session archive", !SessionSync_IsArchive(transcript));
+        Check("a conversation of the fixture is taken away", DeleteFileW(transcript));
+    }
+    if (loaded) SessionStore_Free(&set);
+    loaded = ready && SessionStore_LoadProfiles(&set, &profiles);
+    if (loaded) {
+        ZeroMemory(&report, sizeof report);
+        Check("importing the archive succeeds",
+              SessionSync_Import(&set, archive, 0x8, &sessions, &report) && sessions == 2 && report.added == 2 && report.failed == 0);
+        after = Util_ReadFile(transcript, TRANSCRIPT_READ_MAX, FALSE, &afterLength);
+        Check("importing puts back a missing conversation as it was",
+              after && afterLength == beforeLength && memcmp(after, before, beforeLength) == 0);
+        Check("the imported entries are the exported ones",
+              EntryTitled(entries[3], g_syncIds[2], L"A three") && EntryTitled(entries[3], g_syncIds[0], L"Fixture session"));
+        SessionStore_Free(&set);
+    }
+    if (before) HeapFree(GetProcessHeap(), 0, before);
+    if (after) HeapFree(GetProcessHeap(), 0, after);
+}
+
 /* Environment variable `name` kept to be put back: `*kept` NULL when it is
  * not set. FALSE when it could not be kept. */
 static BOOL KeepVariable(const WCHAR *name, WCHAR **kept)
@@ -2351,6 +2522,7 @@ int wmain(int argc, WCHAR **argv)
             TestBackgroundView(&profiles);
             TestIndexedSessions();
             TestGroupAliases();
+            TestSessionSync(projects);
         }
         Check("nothing outside the fixture was given to the Recycle Bin", !g_recycle.escaped);
         StopStartedClaude();

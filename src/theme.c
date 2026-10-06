@@ -4290,9 +4290,10 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
  * script font is measured once per DPI and font (MeasureMain, a cached
  * MainBudget); a new size only places the controls (Theme_LayoutMain). */
 #define MAIN_SIDE_GAP_DIPS            12
-#define MAIN_RESOURCE_WIDTH_DIPS      821    /* IDD_MAIN's 420 x 270 dialog units in its 9 pt font */
-#define MAIN_RESOURCE_HEIGHT_DIPS     499
+#define MAIN_RESOURCE_WIDTH_DIPS      821    /* IDD_MAIN's 420 x 312 dialog units in its 9 pt font */
+#define MAIN_RESOURCE_HEIGHT_DIPS     577
 #define MAIN_STATUS_MINIMUM_DIPS      60     /* the status text between the header buttons */
+#define SIDEBAR_GROUP_GAP_DIPS        15     /* the sessions' actions stay apart from the profile's */
 #define SIDEBAR_DEFAULT_GAP_DIPS      15     /* "Set as default" stays apart from the other actions */
 #define SIDEBAR_NOTE_GAP_DIPS         10     /* between "Set as default" and the note below it */
 #define DETAILS_PADDING_DIPS          12     /* around the caption of the details' button */
@@ -4308,8 +4309,10 @@ typedef struct MainButton {
 
 static const MainButton kMainActions[] = {
     { IDC_OPEN, { L"&Open", NULL } }, { IDC_NEW, { L"&New profile\x2026", NULL } }, { IDC_EDIT, { L"&Edit\x2026", NULL } },
-    { IDC_DELETE, { L"&Delete\x2026", NULL } }, { IDC_DEFAULT, { L"Set as de&fault", NULL } }
+    { IDC_DELETE, { L"&Delete\x2026", NULL } }, { IDC_MERGE, { L"Merge &all sessions\x2026", NULL } },
+    { IDC_MIRROR, { L"Mi&rror sessions\x2026", NULL } }, { IDC_DEFAULT, { L"Set as de&fault", NULL } }
 };
+#define MAIN_PROFILE_ACTIONS 4                               /* Open to Delete; the sessions' two below them, apart */
 #define MAIN_STACKED_ACTIONS (ARRAYSIZE(kMainActions) - 1)   /* all but "Set as default", which sits above the note */
 static const MainButton kMainShortcuts[] = {
     { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" } },
@@ -4462,7 +4465,7 @@ static ULONGLONG HashControlFont(ULONGLONG key, HWND control)
 
 static ULONGLONG MainFontKey(HWND dialog)
 {
-    static const int kControls[] = { IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SC_DESKTOP,
+    static const int kControls[] = { IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_MIRROR, IDC_DEFAULT, IDC_SC_DESKTOP,
         IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START, IDC_SESSIONS, IDC_LANGUAGE, IDC_STATUS_ACTION, IDC_UNINSTALL,
         IDC_UPDATE, IDCANCEL, IDC_S_ARCHIVED, IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE, IDC_ABOUT };
     HWND list = MainViewContent(dialog, IDC_LIST);
@@ -4625,7 +4628,8 @@ static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
     /* As tall as the side bar's stacked actions, Set as default and its note. */
     budget->noteHeight = NoteHeightMaximum(GetDlgItem(dialog, IDC_NOTE), kMainNote, NOTE_SAMPLE_NAME, budget->sidebar);
     budget->minimumBody = max(budget->minimumBody, budget->headerHeight + (int)MAIN_STACKED_ACTIONS * budget->buttonHeight +
-                              ((int)MAIN_STACKED_ACTIONS - 1) * budget->gap + MulDiv(SIDEBAR_DEFAULT_GAP_DIPS + SIDEBAR_NOTE_GAP_DIPS, (int)dpi, 96) +
+                              ((int)MAIN_STACKED_ACTIONS - 1) * budget->gap +
+                              MulDiv(SIDEBAR_GROUP_GAP_DIPS + SIDEBAR_DEFAULT_GAP_DIPS + SIDEBAR_NOTE_GAP_DIPS, (int)dpi, 96) +
                               budget->buttonHeight + budget->noteHeight);
     budget->headerRow = max(budget->buttonHeight, max(archivedHeight, searchHeight));
     budget->footerHeight = max(budget->buttonHeight, MainFooterHeight(GetDlgItem(dialog, IDC_ABOUT),
@@ -4701,17 +4705,20 @@ static void PlaceMainHeader(MainMoves *moves, const MainBudget *budget, const Ma
     PlaceMainControl(moves,status, statusLeft, statusTop, statusRight - statusLeft, budget->margin + budget->headerRow - statusTop);
 }
 
-/* The profile list, its side bar of actions (Set as default and its note
- * at the bottom of the minimum body) and the shortcuts' title below. */
+/* The profile list, its side bar of actions (the profile's, then apart the
+ * sessions'; Set as default and its note at the bottom of the minimum body)
+ * and the shortcuts' title below. */
 static void PlaceProfilesView(MainMoves *moves, const MainBudget *budget, const MainArea *area)
 {
     HWND dialog = moves->dialog;
     int sidebarLeft = area->right - budget->sidebar, noteTop = area->bodyTop + budget->minimumBody - budget->noteHeight, i;
+    int groupGap = MulDiv(SIDEBAR_GROUP_GAP_DIPS, (int)budget->dpi, 96);
     PlaceMainControl(moves,GetDlgItem(dialog, IDC_LIST), area->left, area->bodyTop, area->rowWidth - budget->sidebar - budget->sideGap,
                      area->bodyHeight);
     for (i = 0; i < (int)MAIN_STACKED_ACTIONS; i++)
         PlaceMainControl(moves,GetDlgItem(dialog, kMainActions[i].id), sidebarLeft,
-                         area->bodyTop + budget->headerHeight + i * (budget->buttonHeight + budget->gap), budget->sidebar, budget->buttonHeight);
+                         area->bodyTop + budget->headerHeight + i * (budget->buttonHeight + budget->gap) + (i >= MAIN_PROFILE_ACTIONS ? groupGap : 0),
+                         budget->sidebar, budget->buttonHeight);
     PlaceMainControl(moves,GetDlgItem(dialog, IDC_NOTE), sidebarLeft, noteTop, budget->sidebar, budget->noteHeight);
     PlaceMainControl(moves,GetDlgItem(dialog, IDC_DEFAULT), sidebarLeft,
                      noteTop - MulDiv(SIDEBAR_NOTE_GAP_DIPS, (int)budget->dpi, 96) - budget->buttonHeight, budget->sidebar, budget->buttonHeight);

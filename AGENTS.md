@@ -66,9 +66,12 @@ Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project s
     (a wheel scroll's) after an event is bounded.
 13. **A running profile's session entries are not written.** Claude keeps its
     sessions in memory and writes them back, so a change to a running
-    profile waits in `pending-sessions-<folder>.txt` (`SessionEdit_Change`)
-    and is made once it closes. A session reaches a profile through
-    `claude://resume`, which makes the entry: never write a new entry.
+    profile waits in `pending-sessions-<folder>.txt` (`SessionEdit_Change`),
+    and sessions sent to it in `pending-sync-<folder>.txt` (`sessionsync.c`),
+    and is made once it closes. One session opened in a profile reaches it
+    through `claude://resume`, which makes the entry; only `sessionsync.c`
+    writes new entries, as Claude writes them, after backing up what they
+    replace.
 
 ## Conventions
 
