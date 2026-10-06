@@ -61,12 +61,12 @@ if ($LASTEXITCODE -eq 0) { gh release create v1.1.0 build\ClaudeDesktopProfilesM
 
 > The asset name never changes: the README download link points to `releases/latest/download/ClaudeDesktopProfilesManager.exe`.
 
-`gh release create` fails when the tag already has a release: tag a new version. Every push to `main` and every pull request also builds the exe, unsigned, as a workflow artifact.
+`gh release create` fails when the tag already has a release: tag a new version. Every push to `main` and every pull request also builds the exe, unsigned, as a workflow artifact; a build of `main` that passes is also published as a pre-release `build-<run number>`. Pre-releases are never "latest", so the download link and the update check still find the signed release only.
 
 ## Project structure
 
 ```
-.github/workflows/build.yml   unsigned CI build of pushes and pull requests, version check of v* tags
+.github/workflows/build.yml   unsigned CI build of pushes and pull requests (main's as pre-releases), version check of v* tags
 build.cmd                     builds the exe, checks the catalogs and runs the tests below, in this order
 sign.cmd                      signs the built exe for a release (the key is on a hardware token)
 docs/HOW-IT-WORKS.md          how profiles start, run and receive claude:// links, and the facts behind it
