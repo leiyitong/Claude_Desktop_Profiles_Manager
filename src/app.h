@@ -255,6 +255,13 @@ BOOL         Core_SyncOpFormat(const SyncOp *op, WCHAR *out, size_t cch);
 BOOL         Core_SyncOpParse(const WCHAR *line, SyncOp *op);
 BOOL         Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added);
 DWORD        Core_Crc32(DWORD crc, const void *data, size_t size);
+/* Deflate (RFC 1951), as ZIP's method 8: the whole input at once. Compressing
+ * needs Core_DeflateBound(size) bytes at most; FALSE when `capacity` is short
+ * or memory runs out. Inflating reads every kind of block; FALSE for a broken
+ * stream or one longer than `capacity`. */
+size_t       Core_DeflateBound(size_t size);
+BOOL         Core_Deflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
+BOOL         Core_Inflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
 BOOL         Core_ArchiveNameSafe(const char *name, size_t length);
 BOOL         Core_ConversationFileName(const WCHAR *relative);
 int          Core_ScrollStep(int pending, int elapsedMs);
