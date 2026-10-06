@@ -3,6 +3,7 @@
  * exits non-zero when a check fails.
  */
 #include "../src/app.h"
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
