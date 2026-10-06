@@ -1467,7 +1467,7 @@ static BOOL FixtureDownloadPath(WCHAR *out, size_t cch)
     return SUCCEEDED(StringCchCopyW(out, cch, g_downloadFile));
 }
 
-static int g_managerLinkRestores, g_uninstallQuestions, g_waitingSessionChanges;
+static int g_managerLinkRestores, g_uninstallQuestions, g_waitingSessionChanges, g_waitingSessionsSent;
 static BOOL g_uninstallAnyway;
 
 static HRESULT FixtureRestoreManagerLink(const WCHAR *exe)
@@ -1481,6 +1481,12 @@ static int FixtureWaitingChanges(const Profile *profile, PendingEdit *edits, int
 {
     (void)profile; (void)edits; (void)capacity;
     return g_waitingSessionChanges;
+}
+
+static int FixtureWaitingSessions(const Profile *profile)
+{
+    (void)profile;
+    return g_waitingSessionsSent;
 }
 
 static BOOL FixtureAskUninstall(HWND owner, LPCWSTR icon, const WCHAR *text, const WCHAR *ok, const WCHAR *cancel, BOOL defaultCancel)
@@ -1764,6 +1770,7 @@ static void FixtureLanguagePinRefresh(const ProfileList *list, const WCHAR *cons
 #define Update_RemoveDownload FixtureRemoveDownload
 #define Update_DownloadPath FixtureDownloadPath
 #define SessionStore_LoadPending FixtureWaitingChanges
+#define SessionSync_PendingCount FixtureWaitingSessions
 #define Ui_Ask FixtureAskUninstall
 #define Install_IsInstalledCopy TestedInstall_IsInstalledCopy
 #define Install_IsRegistered TestedInstall_IsRegistered
@@ -1818,6 +1825,7 @@ static void FixtureLanguagePinRefresh(const ProfileList *list, const WCHAR *cons
 #undef Update_RemoveDownload
 #undef Update_DownloadPath
 #undef SessionStore_LoadPending
+#undef SessionSync_PendingCount
 #undef Ui_Ask
 #undef Install_IsInstalledCopy
 #undef Install_IsRegistered
@@ -2223,7 +2231,13 @@ static void CheckUninstall(void)
     Check("the user may uninstall without them",
           TestedInstall_Uninstall(NULL, &list, removeData) && g_uninstallQuestions == 2 && g_handlerRemovals == 1);
     g_waitingSessionChanges = 0;
+    g_waitingSessionsSent = 1;
     g_uninstallAnyway = FALSE;
+    ResetInstallRecords();
+    Check("sessions sent to a running kept profile are not discarded without asking",
+          !TestedInstall_Uninstall(NULL, &list, removeData) && g_uninstallQuestions == 1 && g_watcherStops == 0 &&
+          g_handlerRemovals == 0);
+    g_waitingSessionsSent = 0;
     g_profileStillRunning = TRUE;
     g_uninstallStateDir[0] = 0;
 }

@@ -5,14 +5,17 @@
  * A running Claude keeps its session list in memory and writes it back: an
  * entry changed under it is overwritten, and one added under it is not seen
  * until it starts again. So:
- * - opening, sharing and copying go through Claude itself, with its own link
- *   claude://resume?session=<id>: the profile's Claude opens the session and
- *   adds it to its list when it is not there (started first when closed);
+ * - opening, sharing and copying one session go through Claude itself, with
+ *   its own link claude://resume?session=<id>: the profile's Claude opens the
+ *   session and adds it to its list when it is not there (started first when
+ *   closed); several at once, merged or mirrored go through sessionsync.c,
+ *   which writes the entries of closed profiles only, as here;
  * - a new title, a star or a removal is made at once in a closed
  *   profile, else kept in a file of ours (pending-sessions-<folder>.txt) and
  *   made when the profile has closed: after its watcher sees Claude exit
  *   (main.c), before it opens through us (Launcher_Open), or when the
- *   manager finds it closed.
+ *   manager finds it closed. What sessionsync.c keeps for a profile is made
+ *   at those same moments, first.
  * A shared session is one conversation (one transcript) that each profile
  * lists; a copy is a new conversation, the transcript copied under a new id,
  * that goes on separately. A session listed twice in one profile is changed
@@ -279,6 +282,17 @@ static void UnlockEdits(HANDLE mutex)
     CloseHandle(mutex);
 }
 
+/* The same lock for sessionsync.c, which changes the same entries. */
+HANDLE SessionEdit_Lock(const Profile *p)
+{
+    return LockEdits(p);
+}
+
+void SessionEdit_Unlock(HANDLE lock)
+{
+    if (lock) UnlockEdits(lock);
+}
+
 /* The file of changes for `p`, rewritten: `add` (when not NULL) replaces the
  * queued changes it supersedes (Core_PendingReplaces); each of `drops`
  * cancels the change of its kind to its session, or with `everyKind` every
@@ -530,14 +544,18 @@ static int ApplyWaitingChanges(HWND owner, const Profile *p, BOOL afterRun)
     return finishedCount - queuedAgain;
 }
 
+/* The sessions sent to the profile first: a change waiting for one of them
+ * finds it listed. */
 int SessionEdit_ApplyPending(HWND owner, const Profile *p)
 {
-    return ApplyWaitingChanges(owner, p, FALSE);
+    int sent = SessionSync_ApplyPending(p, NULL);
+    return sent + ApplyWaitingChanges(owner, p, FALSE);
 }
 
 int SessionEdit_ApplyPendingAfterRun(const Profile *p)
 {
-    return ApplyWaitingChanges(NULL, p, TRUE);
+    int sent = SessionSync_ApplyPending(p, NULL);
+    return sent + ApplyWaitingChanges(NULL, p, TRUE);
 }
 
 /* The watcher's call each time the profile's Claude has closed. */
@@ -557,6 +575,7 @@ void SessionEdit_ApplyPendingFor(const WCHAR *folder)
 static struct {
     WCHAR copyId[SESSION_ID_CCH], sourceKey[SESSION_ID_CCH], targetFolder[FOLDER_CCH];
     WCHAR transcript[LONG_PATH_CCH], projectFolder[LONG_PATH_CCH], workingFolder[MAX_PATH];
+    WCHAR cwd[MAX_PATH];   /* the copy's own working folder, as Claude names it; "" when it works in the original's */
 } g_lastCopy;
 
 static BOOL NewSessionId(WCHAR *out, size_t cch, DWORD *random)
@@ -845,7 +864,10 @@ CopyResult SessionEdit_CopyConversation(HWND owner, const SessionSet *set, int r
     StringCchCopyW(g_lastCopy.targetFolder, ARRAYSIZE(g_lastCopy.targetFolder), targetProfile->folder);
     StringCchCopyW(g_lastCopy.transcript, ARRAYSIZE(g_lastCopy.transcript), copy);
     if (madeProjectDir) StringCchCopyW(g_lastCopy.projectFolder, ARRAYSIZE(g_lastCopy.projectFolder), projectDir);
-    if (madeFolder) StringCchCopyW(g_lastCopy.workingFolder, ARRAYSIZE(g_lastCopy.workingFolder), copiedFiles);
+    if (madeFolder) {
+        StringCchCopyW(g_lastCopy.workingFolder, ARRAYSIZE(g_lastCopy.workingFolder), copiedFiles);
+        StringCchCopyW(g_lastCopy.cwd, ARRAYSIZE(g_lastCopy.cwd), cwd);
+    }
     Util_Log(L"session %s copied as %s for %s", source->key, newId, targetProfile->folder);
     return COPY_MADE;
 failed:
@@ -886,6 +908,15 @@ BOOL SessionEdit_RemoveCopy(const SessionSet *set, int row, int target, const WC
     return removed;
 }
 
+/* The working folder of the latest copy, `copyId`, when it got one of its
+ * own (a session without a folder): its entry names it. */
+BOOL SessionEdit_CopiedCwd(const WCHAR *copyId, WCHAR *cwd, size_t cch)
+{
+    if (cch) cwd[0] = 0;
+    if (!g_lastCopy.copyId[0] || !Core_EqualsI(copyId, g_lastCopy.copyId) || !g_lastCopy.cwd[0]) return FALSE;
+    return SUCCEEDED(StringCchCopyW(cwd, cch, g_lastCopy.cwd));
+}
+
 /* ----------------------------------------------------------- delete */
 
 /* What Claude Code keeps for a session, named after the id of each of its
@@ -894,26 +925,27 @@ typedef struct SessionItem {
     const WCHAR *store;    /* a folder in Claude Code's; NULL: each project folder */
     const WCHAR *suffix;   /* after the id */
     BOOL         folder;
+    BOOL         conversation;   /* part of the conversation: exported with it (sessionsync.c) */
 } SessionItem;
 
 static const SessionItem kSessionItems[] = {
-    { NULL, L".jsonl", FALSE },                     /* the transcript */
-    { NULL, L"", TRUE },                            /* its subagents, tool results and title */
-    { NULL, L".jsonl.pre-import", FALSE },          /* the transcript as it was before Claude took it in */
-    { NULL, L".desktop-released.json", FALSE },     /* Claude's mark of a transcript it let go */
-    { NULL, L".ccr-tip.json", FALSE },
-    { NULL, L".precompact.json", FALSE },
-    { L"file-history", L"", TRUE },                 /* the files before each edit, for rewinding */
-    { L"session-env", L"", TRUE },
-    { L"uploads", L"", TRUE },
-    { L"tasks", L"", TRUE },
-    { L"image-cache", L"", TRUE },
-    { L"debug", L".txt", FALSE },
-    { L"debug", L".1.txt", FALSE },
-    { L"usage-data\\facets", L".json", FALSE },
-    { L"usage-data\\session-meta", L".json", FALSE },
-    { L"startup-perf", L".txt", FALSE },
-    { L"startup-perf", L".json", FALSE },
+    { NULL, L".jsonl", FALSE, TRUE },                     /* the transcript */
+    { NULL, L"", TRUE, TRUE },                            /* its subagents, tool results and title */
+    { NULL, L".jsonl.pre-import", FALSE, FALSE },         /* the transcript as it was before Claude took it in */
+    { NULL, L".desktop-released.json", FALSE, FALSE },    /* Claude's mark of a transcript it let go */
+    { NULL, L".ccr-tip.json", FALSE, FALSE },
+    { NULL, L".precompact.json", FALSE, TRUE },
+    { L"file-history", L"", TRUE, TRUE },                 /* the files before each edit, for rewinding */
+    { L"session-env", L"", TRUE, FALSE },
+    { L"uploads", L"", TRUE, TRUE },
+    { L"tasks", L"", TRUE, TRUE },
+    { L"image-cache", L"", TRUE, TRUE },
+    { L"debug", L".txt", FALSE, FALSE },
+    { L"debug", L".1.txt", FALSE, FALSE },
+    { L"usage-data\\facets", L".json", FALSE, FALSE },
+    { L"usage-data\\session-meta", L".json", FALSE, FALSE },
+    { L"startup-perf", L".txt", FALSE, FALSE },
+    { L"startup-perf", L".json", FALSE, FALSE },
 };
 
 static BOOL AddSessionFile(WCHAR (**paths)[LONG_PATH_CCH], int *count, int *capacity, const WCHAR *file)
@@ -973,6 +1005,69 @@ static BOOL AddPresentItem(WCHAR (**paths)[LONG_PATH_CCH], int *count, int *capa
         return FALSE;
     }
     return AddIfPresent(paths, count, capacity, path, item->folder, failed, code);
+}
+
+/* What Claude Code keeps in its stores for each of `ids` (kSessionItems;
+ * with `conversationOnly`, only what makes up the conversation). FALSE, with
+ * `failed` and `code` saying where and why, when a part could not be told. */
+static BOOL AddStoreItems(WCHAR (**paths)[LONG_PATH_CCH], int *count, int *capacity, const WCHAR *const *ids, int idCount,
+                          BOOL conversationOnly, WCHAR *failed, DWORD *code)
+{
+    WCHAR folder[LONG_PATH_CCH];
+    int item, i;
+    for (item = 0; item < (int)ARRAYSIZE(kSessionItems); item++) {
+        if (!kSessionItems[item].store || (conversationOnly && !kSessionItems[item].conversation)) continue;
+        if (!SessionStore_ClaudeCodePath(kSessionItems[item].store, folder, ARRAYSIZE(folder))) {
+            *code = ERROR_FILENAME_EXCED_RANGE;
+            StringCchCopyW(failed, LONG_PATH_CCH, L"CLAUDE_CONFIG_DIR");
+            return FALSE;
+        }
+        for (i = 0; i < idCount; i++)
+            if (!AddPresentItem(paths, count, capacity, folder, ids[i], &kSessionItems[item], failed, code)) return FALSE;
+    }
+    return TRUE;
+}
+
+/* ... and in each project folder. */
+static BOOL AddProjectItems(WCHAR (**paths)[LONG_PATH_CCH], int *count, int *capacity, const WCHAR *const *ids, int idCount,
+                            BOOL conversationOnly, WCHAR *failed, DWORD *code)
+{
+    WCHAR projects[LONG_PATH_CCH], folder[LONG_PATH_CCH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    int item, i;
+    if (!SessionStore_ProjectsDir(projects, ARRAYSIZE(projects))) {
+        *code = ERROR_FILENAME_EXCED_RANGE;
+        StringCchCopyW(failed, LONG_PATH_CCH, L"CLAUDE_CONFIG_DIR");
+        return FALSE;
+    }
+    find = Util_FindFiles(projects, L"*", &found, TRUE);
+    if (find == INVALID_HANDLE_VALUE) {
+        *code = GetLastError();
+        StringCchCopyW(failed, LONG_PATH_CCH, projects);
+        return *code == ERROR_FILE_NOT_FOUND || *code == ERROR_PATH_NOT_FOUND;
+    }
+    do {
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == L'.') continue;
+        if (FAILED(StringCchPrintfW(folder, ARRAYSIZE(folder), L"%s\\%s", projects, found.cFileName))) {
+            *code = ERROR_FILENAME_EXCED_RANGE;
+            StringCchCopyW(failed, LONG_PATH_CCH, found.cFileName);
+            FindClose(find);
+            return FALSE;
+        }
+        for (item = 0; item < (int)ARRAYSIZE(kSessionItems); item++) {
+            if (kSessionItems[item].store || (conversationOnly && !kSessionItems[item].conversation)) continue;
+            for (i = 0; i < idCount; i++)
+                if (!AddPresentItem(paths, count, capacity, folder, ids[i], &kSessionItems[item], failed, code)) {
+                    FindClose(find);
+                    return FALSE;
+                }
+        }
+    } while (FindNextFileW(find, &found));
+    *code = GetLastError();
+    FindClose(find);
+    StringCchCopyW(failed, LONG_PATH_CCH, projects);
+    return *code == ERROR_NO_MORE_FILES;
 }
 
 /* Claude Code's own temporary folder: CLAUDE_CODE_TMPDIR, else Windows'
@@ -1079,12 +1174,10 @@ BOOL SessionEdit_ListFiles(const SessionSet *set, int row, WCHAR (**paths)[LONG_
 {
     const SessionRow *session;
     const WCHAR **ids = NULL;
-    WCHAR projects[LONG_PATH_CCH], folder[LONG_PATH_CCH], failed[LONG_PATH_CCH], working[MAX_PATH];
-    WIN32_FIND_DATAW found;
-    HANDLE find = INVALID_HANDLE_VALUE;
+    WCHAR failed[LONG_PATH_CCH], working[MAX_PATH];
     DWORD code = ERROR_INVALID_PARAMETER;
     BOOL ok = FALSE;
-    int p, entry, capacity = 0, idCount = 0, i, item;
+    int p, entry, capacity = 0, idCount = 0, i;
     *paths = NULL;
     *count = 0;
     error[0] = 0;
@@ -1114,45 +1207,44 @@ BOOL SessionEdit_ListFiles(const SessionSet *set, int row, WCHAR (**paths)[LONG_
         ok = TRUE;
         goto done;
     }
-    for (item = 0; item < (int)ARRAYSIZE(kSessionItems); item++) {
-        if (!kSessionItems[item].store) continue;
-        if (!SessionStore_ClaudeCodePath(kSessionItems[item].store, folder, ARRAYSIZE(folder))) {
-            code = ERROR_FILENAME_EXCED_RANGE;
-            StringCchCopyW(failed, ARRAYSIZE(failed), L"CLAUDE_CONFIG_DIR");
-            goto done;
-        }
-        for (i = 0; i < idCount; i++)
-            if (!AddPresentItem(paths, count, &capacity, folder, ids[i], &kSessionItems[item], failed, &code)) goto done;
-    }
-    if (!AddTemporaryFolders(paths, count, &capacity, ids, idCount, failed, &code)) goto done;
-    if (!SessionStore_ProjectsDir(projects, ARRAYSIZE(projects))) {
-        code = ERROR_FILENAME_EXCED_RANGE;
-        StringCchCopyW(failed, ARRAYSIZE(failed), L"CLAUDE_CONFIG_DIR");
-        goto done;
-    }
-    find = Util_FindFiles(projects, L"*", &found, TRUE);
-    if (find == INVALID_HANDLE_VALUE) {
-        code = GetLastError();
-        ok = code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND;
-        StringCchCopyW(failed, ARRAYSIZE(failed), projects);
-        goto done;
-    }
-    do {
-        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == L'.') continue;
-        if (FAILED(StringCchPrintfW(folder, ARRAYSIZE(folder), L"%s\\%s", projects, found.cFileName))) {
-            code = ERROR_FILENAME_EXCED_RANGE;
-            StringCchCopyW(failed, ARRAYSIZE(failed), found.cFileName);
-            goto done;
-        }
-        for (item = 0; item < (int)ARRAYSIZE(kSessionItems); item++)
-            for (i = 0; !kSessionItems[item].store && i < idCount; i++)
-                if (!AddPresentItem(paths, count, &capacity, folder, ids[i], &kSessionItems[item], failed, &code)) goto done;
-    } while (FindNextFileW(find, &found));
-    code = GetLastError();
-    ok = code == ERROR_NO_MORE_FILES;
-    StringCchCopyW(failed, ARRAYSIZE(failed), projects);
+    ok = AddStoreItems(paths, count, &capacity, ids, idCount, FALSE, failed, &code) &&
+         AddTemporaryFolders(paths, count, &capacity, ids, idCount, failed, &code) &&
+         AddProjectItems(paths, count, &capacity, ids, idCount, FALSE, failed, &code);
 done:
-    if (find != INVALID_HANDLE_VALUE) FindClose(find);
+    if (ids) HeapFree(GetProcessHeap(), 0, (void *)ids);
+    if (!ok) {
+        if (*paths) HeapFree(GetProcessHeap(), 0, *paths);
+        *paths = NULL;
+        *count = 0;
+        StringCchPrintfW(error, errorCch, TR(L"Its files could not all be listed (error %lu): %s"), code, failed);
+        Util_Log(L"session files could not all be listed (error %lu): %s", code, failed);
+    }
+    return ok;
+}
+
+/* What makes up the conversation of session `row` in Claude Code's folder,
+ * for each of its transcripts, other sessions' too (an export takes it
+ * whole): the files and folders kSessionItems marks as part of it. The
+ * caller frees the heap array. FALSE with the reason in `error` (and logged)
+ * when a part of it could not be told. */
+BOOL SessionEdit_ListConversation(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count, WCHAR *error,
+                                  size_t errorCch)
+{
+    const WCHAR **ids = NULL;
+    WCHAR failed[LONG_PATH_CCH];
+    DWORD code = ERROR_INVALID_PARAMETER;
+    BOOL ok = FALSE;
+    int capacity = 0, idCount = 0;
+    *paths = NULL;
+    *count = 0;
+    error[0] = 0;
+    failed[0] = 0;
+    if (row >= 0 && row < set->rowCount) {
+        StringCchCopyW(failed, ARRAYSIZE(failed), set->rows[row].key);
+        if ((ids = SessionStore_TranscriptIds(set, row, &idCount)) == NULL) code = ERROR_NOT_ENOUGH_MEMORY;
+        else ok = AddStoreItems(paths, count, &capacity, ids, idCount, TRUE, failed, &code) &&
+                  AddProjectItems(paths, count, &capacity, ids, idCount, TRUE, failed, &code);
+    }
     if (ids) HeapFree(GetProcessHeap(), 0, (void *)ids);
     if (!ok) {
         if (*paths) HeapFree(GetProcessHeap(), 0, *paths);

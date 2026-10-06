@@ -69,6 +69,10 @@ COMMAND_FAMILIES = [
     ["Delete", "&Delete\u2026"],
     ["New profile", "&New profile\u2026"],
     ["Uninstall", "&Uninstall\u2026"],
+    ["Merge all sessions", "Merge &all sessions\u2026"],
+    ["Mirror sessions", "Mi&rror sessions\u2026"],
+    ["Export sessions", "E&xport sessions\u2026"],
+    ["Import sessions", "&Import sessions\u2026"],
 ]
 
 # TR() calls whose argument is no literal, by file: the variable or the
@@ -90,8 +94,8 @@ TRANSLATED_THROUGH_VARIABLES = {
                "Use 32 characters or fewer.", "Use 48 characters or fewer.",
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
     "gui.c": ["A profile folder with this name already exists."],
-    "theme.c": ["&Open", "&New profile\u2026", "&Edit\u2026", "&Delete\u2026", "Set as de&fault",
-                "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar", "Pinned",
+    "theme.c": ["&Open", "&New profile\u2026", "&Edit\u2026", "&Delete\u2026", "Merge &all sessions\u2026", "Mi&rror sessions\u2026",
+                "Set as de&fault", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar", "Pinned",
                 "Add to Start &menu", "Remove from Start &menu", "&Sessions  >", "<  &Back", "&Language\u2026",
                 "&Get Claude", "Set up l&inks", "&Uninstall\u2026", "U&pdate", "Close",
                 "Profile", "Role", "Data folder", "Claude icon, default", "Claude icon", "Default",
@@ -106,8 +110,8 @@ TRANSLATED_THROUGH_VARIABLES = {
 STATUS_ACTIONS = ["&Get Claude", "Set up l&inks"]
 ACCESS_KEY_GROUPS = {
     "profiles view": ["&Sessions  >", "&Language\u2026", "&Open", "&New profile\u2026", "&Edit\u2026", "&Delete\u2026",
-                      "Set as de&fault", "Create shortcut on des&ktop", "Create s&hortcut\u2026", "Pin to &taskbar",
-                      "Add to Start &menu", "Remove from Start &menu", "&Uninstall\u2026", "U&pdate"] + STATUS_ACTIONS,
+                      "Merge &all sessions\u2026", "Mi&rror sessions\u2026", "Set as de&fault", "Create shortcut on des&ktop",
+                      "Create s&hortcut\u2026", "Pin to &taskbar", "Add to Start &menu", "Remove from Start &menu", "&Uninstall\u2026", "U&pdate"] + STATUS_ACTIONS,
     "sessions view": ["<  &Back", "&Language\u2026", "Show &archived", "&Uninstall\u2026", "U&pdate"] + STATUS_ACTIONS,
     "profile dialog": ["&Name:", "&Color:", "Open at &Windows sign-in", "Copy &settings from \u201c%s\u201d",
                        "&Open it now to sign in"],
@@ -117,6 +121,12 @@ ACCESS_KEY_GROUPS = {
     "session menu": ["&Open in %s", "Open i&n", "S&hare with", "&Copy to", "&Rename\u2026\tF2", "S&tar",
                      "Uns&tar", "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s", "&Show folder",
                      "&Delete session everywhere\u2026"],
+    "profile list menu": ["&Open", "&Edit\u2026", "&Delete\u2026", "Mi&rror sessions\u2026", "E&xport sessions\u2026",
+                          "&Import sessions\u2026"],
+    "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "S&tar", "Uns&tar", "Re&move\u2026%s",
+                                 "&Delete sessions everywhere\u2026"],
+    "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026"],
+    "sessions dialog": ["&From:", "&To these profiles:", "Also &remove the sessions the source does not list"],
 }
 # Choices made in the same place: a key of one choice never shows with a key of another.
 ALTERNATIVES = [

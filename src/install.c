@@ -477,9 +477,10 @@ void Install_FinishUninstall(void)
     RemoveAfterExit(removals);
 }
 
-/* A running kept profile may have session changes waiting for it to close
- * (SessionEdit_Change), which its watcher makes, and the uninstall stops it:
- * for each, the user decides whether to go on without them. */
+/* A running kept profile may have session changes or sessions sent to it
+ * waiting for it to close (SessionEdit_Change, sessionsync.c), which its
+ * watcher makes, and the uninstall stops it: for each, the user decides
+ * whether to go on without them. */
 static BOOL ConfirmDiscardingWaitingChanges(HWND owner, const ProfileList *list)
 {
     WCHAR text[1024];
@@ -487,7 +488,7 @@ static BOOL ConfirmDiscardingWaitingChanges(HWND owner, const ProfileList *list)
     int i;
     for (i = 0; i < list->count; i++) {
         const Profile *p = &list->items[i];
-        if (!p->running || SessionStore_LoadPending(p, &first, 1) == 0) continue;
+        if (!p->running || (SessionStore_LoadPending(p, &first, 1) == 0 && SessionSync_PendingCount(p) == 0)) continue;
         StringCchPrintfW(text, ARRAYSIZE(text),
                          TR(L"Session changes for \x201C%s\x201D are waiting for it to close, and uninstalling now discards them.\n\n"
                             L"To keep them, choose Cancel, quit Claude for this profile (right-click its icon in the notification area and choose Quit), then uninstall."),

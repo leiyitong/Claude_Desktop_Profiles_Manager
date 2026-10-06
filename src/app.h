@@ -148,6 +148,37 @@ typedef struct PendingEdit {   /* a change to a session entry, waiting for its p
 
 typedef struct CoreSwap { const char *from, *to; } CoreSwap;
 
+/* A change sent to one profile's session entries (sessionsync.c), made at
+ * once when it is closed, else kept in a file of ours until it closes. */
+typedef enum SyncOpKind {
+    SYNC_PUT,      /* its entry for a session written: added, or replacing its own */
+    SYNC_REMOVE,   /* its entries for a session taken away */
+    SYNC_MARK,     /* Claude's mark that a session was deleted there, written */
+    SYNC_UNMARK,   /* ... taken away */
+    SYNC_INDEX     /* its list of archived sessions replaced */
+} SyncOpKind;
+
+#define SYNC_UNDELETE     0x1   /* a put made even where Claude marked the session deleted (the marks go) */
+#define SYNC_REPLACE      0x2   /* a put that replaces the profile's own entry unless it was used since */
+#define SYNC_CONTENT_CCH  32
+
+typedef struct SyncOp {
+    SyncOpKind kind;
+    DWORD      flags;                       /* SYNC_UNDELETE, SYNC_REPLACE */
+    ULONGLONG  time;                        /* put: the entry's last activity; mark: the time it holds (ms since 1970) */
+    ULONGLONG  seen;                        /* put, remove: the profile's own entry's last activity when sent, 0 for none */
+    WCHAR      key[SESSION_ID_CCH];         /* the session's id; mark, unmark: the id marked */
+    WCHAR      content[SYNC_CONTENT_CCH];   /* put, index: the file of ours holding what is written */
+} SyncOp;
+
+typedef struct SyncReport {             /* what sending sessions to profiles did */
+    int   added, updated, removed, skipped, failed;
+    DWORD waiting;                      /* the profiles whose part waits for them to close */
+    DWORD unavailable;                  /* the profiles that have no session entries yet: nothing sent there */
+    WCHAR backup[MAX_PATH];             /* where what was replaced or removed went; "" for nowhere */
+    WCHAR error[LONG_PATH_CCH];         /* the first failure, "" for none */
+} SyncReport;
+
 typedef enum RemoveResult { REMOVE_DONE, REMOVE_CANCELLED, REMOVE_FAILED } RemoveResult;
 
 typedef enum SessionEntryKind { ENTRY_NOT_SESSION, ENTRY_LOCAL, ENTRY_ELSEWHERE } SessionEntryKind;
@@ -199,6 +230,7 @@ SessionEntryKind Core_SessionEntryKind(const char *json, size_t len);
 BOOL         Core_JsonSetMember(const char *json, size_t len, const char *key, const char *raw, char *out, size_t cap, size_t *outLen);
 BOOL         Core_JsonQuote(const WCHAR *text, char *out, size_t cap);
 BOOL         Core_ProjectDirName(const WCHAR *cwd, WCHAR *out, size_t cch);
+#define UUID_TEXT_CCH 37   /* 8-4-4-4-12 hex digits and the terminator */
 BOOL         Core_IsUuid(const WCHAR *id);
 BOOL         Core_ResumeLink(const WCHAR *sessionId, WCHAR *out, size_t cch);
 void         Core_ScratchName(const SYSTEMTIME *day, DWORD random, WCHAR *out, size_t cch);
@@ -207,6 +239,13 @@ size_t       Core_ReplaceChunk(const char *in, size_t len, const CoreSwap *swaps
 BOOL         Core_PendingFormat(const PendingEdit *edit, WCHAR *out, size_t cch);
 BOOL         Core_PendingParse(const WCHAR *line, PendingEdit *edit);
 BOOL         Core_PendingReplaces(const PendingEdit *queued, const PendingEdit *added);
+BOOL         Core_JsonRemoveMember(const char *json, size_t len, const char *key, char *out, size_t cap, size_t *outLen);
+BOOL         Core_SyncOpFormat(const SyncOp *op, WCHAR *out, size_t cch);
+BOOL         Core_SyncOpParse(const WCHAR *line, SyncOp *op);
+BOOL         Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added);
+DWORD        Core_Crc32(DWORD crc, const void *data, size_t size);
+BOOL         Core_ArchiveNameSafe(const char *name, size_t length);
+BOOL         Core_ConversationFileName(const WCHAR *relative);
 int          Core_ScrollStep(int pending, int elapsedMs);
 ULONGLONG    Core_HashBytes(ULONGLONG hash, const void *data, size_t size);
 ULONGLONG    Core_HashText(ULONGLONG hash, const WCHAR *text);
@@ -526,6 +565,36 @@ BOOL         SessionEdit_RemovesWorkingFolder(const SessionSet *set, int row, WC
 RemoveResult SessionEdit_DeleteEverywhere(HWND owner, const SessionSet *set, int row, WCHAR *error, size_t errorCch);
 BOOL         SessionEdit_ListFiles(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count,
                                    WCHAR *error, size_t errorCch);
+BOOL         SessionEdit_ListConversation(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count,
+                                          WCHAR *error, size_t errorCch);
+BOOL         SessionEdit_CopiedCwd(const WCHAR *copyId, WCHAR *cwd, size_t cch);
+HANDLE       SessionEdit_Lock(const Profile *p);   /* the lock of a profile's entry changes; NULL when not taken */
+void         SessionEdit_Unlock(HANDLE lock);
+
+/* ---------------------------------------------------------- sessionsync.c */
+
+DWORD        SessionSync_Takers(const SessionSet *set);   /* the profiles whose entries can take sessions */
+BOOL         SessionSync_Merge(const SessionSet *set, DWORD profiles, SyncReport *report);
+BOOL         SessionSync_Mirror(const SessionSet *set, int source, DWORD targets, BOOL exact, SyncReport *report);
+BOOL         SessionSync_Share(const SessionSet *set, int from, const int *rows, int rowCount, DWORD targets, SyncReport *report);
+CopyResult   SessionSync_Copy(HWND owner, const SessionSet *set, int from, const int *rows, int rowCount, DWORD targets,
+                              SyncReport *report);
+int          SessionSync_ApplyPending(const Profile *p, SyncReport *report);   /* report may be NULL */
+int          SessionSync_PendingCount(const Profile *p);
+BOOL         SessionSync_PlanPath(const Profile *p, WCHAR *out, size_t cch);
+BOOL         SessionSync_Export(const SessionSet *set, int profile, const int *rows, int rowCount, const WCHAR *archive,
+                                int *exported, WCHAR *error, size_t errorCch);
+BOOL         SessionSync_IsArchive(const WCHAR *archive);   /* a session archive this version reads */
+BOOL         SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targets, int *sessions, SyncReport *report);
+
+/* ---------------------------------------------------------------- syncui.c */
+
+BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles);
+BOOL SyncUi_Mirror(HWND owner, const ProfileList *profiles, const WCHAR *selected);
+BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *rows, int rowCount, BOOL copy);
+BOOL SyncUi_Export(HWND owner, const SessionSet *set, int profile, const int *rows, int rowCount);
+BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen);
+BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen);
 
 /* ------------------------------------------------------------- sessions.c */
 
