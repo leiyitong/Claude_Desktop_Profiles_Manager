@@ -361,6 +361,12 @@ static BOOL EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn,
     return NewestSubfolder(root, out, cch, TRUE, NULL, cancel);
 }
 
+BOOL SessionStore_EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn)
+{
+    BOOL ignored;
+    return EntriesDir(p, out, cch, signedIn ? signedIn : &ignored, NULL);
+}
+
 int SessionStore_FindRow(const SessionSet *set, const WCHAR *key)
 {
     const SessionRowIndex *index = set->index;

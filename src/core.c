@@ -1351,3 +1351,347 @@ int Core_CompareVersions(const DWORD a[4], const DWORD b[4])
         if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
     return 0;
 }
+
+/* ---------------------------------------------------------------- deflate */
+
+/* RFC 1951. Compression: one block of the fixed Huffman codes, LZ77 matches
+ * found through hash chains over a 32 KB window; text (what a backup holds
+ * most) shrinks to a third or less. Decompression reads every kind of block,
+ * so an archive another tool made opens too. */
+
+#define DEFLATE_WINDOW     32768
+#define DEFLATE_HASH_BITS  15
+#define DEFLATE_MIN_MATCH  3
+#define DEFLATE_MAX_MATCH  258
+#define DEFLATE_MAX_CHAIN  48     /* earlier places tried for a match: speed against size */
+#define DEFLATE_GOOD_MATCH 64     /* a match this long ends the search */
+
+static const WORD kLengthBase[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
+                                      131, 163, 195, 227, 258 };
+static const BYTE kLengthExtra[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+static const WORD kDistanceBase[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+                                        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+static const BYTE kDistanceExtra[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+
+typedef struct BitWriter {
+    BYTE  *out;
+    size_t capacity, used;
+    DWORD  bits;
+    int    count;
+    BOOL   full;
+} BitWriter;
+
+static void PutBits(BitWriter *writer, DWORD value, int count)
+{
+    writer->bits |= value << writer->count;
+    writer->count += count;
+    while (writer->count >= 8) {
+        if (writer->used < writer->capacity) writer->out[writer->used++] = (BYTE)writer->bits;
+        else writer->full = TRUE;
+        writer->bits >>= 8;
+        writer->count -= 8;
+    }
+}
+
+/* A Huffman code goes out from its first bit, the stream from its lowest. */
+static void PutCode(BitWriter *writer, DWORD code, int length)
+{
+    DWORD reversed = 0;
+    int i;
+    for (i = 0; i < length; i++) reversed |= ((code >> i) & 1) << (length - 1 - i);
+    PutBits(writer, reversed, length);
+}
+
+static void PutLiteral(BitWriter *writer, int symbol)
+{
+    if (symbol < 144) PutCode(writer, 0x30 + (DWORD)symbol, 8);
+    else if (symbol < 256) PutCode(writer, 0x190 + (DWORD)(symbol - 144), 9);
+    else if (symbol < 280) PutCode(writer, (DWORD)(symbol - 256), 7);
+    else PutCode(writer, 0xC0 + (DWORD)(symbol - 280), 8);
+}
+
+static void PutMatch(BitWriter *writer, int length, int distance)
+{
+    int code = 28, d = 29;
+    while (code > 0 && kLengthBase[code] > length) code--;
+    PutLiteral(writer, 257 + code);
+    if (kLengthExtra[code]) PutBits(writer, (DWORD)(length - kLengthBase[code]), kLengthExtra[code]);
+    while (d > 0 && kDistanceBase[d] > distance) d--;
+    PutCode(writer, (DWORD)d, 5);
+    if (kDistanceExtra[d]) PutBits(writer, (DWORD)(distance - kDistanceBase[d]), kDistanceExtra[d]);
+}
+
+static DWORD HashAt(const BYTE *p)
+{
+    return ((DWORD)p[0] << 10 ^ (DWORD)p[1] << 5 ^ p[2]) & ((1u << DEFLATE_HASH_BITS) - 1);
+}
+
+size_t Core_DeflateBound(size_t size)
+{
+    /* At worst every byte a 9-bit literal, plus the block's header and end. */
+    return size + size / 8 + 16;
+}
+
+BOOL Core_Deflate(const void *input, size_t size, void *output, size_t capacity, size_t *written)
+{
+    const BYTE *in = (const BYTE *)input;
+    int *head = NULL, *chain = NULL;
+    BitWriter writer;
+    size_t i = 0;
+    BOOL ok;
+    *written = 0;
+    head = (int *)HeapAlloc(GetProcessHeap(), 0, ((size_t)1 << DEFLATE_HASH_BITS) * sizeof(int));
+    chain = (int *)HeapAlloc(GetProcessHeap(), 0, DEFLATE_WINDOW * sizeof(int));
+    if (!head || !chain) {
+        if (head) HeapFree(GetProcessHeap(), 0, head);
+        if (chain) HeapFree(GetProcessHeap(), 0, chain);
+        return FALSE;
+    }
+    for (i = 0; i < ((size_t)1 << DEFLATE_HASH_BITS); i++) head[i] = -1;
+    ZeroMemory(&writer, sizeof writer);
+    writer.out = (BYTE *)output;
+    writer.capacity = capacity;
+    PutBits(&writer, 1, 1);   /* the last block */
+    PutBits(&writer, 1, 2);   /* fixed codes */
+    i = 0;
+    while (i < size && !writer.full) {
+        int best = 0, bestDistance = 0;
+        if (i + DEFLATE_MIN_MATCH <= size) {
+            DWORD hash = HashAt(in + i);
+            int candidate = head[hash], tries = DEFLATE_MAX_CHAIN;
+            size_t limit = min(size - i, (size_t)DEFLATE_MAX_MATCH);
+            while (candidate >= 0 && tries-- > 0 && i - (size_t)candidate <= DEFLATE_WINDOW) {
+                const BYTE *a = in + candidate, *b = in + i;
+                int length = 0;
+                if (a[best] == b[best]) {   /* a longer match must agree there */
+                    while ((size_t)length < limit && a[length] == b[length]) length++;
+                    if (length > best) {
+                        best = length;
+                        bestDistance = (int)(i - (size_t)candidate);
+                        if (best >= DEFLATE_GOOD_MATCH || (size_t)best == limit) break;
+                    }
+                }
+                {
+                    int next = chain[candidate % DEFLATE_WINDOW];
+                    if (next >= candidate) break;   /* the slot was reused: the chain ends */
+                    candidate = next;
+                }
+            }
+        }
+        if (best >= DEFLATE_MIN_MATCH) {
+            size_t end = i + (size_t)best;
+            PutMatch(&writer, best, bestDistance);
+            for (; i < end; i++) {
+                if (i + DEFLATE_MIN_MATCH <= size) {
+                    DWORD hash = HashAt(in + i);
+                    chain[i % DEFLATE_WINDOW] = head[hash];
+                    head[hash] = (int)i;
+                }
+            }
+        } else {
+            if (i + DEFLATE_MIN_MATCH <= size) {
+                DWORD hash = HashAt(in + i);
+                chain[i % DEFLATE_WINDOW] = head[hash];
+                head[hash] = (int)i;
+            }
+            PutLiteral(&writer, in[i]);
+            i++;
+        }
+    }
+    PutLiteral(&writer, 256);
+    if (writer.count) PutBits(&writer, 0, 8 - writer.count);
+    ok = !writer.full;
+    if (ok) *written = writer.used;
+    HeapFree(GetProcessHeap(), 0, head);
+    HeapFree(GetProcessHeap(), 0, chain);
+    return ok;
+}
+
+/* Decompression, after zlib's puff: canonical codes decoded a bit at a time. */
+typedef struct BitReader {
+    const BYTE *in;
+    size_t      size, at;
+    DWORD       bits;
+    int         count;
+    BYTE       *out;
+    size_t      capacity, used;
+    BOOL        broken;
+} BitReader;
+
+typedef struct Huffman {
+    short count[16];    /* codes of each length */
+    short symbol[320];  /* the symbols, by code */
+} Huffman;
+
+static int GetBits(BitReader *reader, int need)
+{
+    DWORD value = reader->bits;
+    while (reader->count < need) {
+        if (reader->at >= reader->size) {
+            reader->broken = TRUE;
+            return 0;
+        }
+        value |= (DWORD)reader->in[reader->at++] << reader->count;
+        reader->count += 8;
+    }
+    reader->bits = value >> need;
+    reader->count -= need;
+    return (int)(value & ((1u << need) - 1));
+}
+
+static int Decode(BitReader *reader, const Huffman *huffman)
+{
+    int code = 0, first = 0, index = 0, length;
+    for (length = 1; length < 16; length++) {
+        int count;
+        code |= GetBits(reader, 1);
+        if (reader->broken) return -1;
+        count = huffman->count[length];
+        if (code - count < first) return huffman->symbol[index + (code - first)];
+        index += count;
+        first += count;
+        first <<= 1;
+        code <<= 1;
+    }
+    reader->broken = TRUE;
+    return -1;
+}
+
+/* A canonical code from each symbol's code length; FALSE for an over-full code. */
+static BOOL BuildHuffman(Huffman *huffman, const short *lengths, int n)
+{
+    short offsets[16];
+    int symbol, length, left = 1;
+    ZeroMemory(huffman->count, sizeof huffman->count);
+    for (symbol = 0; symbol < n; symbol++) huffman->count[lengths[symbol]]++;
+    if (huffman->count[0] == n) return TRUE;
+    for (length = 1; length < 16; length++) {
+        left <<= 1;
+        left -= huffman->count[length];
+        if (left < 0) return FALSE;
+    }
+    offsets[1] = 0;
+    for (length = 1; length < 15; length++) offsets[length + 1] = (short)(offsets[length] + huffman->count[length]);
+    for (symbol = 0; symbol < n; symbol++)
+        if (lengths[symbol]) huffman->symbol[offsets[lengths[symbol]]++] = (short)symbol;
+    return TRUE;
+}
+
+static BOOL InflateCodes(BitReader *reader, const Huffman *lengths, const Huffman *distances)
+{
+    for (;;) {
+        int symbol = Decode(reader, lengths);
+        if (symbol < 0) return FALSE;
+        if (symbol < 256) {
+            if (reader->used >= reader->capacity) return FALSE;
+            reader->out[reader->used++] = (BYTE)symbol;
+        } else if (symbol == 256) {
+            return TRUE;
+        } else {
+            int length, distance;
+            symbol -= 257;
+            if (symbol >= 29) return FALSE;
+            length = kLengthBase[symbol] + GetBits(reader, kLengthExtra[symbol]);
+            symbol = Decode(reader, distances);
+            if (symbol < 0 || symbol >= 30) return FALSE;
+            distance = kDistanceBase[symbol] + GetBits(reader, kDistanceExtra[symbol]);
+            if (reader->broken || (size_t)distance > reader->used || reader->used + (size_t)length > reader->capacity) return FALSE;
+            while (length--) {
+                reader->out[reader->used] = reader->out[reader->used - (size_t)distance];
+                reader->used++;
+            }
+        }
+    }
+}
+
+static BOOL InflateStored(BitReader *reader)
+{
+    size_t length;
+    reader->bits = 0;
+    reader->count = 0;
+    if (reader->at + 4 > reader->size) return FALSE;
+    length = reader->in[reader->at] | (size_t)reader->in[reader->at + 1] << 8;
+    if ((size_t)(reader->in[reader->at + 2] | reader->in[reader->at + 3] << 8) != (~length & 0xFFFF)) return FALSE;
+    reader->at += 4;
+    if (reader->at + length > reader->size || reader->used + length > reader->capacity) return FALSE;
+    memcpy(reader->out + reader->used, reader->in + reader->at, length);
+    reader->at += length;
+    reader->used += length;
+    return TRUE;
+}
+
+static BOOL InflateFixed(BitReader *reader)
+{
+    Huffman lengths, distances;
+    short code[288];
+    int symbol;
+    for (symbol = 0; symbol < 144; symbol++) code[symbol] = 8;
+    for (; symbol < 256; symbol++) code[symbol] = 9;
+    for (; symbol < 280; symbol++) code[symbol] = 7;
+    for (; symbol < 288; symbol++) code[symbol] = 8;
+    BuildHuffman(&lengths, code, 288);
+    for (symbol = 0; symbol < 30; symbol++) code[symbol] = 5;
+    BuildHuffman(&distances, code, 30);
+    return InflateCodes(reader, &lengths, &distances);
+}
+
+static BOOL InflateDynamic(BitReader *reader)
+{
+    static const BYTE kOrder[19] = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+    Huffman lengths, distances;
+    short code[320];
+    int literals = GetBits(reader, 5) + 257, distanceCount = GetBits(reader, 5) + 1, codes = GetBits(reader, 4) + 4, index;
+    if (reader->broken || literals > 286 || distanceCount > 30) return FALSE;
+    ZeroMemory(code, sizeof code);
+    for (index = 0; index < codes; index++) code[kOrder[index]] = (short)GetBits(reader, 3);
+    if (reader->broken || !BuildHuffman(&lengths, code, 19)) return FALSE;
+    index = 0;
+    while (index < literals + distanceCount) {
+        int symbol = Decode(reader, &lengths), repeat, value = 0;
+        if (symbol < 0) return FALSE;
+        if (symbol < 16) {
+            code[index++] = (short)symbol;
+            continue;
+        }
+        if (symbol == 16) {
+            if (index == 0) return FALSE;
+            value = code[index - 1];
+            repeat = 3 + GetBits(reader, 2);
+        } else if (symbol == 17) {
+            repeat = 3 + GetBits(reader, 3);
+        } else {
+            repeat = 11 + GetBits(reader, 7);
+        }
+        if (reader->broken || index + repeat > literals + distanceCount) return FALSE;
+        while (repeat--) code[index++] = (short)value;
+    }
+    if (code[256] == 0) return FALSE;
+    if (!BuildHuffman(&lengths, code, literals) || !BuildHuffman(&distances, code + literals, distanceCount)) return FALSE;
+    return InflateCodes(reader, &lengths, &distances);
+}
+
+BOOL Core_Inflate(const void *input, size_t size, void *output, size_t capacity, size_t *written)
+{
+    BitReader reader;
+    int last;
+    *written = 0;
+    ZeroMemory(&reader, sizeof reader);
+    reader.in = (const BYTE *)input;
+    reader.size = size;
+    reader.out = (BYTE *)output;
+    reader.capacity = capacity;
+    do {
+        int type;
+        BOOL ok;
+        last = GetBits(&reader, 1);
+        type = GetBits(&reader, 2);
+        if (reader.broken) return FALSE;
+        if (type == 0) ok = InflateStored(&reader);
+        else if (type == 1) ok = InflateFixed(&reader);
+        else if (type == 2) ok = InflateDynamic(&reader);
+        else ok = FALSE;
+        if (!ok || reader.broken) return FALSE;
+    } while (!last);
+    *written = reader.used;
+    return TRUE;
+}

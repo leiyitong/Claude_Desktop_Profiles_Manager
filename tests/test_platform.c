@@ -4183,6 +4183,8 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #define Util_ReadFile TestedUtil_ReadFile
 #define Util_ExtendedPath TestedUtil_ExtendedPath
 #define Util_FindFiles TestedUtil_FindFiles
+#define Util_CopyTree TestedUtil_CopyTree
+#define Util_DeleteTree TestedUtil_DeleteTree
 #include "../src/util.c"
 #undef CreateMutexW
 #undef RegCreateKeyExW
@@ -4232,6 +4234,8 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #undef Util_ReadFile
 #undef Util_ExtendedPath
 #undef Util_FindFiles
+#undef Util_CopyTree
+#undef Util_DeleteTree
 
 /* The program's own Util_EnsureDir, linked from util.c. */
 static void CheckEnsureDir(void)
@@ -4246,6 +4250,33 @@ static void CheckEnsureDir(void)
     if (!Prepared("create a file where the folder was", file != INVALID_HANDLE_VALUE)) return;
     CloseHandle(file);
     Check("EnsureDir refuses an existing file", !Util_EnsureDir(path));
+}
+
+/* Folders past MAX_PATH (Cowork's skills are that deep under a backup):
+ * made, seen, copied and deleted in the \\?\ form. */
+static void CheckLongTree(void)
+{
+    WCHAR top[MAX_PATH], copyTop[MAX_PATH], deep[LONG_PATH_CCH], file[LONG_PATH_CCH], copied[LONG_PATH_CCH], extended[LONG_PATH_CCH];
+    DWORD error = 0;
+    HANDLE handle;
+    int i;
+    if (!Prepared("make private folder paths", JoinPath(g_root, L"long", top, ARRAYSIZE(top)) &&
+                  JoinPath(g_root, L"long-copy", copyTop, ARRAYSIZE(copyTop))))
+        return;
+    StringCchCopyW(deep, ARRAYSIZE(deep), top);
+    for (i = 0; i < 10; i++) StringCchCatW(deep, ARRAYSIZE(deep), L"\\a-folder-name-of-thirty-chars");
+    Check("EnsureDir makes a folder past MAX_PATH", wcslen(deep) > MAX_PATH && Util_EnsureDir(deep) && Util_DirExists(deep));
+    StringCchPrintfW(file, ARRAYSIZE(file), L"%s\\file.txt", deep);
+    Util_ExtendedPath(file, extended, ARRAYSIZE(extended));
+    handle = CreateFileW(extended, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (!Prepared("write a file past MAX_PATH", handle != INVALID_HANDLE_VALUE)) return;
+    CloseHandle(handle);
+    Check("FileExists sees a file past MAX_PATH", Util_FileExists(file));
+    StringCchPrintfW(copied, ARRAYSIZE(copied), L"%s%s\\file.txt", copyTop, deep + wcslen(top));
+    Check("CopyTree copies a tree past MAX_PATH whole", Util_CopyTree(top, copyTop, FALSE, &error) && Util_FileExists(copied));
+    Check("DeleteTree deletes a tree past MAX_PATH whole",
+          Util_DeleteTree(top, &error) && !Util_DirExists(top) && Util_DeleteTree(copyTop, &error) && !Util_DirExists(copyTop));
+    Check("DeleteTree counts a tree already gone as deleted", Util_DeleteTree(top, &error));
 }
 
 static void ResetRemoval(DWORD errorBefore, DWORD errorAfter, int shellCode, BOOL aborted)
@@ -4627,6 +4658,7 @@ int wmain(int argc, WCHAR **argv)
     CheckRouteFailures();
     CheckLauncherRun();
     CheckEnsureDir();
+    CheckLongTree();
     CheckRecycleResults();
     CheckProfileRemovalErrors();
 

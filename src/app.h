@@ -255,6 +255,13 @@ BOOL         Core_SyncOpFormat(const SyncOp *op, WCHAR *out, size_t cch);
 BOOL         Core_SyncOpParse(const WCHAR *line, SyncOp *op);
 BOOL         Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added);
 DWORD        Core_Crc32(DWORD crc, const void *data, size_t size);
+/* Deflate (RFC 1951), as ZIP's method 8: the whole input at once. Compressing
+ * needs Core_DeflateBound(size) bytes at most; FALSE when `capacity` is short
+ * or memory runs out. Inflating reads every kind of block; FALSE for a broken
+ * stream or one longer than `capacity`. */
+size_t       Core_DeflateBound(size_t size);
+BOOL         Core_Deflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
+BOOL         Core_Inflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
 BOOL         Core_ArchiveNameSafe(const char *name, size_t length);
 BOOL         Core_ConversationFileName(const WCHAR *relative);
 int          Core_ScrollStep(int pending, int elapsedMs);
@@ -301,6 +308,8 @@ RemoveResult Util_Recycle(HWND owner, const WCHAR *const *paths, int count);
 char     *Util_ReadFile(const WCHAR *path, DWORD maxBytes, BOOL tail, DWORD *len);
 BOOL      Util_ExtendedPath(const WCHAR *path, WCHAR *out, size_t cch);   /* the \\?\ form, for paths past MAX_PATH */
 HANDLE    Util_FindFiles(const WCHAR *dir, const WCHAR *pattern, WIN32_FIND_DATAW *found, BOOL foldersOnly);
+BOOL      Util_CopyTree(const WCHAR *from, const WCHAR *to, BOOL replace, DWORD *error);
+BOOL      Util_DeleteTree(const WCHAR *path, DWORD *error);
 
 /* -------------------------------------------------------------- claude.c */
 
@@ -329,6 +338,50 @@ RemoveResult Profiles_Delete(HWND owner, const Profile *profile);
 RemoveResult Profiles_RecycleData(HWND owner, const Profile *profile);
 BOOL         Profiles_IsLinked(const Profile *profile);
 BOOL         Profiles_LinkTarget(const Profile *profile, WCHAR *out, size_t cch);
+
+/* --------------------------------------------------------- sessionlink.c */
+/* A profile's entries folder shared with another profile or kept in a
+ * folder of the user's, through a directory junction. */
+typedef enum LinkKind { LINK_NOT_SIGNED_IN, LINK_NO_SESSIONS, LINK_OWN, LINK_PROFILE, LINK_FOLDER, LINK_BROKEN } LinkKind;
+typedef struct LinkState {
+    LinkKind kind;
+    int      profile;                 /* LINK_PROFILE: the profile whose folder it shares */
+    WCHAR    dir[LONG_PATH_CCH];      /* its entries folder, as Claude finds it */
+    WCHAR    target[LONG_PATH_CCH];   /* LINK_PROFILE and LINK_FOLDER: where it leads */
+} LinkState;
+void SessionLink_Read(const ProfileList *list, int index, LinkState *state);
+/* Its Claude runs, or the Claude of a profile sharing its entries folder:
+ * the entries are not written then (Claude writes its own back). */
+BOOL SessionLink_Busy(const Profile *p);
+BOOL SessionLink_Create(HWND owner, const ProfileList *list, int index, const WCHAR *target, WCHAR *error, size_t errorCch);
+BOOL SessionLink_Remove(const ProfileList *list, int index, WCHAR *error, size_t errorCch);
+
+/* ----------------------------------------------------------------- zip.c */
+/* ZIP archives, files stored or deflated, names in UTF-8 with "/" between
+ * folders; no ZIP64 (files and archive under 4 GB, 65535 files at most). A
+ * file goes in whole: 512 MB at most. Zip_Close(zip, TRUE) puts the archive
+ * in place (it was written next to it); FALSE, or a failure, removes it. */
+typedef struct ZipOut ZipOut;
+typedef struct ZipIn ZipIn;
+ZipOut     *Zip_Create(const WCHAR *path, DWORD *error);
+BOOL        Zip_AddData(ZipOut *zip, const char *name, const void *data, size_t size);
+BOOL        Zip_AddFile(ZipOut *zip, const char *name, const WCHAR *path);
+DWORD       Zip_Error(const ZipOut *zip);   /* the first failure's Windows error */
+BOOL        Zip_Close(ZipOut *zip, BOOL keep);
+ZipIn      *Zip_Open(const WCHAR *path);   /* NULL: not a ZIP archive this module reads */
+void        Zip_Free(ZipIn *zip);
+int         Zip_Count(const ZipIn *zip);
+const char *Zip_Name(const ZipIn *zip, int index);
+DWORD       Zip_Size(const ZipIn *zip, int index);
+int         Zip_Find(const ZipIn *zip, const char *name);
+void       *Zip_Read(const ZipIn *zip, int index, DWORD maxBytes, DWORD *size);   /* checked by its CRC; HeapFree it, NUL after it */
+BOOL        Zip_Extract(const ZipIn *zip, int index, const WCHAR *path);
+
+/* -------------------------------------------------------------- backup.c */
+/* A profile backed up to one archive, parts chosen (Code sessions, Cowork
+ * sessions, settings, sign-in), and restored from one into a closed profile. */
+BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index);
+BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index);
 
 /* --------------------------------------------------------------- icons.c */
 
@@ -561,6 +614,9 @@ DWORD        SessionStore_RunningNow(const ProfileList *profiles, const WCHAR *s
 BOOL         SessionStore_ClaudeCodePath(const WCHAR *sub, WCHAR *out, size_t cch);
 BOOL         SessionStore_ProjectsDir(WCHAR *out, size_t cch);
 BOOL         SessionStore_SessionsDir(const Profile *p, WCHAR *out, size_t cch);
+/* The folder of the entries Claude shows for `p`: claude-code-sessions\<account>\<organization>.
+ * FALSE when there is none; `signedIn` then says whether an account is known. */
+BOOL         SessionStore_EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn);
 BOOL         SessionStore_WorkingDir(const SessionSet *set, const WCHAR *cwd, WCHAR *out, size_t cch);
 BOOL         SessionStore_WatchDir(const Profile *p, WCHAR *out, size_t cch);
 BOOL         SessionStore_PendingPath(const Profile *p, WCHAR *out, size_t cch);
@@ -755,7 +811,8 @@ void     Theme_RememberLayout(HWND dialog);
 void     Theme_FitDialog(HWND dialog);
 BOOL     Theme_MainMinimum(HWND dialog, SIZE *client);
 void     Theme_LayoutMain(HWND dialog);
-void     Theme_ProfileColumnWidths(HWND list, int *profile, int *role, int *dataMinimum);   /* dataMinimum may be NULL */
+void     Theme_ProfileColumnWidths(HWND list, int *profile, int *role, int *dataMinimum, int *sessionsMinimum);   /* the minimums may be NULL */
+const WCHAR *Theme_SessionsFolderState(int state);   /* the sessions folder column's words: own, not signed in, no sessions, broken */
 void     Theme_FitLastColumn(HWND list, int minimum);   /* the width the other columns leave, at least `minimum`, unless the user sized it or drags it */
 /* The catalog keys of what the manager window shows, the ones its layout is
  * measured with: a button's caption in `state` (0: the resource's, 1: its

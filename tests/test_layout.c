@@ -228,9 +228,9 @@ static void PopulateProfileTable(HWND table, const WCHAR *name)
     GetClientRect(table, &rect);
     ZeroMemory(&column, sizeof column);
     column.mask = LVCF_TEXT | LVCF_WIDTH;
-    for (i = 0; i < 3; i++) {
+    for (i = 0; Theme_ProfileColumnTitle(i); i++) {
         column.pszText = (WCHAR *)TR(Theme_ProfileColumnTitle(i));
-        column.cx = rect.right / 3;
+        column.cx = rect.right / 4;
         ListView_InsertColumn(table, i, &column);
     }
     ZeroMemory(&item, sizeof item);
@@ -239,6 +239,7 @@ static void PopulateProfileTable(HWND table, const WCHAR *name)
     ListView_InsertItem(table, &item);
     ListView_SetItemText(table, 0, 1, (WCHAR *)TR(Theme_ProfileRole(TRUE, TRUE)));
     ListView_SetItemText(table, 0, 2, L"%APPDATA%\\Claude");
+    ListView_SetItemText(table, 0, 3, (WCHAR *)TR(Theme_SessionsFolderState(0)));
 }
 
 /* The uninstall dialog's profiles to keep, as gui.c makes them: check boxes in
@@ -323,6 +324,43 @@ static void LinkCaptions(HWND dialog, const WCHAR *name)
     StringCchPrintfW(text, ARRAYSIZE(text), TR(L"This sign-in was started in \x201C%s\x201D: it finishes only there."), name);
     SetDlgItemTextW(dialog, IDC_L_TEXT, text);
     SetDlgItemTextW(dialog, IDC_L_LINK, L"claude://login/fixture?...");
+}
+
+/* The backup dialog's parts, as backup.c lists them: check boxes in one
+ * column the view sizes, sign-in left unchecked. */
+static void PopulateBackupParts(HWND dialog)
+{
+    static const WCHAR *const kParts[] = { L"Code sessions and their conversations (%d)", L"Cowork sessions",
+                                           L"Settings: MCP servers, preferences, language and theme", L"Sign-in" };
+    HWND list = GetDlgItem(dialog, IDC_B_LIST);
+    WCHAR text[256];
+    LVCOLUMNW column;
+    LVITEMW item;
+    int i;
+    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    ZeroMemory(&column, sizeof column);
+    ListView_InsertColumn(list, 0, &column);
+    for (i = 0; i < (int)ARRAYSIZE(kParts); i++) {
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(kParts[i]), 1234);
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT;
+        item.iItem = i;
+        item.pszText = text;
+        ListView_InsertItem(list, &item);
+        ListView_SetCheckState(list, i, i != 3);
+    }
+    Theme_SmoothView(list);
+}
+
+/* What the backup dialog says when it restores, its longest form. */
+static void BackupCaptions(HWND dialog, const WCHAR *name)
+{
+    WCHAR text[512];
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Restore \x201C%s\x201D from a backup"), name);
+    SetWindowTextW(dialog, text);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Choose what to restore into \x201C%s\x201D. What it replaces is kept in a backup first."), name);
+    SetDlgItemTextW(dialog, IDC_B_TEXT, text);
+    SetDlgItemTextW(dialog, IDOK, TR(L"Restore"));
 }
 
 /* What the sessions dialog says when it overwrites, its longest form. */
@@ -421,6 +459,10 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         LinkCaptions(dialog, name);
         PopulateLinkProfiles(dialog, name);
         break;
+    case IDD_BACKUP:
+        BackupCaptions(dialog, name);
+        PopulateBackupParts(dialog);
+        break;
     }
 }
 
@@ -456,6 +498,8 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         SyncCaptions(dialog);
     } else if (fixture->resource == IDD_LINK) {
         LinkCaptions(dialog, L"Private profile");
+    } else if (fixture->resource == IDD_BACKUP) {
+        BackupCaptions(dialog, L"Private profile");
     }
 }
 
@@ -1065,13 +1109,27 @@ static void CheckProfileTable(HWND dialog, const LayoutFixture *fixture)
 {
     HWND table = fixture->table;
     RECT client;
-    int first = ListView_GetColumnWidth(table, 0), second = ListView_GetColumnWidth(table, 1);
+    int first = ListView_GetColumnWidth(table, 0), second = ListView_GetColumnWidth(table, 1), third = ListView_GetColumnWidth(table, 2);
+    int profileWidth, roleWidth, dataMinimum;
     GetClientRect(table, &client);
+    Theme_ProfileColumnWidths(table, &profileWidth, &roleWidth, &dataMinimum, NULL);
     Check(fixture, table, "default Profile column is its fixed width at the window's DPI",
           first == MulDiv(THEME_PROFILE_COLUMN_DIPS, (int)GetDpiForWindow(table), 96));
-    Check(fixture, table, "default Data column consumes exactly the remaining client width",
-          ListView_GetColumnWidth(table, 2) == client.right - first - second);
+    Check(fixture, table, "default Data column fits the data folder", third == dataMinimum);
+    Check(fixture, table, "default Sessions folder column consumes exactly the remaining client width",
+          ListView_GetColumnWidth(table, 3) == client.right - first - second - third);
     Check(fixture, table, "default columns do not introduce a horizontal scroll bar", !(GetWindowLongW(table, GWL_STYLE) & WS_HSCROLL));
+    if (ListView_GetColumnWidth(table, 3) != client.right - first - second - third) {
+        RECT dialogClient;
+        SIZE minimum = { 0, 0 };
+        int sessionsMinimum = 0;
+        GetClientRect(dialog, &dialogClient);
+        Theme_MainMinimum(dialog, &minimum);
+        Theme_ProfileColumnWidths(table, &profileWidth, &roleWidth, &dataMinimum, &sessionsMinimum);
+        printf("        client=%ld columns=%d,%d,%d,%d budget=%d,%d,%d,%d dialog=%ldx%ld minimum=%ldx%ld\n", client.right, first, second,
+               third, ListView_GetColumnWidth(table, 3), profileWidth, roleWidth, dataMinimum, sessionsMinimum, dialogClient.right,
+               dialogClient.bottom, minimum.cx, minimum.cy);
+    }
     CheckNativeRoles(fixture);
     CheckShortcutHeading(dialog, fixture);
 }
@@ -1389,7 +1447,7 @@ static void CheckReopenedModal(HWND owner, LayoutFixture *fixture, const LayoutS
  * fonts, size and controls come back exactly. */
 static void CheckLanguageRoundTrips(void)
 {
-    static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK };
+    static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP };
     static const WCHAR *const kVisited[] = { L"zh-CN", L"hi", L"bn", L"ar", L"de" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"fr");
@@ -1549,7 +1607,7 @@ static void CheckHiddenRows(void)
 /* The dialogs other than the manager window, in every language and scale. */
 static void CheckDialogs(void)
 {
-    static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK };
+    static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)
@@ -1780,12 +1838,13 @@ static BOOL DragDivider(HWND table, int column, int width)
 }
 
 /* Columns the user sized keep their widths through layouts and every
- * language; the data column follows the room left until it is sized too. */
+ * language; the sessions folder column follows the room left until it is
+ * sized too. */
 static void CheckColumnInteractions(HWND dialog, LayoutFixture *fixture)
 {
     HWND table = fixture->table;
     int profile = ListView_GetColumnWidth(table, 0), role = ListView_GetColumnWidth(table, 1);
-    int data = ListView_GetColumnWidth(table, 2), language;
+    int data = ListView_GetColumnWidth(table, 2), sessions = ListView_GetColumnWidth(table, 3), language;
     WCHAR name[LABEL_CCH];
     LongName(name, ARRAYSIZE(name));
     ListView_SetItemText(table, 0, 0, name);
@@ -1797,11 +1856,11 @@ static void CheckColumnInteractions(HWND dialog, LayoutFixture *fixture)
     Check(fixture, table, "the role column's divider dragged by the user sizes it", DragDivider(table, 1, role + 10));
     Gui_LayoutProfileColumns(table);
     {
-        int defaultProfile, defaultRole, dataMinimum;
-        Theme_ProfileColumnWidths(table, &defaultProfile, &defaultRole, &dataMinimum);
-        Check(fixture, table, "manual first-column widths survive layout and the data column follows the remainder, down to its minimum",
+        int defaultProfile, defaultRole, dataMinimum, sessionsMinimum;
+        Theme_ProfileColumnWidths(table, &defaultProfile, &defaultRole, &dataMinimum, &sessionsMinimum);
+        Check(fixture, table, "manual first-column widths survive layout and the sessions column follows the remainder, down to its minimum",
               ListView_GetColumnWidth(table, 0) == profile + 20 && ListView_GetColumnWidth(table, 1) == role + 10 &&
-              ListView_GetColumnWidth(table, 2) == max(dataMinimum, data - 30));
+              ListView_GetColumnWidth(table, 2) == data && ListView_GetColumnWidth(table, 3) == max(sessionsMinimum, sessions - 30));
     }
     for (language = 0; language < Localize_LanguageCount(); language++) {
         TransitionLanguage(dialog, fixture, language);
@@ -1811,6 +1870,7 @@ static void CheckColumnInteractions(HWND dialog, LayoutFixture *fixture)
     Check(fixture, table, "the data column's divider dragged by the user sizes it", DragDivider(table, 2, data - 40));
     Gui_LayoutProfileColumns(table);
     Check(fixture, table, "an explicit data-column adjustment is retained", ListView_GetColumnWidth(table, 2) == data - 40);
+    Check(fixture, table, "the sessions folder's divider dragged by the user sizes it", DragDivider(table, 3, ListView_GetColumnWidth(table, 3) - 20));
 }
 
 /* The window frame of a `width` x `height` client, at the work area's corner. */
@@ -2151,9 +2211,9 @@ static void CheckResponsiveMain(void)
             Check(&fixture, fixture.table, "fixed table columns keep their widths at every window size",
                   ListView_GetColumnWidth(fixture.table, 0) == MulDiv(THEME_PROFILE_COLUMN_DIPS, dpi, 96) && ListView_GetColumnWidth(fixture.table, 1) == role);
             GetClientRect(fixture.table, &tableClient);
-            Check(&fixture, fixture.table, "data column is the exact table remainder",
+            Check(&fixture, fixture.table, "sessions folder column is the exact table remainder",
                   ListView_GetColumnWidth(fixture.table, 0) + ListView_GetColumnWidth(fixture.table, 1) +
-                  ListView_GetColumnWidth(fixture.table, 2) == tableClient.right);
+                  ListView_GetColumnWidth(fixture.table, 2) + ListView_GetColumnWidth(fixture.table, 3) == tableClient.right);
             CheckGeometry(dialog, &fixture);
             if (!fixture.sessions) {
                 CheckNoteGeometry(dialog, &fixture);

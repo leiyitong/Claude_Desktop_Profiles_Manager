@@ -233,7 +233,7 @@ static BOOL WriteFileAt(const WCHAR *path, const char *data, size_t length, cons
         SetLastError(ERROR_FILENAME_EXCED_RANGE);
         return FALSE;
     }
-    if (profile && Claude_IsRunning(profile)) {
+    if (profile && SessionLink_Busy(profile)) {
         SetLastError(ERROR_BUSY);
         return FALSE;
     }
@@ -242,7 +242,7 @@ static BOOL WriteFileAt(const WCHAR *path, const char *data, size_t length, cons
     ok = WriteWhole(file, data, length) && FlushFileBuffers(file);
     if (!ok) error = GetLastError();
     CloseHandle(file);
-    if (ok && profile && Claude_IsRunning(profile)) {
+    if (ok && profile && SessionLink_Busy(profile)) {
         ok = FALSE;
         error = ERROR_BUSY;
     }
@@ -644,7 +644,7 @@ static OpResult ApplyPut(const Profile *p, const SessionSet *entries, const WCHA
         result = OP_SAME;
         goto done;
     }
-    if (Claude_IsRunning(p)) {
+    if (SessionLink_Busy(p)) {
         result = OP_STOPPED;
         goto done;
     }
@@ -683,7 +683,7 @@ static OpResult ApplyRemove(const Profile *p, const SessionSet *entries, const S
         return OP_SKIPPED;
     }
     for (; entry >= 0; entry = entries->entries[entry].duplicate) {
-        if (Claude_IsRunning(p)) return OP_STOPPED;
+        if (SessionLink_Busy(p)) return OP_STOPPED;
         if (!BackUp(p, entries->entries[entry].file, TRUE, report)) {
             CannotWrite(report, entries->entries[entry].file, GetLastError());
             return OP_FAILED;
@@ -701,7 +701,7 @@ static OpResult ApplyMark(const Profile *p, const SessionSet *entries, const WCH
     if (!TombstonePath(dir, op->key, path, ARRAYSIZE(path))) return OP_SAME;
     if (op->kind == SYNC_UNMARK) {
         if (!Present(path)) return OP_SAME;
-        if (Claude_IsRunning(p)) return OP_STOPPED;
+        if (SessionLink_Busy(p)) return OP_STOPPED;
         if (BackUp(p, path, TRUE, report)) return OP_MADE;
         CannotWrite(report, path, GetLastError());
         return OP_FAILED;
@@ -731,7 +731,7 @@ static OpResult ApplyIndex(const Profile *p, const WCHAR *dir, const char *conte
     }
     Free(current);
     there = Present(path);
-    if (Claude_IsRunning(p)) return OP_STOPPED;
+    if (SessionLink_Busy(p)) return OP_STOPPED;
     if (there && !BackUp(p, path, FALSE, report)) {
         CannotWrite(report, path, GetLastError());
         return OP_FAILED;
@@ -784,8 +784,8 @@ int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
         report = &own;
     }
     if (!PlanDir(p, staging, ARRAYSIZE(staging)) || (lock = SessionEdit_Lock(p)) == NULL) return 0;
-    if (Claude_IsRunning(p) || (n = LoadPlan(p, &plan)) <= 0) {
-        if (!Claude_IsRunning(p) && n < 0) Util_Log(L"sessions sent to %s: the plan cannot be read", p->folder);
+    if (SessionLink_Busy(p) || (n = LoadPlan(p, &plan)) <= 0) {
+        if (!SessionLink_Busy(p) && n < 0) Util_Log(L"sessions sent to %s: the plan cannot be read", p->folder);
         SessionEdit_Unlock(lock);
         Free(plan.ops);
         return 0;
