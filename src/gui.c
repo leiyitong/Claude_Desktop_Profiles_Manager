@@ -318,14 +318,15 @@ static void FillList(const ListSelection *selection)
     UpdateNote();
 }
 
-/* Whether the list shows the same rows: folders, names and colors. */
+/* Whether the list shows the same rows: folders, names and icons. */
 static BOOL SameProfileRows(const ProfileList *a, const ProfileList *b)
 {
     int i;
     if (a->count != b->count) return FALSE;
     for (i = 0; i < a->count; i++) {
         if (!Core_EqualsI(a->items[i].folder, b->items[i].folder) || wcscmp(a->items[i].name, b->items[i].name) != 0 ||
-            a->items[i].color != b->items[i].color)
+            a->items[i].color != b->items[i].color || wcscmp(a->items[i].badge, b->items[i].badge) != 0 ||
+            a->items[i].picture != b->items[i].picture)
             return FALSE;
     }
     return TRUE;
@@ -618,14 +619,161 @@ typedef struct ProfileDialog {
     const Profile *copyFrom;   /* new profile: whose settings it can start with */
     WCHAR          name[LABEL_CCH];
     int            color;
+    WCHAR          badge[BADGE_CCH];   /* once closed: the badge's own text, empty for the initial */
+    DWORD         *picture;            /* the picture shown, NULL for the Claude icon; the caller frees it */
+    BOOL           pictureChanged;     /* chosen or removed in the dialog */
+    BOOL           badgeOwn;           /* the badge shows text the user typed, not the initial */
+    BOOL           filling;            /* the dialog sets the badge's text itself */
+    int            colorAt[PALETTE_SIZE];   /* each choice's palette index: the colors no other profile uses first */
     BOOL           openNow;
     BOOL           startup;
     BOOL           copy;
     HICON          preview;
-    WCHAR          previewInitial;   /* what `preview` shows, so typing redraws it only when this changes */
+    WCHAR          previewBadge[BADGE_CCH];   /* what `preview` shows, so typing redraws it only when this changes */
+    const DWORD   *previewPicture;
     int            previewColor;
     int            previewSize;
 } ProfileDialog;
+
+/* The color choices with their swatches: the colors no other profile uses,
+ * then the others, under a line, each with the profiles that use it. */
+static void FillColors(HWND dialog, ProfileDialog *state)
+{
+    HWND combo = GetDlgItem(dialog, IDC_P_COLOR);
+    WCHAR users[PALETTE_SIZE][MAX_PROFILES * 8], text[ARRAYSIZE(users[0]) + 128], usedBy[ARRAYSIZE(users[0]) + 64];
+    BOOL used[PALETTE_SIZE] = { 0 }, anyFree = FALSE;
+    int i, pass, count = 0, selected = 0;
+    for (i = 0; i < PALETTE_SIZE; i++) users[i][0] = 0;
+    for (i = 0; i < g_manager.profiles.count; i++) {
+        const Profile *other = &g_manager.profiles.items[i];
+        if ((state->existing && Core_EqualsI(other->folder, state->existing->folder)) || other->color < 0 || other->color >= PALETTE_SIZE)
+            continue;
+        if (used[other->color]) StringCchCatW(users[other->color], ARRAYSIZE(users[0]), TR(L", "));
+        StringCchCatW(users[other->color], ARRAYSIZE(users[0]), other->name);
+        used[other->color] = TRUE;
+    }
+    for (i = 0; i < PALETTE_SIZE; i++) anyFree = anyFree || !used[i];
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (pass = 0; pass < 2; pass++) {
+        BOOL first = TRUE;
+        for (i = 0; i < PALETTE_SIZE; i++) {
+            LRESULT index;
+            LPARAM data = (LPARAM)Icons_PaletteColor(i) | THEME_CHOICE_SWATCH;
+            if (used[i] != (pass == 1)) continue;
+            if (used[i]) {
+                /* After the tab: in the menu only (theme.c). */
+                StringCchPrintfW(usedBy, ARRAYSIZE(usedBy), TR(L"used by %s"), users[i]);
+                StringCchPrintfW(text, ARRAYSIZE(text), L"%s\t%s", TR(g_ColorNames[i]), usedBy);
+                if (first && anyFree) data |= THEME_CHOICE_SEPARATED;
+            } else {
+                StringCchCopyW(text, ARRAYSIZE(text), TR(g_ColorNames[i]));
+            }
+            first = FALSE;
+            index = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)text);
+            if (index < 0) continue;
+            SendMessageW(combo, CB_SETITEMDATA, (WPARAM)index, data);
+            if (i == state->color) selected = count;
+            state->colorAt[count++] = i;
+        }
+    }
+    SendMessageW(combo, CB_SETCURSEL, (WPARAM)selected, 0);
+}
+
+static int ChosenColor(HWND dialog, const ProfileDialog *state)
+{
+    LRESULT i = SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_GETCURSEL, 0, 0);
+    return i >= 0 && i < PALETTE_SIZE ? state->colorAt[i] : 0;
+}
+
+/* The badge's own text as typed, cleaned; empty when it is the initial of
+ * `name` (the badge then follows the name). */
+static void ChosenBadge(HWND dialog, const ProfileDialog *state, const WCHAR *name, WCHAR *badge, size_t cch)
+{
+    WCHAR raw[32], initial[2] = { 0, 0 };
+    GetDlgItemTextW(dialog, IDC_P_BADGE, raw, ARRAYSIZE(raw));
+    initial[0] = Icons_ProfileInitial(name);
+    if (!state->badgeOwn || !Core_CleanBadge(raw, badge, cch) || wcscmp(badge, initial) == 0) badge[0] = 0;
+}
+
+/* The badge box follows the name while the user has not typed in it. */
+static void FollowName(HWND dialog, ProfileDialog *state)
+{
+    WCHAR name[LABEL_CCH], initial[2] = { 0, 0 };
+    if (state->badgeOwn) return;
+    GetDlgItemTextW(dialog, IDC_P_NAME, name, ARRAYSIZE(name));
+    initial[0] = Icons_ProfileInitial(name);
+    state->filling = TRUE;
+    SetDlgItemTextW(dialog, IDC_P_BADGE, initial);
+    state->filling = FALSE;
+}
+
+/* With a picture, the icon has no badge to write in: the badge box rests,
+ * and the picture can be removed. */
+static void ShowPictureState(HWND dialog, const ProfileDialog *state)
+{
+    EnableWindow(GetDlgItem(dialog, IDC_P_BADGE), state->picture == NULL);
+    EnableWindow(GetDlgItem(dialog, IDC_P_NO_PICTURE), state->picture != NULL);
+}
+
+/* A picture file the user chose, in `path`; FALSE when none was (an error said). */
+static BOOL ChoosePictureFile(HWND owner, WCHAR *path, size_t cch)
+{
+    COMDLG_FILTERSPEC filters[2];
+    IFileDialog *dialog = NULL;
+    IShellItem *result = NULL;
+    FILEOPENDIALOGOPTIONS options = 0;
+    PWSTR chosen = NULL;
+    BOOL ok = FALSE;
+    HRESULT hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileDialog, (void **)&dialog);
+    if (FAILED(hr)) {
+        Ui_Message(owner, MB_ICONERROR, TR(L"The file could not be chosen (error 0x%08lX)."), (unsigned long)hr);
+        return FALSE;
+    }
+    filters[0].pszName = TR(L"Pictures");
+    filters[0].pszSpec = L"*.png;*.jpg;*.jpeg;*.jpe;*.jfif;*.gif;*.bmp;*.dib;*.webp;*.ico;*.tif;*.tiff;*.heic;*.heif;*.avif;*.jxr;*.wdp";
+    filters[1].pszName = TR(L"All files");
+    filters[1].pszSpec = L"*.*";
+    IFileDialog_SetTitle(dialog, TR(L"Choose a picture"));
+    IFileDialog_SetFileTypes(dialog, ARRAYSIZE(filters), filters);
+    if (SUCCEEDED(IFileDialog_GetOptions(dialog, &options)))
+        IFileDialog_SetOptions(dialog, options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST);
+    hr = IFileDialog_Show(dialog, owner);
+    if (SUCCEEDED(hr) && SUCCEEDED(hr = IFileDialog_GetResult(dialog, &result))) {
+        if (SUCCEEDED(hr = IShellItem_GetDisplayName(result, SIGDN_FILESYSPATH, &chosen))) {
+            ok = SUCCEEDED(StringCchCopyW(path, cch, chosen));
+            if (!ok) Ui_Message(owner, MB_ICONERROR, TR(L"The path is too long."));
+            CoTaskMemFree(chosen);
+        }
+        IShellItem_Release(result);
+    }
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        Ui_Message(owner, MB_ICONERROR, TR(L"The file could not be chosen (error 0x%08lX)."), (unsigned long)hr);
+    IFileDialog_Release(dialog);
+    return ok;
+}
+
+static void ChoosePicture(HWND dialog, ProfileDialog *state)
+{
+    WCHAR path[MAX_PATH];
+    DWORD *picture;
+    HCURSOR old;
+    HRESULT hr = S_OK;
+    if (!ChoosePictureFile(dialog, path, ARRAYSIZE(path))) return;
+    old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    picture = Icons_ReadPicture(path, &hr);
+    SetCursor(old);
+    if (!picture) {
+        Util_Log(L"could not read the picture %s (0x%08lX)", path, (unsigned long)hr);
+        Ui_Message(dialog, MB_ICONWARNING,
+                   TR(L"This picture could not be read (error 0x%08lX).\n\nWindows reads PNG, JPEG, GIF, BMP, TIFF and ICO files; "
+                      L"WebP and HEIF need their extension from the Microsoft Store."),
+                   (unsigned long)hr);
+        return;
+    }
+    if (state->picture) HeapFree(GetProcessHeap(), 0, state->picture);
+    state->picture = picture;
+    state->pictureChanged = TRUE;
+}
 
 /* The "Copy settings from" check box: a long profile name is cut (with an
  * ellipsis) until the caption and the box's glyph fit the control. */
@@ -681,20 +829,23 @@ static void UpdatePreview(HWND dialog, ProfileDialog *state)
 {
     Profile sample;
     HICON icon;
-    int color = (int)SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_GETCURSEL, 0, 0), size;
-    WCHAR initial;
+    WCHAR shown[BADGE_CCH];
+    int size;
     ZeroMemory(&sample, sizeof sample);
     GetDlgItemTextW(dialog, IDC_P_NAME, sample.name, ARRAYSIZE(sample.name));
-    sample.color = color >= 0 && color < PALETTE_SIZE ? color : 0;
+    sample.color = ChosenColor(dialog, state);
+    ChosenBadge(dialog, state, sample.name, sample.badge, ARRAYSIZE(sample.badge));
+    Icons_BadgeText(&sample, shown, ARRAYSIZE(shown));
     size = MulDiv(PREVIEW_ICON_DIPS, (int)GetDpiForWindow(dialog), 96);
-    initial = Icons_ProfileInitial(sample.name);
-    if (state->preview && state->previewInitial == initial && state->previewColor == sample.color && state->previewSize == size)
+    if (state->preview && wcscmp(state->previewBadge, shown) == 0 && state->previewPicture == state->picture &&
+        state->previewColor == sample.color && state->previewSize == size)
         return;
-    icon = Icons_Create(&g_manager.pkg, &sample, size);
+    icon = Icons_CreateWith(&g_manager.pkg, &sample, state->picture, size);
     SendDlgItemMessageW(dialog, IDC_P_PREVIEW, STM_SETICON, (WPARAM)icon, 0);
     if (state->preview) DestroyIcon(state->preview);
     state->preview = icon;
-    state->previewInitial = initial;
+    StringCchCopyW(state->previewBadge, ARRAYSIZE(state->previewBadge), shown);
+    state->previewPicture = state->picture;
     state->previewColor = sample.color;
     state->previewSize = size;
 }
@@ -702,7 +853,6 @@ static void UpdatePreview(HWND dialog, ProfileDialog *state)
 static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
     ProfileDialog *state = (ProfileDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
-    int i;
 
     switch (message) {
     case WM_INITDIALOG:
@@ -710,9 +860,19 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
         SetWindowTextW(dialog, state->existing ? TR(L"Edit profile") : TR(L"New profile"));
         SendDlgItemMessageW(dialog, IDC_P_NAME, EM_LIMITTEXT, state->existing ? MAX_LABEL : MAX_NAME, 0);
-        for (i = 0; i < PALETTE_SIZE; i++) SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_ADDSTRING, 0, (LPARAM)TR(g_ColorNames[i]));
-        SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_SETCURSEL, (WPARAM)(state->color >= 0 && state->color < PALETTE_SIZE ? state->color : 0), 0);
+        SendDlgItemMessageW(dialog, IDC_P_BADGE, EM_LIMITTEXT, 2 * MAX_BADGE, 0);   /* surrogate pairs too */
+        FillColors(dialog, state);
         if (state->existing) SetDlgItemTextW(dialog, IDC_P_NAME, state->existing->name);
+        state->badgeOwn = state->existing && state->existing->badge[0];
+        if (state->badgeOwn) {
+            state->filling = TRUE;
+            SetDlgItemTextW(dialog, IDC_P_BADGE, state->existing->badge);
+            state->filling = FALSE;
+        } else {
+            FollowName(dialog, state);
+        }
+        if (state->existing && state->existing->picture) state->picture = Icons_LoadPicture(state->existing);
+        ShowPictureState(dialog, state);
         CheckDlgButton(dialog, IDC_P_STARTUP, state->startup ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(dialog, IDC_P_OPEN, state->openNow ? BST_CHECKED : BST_UNCHECKED);
         /* A check box the dialog does not offer leaves no empty row (Theme_FitDialog closes it). */
@@ -732,7 +892,34 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
         case IDC_P_NAME:
             if (HIWORD(wp) == EN_CHANGE) {
                 ValidateProfileDialog(dialog, state, TRUE);
+                FollowName(dialog, state);
                 UpdatePreview(dialog, state);
+            }
+            return TRUE;
+        case IDC_P_BADGE:
+            if (HIWORD(wp) == EN_CHANGE && !state->filling) {
+                WCHAR typed[32];
+                GetDlgItemTextW(dialog, IDC_P_BADGE, typed, ARRAYSIZE(typed));
+                /* Emptied, the badge goes back to the initial. */
+                state->badgeOwn = typed[0] != 0;
+                UpdatePreview(dialog, state);
+            }
+            return TRUE;
+        case IDC_P_PICTURE:
+            if (HIWORD(wp) == BN_CLICKED) {
+                ChoosePicture(dialog, state);
+                ShowPictureState(dialog, state);
+                UpdatePreview(dialog, state);
+            }
+            return TRUE;
+        case IDC_P_NO_PICTURE:
+            if (HIWORD(wp) == BN_CLICKED && state->picture) {
+                HeapFree(GetProcessHeap(), 0, state->picture);
+                state->picture = NULL;
+                state->pictureChanged = TRUE;
+                ShowPictureState(dialog, state);
+                UpdatePreview(dialog, state);
+                SetFocus(GetDlgItem(dialog, IDC_P_PICTURE));
             }
             return TRUE;
         case IDC_P_COLOR:
@@ -740,8 +927,8 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
             return TRUE;
         case IDOK:
             if (!ValidateProfileDialog(dialog, state, TRUE)) return TRUE;
-            i = (int)SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_GETCURSEL, 0, 0);
-            state->color = i >= 0 && i < PALETTE_SIZE ? i : 0;
+            state->color = ChosenColor(dialog, state);
+            ChosenBadge(dialog, state, state->name, state->badge, ARRAYSIZE(state->badge));
             state->openNow = IsDlgButtonChecked(dialog, IDC_P_OPEN) == BST_CHECKED;
             state->startup = IsDlgButtonChecked(dialog, IDC_P_STARTUP) == BST_CHECKED;
             state->copy = !state->existing && state->copyFrom && IsDlgButtonChecked(dialog, IDC_P_COPY) == BST_CHECKED;
@@ -951,12 +1138,24 @@ static void DoNew(void)
     if (SelectedProfile()) source = *SelectedProfile();
     else if ((i = Profiles_DefaultIndex(&g_manager.profiles)) >= 0) source = g_manager.profiles.items[i];
     dialog.copyFrom = source.folder[0] ? &source : NULL;
-    if (Ui_Dialog(g_manager.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&dialog) != IDOK || StateChangesBlocked()) return;
+    if (Ui_Dialog(g_manager.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&dialog) != IDOK || StateChangesBlocked()) {
+        if (dialog.picture) HeapFree(GetProcessHeap(), 0, dialog.picture);
+        return;
+    }
     FinishShellWork();
     if (!Profiles_Create(dialog.name, dialog.color, folder, ARRAYSIZE(folder), error, ARRAYSIZE(error))) {
+        if (dialog.picture) HeapFree(GetProcessHeap(), 0, dialog.picture);
         Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", error);
         return;
     }
+    if (dialog.badge[0] || dialog.picture) {
+        DWORD stamp = 0;
+        if (dialog.picture && !Icons_SavePicture(folder, dialog.picture, &stamp))
+            Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The picture could not be saved: the profile shows the Claude icon."));
+        if (!Profiles_Update(folder, dialog.name, dialog.color, dialog.badge, stamp))
+            Util_Log(L"could not save the badge and picture of %s (error %lu)", folder, GetLastError());
+    }
+    if (dialog.picture) HeapFree(GetProcessHeap(), 0, dialog.picture);
     Refresh(FALSE);
     i = Profiles_Find(&g_manager.profiles, folder);
     if (i < 0) {
@@ -978,26 +1177,42 @@ static void DoEdit(void)
     Profile before, after;
     ProfileDialog dialog;
     WCHAR icon[MAX_PATH];
-    BOOL atStartup;
+    BOOL atStartup, saved;
+    DWORD picture;
     if (!selected) return;
     before = *selected;
     ZeroMemory(&dialog, sizeof dialog);
     dialog.existing = &before;
     dialog.color = before.color;
     dialog.startup = atStartup = Shortcut_IsAtStartup(&before);
-    if (Ui_Dialog(g_manager.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&dialog) != IDOK || StateChangesBlocked()) return;
+    if (Ui_Dialog(g_manager.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&dialog) != IDOK || StateChangesBlocked()) {
+        if (dialog.picture) HeapFree(GetProcessHeap(), 0, dialog.picture);
+        return;
+    }
     FinishShellWork();
-    if (!Profiles_Update(before.folder, dialog.name, dialog.color)) {
+    picture = before.picture;
+    if (dialog.pictureChanged && !dialog.picture) picture = 0;
+    else if (dialog.pictureChanged && !Icons_SavePicture(before.folder, dialog.picture, &picture)) {
+        picture = before.picture;
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The picture could not be saved: the profile keeps its icon."));
+    }
+    if (dialog.picture) HeapFree(GetProcessHeap(), 0, dialog.picture);
+    saved = Profiles_Update(before.folder, dialog.name, dialog.color, dialog.badge, picture);
+    if (!saved) {
         Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The profile could not be saved."));
         return;
     }
+    if (!picture && before.picture) Icons_DeletePicture(before.folder);
     after = before;
     StringCchCopyW(after.name, ARRAYSIZE(after.name), dialog.name);
     after.color = dialog.color;
-    /* The list shows the new name and color first; its shortcuts and pins follow. */
+    StringCchCopyW(after.badge, ARRAYSIZE(after.badge), dialog.badge);
+    after.picture = picture;
+    /* The list shows the new name and icon first; its shortcuts and pins follow. */
     Refresh(FALSE);
     ShowChanges();
-    if ((wcscmp(before.name, after.name) != 0 || before.color != after.color) &&
+    if ((wcscmp(before.name, after.name) != 0 || before.color != after.color || wcscmp(before.badge, after.badge) != 0 ||
+         before.picture != after.picture) &&
         Icons_Ensure(&g_manager.pkg, &after, icon, ARRAYSIZE(icon)))
         ApplyBadge(&before, &after, icon);
     if (dialog.startup != atStartup) SetProfileStartup(&after, dialog.startup);

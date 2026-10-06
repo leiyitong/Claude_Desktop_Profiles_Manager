@@ -41,7 +41,7 @@ rem The tests link every object: one left from a renamed or deleted source must 
 del /q "%OUT%\obj\*.obj" "%OUT%\obj\app.res" "%OUT%\obj\%EXE_NAME%" >nul 2>&1
 
 set "CFLAGS=/nologo /W4 /WX /O2 /MT /GS /guard:cf /sdl /utf-8 /DUNICODE /D_UNICODE"
-set "LIBS=user32.lib gdi32.lib shell32.lib ole32.lib comctl32.lib advapi32.lib uuid.lib uxtheme.lib dwmapi.lib winhttp.lib oleaut32.lib wintrust.lib crypt32.lib"
+set "LIBS=user32.lib gdi32.lib shell32.lib ole32.lib comctl32.lib advapi32.lib uuid.lib uxtheme.lib dwmapi.lib winhttp.lib oleaut32.lib wintrust.lib crypt32.lib windowscodecs.lib"
 
 pushd "%ROOT%src" || exit /b 1
 rc /nologo /fo "%OUT%\obj\app.res" app.rc

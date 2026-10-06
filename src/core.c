@@ -205,6 +205,31 @@ BOOL Core_ValidateLabel(const WCHAR *raw, WCHAR *label, size_t cch, const WCHAR 
     return TRUE;
 }
 
+BOOL Core_CleanBadge(const WCHAR *raw, WCHAR *badge, size_t cch)
+{
+    const WCHAR *start;
+    size_t n, i, length = 0;
+    int characters = 0;
+    if (!badge || cch == 0) return FALSE;
+    badge[0] = 0;
+    if (!raw) return TRUE;
+    n = TrimmedSpan(raw, &start);
+    for (i = 0; i < n && characters < MAX_BADGE; i++, characters++) {
+        BOOL pair = IS_HIGH_SURROGATE(start[i]) && i + 1 < n && IS_LOW_SURROGATE(start[i + 1]);
+        if (IsControl(start[i])) {
+            badge[0] = 0;
+            return FALSE;
+        }
+        if (length + (pair ? 2 : 1) >= cch) break;
+        badge[length++] = start[i];
+        if (pair) badge[length++] = start[++i];
+    }
+    /* "A B" cut after its space. */
+    while (length > 0 && IsSpace(badge[length - 1])) length--;
+    badge[length] = 0;
+    return TRUE;
+}
+
 BOOL Core_IsProfileFolder(const WCHAR *folder)
 {
     size_t prefixLength = wcslen(PROFILE_PREFIX), n, i;

@@ -1,7 +1,9 @@
 /*
  * Profile icons: the installed Claude icon with a colored badge carrying the
- * profile's initial, so shortcuts and taskbar pins can be told apart; the
- * badge alone; and Claude's notification-area glyph in the profile's color.
+ * profile's initial (or its own text of one or two characters), so shortcuts
+ * and taskbar pins can be told apart, or a picture of the user's own in its
+ * place; the badge alone; and Claude's notification-area glyph in the
+ * profile's color.
  *
  * Plain GDI and straight-alpha BGRA buffers (0xAARRGGBB): the Claude icon is
  * extracted at each size by Windows, the badge is drawn with analytic
@@ -10,11 +12,17 @@
  * exact area coverage, centered on the middle of its ink rather than on its
  * text box, so it sits in the middle of the badge at every size. The Claude
  * artwork is never shipped: it is read from the user's own installation.
+ *
+ * A picture is read by Windows' own codecs (WIC), cut to its middle square,
+ * scaled to PICTURE_SIZE and kept as pictures\<folder>.png in the state
+ * folder, so the file the user chose can go. Icons show it alone: no badge.
+ * Windows' icons do not move, so a GIF shows its first frame.
  */
 #include "app.h"
 #include "resource.h"
 #include <math.h>
 #include <string.h>
+#include <wincodec.h>
 
 #define MAX_ICON_SIZE        256
 #define MIN_ICON_SIZE        8
@@ -47,14 +55,24 @@
 #define ICON_EXTENSION      L".ico"
 #define TEMPORARY_EXTENSION L".tmp"
 #define DWORD_DIGITS        10   /* 4294967295: a process ID in a file name */
+#define PICTURES_DIR        L"pictures"
+#define PICTURE_EXTENSION   L".png"
+#define PICTURE_CACHE       4    /* pictures kept decoded: every list refresh draws the profiles' again */
 
+/* Mid and dark tones, under which the white initial stays legible; the
+ * first eight keep the index release 1.1 saved. */
 const WCHAR *const g_ColorNames[PALETTE_SIZE] = {
     L"Orange", L"Blue", L"Green", L"Purple", L"Red", L"Teal", L"Pink", L"Slate",
+    L"Amber", L"Gold", L"Lime", L"Forest", L"Sky", L"Indigo", L"Fuchsia", L"Crimson",
+    L"Brown", L"Navy", L"Plum", L"Graphite",
 };
 
 static const COLORREF kPalette[PALETTE_SIZE] = {
     RGB(0xE0, 0x7A, 0x3F), RGB(0x25, 0x63, 0xEB), RGB(0x16, 0xA3, 0x4A), RGB(0x7C, 0x3A, 0xED),
     RGB(0xDC, 0x26, 0x26), RGB(0x0D, 0x94, 0x88), RGB(0xDB, 0x27, 0x77), RGB(0x47, 0x55, 0x69),
+    RGB(0xD9, 0x77, 0x06), RGB(0xCA, 0x8A, 0x04), RGB(0x65, 0xA3, 0x0D), RGB(0x16, 0x65, 0x34),
+    RGB(0x02, 0x84, 0xC7), RGB(0x4F, 0x46, 0xE5), RGB(0xC0, 0x26, 0xD3), RGB(0x9F, 0x12, 0x39),
+    RGB(0x92, 0x40, 0x0E), RGB(0x1E, 0x3A, 0x8A), RGB(0x6B, 0x21, 0xA8), RGB(0x27, 0x27, 0x2A),
 };
 
 /* The sizes Windows asks for at every scale from 100 % to 300 % (100, 125,
@@ -73,6 +91,8 @@ static COLORREF PaletteColor(int index)
 {
     return kPalette[index >= 0 && index < PALETTE_SIZE ? index : 0];
 }
+
+COLORREF Icons_PaletteColor(int index) { return PaletteColor(index); }
 
 /* A size x size, 32-bit DIB whose rows run top-down, as in the pixel buffers. */
 static void InitTopDownBitmapInfo(BITMAPINFO *info, int size)
@@ -175,14 +195,15 @@ static double Clamp01(double value) { return value < 0.0 ? 0.0 : (value > 1.0 ? 
 
 /* ------------------------------------------------------------- initial */
 
-/* The initial, drawn once at GLYPH_EM pixels on a GLYPH_CANVAS square: a
- * summed-area table of its coverage (0..255) over the box around its ink. */
+/* The initial (or the badge's own text), drawn once at GLYPH_EM pixels on a
+ * GLYPH_CANVAS square: a summed-area table of its coverage (0..255) over the
+ * box around its ink. */
 #define GLYPH_CANVAS 512
 #define GLYPH_EM     256
 #define GLYPH_CACHE  8   /* initials kept: every list refresh draws the profiles' again */
 
 typedef struct Glyph {
-    WCHAR  letter;
+    WCHAR  text[BADGE_CCH];
     int    width, height;   /* the ink box, in canvas pixels */
     DWORD *sum;             /* (width + 1) x (height + 1) */
 } Glyph;
@@ -191,7 +212,7 @@ static SRWLOCK g_glyphLock = SRWLOCK_INIT;
 static Glyph g_glyphCache[GLYPH_CACHE];
 static int g_glyphCacheNext;   /* the entry replaced next */
 
-static BOOL RasterizeLetter(WCHAR letter, Glyph *glyph)
+static BOOL RasterizeLetter(const WCHAR *text, Glyph *glyph)
 {
     const int canvas = GLYPH_CANVAS;
     BITMAPINFO info;
@@ -202,10 +223,11 @@ static BOOL RasterizeLetter(WCHAR letter, Glyph *glyph)
     HFONT font, oldFont;
     TEXTMETRICW metrics;
     SIZE extent;
-    int x, y, stride, left = canvas, top = canvas, right = -1, bottom = -1;
+    int x, y, stride, left = canvas, top = canvas, right = -1, bottom = -1, length = (int)wcslen(text);
     BOOL ok = FALSE;
 
     ZeroMemory(glyph, sizeof *glyph);
+    if (length <= 0 || length >= BADGE_CCH) return FALSE;
     InitTopDownBitmapInfo(&info, canvas);
     dc = CreateCompatibleDC(NULL);
     bitmap = dc ? CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, NULL, 0) : NULL;
@@ -223,9 +245,10 @@ static BOOL RasterizeLetter(WCHAR letter, Glyph *glyph)
     oldFont = (HFONT)SelectObject(dc, font);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, WHITE);
-    /* Unmeasured, the letter is not drawn: no ink, no glyph cached. */
-    if (GetTextMetricsW(dc, &metrics) && GetTextExtentPoint32W(dc, &letter, 1, &extent))
-        TextOutW(dc, (canvas - extent.cx) / 2, (canvas - metrics.tmHeight) / 2, &letter, 1);
+    /* Unmeasured, the letter is not drawn: no ink, no glyph cached. A text
+     * wider than the canvas is cut: two characters fit at this size. */
+    if (GetTextMetricsW(dc, &metrics) && GetTextExtentPoint32W(dc, text, length, &extent))
+        TextOutW(dc, max(0, (canvas - extent.cx) / 2), (canvas - metrics.tmHeight) / 2, text, length);
     GdiFlush();
 
     pixels = (const DWORD *)bits;
@@ -250,7 +273,7 @@ static BOOL RasterizeLetter(WCHAR letter, Glyph *glyph)
                     glyph->sum[(y + 1) * stride + x + 1] = glyph->sum[y * stride + x + 1] + row;
                 }
             }
-            glyph->letter = letter;
+            StringCchCopyW(glyph->text, ARRAYSIZE(glyph->text), text);
             ok = TRUE;
         }
     }
@@ -265,7 +288,7 @@ static BOOL RasterizeLetter(WCHAR letter, Glyph *glyph)
 /* A copy of the initial's glyph (free its `sum`), from the cache, else drawn
  * and kept there. Its `sum` stays NULL when it cannot be drawn: the badge
  * then has no initial. */
-static void LoadGlyph(WCHAR letter, Glyph *glyph)
+static void LoadGlyph(const WCHAR *text, Glyph *glyph)
 {
     const Glyph *cached = NULL;
     Glyph drawn;
@@ -274,8 +297,8 @@ static void LoadGlyph(WCHAR letter, Glyph *glyph)
     ZeroMemory(glyph, sizeof *glyph);
     AcquireSRWLockExclusive(&g_glyphLock);
     for (i = 0; i < GLYPH_CACHE && !cached; i++)
-        if (g_glyphCache[i].sum && g_glyphCache[i].letter == letter) cached = &g_glyphCache[i];
-    if (!cached && RasterizeLetter(letter, &drawn)) {
+        if (g_glyphCache[i].sum && wcscmp(g_glyphCache[i].text, text) == 0) cached = &g_glyphCache[i];
+    if (!cached && RasterizeLetter(text, &drawn)) {
         Free(g_glyphCache[g_glyphCacheNext].sum);
         g_glyphCache[g_glyphCacheNext] = drawn;
         cached = &g_glyphCache[g_glyphCacheNext];
@@ -357,6 +380,18 @@ WCHAR Icons_ProfileInitial(const WCHAR *name)
     return 0;
 }
 
+void Icons_BadgeText(const Profile *profile, WCHAR *out, size_t cch)
+{
+    WCHAR initial[2] = { 0, 0 };
+    if (!out || !cch) return;
+    if (profile->badge[0]) {
+        StringCchCopyW(out, cch, profile->badge);
+        return;
+    }
+    initial[0] = Icons_ProfileInitial(profile->name);
+    StringCchCopyW(out, cch, initial);
+}
+
 /* -------------------------------------------------------------- badge */
 
 /* A disc of radius `radius` in `color` inside a white ring of width `ring`. */
@@ -396,10 +431,49 @@ static BOOL ClaudeArtExe(const ClaudePackage *pkg, WCHAR *exe, size_t cch)
     return Claude_FindPackage(&current) && SUCCEEDED(StringCchCopyW(exe, cch, current.exe));
 }
 
-/* The profile's icon at size x size: the artwork of `artExe` (NULL: the
- * manager's own) with the badge. FALSE when that artwork cannot be read. */
-static BOOL RenderProfileIcon(const WCHAR *artExe, const Profile *profile, int size, DWORD *pixels, const Glyph *glyph)
+/* The picture at size x size: each pixel the average of the part of the
+ * picture under it, weighted by its opacity (premultiplied), so that the
+ * transparent parts do not darken the edges. */
+static void ScalePicture(const DWORD *picture, int size, DWORD *pixels)
 {
+    const double step = (double)PICTURE_SIZE / size;
+    int x, y, sx, sy;
+    for (y = 0; y < size; y++) {
+        double y0 = y * step, y1 = (y + 1) * step;
+        for (x = 0; x < size; x++) {
+            double x0 = x * step, x1 = (x + 1) * step, a = 0, r = 0, g = 0, b = 0, area = 0;
+            for (sy = (int)y0; sy < PICTURE_SIZE && sy < y1; sy++) {
+                double hy = min(y1, sy + 1.0) - max(y0, (double)sy);
+                for (sx = (int)x0; sx < PICTURE_SIZE && sx < x1; sx++) {
+                    DWORD source = picture[sy * PICTURE_SIZE + sx];
+                    double weight = (min(x1, sx + 1.0) - max(x0, (double)sx)) * hy, alpha = ((source >> 24) & 0xFF) / 255.0;
+                    a += weight * alpha;
+                    r += weight * alpha * ((source >> 16) & 0xFF);
+                    g += weight * alpha * ((source >> 8) & 0xFF);
+                    b += weight * alpha * (source & 0xFF);
+                    area += weight;
+                }
+            }
+            if (area <= 0 || a <= 0) {
+                pixels[y * size + x] = 0;
+                continue;
+            }
+            pixels[y * size + x] = ((DWORD)(a / area * 255.0 + 0.5) << 24) | ((DWORD)(r / a + 0.5) << 16) |
+                                   ((DWORD)(g / a + 0.5) << 8) | (DWORD)(b / a + 0.5);
+        }
+    }
+}
+
+/* The profile's icon at size x size: its picture when it has one, else the
+ * artwork of `artExe` (NULL: the manager's own) with the badge. FALSE when
+ * that artwork cannot be read. */
+static BOOL RenderProfileIcon(const WCHAR *artExe, const Profile *profile, const DWORD *picture, int size, DWORD *pixels,
+                              const Glyph *glyph)
+{
+    if (picture) {
+        ScalePicture(picture, size, pixels);
+        return TRUE;
+    }
     if (!TakeIconPixels(artExe ? ExtractSizedIcon(artExe, size) : ManagerIcon(size), size, pixels)) return FALSE;
     DrawBadge(pixels, size, PaletteColor(profile->color), glyph);
     return TRUE;
@@ -469,7 +543,7 @@ static BOOL SaveIconFile(const WCHAR *path, const BYTE *data, DWORD bytes, DWORD
 /* Every size of the profile's icon, drawn on `artExe`'s artwork (NULL: the
  * manager's), in one .ico. FALSE when the artwork cannot be read at a size:
  * the file is then not written. */
-static BOOL WriteIconFile(const WCHAR *path, const WCHAR *artExe, const Profile *profile)
+static BOOL WriteIconFile(const WCHAR *path, const WCHAR *artExe, const Profile *profile, const DWORD *picture)
 {
     const int count = ARRAYSIZE(kIcoSizes);
     const size_t headerBytes = ICONDIR_BYTES + ICONDIRENTRY_BYTES * (size_t)count;
@@ -479,9 +553,10 @@ static BOOL WriteIconFile(const WCHAR *path, const WCHAR *artExe, const Profile 
     BOOL ok = FALSE;
     int i, x, y;
     Glyph glyph;
-    WCHAR letter = Icons_ProfileInitial(profile->name);
+    WCHAR badge[BADGE_CCH];
 
     ZeroMemory(&glyph, sizeof glyph);
+    Icons_BadgeText(profile, badge, ARRAYSIZE(badge));
     for (i = 0; i < count; i++) total += IcoImageBytes(kIcoSizes[i]);
     file = (BYTE *)Alloc(total);
     pixels = (DWORD *)Alloc((size_t)MAX_ICON_SIZE * MAX_ICON_SIZE * sizeof(DWORD));
@@ -489,7 +564,7 @@ static BOOL WriteIconFile(const WCHAR *path, const WCHAR *artExe, const Profile 
         if (FirstIconFailure()) Util_Log(L"could not make icon %s: not enough memory", path);
         goto done;
     }
-    if (letter) LoadGlyph(letter, &glyph);
+    if (badge[0] && !picture) LoadGlyph(badge, &glyph);
 
     directory = file;
     AppendWord(&directory, 0);
@@ -499,7 +574,7 @@ static BOOL WriteIconFile(const WCHAR *path, const WCHAR *artExe, const Profile 
     for (i = 0; i < count; i++) {
         int size = kIcoSizes[i];
         DWORD bytes = (DWORD)IcoImageBytes(size);
-        if (!RenderProfileIcon(artExe, profile, size, pixels, &glyph)) {
+        if (!RenderProfileIcon(artExe, profile, picture, size, pixels, &glyph)) {
             if (FirstIconFailure())
                 Util_Log(L"could not read the artwork of %s at %d pixels for %s", artExe ? artExe : L"the manager", size, path);
             goto done;
@@ -550,14 +625,20 @@ static BOOL IconsDir(WCHAR *out, size_t cch)
            SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\icons", state));
 }
 
-/* The file name encodes what the icon shows (name, color, whether it is drawn
- * on the Claude artwork, and the drawing's revision), so a change produces a
- * new file and Explorer's icon cache cannot serve a stale image. */
+/* The file name encodes what the icon shows (name, color, badge text,
+ * picture, whether it is drawn on the Claude artwork, and the drawing's
+ * revision), so a change produces a new file and Explorer's icon cache cannot
+ * serve a stale image. A profile without a badge text or a picture keeps the
+ * name release 1.1 gave its icon. */
 #define ICON_REVISION 4
 static BOOL IconFilePath(const WCHAR *directory, const Profile *profile, BOOL claudeArt, WCHAR *out, size_t cch)
 {
-    WCHAR style[LABEL_CCH + 16];
-    StringCchPrintfW(style, ARRAYSIZE(style), L"%s|%d|%c|%d", profile->name, profile->color, claudeArt ? L'c' : L'x', ICON_REVISION);
+    WCHAR style[LABEL_CCH + BADGE_CCH + 32];
+    if (profile->badge[0] || profile->picture)
+        StringCchPrintfW(style, ARRAYSIZE(style), L"%s|%d|%s|%08lX|%c|%d", profile->name, profile->color, profile->badge,
+                         (unsigned long)profile->picture, claudeArt ? L'c' : L'x', ICON_REVISION);
+    else
+        StringCchPrintfW(style, ARRAYSIZE(style), L"%s|%d|%c|%d", profile->name, profile->color, claudeArt ? L'c' : L'x', ICON_REVISION);
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\%08lX-%08lX" ICON_EXTENSION, directory,
                                       (unsigned long)Core_HashIgnoringCase(profile->folder),
                                       (unsigned long)Core_HashIgnoringCase(style)));
@@ -621,15 +702,21 @@ static BOOL ProcessEnded(DWORD processId)
 BOOL Icons_Ensure(const ClaudePackage *pkg, const Profile *profile, WCHAR *out, size_t cch)
 {
     WCHAR directory[MAX_PATH], artExe[MAX_PATH];
-    BOOL claudeArt = pkg && pkg->found;
+    BOOL claudeArt = pkg && pkg->found, ok;
+    DWORD *picture;
     if (!IconsDir(directory, ARRAYSIZE(directory)) || !IconFilePath(directory, profile, claudeArt, out, cch)) return FALSE;
     if (Util_FileExists(out)) return TRUE;
     if (!Util_EnsureDir(directory)) return FALSE;
-    if (!claudeArt) return WriteIconFile(out, NULL, profile);
-    if (ClaudeArtExe(pkg, artExe, ARRAYSIZE(artExe)) && WriteIconFile(out, artExe, profile)) return TRUE;
+    /* A picture that cannot be read leaves the Claude icon and the badge, as
+     * if there were none (the file name still says which picture it was). */
+    picture = Icons_LoadPicture(profile);
+    if (!claudeArt) ok = WriteIconFile(out, NULL, profile, picture);
+    else if (ClaudeArtExe(pkg, artExe, ARRAYSIZE(artExe)) && WriteIconFile(out, artExe, profile, picture)) ok = TRUE;
     /* Claude's artwork could not be read: the manager's, under its own name,
      * so that Icons_IsStale offers Claude's again later. */
-    return IconFilePath(directory, profile, FALSE, out, cch) && (Util_FileExists(out) || WriteIconFile(out, NULL, profile));
+    else ok = IconFilePath(directory, profile, FALSE, out, cch) && (Util_FileExists(out) || WriteIconFile(out, NULL, profile, picture));
+    Free(picture);
+    return ok;
 }
 
 static HICON PixelsToIcon(const DWORD *pixels, int size)
@@ -666,23 +753,31 @@ done:
     return icon;
 }
 
-HICON Icons_Create(const ClaudePackage *pkg, const Profile *profile, int size)
+HICON Icons_CreateWith(const ClaudePackage *pkg, const Profile *profile, const DWORD *picture, int size)
 {
-    WCHAR artExe[MAX_PATH];
+    WCHAR artExe[MAX_PATH], badge[BADGE_CCH];
     DWORD *pixels;
     HICON icon = NULL;
     Glyph glyph;
-    WCHAR letter = Icons_ProfileInitial(profile->name);
     if (size < MIN_ICON_SIZE || size > MAX_ICON_SIZE) return NULL;
     pixels = (DWORD *)Alloc((size_t)size * size * sizeof(DWORD));
     if (!pixels) return NULL;
     ZeroMemory(&glyph, sizeof glyph);
-    if (letter && size >= MIN_LETTER_SIZE) LoadGlyph(letter, &glyph);
-    if ((ClaudeArtExe(pkg, artExe, ARRAYSIZE(artExe)) && RenderProfileIcon(artExe, profile, size, pixels, &glyph)) ||
-        RenderProfileIcon(NULL, profile, size, pixels, &glyph))
+    Icons_BadgeText(profile, badge, ARRAYSIZE(badge));
+    if (badge[0] && !picture && size >= MIN_LETTER_SIZE) LoadGlyph(badge, &glyph);
+    if ((ClaudeArtExe(pkg, artExe, ARRAYSIZE(artExe)) && RenderProfileIcon(artExe, profile, picture, size, pixels, &glyph)) ||
+        RenderProfileIcon(NULL, profile, picture, size, pixels, &glyph))
         icon = PixelsToIcon(pixels, size);
     Free(glyph.sum);
     Free(pixels);
+    return icon;
+}
+
+HICON Icons_Create(const ClaudePackage *pkg, const Profile *profile, int size)
+{
+    DWORD *picture = Icons_LoadPicture(profile);
+    HICON icon = Icons_CreateWith(pkg, profile, picture, size);
+    Free(picture);
     return icon;
 }
 
@@ -789,4 +884,257 @@ void Icons_DeleteStale(const Profile *profile, const WCHAR *keep)
         VisitIconFiles(directory, pattern, DeleteStaleVisitor, (void *)keep);
     if (ProfileIconPattern(directory, profile, TRUE, pattern, ARRAYSIZE(pattern)))
         VisitIconFiles(directory, pattern, DeleteOrphanVisitor, NULL);
+}
+
+/* ------------------------------------------------------------- pictures */
+
+static BOOL PicturePath(const WCHAR *folder, WCHAR *out, size_t cch)
+{
+    WCHAR state[MAX_PATH];
+    return folder && folder[0] && Util_StateDir(state, ARRAYSIZE(state)) &&
+           SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" PICTURES_DIR L"\\%s" PICTURE_EXTENSION, state, folder));
+}
+
+/* A hash of its pixels, never 0 (no picture). */
+static DWORD PictureStamp(const DWORD *pixels)
+{
+    ULONGLONG hash = Core_HashBytes(CORE_HASH_START, pixels, (size_t)PICTURE_SIZE * PICTURE_SIZE * sizeof(DWORD));
+    DWORD stamp = (DWORD)(hash ^ (hash >> 32));
+    return stamp ? stamp : 1;
+}
+
+/* WIC's factory, with COM started on this thread for as long as it is used
+ * (a thread that started it in another mode keeps that one). */
+typedef struct Codecs {
+    IWICImagingFactory *factory;
+    BOOL                started;
+} Codecs;
+
+static HRESULT OpenCodecs(Codecs *codecs)
+{
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    codecs->started = SUCCEEDED(hr);
+    codecs->factory = NULL;
+    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&codecs->factory);
+    if (FAILED(hr) && codecs->started) {
+        CoUninitialize();
+        codecs->started = FALSE;
+    }
+    return hr;
+}
+
+static void CloseCodecs(Codecs *codecs)
+{
+    if (codecs->factory) IWICImagingFactory_Release(codecs->factory);
+    if (codecs->started) CoUninitialize();
+    ZeroMemory(codecs, sizeof *codecs);
+}
+
+DWORD *Icons_ReadPicture(const WCHAR *path, HRESULT *result)
+{
+    const UINT stride = PICTURE_SIZE * sizeof(DWORD), bytes = stride * PICTURE_SIZE;
+    Codecs codecs;
+    IWICBitmapDecoder *decoder = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    IWICBitmapSource *converted = NULL;
+    IWICBitmapClipper *clipper = NULL;
+    IWICBitmapScaler *scaler = NULL;
+    UINT width = 0, height = 0, side = 0, i;
+    WICRect square;
+    DWORD *pixels = NULL;
+    HRESULT hr = OpenCodecs(&codecs);
+
+    if (SUCCEEDED(hr))
+        hr = IWICImagingFactory_CreateDecoderFromFilename(codecs.factory, path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
+                                                          &decoder);
+    if (SUCCEEDED(hr)) hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);   /* a GIF's first frame */
+    /* Premultiplied, so that scaling does not bleed the color of transparent pixels. */
+    if (SUCCEEDED(hr)) hr = WICConvertBitmapSource(&GUID_WICPixelFormat32bppPBGRA, (IWICBitmapSource *)frame, &converted);
+    if (SUCCEEDED(hr)) hr = IWICBitmapSource_GetSize(converted, &width, &height);
+    if (SUCCEEDED(hr) && (!width || !height)) hr = WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
+    if (SUCCEEDED(hr)) {
+        side = min(width, height);
+        square.X = (INT)((width - side) / 2);
+        square.Y = (INT)((height - side) / 2);
+        square.Width = square.Height = (INT)side;
+        hr = IWICImagingFactory_CreateBitmapClipper(codecs.factory, &clipper);
+    }
+    if (SUCCEEDED(hr)) hr = IWICBitmapClipper_Initialize(clipper, converted, &square);
+    if (SUCCEEDED(hr)) hr = IWICImagingFactory_CreateBitmapScaler(codecs.factory, &scaler);
+    if (SUCCEEDED(hr)) {
+        /* Fant averages what it shrinks; a smaller picture grows smoothly. */
+        WICBitmapInterpolationMode mode = side >= PICTURE_SIZE ? WICBitmapInterpolationModeFant : WICBitmapInterpolationModeHighQualityCubic;
+        hr = IWICBitmapScaler_Initialize(scaler, (IWICBitmapSource *)clipper, PICTURE_SIZE, PICTURE_SIZE, mode);
+        if (FAILED(hr) && mode != WICBitmapInterpolationModeFant)
+            hr = IWICBitmapScaler_Initialize(scaler, (IWICBitmapSource *)clipper, PICTURE_SIZE, PICTURE_SIZE, WICBitmapInterpolationModeFant);
+    }
+    if (SUCCEEDED(hr) && (pixels = (DWORD *)Alloc(bytes)) == NULL) hr = E_OUTOFMEMORY;
+    if (SUCCEEDED(hr)) hr = IWICBitmapScaler_CopyPixels(scaler, NULL, stride, bytes, (BYTE *)pixels);
+    if (SUCCEEDED(hr)) {
+        /* Straight alpha, as every pixel buffer here. */
+        for (i = 0; i < PICTURE_SIZE * PICTURE_SIZE; i++) {
+            DWORD pixel = pixels[i], alpha = pixel >> 24;
+            if (alpha && alpha < 255)
+                pixels[i] = (alpha << 24) | (min(255, ((pixel >> 16) & 0xFF) * 255 / alpha) << 16) |
+                            (min(255, ((pixel >> 8) & 0xFF) * 255 / alpha) << 8) | min(255, (pixel & 0xFF) * 255 / alpha);
+            else if (!alpha)
+                pixels[i] = 0;
+        }
+    } else {
+        Free(pixels);
+        pixels = NULL;
+    }
+    if (scaler) IWICBitmapScaler_Release(scaler);
+    if (clipper) IWICBitmapClipper_Release(clipper);
+    if (converted) IWICBitmapSource_Release(converted);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (decoder) IWICBitmapDecoder_Release(decoder);
+    CloseCodecs(&codecs);
+    if (result) *result = hr;
+    return pixels;
+}
+
+/* A picture this program saved, as it was saved: PNG keeps straight alpha,
+ * so it comes back pixel for pixel (its stamp still matches). */
+static DWORD *ReadSavedPicture(const WCHAR *path)
+{
+    const UINT stride = PICTURE_SIZE * sizeof(DWORD), bytes = stride * PICTURE_SIZE;
+    Codecs codecs;
+    IWICBitmapDecoder *decoder = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    IWICBitmapSource *converted = NULL;
+    UINT width = 0, height = 0;
+    DWORD *pixels = NULL;
+    HRESULT hr = OpenCodecs(&codecs);
+    if (SUCCEEDED(hr))
+        hr = IWICImagingFactory_CreateDecoderFromFilename(codecs.factory, path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
+                                                          &decoder);
+    if (SUCCEEDED(hr)) hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+    if (SUCCEEDED(hr)) hr = WICConvertBitmapSource(&GUID_WICPixelFormat32bppBGRA, (IWICBitmapSource *)frame, &converted);
+    if (SUCCEEDED(hr)) hr = IWICBitmapSource_GetSize(converted, &width, &height);
+    if (SUCCEEDED(hr) && (width != PICTURE_SIZE || height != PICTURE_SIZE)) hr = WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
+    if (SUCCEEDED(hr) && (pixels = (DWORD *)Alloc(bytes)) == NULL) hr = E_OUTOFMEMORY;
+    if (SUCCEEDED(hr)) hr = IWICBitmapSource_CopyPixels(converted, NULL, stride, bytes, (BYTE *)pixels);
+    if (FAILED(hr)) {
+        Free(pixels);
+        pixels = NULL;
+    }
+    if (converted) IWICBitmapSource_Release(converted);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (decoder) IWICBitmapDecoder_Release(decoder);
+    CloseCodecs(&codecs);
+    return pixels;
+}
+
+/* The pictures decoded last, by folder and stamp. */
+typedef struct CachedPicture {
+    WCHAR  folder[FOLDER_CCH];
+    DWORD  stamp;
+    DWORD *pixels;
+} CachedPicture;
+
+static SRWLOCK g_pictureLock = SRWLOCK_INIT;
+static CachedPicture g_pictureCache[PICTURE_CACHE];
+static int g_pictureCacheNext;
+
+static DWORD *CopyPicture(const DWORD *pixels)
+{
+    const size_t bytes = (size_t)PICTURE_SIZE * PICTURE_SIZE * sizeof(DWORD);
+    DWORD *copy = (DWORD *)HeapAlloc(GetProcessHeap(), 0, bytes);
+    if (copy) memcpy(copy, pixels, bytes);
+    return copy;
+}
+
+DWORD *Icons_LoadPicture(const Profile *profile)
+{
+    WCHAR path[MAX_PATH];
+    DWORD *pixels = NULL, *read;
+    int i;
+    if (!profile || !profile->picture) return NULL;
+    AcquireSRWLockShared(&g_pictureLock);
+    for (i = 0; i < PICTURE_CACHE && !pixels; i++)
+        if (g_pictureCache[i].pixels && g_pictureCache[i].stamp == profile->picture && Core_EqualsI(g_pictureCache[i].folder, profile->folder))
+            pixels = CopyPicture(g_pictureCache[i].pixels);
+    ReleaseSRWLockShared(&g_pictureLock);
+    if (pixels || !PicturePath(profile->folder, path, ARRAYSIZE(path))) return pixels;
+    /* Another picture than the one the profile names (written since, by
+     * another process) is not shown under its stamp. */
+    read = ReadSavedPicture(path);
+    if (!read || PictureStamp(read) != profile->picture) {
+        Free(read);
+        return NULL;
+    }
+    AcquireSRWLockExclusive(&g_pictureLock);
+    Free(g_pictureCache[g_pictureCacheNext].pixels);
+    g_pictureCache[g_pictureCacheNext].pixels = CopyPicture(read);
+    g_pictureCache[g_pictureCacheNext].stamp = profile->picture;
+    StringCchCopyW(g_pictureCache[g_pictureCacheNext].folder, FOLDER_CCH, profile->folder);
+    g_pictureCacheNext = (g_pictureCacheNext + 1) % PICTURE_CACHE;
+    ReleaseSRWLockExclusive(&g_pictureLock);
+    return read;
+}
+
+/* The picture as a PNG at `path`, which must not exist. */
+static HRESULT WritePng(IWICImagingFactory *factory, const WCHAR *path, const DWORD *pixels)
+{
+    const UINT stride = PICTURE_SIZE * sizeof(DWORD);
+    IWICStream *stream = NULL;
+    IWICBitmapEncoder *encoder = NULL;
+    IWICBitmapFrameEncode *frame = NULL;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    HRESULT hr = IWICImagingFactory_CreateStream(factory, &stream);
+    if (SUCCEEDED(hr)) hr = IWICStream_InitializeFromFilename(stream, path, GENERIC_WRITE);
+    if (SUCCEEDED(hr)) hr = IWICImagingFactory_CreateEncoder(factory, &GUID_ContainerFormatPng, NULL, &encoder);
+    if (SUCCEEDED(hr)) hr = IWICBitmapEncoder_Initialize(encoder, (IStream *)stream, WICBitmapEncoderNoCache);
+    if (SUCCEEDED(hr)) hr = IWICBitmapEncoder_CreateNewFrame(encoder, &frame, NULL);
+    if (SUCCEEDED(hr)) hr = IWICBitmapFrameEncode_Initialize(frame, NULL);
+    if (SUCCEEDED(hr)) hr = IWICBitmapFrameEncode_SetSize(frame, PICTURE_SIZE, PICTURE_SIZE);
+    if (SUCCEEDED(hr)) hr = IWICBitmapFrameEncode_SetPixelFormat(frame, &format);
+    if (SUCCEEDED(hr) && !IsEqualGUID(&format, &GUID_WICPixelFormat32bppBGRA)) hr = WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
+    if (SUCCEEDED(hr)) hr = IWICBitmapFrameEncode_WritePixels(frame, PICTURE_SIZE, stride, stride * PICTURE_SIZE, (BYTE *)pixels);
+    if (SUCCEEDED(hr)) hr = IWICBitmapFrameEncode_Commit(frame);
+    if (SUCCEEDED(hr)) hr = IWICBitmapEncoder_Commit(encoder);
+    if (frame) IWICBitmapFrameEncode_Release(frame);
+    if (encoder) IWICBitmapEncoder_Release(encoder);
+    if (stream) IWICStream_Release(stream);
+    return hr;
+}
+
+BOOL Icons_SavePicture(const WCHAR *folder, const DWORD *pixels, DWORD *stamp)
+{
+    WCHAR path[MAX_PATH], directory[MAX_PATH], temporary[MAX_PATH];
+    WCHAR *slash;
+    Codecs codecs;
+    HRESULT hr;
+    if (stamp) *stamp = 0;
+    if (!pixels || !PicturePath(folder, path, ARRAYSIZE(path)) || FAILED(StringCchCopyW(directory, ARRAYSIZE(directory), path)) ||
+        (slash = wcsrchr(directory, L'\\')) == NULL ||
+        FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s.%lu" TEMPORARY_EXTENSION, path, GetCurrentProcessId())))
+        return FALSE;
+    *slash = 0;
+    if (!Util_EnsureDir(directory)) {
+        Util_Log(L"could not create %s (error %lu)", directory, GetLastError());
+        return FALSE;
+    }
+    DeleteFileW(temporary);
+    hr = OpenCodecs(&codecs);
+    if (SUCCEEDED(hr)) hr = WritePng(codecs.factory, temporary, pixels);
+    CloseCodecs(&codecs);
+    if (SUCCEEDED(hr) && !MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    if (FAILED(hr)) {
+        DeleteFileW(temporary);
+        Util_Log(L"could not save the picture of %s (0x%08lX)", folder, (unsigned long)hr);
+        return FALSE;
+    }
+    if (stamp) *stamp = PictureStamp(pixels);
+    return TRUE;
+}
+
+void Icons_DeletePicture(const WCHAR *folder)
+{
+    WCHAR path[MAX_PATH];
+    if (PicturePath(folder, path, ARRAYSIZE(path)) && !DeleteFileW(path) && GetLastError() != ERROR_FILE_NOT_FOUND &&
+        GetLastError() != ERROR_PATH_NOT_FOUND)
+        Util_Log(L"could not delete %s (error %lu)", path, GetLastError());
 }

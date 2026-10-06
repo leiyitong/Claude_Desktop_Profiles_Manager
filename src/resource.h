@@ -59,6 +59,9 @@
 #define IDC_P_OPEN        1105
 #define IDC_P_STARTUP     1106
 #define IDC_P_COPY        1107
+#define IDC_P_BADGE       1108
+#define IDC_P_PICTURE     1109
+#define IDC_P_NO_PICTURE  1110
 
 /* uninstall dialog */
 #define IDC_U_KEEP        1200

@@ -40,6 +40,7 @@
 #include <uxtheme.h>
 #include <vssym32.h>
 #include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <stdarg.h>
 
@@ -770,6 +771,8 @@ void Theme_DrawButton(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFO
 }
 
 #define DROPDOWN_LABEL_INSET_DIPS 8   /* before a drop-down button's label */
+#define SWATCH_DIPS               12  /* a choice's color swatch (THEME_CHOICE_SWATCH) */
+#define SWATCH_GAP_DIPS           6   /* between the swatch and the label */
 #define DROPDOWN_LABEL_GAP_DIPS   2   /* the least room between its label and its arrow */
 #define DROPDOWN_ARROW_INSET_DIPS 2   /* after its arrow */
 
@@ -815,10 +818,93 @@ void Theme_DropDownLabel(HWND owner, const RECT *box, RECT *label)
     label->right = DropDownArrow(owner, box).left;
 }
 
+/* A color swatch, size x size: a disc in `color` inside a ring of `ring`
+ * (thin: it shows the disc on a background of its own tone; `chosen`: thick,
+ * the current choice in a menu, which shows no check mark beside a bitmap).
+ * A premultiplied 32-bit DIB section, as menus and GdiAlphaBlend take it;
+ * NULL on failure. */
+static HBITMAP SwatchBitmap(int size, COLORREF color, COLORREF ring, BOOL chosen)
+{
+    BITMAPINFO info;
+    void *bits = NULL;
+    HBITMAP bitmap;
+    DWORD *pixels;
+    double radius = size / 2.0, inner = radius - (chosen ? max(2.0, size / 5.0) : max(1.0, size / 12.0));
+    int x, y;
+    if (size <= 0) return NULL;
+    ZeroMemory(&info, sizeof info);
+    info.bmiHeader.biSize = sizeof info.bmiHeader;
+    info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    bitmap = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bitmap || !bits) {
+        if (bitmap) DeleteObject(bitmap);
+        return NULL;
+    }
+    pixels = (DWORD *)bits;
+    for (y = 0; y < size; y++) {
+        for (x = 0; x < size; x++) {
+            double distance = sqrt((x + 0.5 - radius) * (x + 0.5 - radius) + (y + 0.5 - radius) * (y + 0.5 - radius));
+            double outer = min(1.0, max(0.0, radius - distance)), fill = min(1.0, max(0.0, inner + 0.5 - distance));
+            double edge = outer - fill;
+            if (edge < 0) edge = 0;
+            pixels[y * size + x] = ((DWORD)(outer * 255.0 + 0.5) << 24) |
+                                   ((DWORD)(GetRValue(color) * fill + GetRValue(ring) * edge + 0.5) << 16) |
+                                   ((DWORD)(GetGValue(color) * fill + GetGValue(ring) * edge + 0.5) << 8) |
+                                   (DWORD)(GetBValue(color) * fill + GetBValue(ring) * edge + 0.5);
+        }
+    }
+    return bitmap;
+}
+
+/* The swatch at the start of `label`, centered on it vertically. */
+static void DrawSwatch(HWND owner, HDC dc, const RECT *label, COLORREF color)
+{
+    int size = ScaleForWindow(owner, SWATCH_DIPS);
+    HBITMAP bitmap = SwatchBitmap(size, color, g_palette.color[THEME_MUTED], FALSE);
+    HDC memory = bitmap ? CreateCompatibleDC(dc) : NULL;
+    if (memory) {
+        BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        HGDIOBJ old = SelectObject(memory, bitmap);
+        GdiAlphaBlend(dc, label->left, label->top + (label->bottom - label->top - size) / 2, size, size, memory, 0, 0, size, size, blend);
+        SelectObject(memory, old);
+        DeleteDC(memory);
+    }
+    if (bitmap) DeleteObject(bitmap);
+}
+
+/* A choice's swatch color, when its item data asks for one. */
+static BOOL ChoiceSwatch(HWND combo, LRESULT item, COLORREF *color)
+{
+    LRESULT data = item >= 0 ? SendMessageW(combo, CB_GETITEMDATA, (WPARAM)item, 0) : CB_ERR;
+    if (data == CB_ERR || !(data & THEME_CHOICE_SWATCH)) return FALSE;
+    *color = (COLORREF)(data & 0xFFFFFF);
+    return TRUE;
+}
+
+/* A choice's text after a tab shows only in its menu (in the column of
+ * shortcuts there): the box and its measures stop at the tab. */
+static void CutAtTab(WCHAR *text)
+{
+    WCHAR *tab = wcschr(text, L'\t');
+    if (tab) *tab = 0;
+}
+
+static void DrawDropDownBox(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state, const COLORREF *swatch);
+
 /* A button that opens a menu (the sessions view's Actions): a push button
  * (see ButtonFace), `text` on its left and on its right the arrow the
  * drop-down lists of the same theme show. */
 void Theme_DrawDropDown(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state)
+{
+    DrawDropDownBox(owner, dc, rc, text, font, state, NULL);
+}
+
+/* Theme_DrawDropDown, with a color swatch before the label when `swatch` is given. */
+static void DrawDropDownBox(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state, const COLORREF *swatch)
 {
     /* Not through `owner`: a window with a theme name of its own (a dialog's
      * drop-down list) would not find the class. */
@@ -839,6 +925,10 @@ void Theme_DrawDropDown(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, H
         if (marlett) DeleteObject(marlett);
     }
     Theme_DropDownLabel(owner, rc, &label);
+    if (swatch) {
+        DrawSwatch(owner, dc, &label, *swatch);
+        label.left += ScaleForWindow(owner, SWATCH_DIPS + SWATCH_GAP_DIPS);
+    }
     DrawLabel(dc, text, font, &label, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
 }
 
@@ -2510,13 +2600,17 @@ static void PaintDropDownList(HWND combo, HDC dc)
     WCHAR local[256], *text;
     RECT rc;
     UINT state = 0;
-    BOOL dropped = SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0) != 0;
-    text = ComboItemText(combo, SendMessageW(combo, CB_GETCURSEL, 0, 0), local, ARRAYSIZE(local));
+    COLORREF swatch;
+    BOOL dropped = SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0) != 0, swatched;
+    LRESULT current = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    text = ComboItemText(combo, current, local, ARRAYSIZE(local));
+    CutAtTab(text);
+    swatched = ChoiceSwatch(combo, current, &swatch);
     if (!IsWindowEnabled(combo)) state = THEME_BUTTON_DISABLED;
     else if (dropped) state = THEME_BUTTON_PRESSED;
     else if (GetPropW(combo, HOT_PROP)) state = THEME_BUTTON_HOT;
     GetClientRect(combo, &rc);
-    Theme_DrawDropDown(combo, dc, &rc, text, (HFONT)SendMessageW(combo, WM_GETFONT, 0, 0), state);
+    DrawDropDownBox(combo, dc, &rc, text, (HFONT)SendMessageW(combo, WM_GETFONT, 0, 0), state, swatched ? &swatch : NULL);
     if (text != local) HeapFree(GetProcessHeap(), 0, text);
     if (ShowsFocusCues(combo) && GetFocus() == combo && !(state & THEME_BUTTON_PRESSED)) {
         RECT focus = rc;
@@ -2564,13 +2658,30 @@ static void QueueChoice(HWND combo)
     }
 }
 
-/* The combo's choices as a menu, the current one checked; NULL when one
- * could not be read or added. Choice values are literal labels: an
- * ampersand is no mnemonic there. */
+/* A choice menu goes with its swatches: menus do not own their bitmaps. */
+static void DestroyChoiceMenu(HMENU menu)
+{
+    int i, count = GetMenuItemCount(menu);
+    for (i = 0; i < count; i++) {
+        MENUITEMINFOW item;
+        ZeroMemory(&item, sizeof item);
+        item.cbSize = sizeof item;
+        item.fMask = MIIM_BITMAP;
+        /* The predefined HBMMENU_ values are small numbers, none of ours. */
+        if (GetMenuItemInfoW(menu, (UINT)i, TRUE, &item) && (ULONG_PTR)item.hbmpItem > (ULONG_PTR)HBMMENU_POPUP_MINIMIZE)
+            DeleteObject(item.hbmpItem);
+    }
+    DestroyMenu(menu);
+}
+
+/* The combo's choices as a menu, the current one checked, each with its
+ * swatch and the lines THEME_CHOICE_SEPARATED asks for; NULL when one could
+ * not be read or added. Choice values are literal labels: an ampersand is no
+ * mnemonic there. */
 static HMENU ChoiceMenu(HWND combo, int count, int current)
 {
     HMENU menu = CreatePopupMenu();
-    int i;
+    int i, swatchSize = ScaleForWindow(combo, SWATCH_DIPS);
     if (!menu) return NULL;
     for (i = 0; i < count; i++) {
         LRESULT length = SendMessageW(combo, CB_GETLBTEXTLEN, i, 0);
@@ -2598,12 +2709,23 @@ static HMENU ChoiceMenu(HWND combo, int count, int current)
         item.dwTypeData = label;
         item.fType = MFT_STRING | MFT_RADIOCHECK;
         item.fState = i == current ? MFS_CHECKED : MFS_UNCHECKED;
-        added = InsertMenuItemW(menu, (UINT)i, TRUE, &item);
+        {
+            LRESULT data = SendMessageW(combo, CB_GETITEMDATA, (WPARAM)i, 0);
+            COLORREF color;
+            if (data != CB_ERR && (data & THEME_CHOICE_SEPARATED) && GetMenuItemCount(menu) > 0)
+                AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+            if (ChoiceSwatch(combo, i, &color) &&
+                (item.hbmpItem = i == current ? SwatchBitmap(swatchSize, color, g_dark ? RGB(0xFF, 0xFF, 0xFF) : RGB(0, 0, 0), TRUE)
+                                              : SwatchBitmap(swatchSize, color, RGB(0x80, 0x80, 0x80), FALSE)) != NULL)
+                item.fMask |= MIIM_BITMAP;
+        }
+        added = InsertMenuItemW(menu, (UINT)GetMenuItemCount(menu), TRUE, &item);
+        if (!added && item.hbmpItem) DeleteObject(item.hbmpItem);
         HeapFree(GetProcessHeap(), 0, text);
         if (!added) break;
     }
     if (i < count) {
-        DestroyMenu(menu);
+        DestroyChoiceMenu(menu);
         return NULL;
     }
     return menu;
@@ -2628,7 +2750,7 @@ static void TrackChoice(HWND combo)
         RedrawWindow(combo, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
         command = Theme_TrackDropDown(GetParent(combo), menu, &box);
     }
-    DestroyMenu(menu);
+    DestroyChoiceMenu(menu);
     if (!IsWindow(combo) || !GetPropW(combo, CHOICE_PROP)) return;
     RemovePropW(combo, CHOICE_PROP);
     if (command && command <= (UINT)count) {
@@ -4154,6 +4276,7 @@ static const WCHAR **ChoiceKeys(HWND combo, int count)
     keys = (const WCHAR **)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *keys);
     if (keys) for (choice = 0; choice < count; choice++) {
         WCHAR local[256], *text = ComboItemText(combo, choice, local, ARRAYSIZE(local));
+        CutAtTab(text);
         keys[choice] = CatalogKeyFor(text);
         if (text != local) HeapFree(GetProcessHeap(), 0, text);
     }
@@ -4170,7 +4293,10 @@ static int WidestChoice(HDC dc, HWND combo, int count, const WCHAR **keys, int l
         const WCHAR *text = keys && keys[choice] ? Localize_TranslateAt(language, keys[choice])
                                                  : (shown = ComboItemText(combo, choice, local, ARRAYSIZE(local)));
         RECT extent = { 0, 0, 0, 0 };
+        COLORREF swatch;
+        if (shown) CutAtTab(shown);
         DrawTextW(dc, text, -1, &extent, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX | ReadingFlagsAt(language));
+        if (ChoiceSwatch(combo, choice, &swatch)) extent.right += ScaleForWindow(combo, SWATCH_DIPS + SWATCH_GAP_DIPS);
         widest = max(widest, extent.right);
         if (shown && shown != local) HeapFree(GetProcessHeap(), 0, shown);
     }

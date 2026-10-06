@@ -10,7 +10,7 @@ Unofficial tool, not affiliated with Anthropic.
 
 - **Profile manager** - Lists existing profiles; creates, renames, recolors and deletes them (to the Recycle Bin)
 - **Link chooser** - With several profiles, Claude Desktop Profiles Manager asks which one opens a `claude://` link; for a browser sign-in, the window that started it is already selected
-- **Profile badges** - Each profile's shortcut and taskbar button show the Claude icon with its own colored badge, and its notification-area icon takes its color
+- **Profile badges** - Each profile's shortcut and taskbar button show the Claude icon with its own colored badge, and its notification-area icon takes its color. Twenty colors, the ones no profile uses listed first and the others with the profiles that use them; a badge shows the name's initial or one or two characters of your own; or a picture of your own (PNG, JPEG, GIF, BMP, TIFF, ICO, and WebP or HEIF with their Windows extension) replaces the icon
 - **Taskbar pins** - Pin a profile to the taskbar in one click
 - **Start menu** - Add a profile to the Start menu, or take it out, in one click
 - **Open at sign-in** - Any profile can open when you sign in to Windows, not only the one the regular Claude icon opens
@@ -37,7 +37,7 @@ To uninstall, click **Uninstall…** or use Settings → Apps: it asks which pro
 
 ## Usage
 
-1. Click **New profile…**, enter a name, pick a color and click **OK**: the profile opens in its own window
+1. Click **New profile…**, enter a name, pick a color (or a badge text, or a picture) and click **OK**: the profile opens in its own window
 2. Sign in to Claude in that window
 3. Click **Create shortcut on desktop** or **Pin to taskbar**, then open the profile from there
 4. *(Optional)* Select a profile and click **Set as default**: it is selected for `claude://` links while Claude is closed

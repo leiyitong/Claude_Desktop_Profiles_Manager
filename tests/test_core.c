@@ -164,6 +164,21 @@ static void TestNames(void)
     Check("label: 48 characters accepted", Core_ValidateLabel(L"abcdefghijabcdefghijabcdefghijabcdefghijabcdefgh", label, ARRAYSIZE(label), &err));
     Check("label: 49 characters refused", !Core_ValidateLabel(L"abcdefghijabcdefghijabcdefghijabcdefghijabcdefghi", label, ARRAYSIZE(label), &err));
 
+    {
+        WCHAR badge[BADGE_CCH];
+        Check("badge: trimmed, two characters kept", Core_CleanBadge(L"  AB ", badge, ARRAYSIZE(badge)) && wcscmp(badge, L"AB") == 0);
+        Check("badge: cut after two characters", Core_CleanBadge(L"\x5DE5\x4F5C\x5BA4", badge, ARRAYSIZE(badge)) &&
+                                                   wcscmp(badge, L"\x5DE5\x4F5C") == 0);
+        Check("badge: a surrogate pair is one character", Core_CleanBadge(L"\xD83D\xDE80" L"XY", badge, ARRAYSIZE(badge)) &&
+                                                            wcscmp(badge, L"\xD83D\xDE80" L"X") == 0);
+        Check("badge: a space left at the cut goes", Core_CleanBadge(L"A B", badge, ARRAYSIZE(badge)) && wcscmp(badge, L"A") == 0);
+        Check("badge: empty is valid (the initial)", Core_CleanBadge(L"   ", badge, ARRAYSIZE(badge)) && badge[0] == 0 &&
+                                                       Core_CleanBadge(NULL, badge, ARRAYSIZE(badge)) && badge[0] == 0);
+        Check("badge: a control character refused", !Core_CleanBadge(L"A\tB", badge, ARRAYSIZE(badge)) && badge[0] == 0);
+        Check("badge: a buffer too short keeps whole characters", Core_CleanBadge(L"\xD83D\xDE80\xD83D\xDE80", badge, 4) &&
+                                                                    wcscmp(badge, L"\xD83D\xDE80") == 0);
+    }
+
     Check("folder Claude-Work", Core_IsProfileFolder(L"Claude-Work"));
     Check("folder case-insensitive prefix", Core_IsProfileFolder(L"claude-work"));
     Check("folder with spaces", Core_IsProfileFolder(L"Claude-Client A"));

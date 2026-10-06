@@ -13,6 +13,8 @@
 
 #define VALUE_NAME            L"Name"             /* under the profile's key */
 #define VALUE_COLOR           L"Color"
+#define VALUE_BADGE           L"Badge"            /* the badge's own text, absent for the initial */
+#define VALUE_PICTURE         L"Picture"          /* the stamp of its own picture (icons.c), absent for none */
 #define VALUE_DEFAULT_PROFILE L"DefaultProfile"   /* under REG_ROOT */
 
 static void ProfileKey(const WCHAR *folder, WCHAR *out, size_t cch)
@@ -57,8 +59,8 @@ BOOL Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, const WCHAR 
 
 static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isStock, const ClaudePackage *pkg)
 {
-    WCHAR key[MAX_PATH], localAppData[MAX_PATH];
-    DWORD color;
+    WCHAR key[MAX_PATH], localAppData[MAX_PATH], badge[BADGE_CCH];
+    DWORD color, picture;
     ZeroMemory(p, sizeof *p);
     StringCchCopyW(p->folder, ARRAYSIZE(p->folder), folder);
     if (FAILED(StringCchPrintfW(p->dataDir, ARRAYSIZE(p->dataDir), L"%s\\%s", appData, folder))) p->dataDir[0] = 0;
@@ -71,9 +73,11 @@ static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isS
     if (!Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_NAME, p->name, ARRAYSIZE(p->name)) || !p->name[0])
         StringCchCopyW(p->name, ARRAYSIZE(p->name), isStock ? STOCK_DEFAULT_NAME : folder + wcslen(PROFILE_PREFIX));
     p->color = (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_COLOR, &color) && color < PALETTE_SIZE) ? (int)color : -1;
+    if (Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_BADGE, badge, ARRAYSIZE(badge))) Core_CleanBadge(badge, p->badge, ARRAYSIZE(p->badge));
+    if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_PICTURE, &picture)) p->picture = picture;
 }
 
-/* The profile's name and color. */
+/* The profile's name, color, badge text and picture stamp. */
 static void DeleteProfileKey(const WCHAR *folder)
 {
     WCHAR key[MAX_PATH];
@@ -83,15 +87,16 @@ static void DeleteProfileKey(const WCHAR *folder)
         Util_Log(L"could not remove the name and color of %s (error %ld)", folder, status);
 }
 
-/* What the manager keeps for a profile that is gone: its name and color, the
- * session changes queued for it and the default setting when it names it. A
- * new profile of that name must not inherit them. */
+/* What the manager keeps for a profile that is gone: its name and color, its
+ * picture, the session changes queued for it and the default setting when it
+ * names it. A new profile of that name must not inherit them. */
 static void ForgetProfile(const WCHAR *folder)
 {
     WCHAR pending[MAX_PATH], defaultFolder[FOLDER_CCH];
     Profile gone;
     LSTATUS status;
     DeleteProfileKey(folder);
+    Icons_DeletePicture(folder);
     ZeroMemory(&gone, sizeof gone);
     StringCchCopyW(gone.folder, ARRAYSIZE(gone.folder), folder);
     if (SessionStore_PendingPath(&gone, pending, ARRAYSIZE(pending)) && !DeleteFileW(pending) &&
@@ -286,10 +291,25 @@ BOOL Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t folderC
     return TRUE;
 }
 
-BOOL Profiles_Update(const WCHAR *folder, const WCHAR *label, int color)
+/* A value written, or gone when `present` is FALSE (a value already absent is fine). */
+static BOOL WriteOrDelete(const WCHAR *key, const WCHAR *value, BOOL present, BOOL written)
 {
-    WCHAR clean[LABEL_CCH];
-    return Core_ValidateLabel(label, clean, ARRAYSIZE(clean), NULL) && WriteNameAndColor(folder, clean, color);
+    LSTATUS status;
+    if (present) return written;
+    status = Util_RegDeleteValue(HKEY_CURRENT_USER, key, value);
+    return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
+}
+
+BOOL Profiles_Update(const WCHAR *folder, const WCHAR *label, int color, const WCHAR *badge, DWORD picture)
+{
+    WCHAR clean[LABEL_CCH], cleanBadge[BADGE_CCH], key[MAX_PATH];
+    if (!Core_ValidateLabel(label, clean, ARRAYSIZE(clean), NULL) || !Core_CleanBadge(badge, cleanBadge, ARRAYSIZE(cleanBadge)) ||
+        !WriteNameAndColor(folder, clean, color))
+        return FALSE;
+    ProfileKey(folder, key, ARRAYSIZE(key));
+    return WriteOrDelete(key, VALUE_BADGE, cleanBadge[0] != 0,
+                         cleanBadge[0] && Util_RegSetString(HKEY_CURRENT_USER, key, VALUE_BADGE, cleanBadge)) &&
+           WriteOrDelete(key, VALUE_PICTURE, picture != 0, picture && Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_PICTURE, picture));
 }
 
 BOOL Profiles_SetDefault(const WCHAR *folder)
