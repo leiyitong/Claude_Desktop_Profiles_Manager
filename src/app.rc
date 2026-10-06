@@ -53,7 +53,7 @@ BEGIN
     PUSHBUTTON      L"&Edit\x2026", IDC_EDIT, 334, 66, 76, 15
     PUSHBUTTON      L"&Delete\x2026", IDC_DELETE, 334, 85, 76, 15
     PUSHBUTTON      L"Merge &all sessions\x2026", IDC_MERGE, 334, 110, 76, 15
-    PUSHBUTTON      L"Mi&rror sessions\x2026", IDC_MIRROR, 334, 129, 76, 15
+    PUSHBUTTON      L"Ove&rwrite sessions\x2026", IDC_OVERWRITE, 334, 129, 76, 15
     PUSHBUTTON      "Set as de&fault", IDC_DEFAULT, 334, 154, 76, 15
     LTEXT           "", IDC_NOTE, 334, 176, 76, 60, SS_NOPREFIX
     CONTROL         "Shortcuts", IDC_SC_GROUP, "Static", SS_OWNERDRAW | SS_NOPREFIX, 10, 244, 400, 10
@@ -127,6 +127,18 @@ BEGIN
     LTEXT           "A profile open now gets the changes once it closes. What is replaced or removed is kept in a backup first.", IDC_Y_NOTE, 10, 166, 248, 18
     DEFPUSHBUTTON   "OK", IDOK, 154, 192, 50, 15
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 192, 50, 15
+END
+
+IDD_LINK DIALOGEX 0, 0, 268, 160
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Open a Claude link"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_L_TEXT, 10, 10, 248, 10, SS_NOPREFIX
+    LTEXT           "", IDC_L_LINK, 10, 24, 248, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    CONTROL         "", IDC_L_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 40, 248, 90
+    DEFPUSHBUTTON   "Open", IDOK, 154, 138, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 208, 138, 50, 15
 END
 
 IDD_UNINSTALL DIALOGEX 0, 0, 292, 206

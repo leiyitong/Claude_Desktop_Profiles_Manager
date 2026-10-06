@@ -3,7 +3,7 @@
  * temporary fixture: where a profile's sessions are stored and how they are
  * read (sessionstore.c); copies, changes waiting for a running profile,
  * removals and Delete session everywhere, with a stand-in for the Recycle
- * Bin (sessionedit.c); sessions merged, mirrored, shared to a running
+ * Bin (sessionedit.c); sessions merged, overwritten, shared to a running
  * profile, exported and imported (sessionsync.c); paths past MAX_PATH; reads
  * cancelled or made at once; the sessions view's background snapshots
  * (sessions.c). Built and run by build.cmd; exits non-zero when a check fails.
@@ -2339,7 +2339,7 @@ static BOOL MarkPath(const WCHAR *entries, const WCHAR *id, WCHAR *out, size_t c
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\deleted_%s", entries, id));
 }
 
-/* Merging, mirroring, sharing to a running profile, and an archive taken
+/* Merging, overwriting, sharing to a running profile, and an archive taken
  * from one profile into another, on four profiles of their own. */
 static void TestSessionSync(const WCHAR *projects)
 {
@@ -2383,24 +2383,24 @@ static void TestSessionSync(const WCHAR *projects)
           loaded && SessionSync_Merge(&set, 0x7, &report) && report.added == 0 && report.updated == 0 && report.failed == 0);
     SessionStore_Free(&set);
 
-    /* Mirror: the source's sessions and its marks of deleted ones; exact also takes the others away. */
+    /* Overwrite: the source's sessions and its marks of deleted ones; exact also takes the others away. */
     ready = WriteSyncEntry(entries[1], g_syncIds[3], "B four", 50) && MarkPath(entries[0], g_syncIds[4], path, ARRAYSIZE(path)) &&
             Save(path, "777");
-    Check("mirror fixtures created", ready);
+    Check("overwrite fixtures created", ready);
     if (!ready) return;
     loaded = SessionStore_LoadProfiles(&set, &profiles);
     ZeroMemory(&report, sizeof report);
-    Check("mirroring a profile succeeds", loaded && SessionSync_Mirror(&set, 0, 0x6, FALSE, &report) && report.failed == 0);
-    Check("mirroring keeps the targets' own sessions", report.removed == 0 && EntryThere(entries[1], g_syncIds[3]));
-    Check("mirroring carries the source's marks of deleted sessions",
+    Check("overwriting with a profile succeeds", loaded && SessionSync_Overwrite(&set, 0, 0x6, FALSE, &report) && report.failed == 0);
+    Check("overwriting keeps the targets' own sessions", report.removed == 0 && EntryThere(entries[1], g_syncIds[3]));
+    Check("overwriting carries the source's marks of deleted sessions",
           MarkPath(entries[2], g_syncIds[4], path, ARRAYSIZE(path)) && FileThere(path));
     SessionStore_Free(&set);
     loaded = SessionStore_LoadProfiles(&set, &profiles);
     ZeroMemory(&report, sizeof report);
-    Check("an exact mirror succeeds", loaded && SessionSync_Mirror(&set, 0, 0x2, TRUE, &report) && report.failed == 0);
-    Check("an exact mirror takes away what the source does not list", report.removed == 1 && !EntryThere(entries[1], g_syncIds[3]));
-    Check("a mirrored-away entry is kept in the backup", BackedUp(&report, &profiles.items[1], g_syncIds[3], path, ARRAYSIZE(path)));
-    Check("an exact mirror keeps the marks the source has",
+    Check("an exact overwrite succeeds", loaded && SessionSync_Overwrite(&set, 0, 0x2, TRUE, &report) && report.failed == 0);
+    Check("an exact overwrite takes away what the source does not list", report.removed == 1 && !EntryThere(entries[1], g_syncIds[3]));
+    Check("an overwritten-away entry is kept in the backup", BackedUp(&report, &profiles.items[1], g_syncIds[3], path, ARRAYSIZE(path)));
+    Check("an exact overwrite keeps the marks the source has",
           MarkPath(entries[1], g_syncIds[4], path, ARRAYSIZE(path)) && FileThere(path));
     SessionStore_Free(&set);
 

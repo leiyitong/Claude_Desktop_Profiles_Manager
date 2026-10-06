@@ -398,47 +398,44 @@ BOOL Core_LastQuit(const char *text, size_t len, SYSTEMTIME *when, BOOL *forUpda
 
 /* --------------------------------------------------------------- routing */
 
-int Core_SelectTargets(int count, const ULONGLONG *signInTicks, ULONGLONG nowTicks,
-                       ULONGLONG signInMaxAgeTicks, BOOL signInUrl, int lastUsed,
-                       int defaultIndex, int *targets, RouteReason *reason)
+int Core_SuggestTarget(int count, const ULONGLONG *signInTicks, ULONGLONG nowTicks, ULONGLONG signInMaxAgeTicks,
+                       BOOL signInUrl, int lastUsed, int defaultIndex, RouteReason *reason)
 {
     /* A stamp up to a minute ahead still counts: the clock may have been set
      * back since Claude wrote it. */
     const ULONGLONG clockSkewTicks = 60 * TICKS_PER_SECOND;
     RouteReason chosen;
-    int n = 0, i, best = -1;
+    int suggested = -1, i;
 
     if (count <= 0) {
         chosen = ROUTE_NOTHING_RUNNING;
-    } else if (count == 1) {
-        targets[n++] = 0;
-        chosen = ROUTE_ONLY_ONE;
-    } else if (signInUrl) {
-        for (i = 0; i < count; i++) {
-            ULONGLONG signInTime = signInTicks ? signInTicks[i] : 0;
-            if (!signInTime || signInTime > nowTicks + clockSkewTicks) continue;
-            if (nowTicks > signInTime && nowTicks - signInTime > signInMaxAgeTicks) continue;
-            if (best < 0 || signInTime > signInTicks[best]) best = i;
-        }
-        if (best >= 0) {
-            targets[n++] = best;
-            chosen = ROUTE_SIGNIN;
-        } else {
-            for (i = 0; i < count; i++) targets[n++] = i;
-            chosen = ROUTE_BROADCAST;
-        }
-    } else if (lastUsed >= 0 && lastUsed < count) {
-        targets[n++] = lastUsed;
-        chosen = ROUTE_LAST_USED;
-    } else if (defaultIndex >= 0 && defaultIndex < count) {
-        targets[n++] = defaultIndex;
-        chosen = ROUTE_DEFAULT;
     } else {
-        targets[n++] = 0;
-        chosen = ROUTE_FIRST;
+        if (signInUrl) {
+            for (i = 0; i < count; i++) {
+                ULONGLONG signInTime = signInTicks ? signInTicks[i] : 0;
+                if (!signInTime || signInTime > nowTicks + clockSkewTicks) continue;
+                if (nowTicks > signInTime && nowTicks - signInTime > signInMaxAgeTicks) continue;
+                if (suggested < 0 || signInTime > signInTicks[suggested]) suggested = i;
+            }
+        }
+        if (suggested >= 0) {
+            chosen = ROUTE_SIGNIN;
+        } else if (count == 1) {
+            suggested = 0;
+            chosen = ROUTE_ONLY_ONE;
+        } else if (lastUsed >= 0 && lastUsed < count) {
+            suggested = lastUsed;
+            chosen = ROUTE_LAST_USED;
+        } else if (defaultIndex >= 0 && defaultIndex < count) {
+            suggested = defaultIndex;
+            chosen = ROUTE_DEFAULT;
+        } else {
+            suggested = 0;
+            chosen = ROUTE_FIRST;
+        }
     }
     if (reason) *reason = chosen;
-    return n;
+    return suggested;
 }
 
 /* ---------------------------------------------------------------- shortcuts */

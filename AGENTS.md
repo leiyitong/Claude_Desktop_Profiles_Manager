@@ -32,9 +32,10 @@ Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project s
 4. **Arguments are built by `Core_BuildLaunchArgs`** and links cleaned by
    `Core_SanitizeUrl`: a quote, backslash or space in a `claude://` link would
    otherwise inject Chromium switches.
-5. **Routing follows what the app did, not what the user declared**: sign-in
-   links go to the window whose `main.log` last logged
-   `[Auth] Using system browser for:`. No marker files, arm windows or
+5. **The user picks the profile that opens a claude:// link** (`IDD_LINK`,
+   `router.c`, when there are several), and the one selected at first follows
+   what the app did: for a sign-in link, the window whose `main.log` last
+   logged `[Auth] Using system browser for:`. No marker files, arm windows or
    "sign in" shortcuts.
 6. **Running detection is read-only**: `Chrome_MessageWindow` titles, and
    change notifications on a profile's folder to see it start. Do not open
