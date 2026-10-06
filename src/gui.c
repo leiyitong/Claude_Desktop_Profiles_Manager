@@ -107,13 +107,16 @@ static const Profile *FocusedProfile(void)
     return (i >= 0 && i < g_manager.profiles.count) ? &g_manager.profiles.items[i] : NULL;
 }
 
-/* The profiles selected, one bit each (MAX_PROFILES <= 32). */
+/* The profiles selected, one bit each (MAX_PROFILES <= 32). Each row found
+ * must come after the last: a list not made yet answers 0 every time. */
 static DWORD SelectedProfiles(void)
 {
     DWORD bits = 0;
-    int i = -1;
-    while ((i = ListView_GetNextItem(g_manager.list, i, LVNI_SELECTED)) >= 0)
-        if (i < g_manager.profiles.count) bits |= 1u << i;
+    int i = -1, next;
+    while ((next = ListView_GetNextItem(g_manager.list, i, LVNI_SELECTED)) > i && next < g_manager.profiles.count) {
+        bits |= 1u << next;
+        i = next;
+    }
     return bits;
 }
 
