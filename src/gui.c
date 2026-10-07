@@ -1543,8 +1543,6 @@ static BOOL ChooseFolder(HWND owner, const WCHAR *title, WCHAR *path, size_t cch
     return ok;
 }
 
-/* The selected profile's session folder kept in profile `other`'s (an
- * index), or with -1 in a folder the user chooses. */
 /* TRUE (and says so) when the profile, or one sharing its session folder, runs: its sessions are in Claude's memory. */
 static BOOL LinkBusy(const Profile *p)
 {
@@ -1553,14 +1551,31 @@ static BOOL LinkBusy(const Profile *p)
     return TRUE;
 }
 
+/* `error` on a line of its own after what `errors` says already. */
+static void AddError(WCHAR *errors, size_t cch, const WCHAR *error)
+{
+    if (errors[0]) StringCchCatW(errors, cch, L"\n\n");
+    StringCchCatW(errors, cch, error);
+}
+
+/* The session folders of the profiles selected (`selected`) kept in profile
+ * `other`'s (an index, never one of them), or with -1 in a folder the user
+ * chooses: each one's entries join it, one profile after the other. */
 static void DoLink(int other)
 {
-    const Profile *p = SelectedProfile();
-    WCHAR folder[LONG_PATH_CCH], text[1024 + LONG_PATH_CCH], error[512 + 2 * LONG_PATH_CCH];
+    WCHAR folder[LONG_PATH_CCH], text[1024 + LONG_PATH_CCH], error[512 + 2 * LONG_PATH_CCH], errors[4 * (512 + 2 * LONG_PATH_CCH)];
+    const Profile *first = NULL;
     LinkState shared;
-    int index;
-    if (!p || StateChangesBlocked() || LinkBusy(p) || (other >= 0 && LinkBusy(&g_manager.profiles.items[other]))) return;
-    index = (int)(p - g_manager.profiles.items);
+    DWORD selected = SelectedProfiles();
+    int i, count = 0;
+    if (other >= 0) selected &= ~(1u << other);
+    if (!selected || StateChangesBlocked()) return;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if (selected & (1u << i)) {
+            if (LinkBusy(&g_manager.profiles.items[i])) return;
+            if (!count++) first = &g_manager.profiles.items[i];
+        }
+    if (other >= 0 && LinkBusy(&g_manager.profiles.items[other])) return;
     if (other >= 0) {
         SessionLink_Read(&g_manager.profiles, other, &shared);
         if (shared.kind == LINK_OWN) StringCchCopyW(folder, ARRAYSIZE(folder), shared.dir);
@@ -1570,37 +1585,83 @@ static void DoLink(int other)
                        g_manager.profiles.items[other].name);
             return;
         }
-        StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Link the session folder of \x201C%s\x201D to the one of \x201C%s\x201D?\n\nBoth profiles then list the same Code sessions. "
-                            L"The sessions \x201C%s\x201D lists now are added there first, and kept in a backup. Close both profiles first."),
-                         p->name, g_manager.profiles.items[other].name, p->name);
+        if (count == 1)
+            StringCchPrintfW(text, ARRAYSIZE(text),
+                             TR(L"Link the session folder of \x201C%s\x201D to the one of \x201C%s\x201D?\n\nBoth profiles then list the same Code sessions. "
+                                L"The sessions \x201C%s\x201D lists now are added there first, and kept in a backup. Close both profiles first."),
+                             first->name, g_manager.profiles.items[other].name, first->name);
+        else
+            StringCchPrintfW(text, ARRAYSIZE(text),
+                             TR(L"Link the session folders of the %d profiles selected to the one of \x201C%s\x201D?\n\nThey all list the same Code sessions then. "
+                                L"The sessions each one lists now are added there first, and kept in a backup. Close them first."),
+                             count, g_manager.profiles.items[other].name);
     } else {
         if (!ChooseFolder(g_manager.dlg, TR(L"Choose the folder of the sessions"), folder, ARRAYSIZE(folder))) return;
-        StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Keep the session folder of \x201C%s\x201D in\n%s?\n\nThe sessions it lists now are added there first, and kept in a backup. "
-                            L"A folder synchronized to another PC carries the list of sessions, not their conversations, which stay in this PC's Claude Code folder."),
-                         p->name, folder);
+        if (count == 1)
+            StringCchPrintfW(text, ARRAYSIZE(text),
+                             TR(L"Keep the session folder of \x201C%s\x201D in\n%s?\n\nThe sessions it lists now are added there first, and kept in a backup. "
+                                L"A folder synchronized to another PC carries the list of sessions, not their conversations, which stay in this PC's Claude Code folder."),
+                             first->name, folder);
+        else
+            StringCchPrintfW(text, ARRAYSIZE(text),
+                             TR(L"Keep the session folders of the %d profiles selected in\n%s?\n\nThe sessions each one lists now are added there first, and kept in a backup. "
+                                L"A folder synchronized to another PC carries the list of sessions, not their conversations, which stay in this PC's Claude Code folder."),
+                             count, folder);
     }
     if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Link"), TR(L"Cancel"), FALSE)) return;
     FinishShellWork();
-    if (!SessionLink_Create(g_manager.dlg, &g_manager.profiles, index, folder, error, ARRAYSIZE(error)))
-        Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", error);
+    errors[0] = 0;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if ((selected & (1u << i)) && !SessionLink_Create(g_manager.dlg, &g_manager.profiles, i, folder, error, ARRAYSIZE(error)))
+            AddError(errors, ARRAYSIZE(errors), error);
+    if (errors[0]) Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", errors);
     Refresh(FALSE);
 }
 
+/* The profiles of `selected` whose session folder is a link. */
+static DWORD LinkedProfiles(DWORD selected)
+{
+    LinkState state;
+    DWORD linked = 0;
+    int i;
+    for (i = 0; i < g_manager.profiles.count; i++) {
+        if (!(selected & (1u << i))) continue;
+        SessionLink_Read(&g_manager.profiles, i, &state);
+        if (state.kind == LINK_PROFILE || state.kind == LINK_FOLDER || state.kind == LINK_BROKEN) linked |= 1u << i;
+    }
+    return linked;
+}
+
+/* The profiles selected whose session folder is linked get one of their own again. */
 static void DoUnlink(void)
 {
-    const Profile *p = SelectedProfile();
-    WCHAR text[1024], error[512 + 2 * LONG_PATH_CCH];
-    if (!p || StateChangesBlocked() || LinkBusy(p)) return;
-    StringCchPrintfW(text, ARRAYSIZE(text),
-                     TR(L"Give \x201C%s\x201D a session folder of its own again?\n\nIt keeps the sessions the shared folder lists now; "
-                        L"from then on the two lists go apart."),
-                     p->name);
+    WCHAR text[1024], error[512 + 2 * LONG_PATH_CCH], errors[4 * (512 + 2 * LONG_PATH_CCH)];
+    const Profile *first = NULL;
+    DWORD linked = LinkedProfiles(SelectedProfiles());
+    int i, count = 0;
+    if (!linked || StateChangesBlocked()) return;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if (linked & (1u << i)) {
+            if (LinkBusy(&g_manager.profiles.items[i])) return;
+            if (!count++) first = &g_manager.profiles.items[i];
+        }
+    if (count == 1)
+        StringCchPrintfW(text, ARRAYSIZE(text),
+                         TR(L"Give \x201C%s\x201D a session folder of its own again?\n\nIt keeps the sessions the shared folder lists now; "
+                            L"from then on the two lists go apart."),
+                         first->name);
+    else
+        StringCchPrintfW(text, ARRAYSIZE(text),
+                         TR(L"Give the %d linked profiles selected session folders of their own again?\n\nEach one keeps the sessions its shared folder lists now; "
+                            L"from then on the lists go apart."),
+                         count);
     if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Unlink"), TR(L"Cancel"), FALSE)) return;
     FinishShellWork();
-    if (!SessionLink_Remove(&g_manager.profiles, (int)(p - g_manager.profiles.items), error, ARRAYSIZE(error)))
-        Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", error);
+    errors[0] = 0;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if ((linked & (1u << i)) && !SessionLink_Remove(&g_manager.profiles, i, error, ARRAYSIZE(error)))
+            AddError(errors, ARRAYSIZE(errors), error);
+    if (errors[0]) Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", errors);
     Refresh(FALSE);
 }
 
@@ -1636,7 +1697,7 @@ static void ListMenu(LPARAM pos)
     BOOL isDefault;
     POINT pt;
     UINT cmd;
-    int index = -1, i;
+    int i;
     if (pos == (LPARAM)-1) {
         RECT rc;
         int focused = ListView_GetNextItem(g_manager.list, -1, LVNI_FOCUSED);
@@ -1651,7 +1712,6 @@ static void ListMenu(LPARAM pos)
     /* The row just clicked is selected, its WM_APP_SELECTION maybe not handled yet: the shortcuts' state follows it now. */
     UpdateButtons();
     one = SelectedProfile();
-    if (one) index = (int)(one - g_manager.profiles.items);
     isDefault = one && Core_EqualsI(one->folder, g_manager.profiles.defaultFolder);
     if ((menu = CreatePopupMenu()) == NULL) return;
     links = CreatePopupMenu();
@@ -1676,27 +1736,24 @@ static void ListMenu(LPARAM pos)
     AppendMenuW(menu, MF_STRING | (g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDC_OVERWRITE, TR(Theme_MainCaption(IDC_OVERWRITE, 0)));
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDM_LIST_EXPORT, TR(L"E&xport sessions\x2026"));
     AppendMenuW(menu, MF_STRING, IDM_LIST_IMPORT, TR(L"&Import sessions\x2026"));
-    /* Session folders: shared with another profile or kept in a folder of the user's. Every
-     * choice is offered: one that cannot be made yet says why (not signed in, no sessions). */
+    /* Session folders: the profiles selected share another profile's or keep theirs in a folder of
+     * the user's. Every choice is offered: one that cannot be made yet says why (not signed in, no
+     * sessions). The profiles selected are not among the folders offered. */
     if (links) {
-        LinkState state;
-        ZeroMemory(&state, sizeof state);
-        if (one) SessionLink_Read(&g_manager.profiles, index, &state);
-        for (i = 0; one && i < g_manager.profiles.count; i++) {
+        for (i = 0; selected && i < g_manager.profiles.count; i++) {
             WCHAR label[2 * LABEL_CCH];
-            if (i == index) continue;
+            if (selected & (1u << i)) continue;
             MenuName(g_manager.profiles.items[i].name, label, ARRAYSIZE(label));
             AppendMenuW(links, MF_STRING, IDM_LIST_LINK_FIRST + (UINT)i, label);
         }
         if (GetMenuItemCount(links) > 0) AppendMenuW(links, MF_SEPARATOR, 0, NULL);
         AppendMenuW(links, MF_STRING, IDM_LIST_LINK_FOLDER, TR(L"Another &folder\x2026"));
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(menu, MF_POPUP | (one ? 0 : MF_GRAYED), (UINT_PTR)links, TR(L"&Link sessions folder to"));
-        AppendMenuW(menu, MF_STRING | (one && (state.kind == LINK_PROFILE || state.kind == LINK_FOLDER || state.kind == LINK_BROKEN) ? 0 : MF_GRAYED),
-                    IDM_LIST_UNLINK, TR(L"U&nlink sessions folder\x2026"));
+        AppendMenuW(menu, MF_POPUP | (selected ? 0 : MF_GRAYED), (UINT_PTR)links, TR(L"&Link sessions folder to"));
+        AppendMenuW(menu, MF_STRING | (LinkedProfiles(selected) ? 0 : MF_GRAYED), IDM_LIST_UNLINK, TR(L"U&nlink sessions folder\x2026"));
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDM_LIST_BACKUP, TR(L"&Back up\x2026"));
+    AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDM_LIST_BACKUP, TR(L"&Back up\x2026"));
     AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDM_LIST_RESTORE, TR(L"Restore from bac&kup\x2026"));
     if (selected && g_manager.pkg.found) SetMenuDefaultItem(menu, IDC_OPEN, FALSE);
     cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | (Localize_IsRTL() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, g_manager.dlg, NULL);
@@ -1715,7 +1772,7 @@ static void ListMenu(LPARAM pos)
     case IDM_LIST_LINK_FOLDER: DoLink(-1); break;
     case IDM_LIST_UNLINK: DoUnlink(); break;
     case IDM_LIST_BACKUP:
-        if (SelectedProfile()) Backup_Create(g_manager.dlg, &g_manager.pkg, &g_manager.profiles, (int)(SelectedProfile() - g_manager.profiles.items));
+        if (SelectedProfiles()) Backup_Create(g_manager.dlg, &g_manager.pkg, &g_manager.profiles, SelectedProfiles());
         break;
     case IDM_LIST_RESTORE:
         if (SelectedProfile() && !StateChangesBlocked()) {

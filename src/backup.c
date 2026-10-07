@@ -164,38 +164,50 @@ static INT_PTR CALLBACK BackupProc(HWND dialog, UINT message, WPARAM wp, LPARAM 
     return FALSE;
 }
 
-/* The archive the user chose to write (`save`, named after the profile) or read. */
-static BOOL ChooseArchive(HWND owner, BOOL save, const WCHAR *title, const WCHAR *profileName, WCHAR *path, size_t cch)
+typedef enum ArchiveChoice { ARCHIVE_SAVE, ARCHIVE_OPEN, ARCHIVE_FOLDER } ArchiveChoice;
+
+/* "<profile> <date>.zip", without the characters a file name cannot hold. */
+static void ArchiveName(const WCHAR *profileName, WCHAR *name, size_t cch)
+{
+    SYSTEMTIME now;
+    size_t i;
+    GetLocalTime(&now);
+    StringCchPrintfW(name, cch, L"%s %04u-%02u-%02u." ARCHIVE_EXTENSION, profileName, now.wYear, now.wMonth, now.wDay);
+    for (i = 0; name[i]; i++)
+        if (wcschr(L"\\/:*?\"<>|", name[i])) name[i] = L'_';
+}
+
+/* The archive the user chose to write (named after the profile) or read, or
+ * the folder the archives of several profiles go to. */
+static BOOL ChooseArchive(HWND owner, ArchiveChoice choice, const WCHAR *title, const WCHAR *profileName, WCHAR *path, size_t cch)
 {
     IFileDialog *dialog = NULL;
     IShellItem *result = NULL;
     COMDLG_FILTERSPEC filter;
-    FILEOPENDIALOGOPTIONS options = 0;
+    FILEOPENDIALOGOPTIONS options = 0, extra;
     PWSTR chosen = NULL;
-    BOOL ok = FALSE;
+    BOOL ok = FALSE, save = choice == ARCHIVE_SAVE;
     HRESULT hr = CoCreateInstance(save ? &CLSID_FileSaveDialog : &CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileDialog,
                                   (void **)&dialog);
     if (FAILED(hr)) {
         Ui_Message(owner, MB_ICONERROR, TR(L"The file could not be chosen (error 0x%08lX)."), (unsigned long)hr);
         return FALSE;
     }
-    filter.pszName = TR(L"Profile backup (*.zip)");
-    filter.pszSpec = L"*." ARCHIVE_EXTENSION;
     IFileDialog_SetTitle(dialog, title);
-    IFileDialog_SetFileTypes(dialog, 1, &filter);
-    IFileDialog_SetDefaultExtension(dialog, ARCHIVE_EXTENSION);
+    if (choice != ARCHIVE_FOLDER) {
+        filter.pszName = TR(L"Profile backup (*.zip)");
+        filter.pszSpec = L"*." ARCHIVE_EXTENSION;
+        IFileDialog_SetFileTypes(dialog, 1, &filter);
+        IFileDialog_SetDefaultExtension(dialog, ARCHIVE_EXTENSION);
+    }
     if (save) {
         WCHAR name[MAX_PATH];
-        SYSTEMTIME now;
-        size_t i;
-        GetLocalTime(&now);
-        StringCchPrintfW(name, ARRAYSIZE(name), L"%s %04u-%02u-%02u." ARCHIVE_EXTENSION, profileName, now.wYear, now.wMonth, now.wDay);
-        for (i = 0; name[i]; i++)
-            if (wcschr(L"\\/:*?\"<>|", name[i])) name[i] = L'_';
+        ArchiveName(profileName, name, ARRAYSIZE(name));
         IFileDialog_SetFileName(dialog, name);
     }
+    extra = choice == ARCHIVE_SAVE ? FOS_OVERWRITEPROMPT : choice == ARCHIVE_OPEN ? FOS_FILEMUSTEXIST : FOS_PICKFOLDERS;
     if (SUCCEEDED(IFileDialog_GetOptions(dialog, &options)))
-        IFileDialog_SetOptions(dialog, options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | (save ? FOS_OVERWRITEPROMPT : FOS_FILEMUSTEXIST));
+        IFileDialog_SetOptions(dialog, options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | extra);
     hr = IFileDialog_Show(dialog, owner);
     if (SUCCEEDED(hr) && SUCCEEDED(hr = IFileDialog_GetResult(dialog, &result))) {
         if (SUCCEEDED(hr = IShellItem_GetDisplayName(result, SIGDN_FILESYSPATH, &chosen))) {
@@ -318,72 +330,52 @@ static BOOL AddSessions(ZipOut *zip, const ProfileList *list, int index, int *co
     return ok;
 }
 
-static int CountSessions(const ProfileList *list, int index)
+/* The sessions the profiles of `profiles` list, together; -1 when they could not be read. */
+static int CountSessions(const ProfileList *list, DWORD profiles)
 {
     SessionSet set;
-    int r, n = 0;
+    int r, i, n = 0;
     if (!SessionStore_LoadProfiles(&set, list)) return -1;
-    for (r = 0; r < set.rowCount; r++)
-        if (set.rows[r].entry[index] >= 0 && !set.entries[set.rows[r].entry[index]].pendingRemove) n++;
+    for (i = 0; i < list->count; i++)
+        for (r = 0; (profiles & (1u << i)) && r < set.rowCount; r++)
+            if (set.rows[r].entry[i] >= 0 && !set.entries[set.rows[r].entry[i]].pendingRemove) n++;
     SessionStore_Free(&set);
     return n;
 }
 
-BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index)
+/* Profile `index`'s parts `chosen` written to the archive `path`; FALSE with what went wrong in `error`. */
+static BOOL WriteBackup(const ProfileList *list, int index, const BOOL *chosen, const WCHAR *path, WCHAR *error, size_t errorCch)
 {
     const Profile *p = &list->items[index];
-    WCHAR title[LABEL_CCH + 64], path[LONG_PATH_CCH], error[LONG_PATH_CCH + 256], text[LONG_PATH_CCH + 512], cowork[LONG_PATH_CCH];
+    WCHAR cowork[LONG_PATH_CCH];
     char manifest[1024], quoted[3 * LABEL_CCH + 8];
-    BackupDialog dialog;
     ZipOut *zip;
-    HCURSOR old;
     DWORD code = 0;
     int part, sessions = 0;
     size_t used;
-    BOOL ok = TRUE;
-    (void)pkg;
-    if (!p->storageDir[0]) return FALSE;
-    StringCchPrintfW(title, ARRAYSIZE(title), TR(L"Back up \x201C%s\x201D"), p->name);
-    ZeroMemory(&dialog, sizeof dialog);
-    dialog.title = title;
-    dialog.text = TR(L"Choose what the backup holds:");
-    dialog.action = TR(L"Back up");
-    old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
-    dialog.sessions = CountSessions(list, index);
-    SetCursor(old);
-    StringCchPrintfW(cowork, ARRAYSIZE(cowork), L"%s\\" COWORK_DIR, p->storageDir);
-    dialog.offered[PART_SESSIONS] = dialog.chosen[PART_SESSIONS] = dialog.sessions != 0;
-    dialog.offered[PART_COWORK] = dialog.chosen[PART_COWORK] = Util_DirExists(cowork);
-    dialog.offered[PART_SETTINGS] = dialog.chosen[PART_SETTINGS] = TRUE;
-    dialog.offered[PART_SIGNIN] = TRUE;   /* left unchecked: the user asks for it */
-    if (Ui_Dialog(owner, IDD_BACKUP, BackupProc, (LPARAM)&dialog) != IDOK) return FALSE;
-    if (dialog.chosen[PART_SIGNIN] && Claude_IsRunning(p)) {
-        Ui_Message(owner, MB_ICONINFORMATION, TR(L"Close \x201C%s\x201D first: its sign-in files are in use."), p->name);
-        return FALSE;
-    }
-    if (!ChooseArchive(owner, TRUE, title, p->name, path, ARRAYSIZE(path))) return FALSE;
-    if ((zip = Zip_Create(path, &code)) == NULL) {
-        Ui_Message(owner, MB_ICONERROR, TR(L"The backup could not be written (error %lu)."), code);
-        return FALSE;
-    }
-    old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    BOOL ok;
     error[0] = 0;
+    if ((zip = Zip_Create(path, &code)) == NULL) {
+        StringCchPrintfW(error, errorCch, TR(L"The backup could not be written (error %lu)."), code);
+        return FALSE;
+    }
+    StringCchPrintfW(cowork, ARRAYSIZE(cowork), L"%s\\" COWORK_DIR, p->storageDir);
     if (!Core_JsonQuote(p->name, quoted, sizeof quoted)) StringCchCopyA(quoted, ARRAYSIZE(quoted), "\"\"");
     used = AppendA(manifest, sizeof manifest, 0, "{\"format\":\"" BACKUP_FORMAT "\",\"version\":%d,\"profile\":%s,\"parts\":[", BACKUP_VERSION, quoted);
     for (part = 0; part < PARTS; part++) {
-        if (!dialog.chosen[part]) continue;
+        if (!chosen[part]) continue;
         used = AppendA(manifest, sizeof manifest, used, "%s\"%s\"", manifest[used - 1] == '[' ? "" : ",", kPartNames[part]);
     }
     used = AppendA(manifest, sizeof manifest, used, "]}");
     ok = Zip_AddData(zip, MANIFEST_NAME, manifest, used);
-    if (ok && dialog.chosen[PART_SESSIONS]) ok = AddSessions(zip, list, index, &sessions, error, ARRAYSIZE(error));
-    if (ok && dialog.chosen[PART_COWORK]) ok = AddTree(zip, cowork, L"cowork");
-    if (ok && dialog.chosen[PART_SETTINGS]) {
+    if (ok && chosen[PART_SESSIONS]) ok = AddSessions(zip, list, index, &sessions, error, errorCch);
+    if (ok && chosen[PART_COWORK]) ok = AddTree(zip, cowork, L"cowork");
+    if (ok && chosen[PART_SETTINGS]) {
         size_t i;
         for (i = 0; ok && i < ARRAYSIZE(kSettingsFiles); i++) ok = AddIfThere(zip, p->storageDir, kSettingsFiles[i], L"settings");
         ok = ok && AddAppearance(zip, p->storageDir);
     }
-    if (ok && dialog.chosen[PART_SIGNIN]) {
+    if (ok && chosen[PART_SIGNIN]) {
         size_t i;
         WCHAR dir[LONG_PATH_CCH], prefix[MAX_PATH];
         for (i = 0; ok && i < ARRAYSIZE(kSigninFiles); i++) ok = AddIfThere(zip, p->storageDir, kSigninFiles[i], L"signin");
@@ -395,16 +387,104 @@ BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list
     }
     code = Zip_Error(zip);
     ok = Zip_Close(zip, ok) && ok;
-    SetCursor(old);
-    if (!ok) {
-        if (error[0]) Ui_Message(owner, MB_ICONERROR, L"%s", error);
-        else Ui_Message(owner, MB_ICONERROR, TR(L"The backup could not be written (error %lu)."), code ? code : GetLastError());
-        return FALSE;
+    if (!ok && !error[0]) StringCchPrintfW(error, errorCch, TR(L"The backup could not be written (error %lu)."), code ? code : GetLastError());
+    if (ok) Util_Log(L"backed up %s to %s", p->folder, path);
+    return ok;
+}
+
+/* `folder`\`name`, or "<name> (2).zip" and on while that is taken. */
+static BOOL FreeArchivePath(const WCHAR *folder, const WCHAR *name, WCHAR *path, size_t cch)
+{
+    WCHAR stem[MAX_PATH];
+    int n;
+    if (FAILED(StringCchPrintfW(path, cch, L"%s\\%s", folder, name))) return FALSE;
+    if (!Util_FileExists(path)) return TRUE;
+    StringCchCopyW(stem, ARRAYSIZE(stem), name);
+    if (Core_EndsWithI(stem, L"." ARCHIVE_EXTENSION)) stem[wcslen(stem) - ARRAYSIZE(ARCHIVE_EXTENSION)] = 0;
+    for (n = 2; n < 100; n++)
+        if (SUCCEEDED(StringCchPrintfW(path, cch, L"%s\\%s (%d)." ARCHIVE_EXTENSION, folder, stem, n)) && !Util_FileExists(path)) return TRUE;
+    return FALSE;
+}
+
+BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list, DWORD profiles)
+{
+    WCHAR title[LABEL_CCH + 64], path[LONG_PATH_CCH], folder[LONG_PATH_CCH], name[MAX_PATH], cowork[LONG_PATH_CCH];
+    WCHAR error[LONG_PATH_CCH + 256], line[LABEL_CCH + LONG_PATH_CCH + 300], report[8 * (LONG_PATH_CCH + 300)], text[9 * (LONG_PATH_CCH + 300)];
+    const Profile *first = NULL;
+    BackupDialog dialog;
+    HCURSOR old;
+    int i, count = 0, saved = 0;
+    (void)pkg;
+    for (i = 0; i < list->count; i++) {
+        if (!(profiles & (1u << i))) continue;
+        if (!list->items[i].storageDir[0]) {   /* no folder of its own to back up */
+            profiles &= ~(1u << i);
+            continue;
+        }
+        if (!count++) first = &list->items[i];
     }
-    Util_Log(L"backed up %s to %s", p->folder, path);
-    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Backup saved:\n%s"), path);
-    Ui_Message(owner, MB_ICONINFORMATION, L"%s", text);
-    return TRUE;
+    if (!count) return FALSE;
+    if (count == 1) StringCchPrintfW(title, ARRAYSIZE(title), TR(L"Back up \x201C%s\x201D"), first->name);
+    else StringCchPrintfW(title, ARRAYSIZE(title), TR(L"Back up %d profiles"), count);
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.title = title;
+    dialog.text = TR(L"Choose what the backup holds:");
+    dialog.action = TR(L"Back up");
+    old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    dialog.sessions = CountSessions(list, profiles);
+    SetCursor(old);
+    for (i = 0; i < list->count; i++)
+        if ((profiles & (1u << i)) && SUCCEEDED(StringCchPrintfW(cowork, ARRAYSIZE(cowork), L"%s\\" COWORK_DIR, list->items[i].storageDir)) &&
+            Util_DirExists(cowork))
+            dialog.offered[PART_COWORK] = dialog.chosen[PART_COWORK] = TRUE;
+    dialog.offered[PART_SESSIONS] = dialog.chosen[PART_SESSIONS] = dialog.sessions != 0;
+    dialog.offered[PART_SETTINGS] = dialog.chosen[PART_SETTINGS] = TRUE;
+    dialog.offered[PART_SIGNIN] = TRUE;   /* left unchecked: the user asks for it */
+    if (Ui_Dialog(owner, IDD_BACKUP, BackupProc, (LPARAM)&dialog) != IDOK) return FALSE;
+    for (i = 0; dialog.chosen[PART_SIGNIN] && i < list->count; i++)
+        if ((profiles & (1u << i)) && Claude_IsRunning(&list->items[i])) {
+            Ui_Message(owner, MB_ICONINFORMATION, TR(L"Close \x201C%s\x201D first: its sign-in files are in use."), list->items[i].name);
+            return FALSE;
+        }
+    if (count == 1) {
+        if (!ChooseArchive(owner, ARCHIVE_SAVE, title, first->name, path, ARRAYSIZE(path))) return FALSE;
+        old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+        i = (int)(first - list->items);
+        if (!WriteBackup(list, i, dialog.chosen, path, error, ARRAYSIZE(error))) {
+            SetCursor(old);
+            Ui_Message(owner, MB_ICONERROR, L"%s", error);
+            return FALSE;
+        }
+        SetCursor(old);
+        StringCchPrintfW(report, ARRAYSIZE(report), TR(L"Backup saved:\n%s"), path);
+        Ui_Message(owner, MB_ICONINFORMATION, L"%s", report);
+        return TRUE;
+    }
+    /* Several: one archive each, named after its profile, in the folder chosen. */
+    if (!ChooseArchive(owner, ARCHIVE_FOLDER, TR(L"Choose the folder of the backups"), NULL, folder, ARRAYSIZE(folder))) return FALSE;
+    old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    report[0] = 0;
+    for (i = 0; i < list->count; i++) {
+        if (!(profiles & (1u << i))) continue;
+        ArchiveName(list->items[i].name, name, ARRAYSIZE(name));
+        if (!FreeArchivePath(folder, name, path, ARRAYSIZE(path)))
+            StringCchPrintfW(error, ARRAYSIZE(error), TR(L"The backup could not be written (error %lu)."), (unsigned long)ERROR_FILE_EXISTS);
+        else if (WriteBackup(list, i, dialog.chosen, path, error, ARRAYSIZE(error))) {
+            saved++;
+            continue;
+        }
+        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"\x201C%s\x201D: %s"), list->items[i].name, error);
+        if (report[0]) StringCchCatW(report, ARRAYSIZE(report), L"\n");
+        StringCchCatW(report, ARRAYSIZE(report), line);
+    }
+    SetCursor(old);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%d backups saved in:\n%s"), saved, folder);
+    if (report[0]) {
+        StringCchCatW(text, ARRAYSIZE(text), L"\n\n");
+        StringCchCatW(text, ARRAYSIZE(text), report);
+    }
+    Ui_Message(owner, saved == count ? MB_ICONINFORMATION : MB_ICONWARNING, L"%s", text);
+    return saved == count;
 }
 
 /* ------------------------------------------------------------ restoring */
@@ -594,7 +674,7 @@ BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *lis
         return FALSE;
     }
     StringCchPrintfW(title, ARRAYSIZE(title), TR(L"Restore \x201C%s\x201D from a backup"), p->name);
-    if (!ChooseArchive(owner, FALSE, title, p->name, path, ARRAYSIZE(path))) return FALSE;
+    if (!ChooseArchive(owner, ARCHIVE_OPEN, title, p->name, path, ARRAYSIZE(path))) return FALSE;
     zip = Zip_Open(path);
     item = zip ? Zip_Find(zip, MANIFEST_NAME) : -1;
     manifest = item >= 0 ? (char *)Zip_Read(zip, item, MANIFEST_MAX, &length) : NULL;
