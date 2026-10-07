@@ -174,6 +174,7 @@ typedef struct SessionsView {
     TreeNodeKey   pressedSelection;     /* the selection when a control was pressed: its session is the one acted on */
     int           scroll;               /* how far the profiles' parts are scrolled, px */
     HANDLE        watchThread, watchStop;
+    int           watchPaused;          /* SessionsView_PauseWatching calls not resumed yet: no watcher meanwhile */
     WatchPlan     watched;              /* what the watcher thread watches */
     WatchPlan     planned;              /* what the snapshot shown asks to watch */
     WCHAR         collapsed[MAX_COLLAPSED][MAX_PATH];   /* folders the user folded, by GroupKey */
@@ -2742,7 +2743,7 @@ static void Watch(const WatchPlan *plan)
 {
     WatcherParameters *parameters;
     DWORD error;
-    if (WatchingThese(plan)) return;
+    if (g_view.watchPaused || WatchingThese(plan)) return;
     StopWatching();
     parameters = (WatcherParameters *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *parameters);
     if (parameters && (g_view.watchStop = CreateEventW(NULL, TRUE, FALSE, NULL)) != NULL) {
@@ -3145,6 +3146,22 @@ void SessionsView_Leave(void)
 void SessionsView_Reload(void)
 {
     RequestLoad(FALSE);
+}
+
+/* A folder a handle is open in cannot be moved or renamed (Windows answers
+ * "access denied"), and the watcher holds one in every profile's folder:
+ * it stops while profile folders go to the Recycle Bin or are linked,
+ * and no snapshot that arrives meanwhile starts it again. */
+void SessionsView_PauseWatching(void)
+{
+    g_view.watchPaused++;
+    StopWatching();
+}
+
+/* The next snapshot watches the folders as they are then. */
+void SessionsView_ResumeWatching(void)
+{
+    if (g_view.watchPaused > 0 && --g_view.watchPaused == 0 && g_view.warmed) RequestLoad(FALSE);
 }
 
 /* Fonts or scale changed: everything measured and filled again, the row on

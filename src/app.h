@@ -705,6 +705,10 @@ void         SessionsView_Leave(void);
 BOOL         SessionsView_Shown(void);
 const WCHAR *SessionsView_Profile(void);
 void         SessionsView_Reload(void);
+/* The folder watch stopped while profile folders are moved or removed, and
+ * started again after (calls pair up). */
+void         SessionsView_PauseWatching(void);
+void         SessionsView_ResumeWatching(void);
 BOOL         SessionsView_Command(WPARAM wp);
 BOOL         SessionsView_ClearSearch(void);
 BOOL         SessionsView_Notify(const NMHDR *header, LRESULT *result);
