@@ -2452,6 +2452,18 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
                 PostOnce(&g_manager.selectionPending, WM_APP_SELECTION);
         } else if (header->code == NM_DBLCLK) {
             if (((const NMITEMACTIVATE *)lp)->iItem >= 0) DoOpen();
+        } else if (header->code == NM_RCLICK || header->code == LVN_BEGINRDRAG) {
+            /* The menu at the pointer for a right click, and for a press a touchpad
+             * moved past the drag distance: the list starts a right drag then, and
+             * would show no menu. Handled here, the list sends no WM_CONTEXTMENU. */
+            int item = header->code == LVN_BEGINRDRAG ? ((const NMLISTVIEW *)lp)->iItem : -1;
+            if (item >= 0 && !ListView_GetItemState(g_manager.list, item, LVIS_SELECTED)) {
+                ListView_SetItemState(g_manager.list, -1, 0, LVIS_SELECTED);
+                ListView_SetItemState(g_manager.list, item, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            }
+            ListMenu((LPARAM)GetMessagePos());
+            SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+            return TRUE;
         } else if (header->code == LVN_KEYDOWN) {
             WORD key = ((const NMLVKEYDOWN *)lp)->wVKey;
             if (key == VK_DELETE) DoDelete();
@@ -2572,7 +2584,8 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         break;
 
     case WM_CONTEXTMENU:
-        if ((HWND)wp == g_manager.list && !SessionsView_Shown()) {
+        /* The list, from the keyboard, or the view around it below its rows. */
+        if (((HWND)wp == g_manager.list || (HWND)wp == GetDlgItem(dialog, IDC_LIST)) && !SessionsView_Shown()) {
             ListMenu(lp);
             return TRUE;
         }
