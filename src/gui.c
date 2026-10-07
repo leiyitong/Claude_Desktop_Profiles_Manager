@@ -1368,6 +1368,7 @@ static void DeleteSeveral(DWORD bits)
                      names);
     if (!Ui_Ask(g_manager.dlg, IDI_WARNING, text, TR(L"Delete profiles"), TR(L"Cancel"), TRUE) || StateChangesBlocked()) return;
     FinishShellWork();
+    SessionsView_PauseWatching();
     for (i = 0; i < chosen.count && !StateChangesBlocked(); i++) {
         Profile profile;
         if ((p = Profiles_Find(&g_manager.profiles, chosen.folders[i])) < 0) continue;
@@ -1379,6 +1380,7 @@ static void DeleteSeveral(DWORD bits)
                        TR(L"\x201C%s\x201D could not be deleted completely. Make sure Claude is closed for this profile and try again."),
                        profile.name);
     }
+    SessionsView_ResumeWatching();
     Refresh(FALSE);
 }
 
@@ -1404,12 +1406,14 @@ static void DoDelete(void)
         return;
     }
     FinishShellWork();
+    SessionsView_PauseWatching();
     /* REMOVE_CANCELLED (the user answered No to Windows' "delete
      * permanently?") needs no message. */
     if (Profiles_Delete(g_manager.dlg, &p) == REMOVE_FAILED)
         Ui_Message(g_manager.dlg, MB_ICONWARNING,
                    TR(L"\x201C%s\x201D could not be deleted completely. Make sure Claude is closed for this profile and try again."),
                    p.name);
+    SessionsView_ResumeWatching();
     Refresh(FALSE);
 }
 
@@ -1611,9 +1615,11 @@ static void DoLink(int other)
     if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Link"), TR(L"Cancel"), FALSE)) return;
     FinishShellWork();
     errors[0] = 0;
+    SessionsView_PauseWatching();
     for (i = 0; i < g_manager.profiles.count; i++)
         if ((selected & (1u << i)) && !SessionLink_Create(g_manager.dlg, &g_manager.profiles, i, folder, error, ARRAYSIZE(error)))
             AddError(errors, ARRAYSIZE(errors), error);
+    SessionsView_ResumeWatching();
     if (errors[0]) Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", errors);
     Refresh(FALSE);
 }
@@ -1658,9 +1664,11 @@ static void DoUnlink(void)
     if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Unlink"), TR(L"Cancel"), FALSE)) return;
     FinishShellWork();
     errors[0] = 0;
+    SessionsView_PauseWatching();
     for (i = 0; i < g_manager.profiles.count; i++)
         if ((linked & (1u << i)) && !SessionLink_Remove(&g_manager.profiles, i, error, ARRAYSIZE(error)))
             AddError(errors, ARRAYSIZE(errors), error);
+    SessionsView_ResumeWatching();
     if (errors[0]) Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", errors);
     Refresh(FALSE);
 }
@@ -1777,7 +1785,9 @@ static void ListMenu(LPARAM pos)
     case IDM_LIST_RESTORE:
         if (SelectedProfile() && !StateChangesBlocked()) {
             FinishShellWork();
+            SessionsView_PauseWatching();
             Backup_Restore(g_manager.dlg, &g_manager.pkg, &g_manager.profiles, (int)(SelectedProfile() - g_manager.profiles.items));
+            SessionsView_ResumeWatching();
             Refresh(FALSE);
         }
         break;
@@ -2077,7 +2087,9 @@ static void DoUninstall(void)
     Claude_UpdateRunning(&snapshot);
     stockIndex = Profiles_Find(&snapshot, STOCK_FOLDER);
     StringCchCopyW(stock, ARRAYSIZE(stock), stockIndex >= 0 ? snapshot.items[stockIndex].name : STOCK_DEFAULT_NAME);
+    SessionsView_PauseWatching();   /* not resumed once uninstalled: the window closes */
     if (!Install_Uninstall(g_manager.dlg, &snapshot, dialog.removeData)) {
+        SessionsView_ResumeWatching();
         EndUninstallAttempt();
         return;
     }
