@@ -395,7 +395,7 @@ BOOL        Zip_Extract(const ZipIn *zip, int index, const WCHAR *path);
 /* -------------------------------------------------------------- backup.c */
 /* A profile backed up to one archive, parts chosen (Code sessions, Cowork
  * sessions, settings, sign-in), and restored from one into a closed profile. */
-BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index);
+BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list, DWORD profiles);   /* one bit per profile: an archive each */
 BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index);
 
 /* --------------------------------------------------------------- icons.c */
