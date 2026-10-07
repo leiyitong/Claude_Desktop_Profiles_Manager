@@ -1069,16 +1069,43 @@ static HTREEITEM FindShownSession(const WCHAR *key)
     return FindShownRow(&node);
 }
 
-/* Choosing starts from the selection: its session is the first chosen. */
+static void MarkFolder(HTREEITEM folder, BOOL on);
+
+/* Choosing starts from the selection: its session, or a folder's sessions, the first chosen. */
 static void StartMarks(void)
 {
+    HTREEITEM selected;
     if (g_view.several) return;
     g_view.several = TRUE;
     g_view.markedCount = 0;
     if (!g_view.selection.folder) Mark(g_view.selection.key, TRUE);
+    else if ((selected = TreeView_GetSelection(g_view.tree)) != NULL && NodeParam(selected) < 0 && NodeParam(selected) != NODE_NONE)
+        MarkFolder(selected, TRUE);
 }
 
-/* The sessions shown from the anchor's row to `to` chosen; with `add`, with
+/* Every session of folder row `folder` (Starred's too), folded or not, chosen (`on`) or no longer. */
+static void MarkFolder(HTREEITEM folder, BOOL on)
+{
+    HTREEITEM child;
+    for (child = TreeView_GetChild(g_view.tree, folder); child; child = TreeView_GetNextSibling(g_view.tree, child)) {
+        LPARAM node = NodeParam(child);
+        if (node >= 0 && node < g_view.set.rowCount) Mark(g_view.set.rows[node].key, on);
+    }
+}
+
+/* Every session of folder row `folder` is chosen already. */
+static BOOL FolderMarked(HTREEITEM folder)
+{
+    HTREEITEM child;
+    for (child = TreeView_GetChild(g_view.tree, folder); child; child = TreeView_GetNextSibling(g_view.tree, child)) {
+        LPARAM node = NodeParam(child);
+        if (node >= 0 && node < g_view.set.rowCount && MarkIndex(g_view.set.rows[node].key) < 0) return FALSE;
+    }
+    return TRUE;
+}
+
+/* The sessions shown from the anchor's row to `to` chosen, a folder's row
+ * standing for all its sessions (the lower edge's too); with `add`, with
  * those chosen already. */
 static void MarkRange(HTREEITEM to, BOOL add)
 {
@@ -1092,7 +1119,9 @@ static void MarkRange(HTREEITEM to, BOOL add)
         LPARAM node = NodeParam(item);
         if (item == from) edges++;
         if (item == to) edges++;   /* both at once when they are the same row */
-        if (edges > 0 && node >= 0 && node < g_view.set.rowCount) Mark(g_view.set.rows[node].key, TRUE);
+        if (edges == 0) continue;
+        if (node >= 0 && node < g_view.set.rowCount) Mark(g_view.set.rows[node].key, TRUE);
+        else if (node != NODE_NONE) MarkFolder(item, TRUE);
     }
 }
 
@@ -1103,9 +1132,9 @@ static void ShowMarks(HTREEITEM selected)
     RedrawDetails(FALSE);
 }
 
-/* A click on session `item` with Ctrl (`toggle`: it is chosen or no longer
- * is) or Shift (`range`: the sessions from the anchor to it, added to those
- * chosen with Ctrl too). */
+/* A click on session or folder `item` with Ctrl (`toggle`: it, or all of a
+ * folder's sessions, chosen or no longer) or Shift (`range`: the sessions
+ * from the anchor to it, added to those chosen with Ctrl too). */
 static void ClickToChoose(HTREEITEM item, BOOL toggle, BOOL range)
 {
     TreeNodeKey key;
@@ -1114,7 +1143,8 @@ static void ClickToChoose(HTREEITEM item, BOOL toggle, BOOL range)
         MarkRange(item, toggle);
     } else {
         StartMarks();
-        Mark(key.key, MarkIndex(key.key) < 0);
+        if (NodeParam(item) >= 0) Mark(key.key, MarkIndex(key.key) < 0);
+        else MarkFolder(item, !FolderMarked(item));
         g_view.anchor = key;
         /* One left, or none: the tree's own selection again, on it. */
         if (g_view.markedCount <= 1) {
@@ -1163,7 +1193,7 @@ static LRESULT CALLBACK TreeSubclass(HWND window, UINT msg, WPARAM wp, LPARAM lp
         hit.pt.x = GET_X_LPARAM(lp);
         hit.pt.y = GET_Y_LPARAM(lp);
         onRow = TreeView_HitTest(window, &hit) && (hit.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT | TVHT_ONITEMINDENT));
-        if (onRow && (wp & (MK_CONTROL | MK_SHIFT)) && NodeParam(hit.hItem) >= 0) {
+        if (onRow && (wp & (MK_CONTROL | MK_SHIFT)) && NodeParam(hit.hItem) != NODE_NONE) {
             SetFocus(window);
             ClickToChoose(hit.hItem, (wp & MK_CONTROL) != 0, (wp & MK_SHIFT) != 0);
             return 0;
