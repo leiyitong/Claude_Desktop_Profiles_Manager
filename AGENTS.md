@@ -98,12 +98,12 @@ Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project s
   procedure only fills it. Nothing else picks a color, draws a selection or
   places a dialog; a new kind of control is themed there, and
   `tests/test_theme.c` compares it with Windows.
-- User-visible text is plain English in `TR(L"...")` or `app.rc`, with a row for all twelve
-  languages in `localize_catalog.inc` (kept sorted); `test_localize` and
-  `tools/check-localization.py` check it. A key the code reaches through a variable is listed
-  in the checker. English uses "…" (`\x2026` in `app.rc`, which stays ASCII); zh, hi, bn and ur
-  put access keys after the text as "(&X)"; text naming Claude's interface uses Claude's own
-  words. Comments explain why, not history.
+- User-visible text is plain English in `TR(L"...")` or `app.rc`, with a row giving its
+  Simplified Chinese in `localize_catalog.inc` (kept sorted); the interface is English and
+  Simplified Chinese only. `test_localize` and `tools/check-localization.py` check it. A key the
+  code reaches through a variable is listed in the checker. English uses "…" (`\x2026` in
+  `app.rc`, which stays ASCII); Chinese puts access keys after the text as "(&X)"; text naming
+  Claude's interface uses Claude's own words. Comments explain why, not history.
 - Tests never touch the user's real state: private folders (`Util_SetStateDir` for the log and
   queued session changes), private registry keys, throwaway profiles.
 

@@ -7,9 +7,9 @@
  *    monitor's work area, without overlaps, each caption whole (wrapped
  *    labels, buttons, check boxes, links, edits, drop-down lists);
  *  - the manager window: one client size for every language, both views and
- *    every status and footer, level with the buttons beside them; its table
- *    columns, profile note and shortcut row; live language changes in the
- *    same window and in its modal dialogs;
+ *    every status and version, level with the buttons beside them; its table
+ *    columns and profile note; live language changes in the same window and
+ *    in its modal dialogs;
  *    its responsive layout from the minimum to wide, tall and maximized
  *    frames, and its native frame messages;
  *  - the sessions view driven by sessions.c on private profiles, entries and
@@ -60,7 +60,7 @@ typedef struct LayoutFixture {
     BOOL sessions;                      /* the sessions view shows */
     BOOL realSessions;                  /* sessions.c drives that view */
     LinkStatus links;
-    MainFooter footer;
+    MainVersion version;
     /* What sessions.c did through the window. */
     int reloadRequests, openPrompts;
     HWND lastPrompt;
@@ -420,17 +420,19 @@ static void PurgeCaptions(HWND dialog, BOOL fill)
     Theme_SmoothView(list);
 }
 
-/* What the sessions dialog says when it overwrites, its longest form. */
+/* What the sessions dialog says when it moves every session, its longest form. */
 static void SyncCaptions(HWND dialog)
 {
-    SetWindowTextW(dialog, TR(L"Overwrite sessions"));
-    SetDlgItemTextW(dialog, IDC_Y_TEXT, TR(L"The profiles checked get every session of the profile chosen, in its state there, "
-                                           L"even the ones they deleted."));
+    WCHAR text[1024];
+    SetWindowTextW(dialog, TR(L"Move all sessions"));
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"The profiles checked get every session %s lists, which then leaves it. "
+                                               L"The conversations stay on this PC."), L"Private profile");
+    SetDlgItemTextW(dialog, IDC_Y_TEXT, text);
     SetDlgItemTextW(dialog, IDC_Y_TO_LABEL, TR(L"&To these profiles:"));
-    SetDlgItemTextW(dialog, IDOK, TR(L"Overwrite"));
+    SetDlgItemTextW(dialog, IDOK, TR(L"Move"));
 }
 
-/* The status line and its button, and the footer, as gui.c shows them. */
+/* The status line and its button, and the version, as gui.c shows them. */
 static void MainCaptions(HWND dialog, const LayoutFixture *fixture)
 {
     WCHAR text[2048];
@@ -446,15 +448,23 @@ static void MainCaptions(HWND dialog, const LayoutFixture *fixture)
         SetWindowTextW(statusAction, TR(Theme_MainCaption(IDC_STATUS_ACTION, 1)));
     }
     ShowWindow(statusAction, fixture->links == LINKS_ROUTED ? SW_HIDE : SW_SHOW);
-    if (fixture->footer == MAIN_FOOTER_AVAILABLE)
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainFooter(MAIN_FOOTER_AVAILABLE)), APP_VERSION_WSTR, L"9.8.7");
-    else if (fixture->footer == MAIN_FOOTER_DOWNLOADING)
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainFooter(MAIN_FOOTER_DOWNLOADING)), L"9.8.7");
-    else if (fixture->footer == MAIN_FOOTER_INSTALLING)
-        StringCchCopyW(text, ARRAYSIZE(text), TR(Theme_MainFooter(MAIN_FOOTER_INSTALLING)));
-    else StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainFooter(MAIN_FOOTER_CREDITS)), APP_VERSION_WSTR, APP_AUTHOR_URL);
-    SetDlgItemTextW(dialog, IDC_ABOUT, text);
-    ShowWindow(GetDlgItem(dialog, IDC_UPDATE), fixture->footer != MAIN_FOOTER_CREDITS ? SW_SHOW : SW_HIDE);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainVersion(fixture->version)),
+                     fixture->version == MAIN_VERSION_BUILD ? L"2026.12.31 23:59" : L"9.8.7");
+    SetDlgItemTextW(dialog, IDC_VERSION, text);
+    ShowWindow(GetDlgItem(dialog, IDC_UPDATE), fixture->version != MAIN_VERSION_BUILD ? SW_SHOW : SW_HIDE);
+}
+
+/* The profile dialog's choices for its sessions, as gui.c fills them. */
+static void SessionChoices(HWND dialog, const WCHAR *name)
+{
+    HWND combo = GetDlgItem(dialog, IDC_P_SYNC);
+    WCHAR text[LABEL_CCH * 3 + 64], names[LABEL_CCH * 2 + 8];
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(L"Its own, kept apart"));
+    StringCchPrintfW(names, ARRAYSIZE(names), L"%s, %s", name, L"Work");
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"The same as %s"), names);
+    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)text);
+    SendMessageW(combo, CB_SETCURSEL, 1, 0);
 }
 
 static void FillMock(HWND dialog, const LayoutFixture *fixture)
@@ -466,8 +476,6 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         MainCaptions(dialog, fixture);
         StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainNote()), name);
         SetDlgItemTextW(dialog, IDC_NOTE, text);
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Shortcuts for \x201C%s\x201D"), name);
-        SetDlgItemTextW(dialog, IDC_SC_GROUP, text);
         PopulateProfileTable(GetDlgItem(dialog, IDC_LIST), name);
         break;
     case IDD_PROFILE: {
@@ -485,6 +493,7 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         CheckDlgButton(dialog, IDC_P_STARTUP, BST_CHECKED);
         CheckDlgButton(dialog, IDC_P_COPY, BST_CHECKED);
         CheckDlgButton(dialog, IDC_P_OPEN, BST_CHECKED);
+        SessionChoices(dialog, name);
         break;
     }
     case IDD_TITLE:
@@ -508,8 +517,6 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         break;
     case IDD_SYNC:
         SyncCaptions(dialog);
-        SendDlgItemMessageW(dialog, IDC_Y_FROM, CB_ADDSTRING, 0, (LPARAM)name);
-        SendDlgItemMessageW(dialog, IDC_Y_FROM, CB_SETCURSEL, 0, 0);
         PopulateSyncProfiles(dialog, name);
         break;
     case IDD_LINK:
@@ -540,7 +547,6 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainNote()), name);
         SetDlgItemTextW(dialog, IDC_NOTE, text);
         SetDlgItemTextW(dialog, IDC_SESSIONS, TR(Theme_MainCaption(IDC_SESSIONS, fixture->sessions)));
-        SetDlgItemTextW(dialog, IDC_SC_GROUP, TR(L"Shortcuts"));
         MainCaptions(dialog, fixture);
     } else if (fixture->resource == IDD_PROFILE) {
         HWND combo = GetDlgItem(dialog, IDC_P_COLOR);
@@ -552,6 +558,7 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         SendMessageW(combo, CB_RESETCONTENT, 0, 0);
         for (color = 0; color < PALETTE_SIZE; color++) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(g_ColorNames[color]));
         SendMessageW(combo, CB_SETCURSEL, 0, 0);
+        SessionChoices(dialog, L"Private profile");
     } else if (fixture->resource == IDD_TITLE) {
         SetDlgItemTextW(dialog, IDC_T_TITLE, L"Private user text");
     } else if (fixture->resource == IDD_MESSAGE) {
@@ -597,8 +604,8 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_RESTORE,
-                                            IDC_PURGE, IDC_BACKUP_CODE, IDC_DEFAULT, IDC_NOTE, IDC_SC_GROUP, IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
+    static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR,
+                                            IDC_DEFAULT, IDC_NOTE };
     static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
     size_t i;
     for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
@@ -660,7 +667,7 @@ static INT_PTR CALLBACK FixtureProc(HWND dialog, UINT message, WPARAM wp, LPARAM
     }
     if (!fixture) return FALSE;
     if (message >= WM_CTLCOLORMSGBOX && message <= WM_CTLCOLORSTATIC)
-        return Theme_CtlColor(message, wp, lp, fixture->resource == IDD_MAIN ? IDC_ABOUT : 0);
+        return Theme_CtlColor(message, wp, lp, fixture->resource == IDD_MAIN ? IDC_VERSION : 0);
     if (fixture->resource == IDD_MAIN && (message == WM_GETMINMAXINFO || message == WM_DPICHANGED))
         return Gui_MainWindowGeometry(dialog, message, wp, lp);
     if (fixture->realSessions) {
@@ -871,25 +878,6 @@ static void CheckNativeRoles(const LayoutFixture *fixture)
     ListView_SetItemText(table, 0, 1, original);
 }
 
-/* gui.c draws the shortcut heading on one line (its badge, then the
- * profile's name cut to fit): that line must fit its height. */
-static void CheckShortcutHeading(HWND dialog, const LayoutFixture *fixture)
-{
-    HWND heading = GetDlgItem(dialog, IDC_SC_GROUP);
-    TEXTMETRICW metrics = { 0 };
-    RECT client;
-    BOOL measured = FALSE;
-    HDC dc = GetDC(heading);
-    if (dc) {
-        HGDIOBJ previous = SelectObject(dc, (HFONT)SendMessageW(heading, WM_GETFONT, 0, 0));
-        measured = GetTextMetricsW(dc, &metrics);
-        SelectObject(dc, previous);
-        ReleaseDC(heading, dc);
-    }
-    GetClientRect(heading, &client);
-    Check(fixture, heading, "shortcut heading holds one line of its font", measured && client.bottom >= metrics.tmHeight);
-}
-
 static void CheckNativeNote(HWND dialog, const LayoutFixture *fixture)
 {
     HWND note = GetDlgItem(dialog, IDC_NOTE);
@@ -994,12 +982,12 @@ static void CheckNoteGeometry(HWND dialog, const LayoutFixture *fixture)
 {
     HWND note = GetDlgItem(dialog, IDC_NOTE);
     RECT client, table = RelativeRect(dialog, fixture->tableViewport), placed = RelativeRect(dialog, note);
-    RECT setDefault = RelativeRect(dialog, GetDlgItem(dialog, IDC_DEFAULT)), overwrite = RelativeRect(dialog, GetDlgItem(dialog, IDC_BACKUP_CODE));
+    RECT setDefault = RelativeRect(dialog, GetDlgItem(dialog, IDC_DEFAULT)), overwrite = RelativeRect(dialog, GetDlgItem(dialog, IDC_REPAIR));
     GetClientRect(dialog, &client);
     Check(fixture, note, "note stays beside the table and inside the dialog",
           placed.left >= table.right && placed.top >= 0 && placed.right <= client.right && placed.bottom <= client.bottom);
     Check(fixture, note, "note fits the table's vertical band", placed.bottom <= table.bottom);
-    Check(fixture, GetDlgItem(dialog, IDC_DEFAULT), "default button fits between the sessions' last action and the complete note",
+    Check(fixture, GetDlgItem(dialog, IDC_DEFAULT), "default button fits between the side bar's last action and the complete note",
           setDefault.top >= overwrite.bottom && setDefault.bottom <= placed.top);
 }
 
@@ -1083,30 +1071,6 @@ static void CheckText(const LayoutFixture *fixture, HWND control)
     ReleaseDC(control, dc);
 }
 
-static void CheckShortcutRows(HWND dialog, const LayoutFixture *fixture)
-{
-    static const int kShortcuts[] = { IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
-    RECT buttons[ARRAYSIZE(kShortcuts)], group = RelativeRect(dialog, GetDlgItem(dialog, IDC_SC_GROUP));
-    int i, gap = MulDiv(THEME_MAIN_GAP_DIPS, (int)GetDpiForWindow(dialog), 96);
-    for (i = 0; i < (int)ARRAYSIZE(kShortcuts); i++) buttons[i] = RelativeRect(dialog, GetDlgItem(dialog, kShortcuts[i]));
-    Check(fixture, GetDlgItem(dialog, IDC_SC_DESKTOP), "shortcut row starts at its group's left edge", buttons[0].left == group.left);
-    Check(fixture, GetDlgItem(dialog, IDC_SC_START), "shortcut row finishes at its group's right edge", buttons[3].right == group.right);
-    if (buttons[0].top == buttons[3].top) {
-        for (i = 1; i < (int)ARRAYSIZE(kShortcuts); i++) {
-            int actualGap = buttons[i].left - buttons[i - 1].right, firstGap = buttons[1].left - buttons[0].right;
-            Check(fixture, GetDlgItem(dialog, kShortcuts[i]), "single shortcut row distributes its free space evenly",
-                  actualGap >= gap && abs(actualGap - firstGap) <= 1);
-            Check(fixture, GetDlgItem(dialog, kShortcuts[i]), "single shortcut row shares a baseline",
-                  buttons[i].top == buttons[0].top && buttons[i].bottom == buttons[0].bottom);
-        }
-    } else {
-        Check(fixture, GetDlgItem(dialog, IDC_SC_SAVEAS), "first fallback row uses its group's full width", buttons[1].right == group.right);
-        Check(fixture, GetDlgItem(dialog, IDC_SC_PIN), "second fallback row uses its group's full width", buttons[2].left == group.left);
-        Check(fixture, GetDlgItem(dialog, IDC_SC_SAVEAS), "first fallback row retains its minimum gap", buttons[1].left - buttons[0].right >= gap);
-        Check(fixture, GetDlgItem(dialog, IDC_SC_START), "second fallback row retains its minimum gap", buttons[3].left - buttons[2].right >= gap);
-    }
-}
-
 /* The middle of the first line of `label`'s text (drawn at its top), in the
  * dialog's client. */
 static int FirstLineMiddle(HWND dialog, HWND label)
@@ -1123,13 +1087,13 @@ static int FirstLineMiddle(HWND dialog, HWND label)
     return rect.top + metrics.tmHeight / 2;
 }
 
-/* The status and the version link read on the same line as the buttons
- * beside them (a button centers its caption, a label draws at its top). */
+/* The status and the version read on the same line as the header's
+ * buttons (a button centers its caption, a label draws at its top). */
 static void CheckLabelsLevelWithButtons(HWND dialog, const LayoutFixture *fixture)
 {
     static const struct { int label, button; const char *name; } kRows[] = {
-        { IDC_STATUS, IDC_LANGUAGE, "the status's text is level with the header buttons' captions" },
-        { IDC_ABOUT, IDC_UNINSTALL, "the version link's first line is level with the footer buttons' captions" }
+        { IDC_STATUS, IDC_MENU_APP, "the status's text is level with the header buttons' captions" },
+        { IDC_VERSION, IDC_SESSIONS, "the version is level with the header buttons' captions" }
     };
     size_t i;
     for (i = 0; i < ARRAYSIZE(kRows); i++) {
@@ -1166,7 +1130,6 @@ static void CheckGeometry(HWND dialog, const LayoutFixture *fixture)
             if (!clear) printf("        other=%d overlap=%ldx%ld\n", GetDlgCtrlID(controls[j]), overlap.right - overlap.left, overlap.bottom - overlap.top);
         }
     }
-    if (fixture->resource == IDD_MAIN && !fixture->sessions) CheckShortcutRows(dialog, fixture);
     if (fixture->resource == IDD_MAIN) CheckLabelsLevelWithButtons(dialog, fixture);
 }
 
@@ -1198,7 +1161,6 @@ static void CheckProfileTable(HWND dialog, const LayoutFixture *fixture)
                dialogClient.bottom, minimum.cx, minimum.cy);
     }
     CheckNativeRoles(fixture);
-    CheckShortcutHeading(dialog, fixture);
 }
 
 static void CheckHiddenProfileNote(HWND dialog, const LayoutFixture *fixture)
@@ -1610,8 +1572,7 @@ static void CheckHiddenRows(void)
         { IDD_PROFILE, IDC_P_COPY, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
         { IDD_UNINSTALL, IDC_U_KEEP, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
         /* The label is centered on the drop-down list: at some scales it ends below it. */
-        { IDD_SYNC, IDC_Y_TEXT, { IDC_Y_FROM_LABEL, IDC_Y_FROM, 0 }, 2, "the sessions dialog without its source" },
-        { IDD_SYNC, IDC_Y_LIST, { IDC_Y_EXACT, 0, 0 }, 1, "the sessions dialog without its removal choice" },
+        { IDD_PROFILE, IDC_P_PICTURE, { IDC_P_SYNC_LABEL, IDC_P_SYNC, 0 }, 2, "the profile dialog without its sessions" },
     };
     size_t i, scale;
     for (i = 0; i < ARRAYSIZE(kCases); i++) for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) {
@@ -1767,41 +1728,13 @@ static void CheckMessageBoxes(void)
     DestroyWindow(owner);
 }
 
-/* Captions too wide for one row take two, each row filling the group. */
-static void CheckShortcutFallback(void)
-{
-    static const int kShortcuts[] = { IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
-    LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
-    HWND dialog;
-    HFONT larger = NULL;
-    LOGFONTW font;
-    size_t i;
-    if (!NativeScaleFits("the shortcuts' two-row fallback")) return;
-    dialog = CreateFixture(&fixture);
-    Check(&fixture, NULL, "shortcut fallback private fixture created", dialog != NULL);
-    if (dialog && GetObjectW((HFONT)SendDlgItemMessageW(dialog, IDC_SC_SAVEAS, WM_GETFONT, 0, 0), sizeof font, &font)) {
-        font.lfHeight = MulDiv(font.lfHeight, 3, 2);
-        larger = CreateFontIndirectW(&font);
-    }
-    if (larger) {
-        for (i = 0; i < ARRAYSIZE(kShortcuts); i++) SendDlgItemMessageW(dialog, kShortcuts[i], WM_SETFONT, (WPARAM)larger, FALSE);
-        Theme_FitDialog(dialog);
-        Check(&fixture, NULL, "larger shortcut captions take the two-row fallback",
-              RelativeRect(dialog, GetDlgItem(dialog, IDC_SC_DESKTOP)).top != RelativeRect(dialog, GetDlgItem(dialog, IDC_SC_START)).top);
-        CheckShortcutRows(dialog, &fixture);
-        for (i = 0; i < ARRAYSIZE(kShortcuts); i++) CheckText(&fixture, GetDlgItem(dialog, kShortcuts[i]));
-    } else Check(&fixture, NULL, "larger shortcut caption font created", FALSE);
-    DestroyFixture(dialog, &fixture);
-    if (larger) DeleteObject(larger);
-}
-
 /* The manager window in every language, view and scale, through every link
- * status and footer: one client size, every control in place. Its table,
+ * status and version: one client size, every control in place. Its table,
  * note and details are checked once per window. */
 static void CheckMainStates(void)
 {
     size_t scale;
-    int language, view, links, footer;
+    int language, view, links, version;
     for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) {
         RECT common = { 0, 0, 0, 0 };
         int commonRole = -1;
@@ -1832,13 +1765,13 @@ static void CheckMainStates(void)
                 CheckSessionActionWidths(dialog, &fixture);
                 CheckHiddenProfileNote(dialog, &fixture);
             }
-            for (links = 0; links < LINK_STATUSES; links++) for (footer = 0; footer < MAIN_FOOTERS; footer++) {
+            for (links = 0; links < LINK_STATUSES; links++) for (version = 0; version < MAIN_VERSIONS; version++) {
                 fixture.links = (LinkStatus)links;
-                fixture.footer = (MainFooter)footer;
+                fixture.version = (MainVersion)version;
                 MainCaptions(dialog, &fixture);
                 Theme_LayoutMain(dialog);
                 GetClientRect(dialog, &client);
-                Check(&fixture, NULL, "status and footer changes keep the main client size", EqualRect(&common, &client));
+                Check(&fixture, NULL, "status and version changes keep the main client size", EqualRect(&common, &client));
                 CheckGeometry(dialog, &fixture);
             }
             DestroyFixture(dialog, &fixture);
@@ -1995,15 +1928,17 @@ static void DescribeFrame(const char *what, HWND dialog, const RECT *expected)
 
 /* The content has a bounded reading width (THEME_MAIN_READING_WIDTH_DIPS, or
  * the minimum when wider): a client up to it is filled within the margins,
- * a wider one keeps that width, centered. Its widest row is the shortcuts'. */
+ * a wider one keeps that width, centered. The header spans it: the first
+ * menu to the view's button. */
 static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE minimum, const char *name)
 {
-    HWND row = GetDlgItem(dialog, IDC_SC_GROUP);
-    RECT client, group = RelativeRect(dialog, row);
+    HWND row = GetDlgItem(dialog, IDC_MENU_APP);
+    RECT client, group = RelativeRect(dialog, row), last = RelativeRect(dialog, GetDlgItem(dialog, IDC_SESSIONS));
     int dpi = (int)GetDpiForWindow(dialog), margin = MulDiv(THEME_MAIN_MARGIN_DIPS, dpi, 96);
     int reading = max(minimum.cx, MulDiv(THEME_MAIN_READING_WIDTH_DIPS, dpi, 96)), left, right;
     BOOL bounded;
     GetClientRect(dialog, &client);
+    group.right = last.right;
     left = group.left;
     right = client.right - group.right;
     if (client.right <= reading) bounded = left == margin && right == margin;
@@ -2017,8 +1952,7 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
  * is on screen meanwhile: messages are handled between steps (PumpMessages). */
 static void CheckMainFrameMessages(void)
 {
-    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_RESTORE, IDC_PURGE,
-                                    IDC_BACKUP_CODE, IDC_DEFAULT };
+    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR, IDC_DEFAULT };
     LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];
@@ -2224,7 +2158,7 @@ static void CheckResponsiveMain(void)
         HWND dialog = CreateFixture(&fixture);
         SIZE minimum = { 0, 0 };
         RECT initialNote, initialDefault;
-        int dpi, role, footer;
+        int dpi, role, version;
         Check(&fixture, NULL, "responsive private fixture created", dialog != NULL);
         if (!dialog) {
             DestroyFixture(dialog, &fixture);
@@ -2263,7 +2197,7 @@ static void CheckResponsiveMain(void)
             Check(&fixture, NULL, "fitting and note updates retain the user's frame and position", EqualRect(&before, &after));
 
             table = RelativeRect(dialog, fixture.tableViewport);
-            group = RelativeRect(dialog, GetDlgItem(dialog, IDC_SC_GROUP));
+            group = RelativeRect(dialog, GetDlgItem(dialog, IDC_MENU_APP));
             note = RelativeRect(dialog, GetDlgItem(dialog, IDC_NOTE));
             setDefault = RelativeRect(dialog, GetDlgItem(dialog, IDC_DEFAULT));
             sessionProfiles = RelativeRect(dialog, fixture.profilesViewport);
@@ -2291,15 +2225,15 @@ static void CheckResponsiveMain(void)
                 CheckNoteGeometry(dialog, &fixture);
                 CheckNativeNote(dialog, &fixture);
             } else CheckSessionActionWidths(dialog, &fixture);
-            for (footer = 0; footer < MAIN_FOOTERS; footer++) {
-                fixture.footer = (MainFooter)footer;
+            for (version = 0; version < MAIN_VERSIONS; version++) {
+                fixture.version = (MainVersion)version;
                 MainCaptions(dialog, &fixture);
                 Theme_FitDialog(dialog);
-                CheckText(&fixture, GetDlgItem(dialog, IDC_ABOUT));
+                CheckText(&fixture, GetDlgItem(dialog, IDC_VERSION));
                 GetWindowRect(dialog, &after);
-                Check(&fixture, NULL, "footer variants retain the resized frame", EqualRect(&before, &after));
+                Check(&fixture, NULL, "version variants retain the resized frame", EqualRect(&before, &after));
             }
-            fixture.footer = MAIN_FOOTER_CREDITS;
+            fixture.version = MAIN_VERSION_BUILD;
             MainCaptions(dialog, &fixture);
             Theme_LayoutMain(dialog);
         }
@@ -2630,6 +2564,40 @@ static void ReadPrivateTree(HWND tree, HTREEITEM item, PrivateTreeItem *items, i
     }
 }
 
+/* Whether hovering `x`, `y` of `control` changes what it draws there. */
+static BOOL LitUnderMouse(HWND control, int x, int y)
+{
+    HDC dc;
+    COLORREF before, after;
+    SendMessageW(control, WM_MOUSELEAVE, 0, 0);
+    UpdateWindow(control);
+    dc = GetDC(control);
+    before = GetPixel(dc, x, y);
+    ReleaseDC(control, dc);
+    SendMessageW(control, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+    UpdateWindow(control);
+    dc = GetDC(control);
+    after = GetPixel(dc, x, y);
+    ReleaseDC(control, dc);
+    SendMessageW(control, WM_MOUSELEAVE, 0, 0);
+    UpdateWindow(control);
+    return before != CLR_INVALID && after != CLR_INVALID && before != after;
+}
+
+/* The first row of the details' scrolling part where the first profile's
+ * Actions box, at its right end (`x`), lights up under the mouse: its place
+ * follows the scale. -1 when none does. */
+static int ActionsRow(HWND parts, int x)
+{
+    RECT client;
+    int y, limit;
+    if (!GetClientRect(parts, &client)) return -1;
+    limit = min(client.bottom, MulDiv(120, (int)GetDpiForWindow(parts), 96));
+    for (y = 0; y < limit; y++)
+        if (LitUnderMouse(parts, x, y)) return y + 2 < client.bottom ? y + 2 : y;
+    return -1;
+}
+
 static void CheckDetailHover(HWND control, const LayoutFixture *fixture, int x, int y, const char *name)
 {
     HDC dc;
@@ -2698,7 +2666,11 @@ static void CheckSessionsResize(SessionsFixture *sessions)
               part.right <= detail.right && part.bottom < detail.bottom);
         CheckDetailHover(details, fixture, 10, detail.bottom - 5, "resized bottom action hit region is current before its hover paint");
         GetClientRect(parts, &inside);
-        CheckDetailHover(parts, fixture, inside.right - 8, 15, "resized Actions menu hit region matches its native drawing");
+        {
+            int row = ActionsRow(parts, inside.right - 8);
+            Check(fixture, parts, "resized Actions menu hit region matches its native drawing", row >= 0);
+            if (row >= 0) CheckDetailHover(parts, fixture, inside.right - 8, row, "resized Actions menu hit region matches its native drawing");
+        }
         CheckSessionActionWidths(dialog, fixture);
     }
 }
@@ -2932,8 +2904,8 @@ static void CheckSessionsActionsWidth(SessionsFixture *sessions)
         return;
     }
     inside.x = client.right - 8;
-    inside.y = 15;
-    if (!ActionsBoxLit(parts, inside.x, inside)) {
+    inside.y = ActionsRow(parts, inside.x);
+    if (inside.y < 0 || !ActionsBoxLit(parts, inside.x, inside)) {
         Check(fixture, parts, "the details' Actions box lights up under the mouse", FALSE);
         return;
     }
@@ -3058,7 +3030,6 @@ int wmain(void)
     CheckMessageBoxes();
     CheckHiddenRows();
     CheckMainStates();
-    CheckShortcutFallback();
     CheckProfileNotes();
     CheckLanguageRoundTrips();
     CheckResponsiveMain();

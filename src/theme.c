@@ -4235,7 +4235,7 @@ static SIZE MeasureEveryLanguage(HWND control, const WCHAR *const *keys, int key
     return largest;
 }
 
-static const WCHAR *const kProfileColumnTitles[] = { L"Profile", L"Role", L"Data folder", L"Sessions folder" };
+static const WCHAR *const kProfileColumnTitles[] = { L"Profile", L"Role", L"Data folder", L"Sessions" };
 /* What the sessions folder column says besides a link's target (sessionlink.c). */
 static const WCHAR *const kSessionsFolderStates[] = { L"This profile", L"Not signed in", L"No sessions yet", L"Link broken" };
 /* The role column's values: the profile the regular Claude icon opens, the default one, or both. */
@@ -4451,18 +4451,20 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
 
 /* The manager window: what every control needs in every language and
  * script font is measured once per DPI and font (MeasureMain, a cached
- * MainBudget); a new size only places the controls (Theme_LayoutMain). */
+ * MainBudget); a new size only places the controls (Theme_LayoutMain).
+ * The header holds the menus on the left, the status (or the progress of a
+ * sync) in the middle, the version and the view's button on the right; the
+ * list fills the body, the profiles' actions beside it. */
 #define MAIN_SIDE_GAP_DIPS            12
-#define MAIN_RESOURCE_WIDTH_DIPS      821    /* IDD_MAIN's 420 x 312 dialog units in its 9 pt font */
-#define MAIN_RESOURCE_HEIGHT_DIPS     577
-#define MAIN_STATUS_MINIMUM_DIPS      60     /* the status text between the header buttons */
-#define SIDEBAR_GROUP_GAP_DIPS        12     /* the sessions' actions stay apart from the profile's */
-#define SIDEBAR_DEFAULT_GAP_DIPS      9      /* "Set as default" below the other actions: with these gaps the window fits 150 % on 1080p */
+#define MAIN_RESOURCE_WIDTH_DIPS      821    /* IDD_MAIN's 420 x 282 dialog units in its 9 pt font */
+#define MAIN_RESOURCE_HEIGHT_DIPS     522
+#define MAIN_STATUS_MINIMUM_DIPS      120    /* the status text, or the progress of a sync, between the menus and the version */
+#define SIDEBAR_GROUP_GAP_DIPS        12     /* between the side bar's groups of actions */
+#define SIDEBAR_DEFAULT_GAP_DIPS      9      /* "Set as default" below the other actions */
 #define SIDEBAR_NOTE_GAP_DIPS         9      /* between "Set as default" and the note below it */
 #define DETAILS_PADDING_DIPS          12     /* around the caption of the details' button */
 #define ARCHIVED_INSET_DIPS           5      /* "Show archived" ends before the tree: room before the details */
-#define SHORTCUT_GROWTH_ONE_ROW_DIPS  280    /* the most a shortcut button grows, on one row */
-#define SHORTCUT_GROWTH_TWO_ROWS_DIPS 420    /* ... and on two rows */
+#define VERSION_SAMPLE                L"2026.12.31 23:59"   /* the longest version the label shows */
 
 /* A button, with every caption it shows (catalog keys). */
 typedef struct MainButton {
@@ -4470,35 +4472,38 @@ typedef struct MainButton {
     const WCHAR *captions[2];
 } MainButton;
 
+/* The side bar, top down: the profiles' Claude, the profiles, their sessions and the program. */
 static const MainButton kMainActions[] = {
-    { IDC_OPEN, { L"&Open", NULL } }, { IDC_STOP, { L"&Quit", NULL } }, { IDC_NEW, { L"&New profile\x2026", NULL } }, { IDC_EDIT, { L"&Edit\x2026", NULL } },
-    { IDC_DELETE, { L"&Delete\x2026", NULL } }, { IDC_MERGE, { L"Merge &all sessions\x2026", NULL } },
-    { IDC_OVERWRITE, { L"Ove&rwrite sessions\x2026", NULL } }, { IDC_RESTORE, { L"Reco&ver sessions\x2026", NULL } },
-    { IDC_PURGE, { L"&Clean up deleted sessions\x2026", NULL } }, { IDC_BACKUP_CODE, { L"&Back up .claude\x2026", NULL } },
+    { IDC_OPEN, { L"&Open", NULL } }, { IDC_STOP, { L"&Quit", NULL } }, { IDC_RESTART, { L"&Restart", NULL } },
+    { IDC_NEW, { L"&New\x2026", NULL } }, { IDC_EDIT, { L"&Edit\x2026", NULL } }, { IDC_DELETE, { L"&Delete\x2026", NULL } },
+    { IDC_SYNC, { L"S&ync sessions", NULL } }, { IDC_REPAIR, { L"Rep&air", NULL } },
     { IDC_DEFAULT, { L"Set as de&fault", NULL } }
 };
-#define MAIN_PROFILE_ACTIONS 5                               /* Open to Delete; the sessions' below them, apart */
 #define MAIN_STACKED_ACTIONS (ARRAYSIZE(kMainActions) - 1)   /* all but "Set as default", which sits above the note */
+static const int kMainActionGroups[] = { 3, 6 };            /* the actions that start a group of their own */
+static const MainButton kMainMenus[] = {
+    { IDC_MENU_APP, { L"&Program", NULL } }, { IDC_MENU_SESSIONS, { L"&Sessions", NULL } }, { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL } }
+};
+/* The shortcuts menu's commands, each in the state its profile is in. */
 static const MainButton kMainShortcuts[] = {
     { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" } },
     { IDC_SC_SAVEAS, { L"Create s&hortcut\x2026", NULL } },
     { IDC_SC_PIN, { L"Pin to &taskbar", L"Pinned" } },
     { IDC_SC_START, { L"Add to Start &menu", L"Remove from Start &menu" } }
 };
-static const MainButton kMainSessions = { IDC_SESSIONS, { L"&Sessions  >", L"<  &Back" } };
-static const MainButton kMainLanguage = { IDC_LANGUAGE, { L"&Language\x2026", NULL } };
+static const MainButton kMainSessions = { IDC_SESSIONS, { L"Sessions &view  >", L"<  &Back" } };
 static const MainButton kMainStatusAction = { IDC_STATUS_ACTION, { L"&Get Claude", L"Set up l&inks" } };
-static const MainButton kMainUninstall = { IDC_UNINSTALL, { L"&Uninstall\x2026", NULL } };
-static const MainButton kMainUpdate = { IDC_UPDATE, { L"U&pdate", NULL } };
-static const MainButton kMainClose = { IDCANCEL, { L"Close", NULL } };
+static const MainButton kMainUpdate = { IDC_UPDATE, { L"&Update", NULL } };
 
 const WCHAR *Theme_MainCaption(int id, int state)
 {
-    static const MainButton *const single[] = { &kMainSessions, &kMainLanguage, &kMainStatusAction, &kMainUninstall, &kMainUpdate, &kMainClose };
+    static const MainButton *const single[] = { &kMainSessions, &kMainStatusAction, &kMainUpdate };
     const MainButton *button = NULL;
     size_t i;
     for (i = 0; i < ARRAYSIZE(kMainActions); i++)
         if (kMainActions[i].id == id) button = &kMainActions[i];
+    for (i = 0; i < ARRAYSIZE(kMainMenus); i++)
+        if (kMainMenus[i].id == id) button = &kMainMenus[i];
     for (i = 0; i < ARRAYSIZE(kMainShortcuts); i++)
         if (kMainShortcuts[i].id == id) button = &kMainShortcuts[i];
     for (i = 0; i < ARRAYSIZE(single); i++)
@@ -4507,11 +4512,11 @@ const WCHAR *Theme_MainCaption(int id, int state)
     return state && button->captions[1] ? button->captions[1] : button->captions[0];
 }
 
-/* The footer link's texts in each state (MainFooter); their arguments: this
- * version and the author's page; this version and the new one; the new one. */
-static const WCHAR *const kMainFooters[MAIN_FOOTERS] = {
-    L"Version %s \x00B7 by <a href=\"%s\">Freenitial</a>, not affiliated with Anthropic",
-    L"Version %s \x00B7 version %s is available",
+/* The version label's texts in each state (MainVersion), each with one %s:
+ * this build, the release available, the one downloading. */
+static const WCHAR *const kMainVersions[MAIN_VERSIONS] = {
+    L"Version %s",
+    L"Version %s is available",
     L"Downloading version %s\x2026",
     L"Installing the new version\x2026"
 };
@@ -4520,9 +4525,9 @@ static const WCHAR kMainNote[] = L"The default profile is selected for claude://
 /* The sessions details' captions the main window's minimum keeps room for (SessionsCaption). */
 static const WCHAR *const kSessionsCaptions[SESSIONS_CAPTIONS] = { L"Actions", L"Delete session everywhere\x2026" };
 
-const WCHAR *Theme_MainFooter(MainFooter state)
+const WCHAR *Theme_MainVersion(MainVersion state)
 {
-    return state >= 0 && state < MAIN_FOOTERS ? kMainFooters[state] : kMainFooters[MAIN_FOOTER_CREDITS];
+    return state >= 0 && state < MAIN_VERSIONS ? kMainVersions[state] : kMainVersions[MAIN_VERSION_BUILD];
 }
 
 const WCHAR *Theme_MainNote(void)
@@ -4544,9 +4549,9 @@ typedef struct MainBudget {
     BOOL initialized, measuring;
     SIZE minimum;
     int margin, gap, sideGap, sidebar, headerHeight, buttonHeight, headerRow;
-    int sessionsWidth, languageWidth, statusActionWidth, uninstallWidth, updateWidth, closeWidth;
+    int menuWidth[ARRAYSIZE(kMainMenus)], menusWidth, statusActionWidth, versionWidth, updateWidth;
     int profileWidth, roleWidth, dataMinimum, sessionsMinimum, profilesPane, detailsPane, archivedWidth;
-    int shortcutWidth[ARRAYSIZE(kMainShortcuts)], shortcutTotal, noteHeight, groupHeight, minimumBody, footerHeight;
+    int noteHeight, minimumBody;
 } MainBudget;
 
 static BOOL IsMainDialog(HWND dialog)
@@ -4630,10 +4635,9 @@ static ULONGLONG HashControlFont(ULONGLONG key, HWND control)
 
 static ULONGLONG MainFontKey(HWND dialog)
 {
-    static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_RESTORE, IDC_PURGE,
-        IDC_BACKUP_CODE, IDC_DEFAULT, IDC_SC_DESKTOP,
-        IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START, IDC_SESSIONS, IDC_LANGUAGE, IDC_STATUS_ACTION, IDC_UNINSTALL,
-        IDC_UPDATE, IDCANCEL, IDC_S_ARCHIVED, IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE, IDC_ABOUT };
+    static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR, IDC_DEFAULT,
+        IDC_MENU_APP, IDC_MENU_SESSIONS, IDC_MENU_SHORTCUTS, IDC_SESSIONS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_ARCHIVED,
+        IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE };
     HWND list = MainViewContent(dialog, IDC_LIST);
     ULONGLONG key = Core_HashBytes(CORE_HASH_START, &g_dark, sizeof g_dark);
     size_t i;
@@ -4671,29 +4675,6 @@ static int TextLineOffset(HWND control, HFONT font, int rowHeight)
     return offset;
 }
 
-/* The footer link in every state it shows, its first line beside the
- * buttons' captions (`buttonHeight`): credits, a new version, its download
- * and install. */
-static int MainFooterHeight(HWND about, int width, int buttonHeight)
-{
-    int language, state, height = 0;
-    for (language = 0; language < Localize_LanguageCount(); language++) {
-        HFONT font = LayoutFontAt(about, language);
-        WCHAR text[1024];
-        int offset;
-        if (!font) continue;
-        offset = TextLineOffset(about, font, buttonHeight);
-        for (state = 0; state < MAIN_FOOTERS; state++) {
-            /* A format takes the arguments of its state; one that takes fewer ignores the rest. */
-            StringCchPrintfW(text, ARRAYSIZE(text), Localize_TranslateAt(language, kMainFooters[state]), APP_VERSION_WSTR,
-                             state == MAIN_FOOTER_CREDITS ? APP_AUTHOR_URL : APP_VERSION_WSTR);
-            height = max(height, offset + LayoutLinkHeight(about, font, text, width) + LABEL_SLACK_PX);
-        }
-        DeleteObject(font);
-    }
-    return height;
-}
-
 /* A check box's widest caption in any language, with its glyph. */
 static void MainCheckBoxBudget(HWND control, int *width, int *height)
 {
@@ -4704,17 +4685,11 @@ static void MainCheckBoxBudget(HWND control, int *width, int *height)
     *height = max(*height, needHeight);
 }
 
-/* One row of shortcut buttons when they fit the row with their gaps, else two. */
-static int ShortcutRows(const MainBudget *budget, int rowWidth)
-{
-    return budget->shortcutTotal + ((int)ARRAYSIZE(kMainShortcuts) - 1) * budget->gap <= rowWidth ? 1 : 2;
-}
-
 #define LIST_FRAME_PX    2       /* the least of the profile list's frame, a pixel on each side */
 #define NOTE_SAMPLE_NAME L"WW"   /* a name the note shows cut to one character: its shortest text */
 
-/* Every button of the window: the side bar's width, each shortcut's, the
- * header's and the footer's, and the tallest of them. */
+/* Every button of the window: the side bar's width, the menus', the
+ * header's, and the tallest of them. */
 static void MeasureMainButtons(HWND dialog, const DialogBase *base, MainBudget *budget)
 {
     UINT dpi = budget->dpi;
@@ -4724,20 +4699,20 @@ static void MeasureMainButtons(HWND dialog, const DialogBase *base, MainBudget *
         budget->sidebar = max(budget->sidebar, width);
         budget->buttonHeight = max(budget->buttonHeight, height);
     }
-    for (i = 0; i < (int)ARRAYSIZE(kMainShortcuts); i++) {
-        MainButtonBudget(dialog, base, dpi, &kMainShortcuts[i], &budget->shortcutWidth[i], &height);
-        budget->shortcutTotal += budget->shortcutWidth[i];
+    /* The view's button sits above the side bar, as wide. */
+    MainButtonBudget(dialog, base, dpi, &kMainSessions, &width, &height);
+    budget->sidebar = max(budget->sidebar, width);
+    budget->buttonHeight = max(budget->buttonHeight, height);
+    for (i = 0; i < (int)ARRAYSIZE(kMainMenus); i++) {
+        MainButtonBudget(dialog, base, dpi, &kMainMenus[i], &budget->menuWidth[i], &height);
+        budget->menusWidth += budget->menuWidth[i] + (i ? budget->gap : 0);
         budget->buttonHeight = max(budget->buttonHeight, height);
     }
-    MainButtonBudget(dialog, base, dpi, &kMainSessions, &budget->sessionsWidth, &height);
-    budget->buttonHeight = max(budget->buttonHeight, height);
-    MainButtonBudget(dialog, base, dpi, &kMainLanguage, &budget->languageWidth, &height);
-    budget->buttonHeight = max(budget->buttonHeight, height);
-    /* The status action and the footer's buttons take the others' height. */
+    /* The status action and Update take the others' height. */
     MainButtonBudget(dialog, base, dpi, &kMainStatusAction, &budget->statusActionWidth, &height);
-    MainButtonBudget(dialog, base, dpi, &kMainUninstall, &budget->uninstallWidth, &height);
     MainButtonBudget(dialog, base, dpi, &kMainUpdate, &budget->updateWidth, &height);
-    MainButtonBudget(dialog, base, dpi, &kMainClose, &budget->closeWidth, &height);
+    budget->versionWidth = MeasureEveryLanguage(GetDlgItem(dialog, IDC_VERSION), kMainVersions, MAIN_VERSIONS, VERSION_SAMPLE,
+                                                DT_SINGLELINE | DT_NOPREFIX, 0, NULL).cx + LABEL_SLACK_PX;
 }
 
 /* The sessions view's panes: the profiles' side bar and the details as in
@@ -4779,11 +4754,12 @@ static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
 {
     HWND list = MainViewContent(dialog, IDC_LIST);
     RECT source;
-    int textWidth, textHeight, tallestFont, searchHeight, archivedHeight, treePane, rows;
+    int textWidth, textHeight, tallestFont, searchHeight, archivedHeight, treePane, groupGap;
     UINT dpi = budget->dpi;
     budget->margin = MulDiv(THEME_MAIN_MARGIN_DIPS, (int)dpi, 96);
     budget->gap = MulDiv(THEME_MAIN_GAP_DIPS, (int)dpi, 96);
     budget->sideGap = MulDiv(MAIN_SIDE_GAP_DIPS, (int)dpi, 96);
+    groupGap = MulDiv(SIDEBAR_GROUP_GAP_DIPS, (int)dpi, 96);
     budget->measuring = TRUE;
     Theme_ProfileColumnWidths(list, &budget->profileWidth, &budget->roleWidth, &budget->dataMinimum, &budget->sessionsMinimum);
     MeasureMainButtons(dialog, base, budget);
@@ -4792,31 +4768,22 @@ static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
     budget->headerHeight = tallestFont + MulDiv(BUTTON_TEXT_MARGIN_DIPS, (int)dpi, 96);
     LayoutSourceRect(dialog, base, GetDlgItem(dialog, IDC_LIST), dpi, &source);
     budget->minimumBody = source.bottom - source.top;
-    LayoutSourceRect(dialog, base, GetDlgItem(dialog, IDC_SC_GROUP), dpi, &source);
-    budget->groupHeight = source.bottom - source.top;
     /* As wide as the list's columns and the side bar, the sessions' panes,
-     * and the header's buttons with room for the status; never narrower than
-     * the resource. */
+     * and the header with room for the status; never narrower than the
+     * resource. */
     budget->minimum.cx = max(budget->profileWidth + budget->roleWidth + budget->dataMinimum + budget->sessionsMinimum + ListFramePx(dialog, list) +
                                  budget->sidebar + budget->sideGap,
                              budget->profilesPane + treePane + budget->detailsPane + 2 * budget->gap) + 2 * budget->margin;
-    budget->minimum.cx = max(budget->minimum.cx, budget->sessionsWidth + budget->languageWidth + budget->statusActionWidth + 3 * budget->gap +
-                             2 * budget->margin + MulDiv(MAIN_STATUS_MINIMUM_DIPS, (int)dpi, 96));
+    budget->minimum.cx = max(budget->minimum.cx, budget->menusWidth + MulDiv(MAIN_STATUS_MINIMUM_DIPS, (int)dpi, 96) + budget->statusActionWidth +
+                             budget->versionWidth + budget->updateWidth + 4 * budget->gap + budget->sideGap + budget->sidebar + 2 * budget->margin);
     budget->minimum.cx = max(budget->minimum.cx, MulDiv(MAIN_RESOURCE_WIDTH_DIPS, (int)dpi, 96));
     /* As tall as the side bar's stacked actions, Set as default and its note. */
     budget->noteHeight = NoteHeightMaximum(GetDlgItem(dialog, IDC_NOTE), kMainNote, NOTE_SAMPLE_NAME, budget->sidebar);
     budget->minimumBody = max(budget->minimumBody, budget->headerHeight + (int)MAIN_STACKED_ACTIONS * budget->buttonHeight +
-                              ((int)MAIN_STACKED_ACTIONS - 1) * budget->gap +
-                              MulDiv(SIDEBAR_GROUP_GAP_DIPS + SIDEBAR_DEFAULT_GAP_DIPS + SIDEBAR_NOTE_GAP_DIPS, (int)dpi, 96) +
-                              budget->buttonHeight + budget->noteHeight);
+                              ((int)MAIN_STACKED_ACTIONS - 1) * budget->gap + (int)ARRAYSIZE(kMainActionGroups) * groupGap +
+                              MulDiv(SIDEBAR_DEFAULT_GAP_DIPS + SIDEBAR_NOTE_GAP_DIPS, (int)dpi, 96) + budget->buttonHeight + budget->noteHeight);
     budget->headerRow = max(budget->buttonHeight, max(archivedHeight, searchHeight));
-    budget->footerHeight = max(budget->buttonHeight, MainFooterHeight(GetDlgItem(dialog, IDC_ABOUT),
-        max(1, budget->minimum.cx - 2 * budget->margin - budget->uninstallWidth - budget->closeWidth - budget->updateWidth - 3 * budget->gap),
-        budget->buttonHeight));
-    rows = ShortcutRows(budget, budget->minimum.cx - 2 * budget->margin);
-    budget->minimum.cy = budget->margin + budget->headerRow + budget->sideGap + budget->minimumBody + budget->sideGap +
-                         budget->groupHeight + budget->gap + rows * budget->buttonHeight + (rows - 1) * budget->gap + 2 * budget->gap +
-                         budget->footerHeight + budget->margin;
+    budget->minimum.cy = budget->margin + budget->headerRow + budget->sideGap + budget->minimumBody + budget->margin;
     budget->minimum.cy = max(budget->minimum.cy, MulDiv(MAIN_RESOURCE_HEIGHT_DIPS, (int)dpi, 96));
     budget->measuring = FALSE;
 }
@@ -4861,116 +4828,83 @@ BOOL Theme_MainMinimum(HWND dialog, SIZE *client)
 typedef struct MainArea {
     int left, right;              /* the content's edges inside the margins */
     int rowWidth;                 /* right - left */
-    int bodyTop, bodyHeight;      /* the list (or the sessions' panes) */
-    int shortcutsTop, shortcutRows, footerTop;
+    int bodyTop, bodyBottom;      /* the list, or the sessions' panes */
 } MainArea;
 
-/* The header row: Sessions and Language on the left, the status action on
- * the right while it shows, the status between them, its text level with
- * the buttons' captions. */
-static void PlaceMainHeader(MainMoves *moves, const MainBudget *budget, const MainArea *area)
+static BOOL Shown(HWND dialog, int id)
 {
-    HWND dialog = moves->dialog, status = GetDlgItem(dialog, IDC_STATUS);
-    int gap = budget->gap, statusLeft = area->left + budget->sessionsWidth + gap + budget->languageWidth + gap, statusRight = area->right;
-    int statusTop = budget->margin + TextLineOffset(status, NULL, budget->headerRow);
-    if (GetWindowLongW(GetDlgItem(dialog, IDC_STATUS_ACTION), GWL_STYLE) & WS_VISIBLE)
-        statusRight -= budget->statusActionWidth + gap;
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_SESSIONS), area->left, budget->margin, budget->sessionsWidth, budget->headerRow);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_LANGUAGE), area->left + budget->sessionsWidth + gap, budget->margin, budget->languageWidth,
-                     budget->headerRow);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_STATUS_ACTION), area->right - budget->statusActionWidth, budget->margin,
-                     budget->statusActionWidth, budget->headerRow);
-    PlaceMainControl(moves,status, statusLeft, statusTop, statusRight - statusLeft, budget->margin + budget->headerRow - statusTop);
+    return (GetWindowLongW(GetDlgItem(dialog, id), GWL_STYLE) & WS_VISIBLE) != 0;
 }
 
-/* The profile list, its side bar of actions (the profile's, then apart the
- * sessions'; Set as default and its note at the bottom of the minimum body)
- * and the shortcuts' title below. */
+/* The header: the menus on the left; on the right, above the side bar, the
+ * view's button, then leftwards Update while it shows, the version and the
+ * status action while it shows; between them the status, or the progress of
+ * a sync in its place, their text level with the buttons' captions. */
+static void PlaceMainHeader(MainMoves *moves, const MainBudget *budget, const MainArea *area)
+{
+    HWND dialog = moves->dialog, status = GetDlgItem(dialog, IDC_STATUS), version = GetDlgItem(dialog, IDC_VERSION);
+    int gap = budget->gap, x = area->left, right = area->right - budget->sidebar, i;
+    int statusTop = budget->margin + TextLineOffset(status, NULL, budget->headerRow);
+    for (i = 0; i < (int)ARRAYSIZE(kMainMenus); i++) {
+        PlaceMainControl(moves, GetDlgItem(dialog, kMainMenus[i].id), x, budget->margin, budget->menuWidth[i], budget->headerRow);
+        x += budget->menuWidth[i] + gap;
+    }
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_SESSIONS), right, budget->margin, budget->sidebar, budget->headerRow);
+    right -= budget->sideGap;
+    if (Shown(dialog, IDC_UPDATE)) {
+        right -= budget->updateWidth;
+        PlaceMainControl(moves, GetDlgItem(dialog, IDC_UPDATE), right, budget->margin, budget->updateWidth, budget->headerRow);
+        right -= gap;
+    }
+    PlaceMainControl(moves, version, right - budget->versionWidth, budget->margin + TextLineOffset(version, NULL, budget->headerRow),
+                     budget->versionWidth, budget->margin + budget->headerRow - (budget->margin + TextLineOffset(version, NULL, budget->headerRow)));
+    right -= budget->versionWidth + gap;
+    if (Shown(dialog, IDC_STATUS_ACTION)) {
+        right -= budget->statusActionWidth;
+        PlaceMainControl(moves, GetDlgItem(dialog, IDC_STATUS_ACTION), right, budget->margin, budget->statusActionWidth, budget->headerRow);
+        right -= gap;
+    }
+    PlaceMainControl(moves, status, x, statusTop, right - x, budget->margin + budget->headerRow - statusTop);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_PROGRESS), x, budget->margin, right - x, budget->headerRow);
+}
+
+/* The profile list and its side bar of actions, in groups (Set as default and
+ * its note at the bottom of the minimum body). */
 static void PlaceProfilesView(MainMoves *moves, const MainBudget *budget, const MainArea *area)
 {
     HWND dialog = moves->dialog;
-    int sidebarLeft = area->right - budget->sidebar, noteTop = area->bodyTop + budget->minimumBody - budget->noteHeight, i;
-    int groupGap = MulDiv(SIDEBAR_GROUP_GAP_DIPS, (int)budget->dpi, 96);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_LIST), area->left, area->bodyTop, area->rowWidth - budget->sidebar - budget->sideGap,
-                     area->bodyHeight);
-    for (i = 0; i < (int)MAIN_STACKED_ACTIONS; i++)
-        PlaceMainControl(moves,GetDlgItem(dialog, kMainActions[i].id), sidebarLeft,
-                         area->bodyTop + budget->headerHeight + i * (budget->buttonHeight + budget->gap) + (i >= MAIN_PROFILE_ACTIONS ? groupGap : 0),
-                         budget->sidebar, budget->buttonHeight);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_NOTE), sidebarLeft, noteTop, budget->sidebar, budget->noteHeight);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_DEFAULT), sidebarLeft,
+    int sidebarLeft = area->right - budget->sidebar, noteTop = area->bodyTop + budget->minimumBody - budget->noteHeight, i, group;
+    int groupGap = MulDiv(SIDEBAR_GROUP_GAP_DIPS, (int)budget->dpi, 96), top = area->bodyTop + budget->headerHeight;
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_LIST), area->left, area->bodyTop, area->rowWidth - budget->sidebar - budget->sideGap,
+                     area->bodyBottom - area->bodyTop);
+    for (i = 0; i < (int)MAIN_STACKED_ACTIONS; i++) {
+        for (group = 0; group < (int)ARRAYSIZE(kMainActionGroups); group++)
+            if (kMainActionGroups[group] == i) top += groupGap;
+        PlaceMainControl(moves, GetDlgItem(dialog, kMainActions[i].id), sidebarLeft, top, budget->sidebar, budget->buttonHeight);
+        top += budget->buttonHeight + budget->gap;
+    }
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_NOTE), sidebarLeft, noteTop, budget->sidebar, budget->noteHeight);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_DEFAULT), sidebarLeft,
                      noteTop - MulDiv(SIDEBAR_NOTE_GAP_DIPS, (int)budget->dpi, 96) - budget->buttonHeight, budget->sidebar, budget->buttonHeight);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_SC_GROUP), area->left, area->bodyTop + area->bodyHeight + budget->sideGap, area->rowWidth,
-                     budget->groupHeight);
 }
 
-/* The shortcut buttons on one row or two. The free space goes to the two
- * middle buttons, up to a limit; on one row, what is left is shared between
- * the gaps; on two, each row's second button ends at the right edge. */
-static void PlaceShortcuts(MainMoves *moves, const MainBudget *budget, const MainArea *area)
-{
-    HWND dialog = moves->dialog;
-    int width[ARRAYSIZE(kMainShortcuts)], gaps = (int)ARRAYSIZE(kMainShortcuts) - 1, gap = budget->gap, i, before;
-    CopyMemory(width, budget->shortcutWidth, sizeof width);
-    if (area->shortcutRows == 1) {
-        int extra = max(0, area->rowWidth - budget->shortcutTotal - gaps * gap);
-        int limit = MulDiv(SHORTCUT_GROWTH_ONE_ROW_DIPS, (int)budget->dpi, 96);
-        width[1] += min(extra / 2, max(0, limit - width[1]));
-        width[2] += min(extra - extra / 2, max(0, limit - width[2]));
-    } else {
-        int limit = MulDiv(SHORTCUT_GROWTH_TWO_ROWS_DIPS, (int)budget->dpi, 96);
-        width[1] = max(width[1], min(limit, area->rowWidth - width[0] - gap));
-        width[2] = max(width[2], min(limit, area->rowWidth - width[3] - gap));
-    }
-    for (i = 0; i < (int)ARRAYSIZE(kMainShortcuts); i++) {
-        int x = area->left, row = area->shortcutRows == 1 ? 0 : i / 2, column = area->shortcutRows == 1 ? i : i % 2;
-        if (area->shortcutRows == 1) {
-            int spaces = area->rowWidth;
-            for (before = 0; before < (int)ARRAYSIZE(kMainShortcuts); before++) spaces -= width[before];
-            for (before = 0; before < column; before++) x += width[before];
-            x += column * (spaces / gaps) + min(column, spaces % gaps);
-        } else if (column) {
-            x += area->rowWidth - width[i];
-        }
-        PlaceMainControl(moves,GetDlgItem(dialog, kMainShortcuts[i].id), x, area->shortcutsTop + row * (budget->buttonHeight + gap),
-                         width[i], budget->buttonHeight);
-    }
-}
-
-/* The footer: Uninstall, the version link (its first line level with the
- * buttons' captions), Update while it shows, Close. */
-static void PlaceMainFooter(MainMoves *moves, const MainBudget *budget, const MainArea *area)
-{
-    HWND dialog = moves->dialog, about = GetDlgItem(dialog, IDC_ABOUT);
-    int gap = budget->gap, updateRoom = (GetWindowLongW(GetDlgItem(dialog, IDC_UPDATE), GWL_STYLE) & WS_VISIBLE) ? budget->updateWidth + gap : 0;
-    int aboutTop = area->footerTop + TextLineOffset(about, NULL, budget->buttonHeight);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_UNINSTALL), area->left, area->footerTop, budget->uninstallWidth, budget->buttonHeight);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDCANCEL), area->right - budget->closeWidth, area->footerTop, budget->closeWidth,
-                     budget->buttonHeight);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_UPDATE), area->right - budget->closeWidth - gap - budget->updateWidth, area->footerTop,
-                     budget->updateWidth, budget->buttonHeight);
-    PlaceMainControl(moves,about, area->left + budget->uninstallWidth + gap, aboutTop,
-                     area->rowWidth - budget->uninstallWidth - budget->closeWidth - updateRoom - 2 * gap,
-                     area->footerTop + budget->footerHeight - aboutTop);
-}
-
-/* The sessions: profiles, tree and details down to the footer; above the
+/* The sessions: profiles, tree and details down to the margin; above the
  * tree, the search box and "Show archived", as wide as its caption in the
  * current language. */
 static void PlaceSessionsView(MainMoves *moves, const MainBudget *budget, const MainArea *area)
 {
     HWND dialog = moves->dialog, archived = GetDlgItem(dialog, IDC_S_ARCHIVED);
     SIZE ideal;
-    int gap = budget->gap, bottom = area->footerTop - budget->sideGap, detailsLeft = area->right - budget->detailsPane;
+    int gap = budget->gap, bottom = area->bodyBottom, detailsLeft = area->right - budget->detailsPane;
     int treeLeft = area->left + budget->profilesPane + gap, treeRight = detailsLeft - gap;
     int archivedRight = treeRight - MulDiv(ARCHIVED_INSET_DIPS, (int)budget->dpi, 96);
     int archivedWidth = Theme_CheckBoxSize(archived, &ideal) && ideal.cx > 0 ? ideal.cx : budget->archivedWidth;
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_S_PROFILES), area->left, area->bodyTop, budget->profilesPane, bottom - area->bodyTop);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_S_DETAILS), detailsLeft, area->bodyTop, budget->detailsPane, bottom - area->bodyTop);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_S_SEARCH), treeLeft, area->bodyTop, archivedRight - archivedWidth - gap - treeLeft,
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_PROFILES), area->left, area->bodyTop, budget->profilesPane, bottom - area->bodyTop);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_DETAILS), detailsLeft, area->bodyTop, budget->detailsPane, bottom - area->bodyTop);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_SEARCH), treeLeft, area->bodyTop, archivedRight - archivedWidth - gap - treeLeft,
                      budget->headerRow);
-    PlaceMainControl(moves,archived, archivedRight - archivedWidth, area->bodyTop, archivedWidth, budget->headerRow);
-    PlaceMainControl(moves,GetDlgItem(dialog, IDC_S_TREE), treeLeft, area->bodyTop + budget->headerRow + gap, treeRight - treeLeft,
+    PlaceMainControl(moves, archived, archivedRight - archivedWidth, area->bodyTop, archivedWidth, budget->headerRow);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_TREE), treeLeft, area->bodyTop + budget->headerRow + gap, treeRight - treeLeft,
                      bottom - area->bodyTop - budget->headerRow - gap);
 }
 
@@ -4978,8 +4912,6 @@ static void PlaceMain(MainMoves *moves, const MainBudget *budget, const MainArea
 {
     PlaceMainHeader(moves, budget, area);
     PlaceProfilesView(moves, budget, area);
-    PlaceShortcuts(moves, budget, area);
-    PlaceMainFooter(moves, budget, area);
     PlaceSessionsView(moves, budget, area);
 }
 
@@ -4989,18 +4921,14 @@ void Theme_LayoutMain(HWND dialog)
     MainArea area;
     MainMoves moves;
     RECT client;
-    int width, gap;
+    int width;
     if (!budget || !GetClientRect(dialog, &client) || client.right <= 0 || client.bottom <= 0) return;
-    gap = budget->gap;
     width = min(client.right, max(budget->minimum.cx, MulDiv(THEME_MAIN_READING_WIDTH_DIPS, (int)budget->dpi, 96)));
     area.left = (client.right - width) / 2 + budget->margin;
     area.right = (client.right - width) / 2 + width - budget->margin;
     area.rowWidth = area.right - area.left;
-    area.shortcutRows = ShortcutRows(budget, area.rowWidth);
     area.bodyTop = budget->margin + budget->headerRow + budget->sideGap;
-    area.footerTop = client.bottom - budget->margin - budget->footerHeight;
-    area.shortcutsTop = area.footerTop - 2 * gap - area.shortcutRows * budget->buttonHeight - (area.shortcutRows - 1) * gap;
-    area.bodyHeight = area.shortcutsTop - gap - budget->groupHeight - budget->sideGap - area.bodyTop;
+    area.bodyBottom = client.bottom - budget->margin;
     moves.dialog = dialog;
     moves.lost = FALSE;
     moves.batch = BeginDeferWindowPos(MAIN_PLACED_CONTROLS);
@@ -5011,6 +4939,35 @@ void Theme_LayoutMain(HWND dialog)
         moves.lost = FALSE;
         PlaceMain(&moves, budget, &area);
     }
+}
+
+/* The progress of a sync, in the header: a bar `done` of `total` full (none
+ * while the total is not known), `text` over it. */
+void Theme_DrawProgress(HWND owner, HDC dc, const RECT *rc, int done, int total, const WCHAR *text)
+{
+    ThemeBuffer buffer;
+    HDC paint = Theme_BufferBegin(&buffer, dc, rc);
+    RECT bar = *rc, fill;
+    HFONT old;
+    int radius = CornerRadius(owner);
+    FillSolid(paint, rc, g_palette.color[THEME_FACE]);
+    RoundedBox(paint, &bar, radius, g_palette.color[THEME_FIELD], g_palette.color[THEME_SEPARATOR], LineWidth(owner));
+    if (total > 0 && done > 0) {
+        fill = bar;
+        fill.right = fill.left + MulDiv(bar.right - bar.left, min(done, total), total);
+        if (fill.right - fill.left > 2 * radius)
+            RoundedBox(paint, &fill, radius, g_palette.color[THEME_PALE_BLUE], g_palette.color[THEME_BRIGHT_BLUE], LineWidth(owner));
+    }
+    if (text && text[0]) {
+        RECT label = bar;
+        InflateRect(&label, -ScaleForWindow(owner, 8), 0);
+        old = (HFONT)SelectObject(paint, (HFONT)SendMessageW(owner, WM_GETFONT, 0, 0));
+        SetBkMode(paint, TRANSPARENT);
+        SetTextColor(paint, g_palette.color[THEME_TEXT]);
+        DrawTextW(paint, text, -1, &label, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS | DT_NOPREFIX | Localize_ReadingFlags());
+        SelectObject(paint, old);
+    }
+    Theme_BufferEnd(&buffer);
 }
 
 static void FitCompactMain(HWND dialog)

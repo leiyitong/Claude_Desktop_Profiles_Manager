@@ -2611,6 +2611,7 @@ static LSTATUS WINAPI FixturePackageListClose(HKEY key)
 #define Taskbar_IsWatched TestedTaskbar_IsWatched
 #define Taskbar_Watch TestedTaskbar_Watch
 #define Taskbar_Refresh TestedTaskbar_Refresh
+#define Taskbar_QuitComing TestedTaskbar_QuitComing
 #define Taskbar_StopWatchers TestedTaskbar_StopWatchers
 #define Taskbar_WatchRun TestedTaskbar_WatchRun
 /* The program's taskbar object defines these SDK constants once. */
@@ -2657,6 +2658,7 @@ static LSTATUS WINAPI FixturePackageListClose(HKEY key)
 #undef TaskbarPin_TellShortcutChanged
 #undef Taskbar_IsWatched
 #undef Taskbar_Watch
+#undef Taskbar_QuitComing
 #undef Taskbar_Refresh
 #undef Taskbar_StopWatchers
 #undef Taskbar_WatchRun
@@ -3403,7 +3405,7 @@ static BOOL WINAPI FixtureSetCaption(HWND window, int id, LPCWSTR text)
 {
     (void)window;
     g_captionChanges++;
-    if (id == IDC_ABOUT) StringCchCopyW(g_footer, ARRAYSIZE(g_footer), text);
+    if (id == IDC_VERSION) StringCchCopyW(g_footer, ARRAYSIZE(g_footer), text);
     return TRUE;
 }
 
@@ -3578,9 +3580,9 @@ static void CheckLateDownloads(void)
         ResetManagerRecords();
         g_uninstallDialogCancelled = state == 0;
         DoUninstall();
-        CheckFor("the window and its version footer come back after the uninstall dialog", state == 0 ? "cancelled" : "failed",
-                 g_uninstallDialogs == 1 && !g_manager.uninstallInProgress && !g_manager.uninstalled &&
-                 wcsstr(g_footer, APP_VERSION_WSTR) != NULL && wcsstr(g_footer, L"Freenitial") != NULL);
+        CheckFor("the window and its version come back after the uninstall dialog", state == 0 ? "cancelled" : "failed",
+                 g_uninstallDialogs == 1 && !g_manager.uninstallInProgress && !g_manager.uninstalled && g_manager.build[0] &&
+                 wcsstr(g_footer, g_manager.build) != NULL);
     }
 }
 
@@ -3851,6 +3853,7 @@ static INT_PTR FixtureRouteDialog(HWND owner, int id, DLGPROC proc, LPARAM param
 #define Router_Run TestedRouter_Run
 #define Launcher_Run TestedLauncher_Run
 #define Launcher_Open TestedLauncher_Open
+#define Launcher_OpenSynced TestedLauncher_OpenSynced
 #include "../src/router.c"
 #undef Profiles_Load
 #undef Claude_FindPackage
@@ -3872,6 +3875,7 @@ static INT_PTR FixtureRouteDialog(HWND owner, int id, DLGPROC proc, LPARAM param
 #undef Ui_Dialog
 #undef Router_Run
 #undef Launcher_Run
+#undef Launcher_OpenSynced
 #undef Launcher_Open
 
 /* The link dialog: what it was shown is recorded, and it answers g_routeChoice. */
@@ -4529,7 +4533,7 @@ static RemoveResult FixtureRecycleLocation(HWND owner, const WCHAR *const *paths
 #define Profiles_LinkTarget TestedProfiles_LinkTarget
 #define Profiles_RecycleData TestedProfiles_RecycleData
 #define Profiles_Delete TestedProfiles_Delete
-#define Profiles_SetSyncSessions TestedProfiles_SetSyncSessions
+#define Profiles_SetSyncGroup TestedProfiles_SetSyncGroup
 /* Profiles_Load calls it before its definition. */
 int TestedProfiles_Find(const ProfileList *list, const WCHAR *folder);
 #include "../src/profiles.c"

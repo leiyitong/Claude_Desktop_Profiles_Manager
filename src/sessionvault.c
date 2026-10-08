@@ -11,21 +11,31 @@
  * which nothing here brings back. A version is written only when the list
  * changed, and every version stays.
  *
- * The profiles whose sessions are kept the same (Profile.syncSessions) share
- * one list, VAULT_GROUP_LIST. Whenever one of them closes (its watcher), opens
- * through us, or the manager opens, each session is resolved against the
- * group's last version (Core_MirrorResolve): a change made in one profile
- * since then, the latest first, goes to the others; a session deleted in one
- * goes from the others; a profile that never had the list, or lost it (its
- * entries folder is new: Claude reinstalled, another account), gets it. The
- * entries go through sessionsync.c as Claude writes its own, at once where a
- * profile is closed, else once it closes, each backed up first; the version
- * is written only once every change was made or waits. A profile alone keeps
- * a list named after its folder, which only follows it: what it lost stays
- * listed there, to be restored (SessionVault_Restore).
+ * The profiles of one group (Profile.syncGroup) keep the same sessions and
+ * share one list, "group" for group 1, "group-<n>" for the others. Whenever
+ * one of them closes (its watcher), opens through us, or the manager opens
+ * or is asked to, each session is resolved against the group's last version
+ * (Core_MirrorResolve): a change made in one profile since then, the latest
+ * first, goes to the others; a session deleted in one goes from the others;
+ * a profile that never had the list, or lost it (its entries folder is new:
+ * Claude reinstalled, another account), gets it. A session two profiles both
+ * went on with, apart, is kept twice: the branch the other one took becomes
+ * a session of its own (ForkSession). The pins and groups of Claude's sidebar
+ * (claude_desktop_config.json) are kept the same the same way. A session
+ * without a folder works in each profile's own "no folder" area, under the
+ * same folder name, so it shows there as Claude's own (ForMember).
+ *
+ * The entries go through sessionsync.c as Claude writes its own, at once
+ * where a profile is closed, else once it closes, each backed up first; the
+ * version is written only once every change was made or waits. A profile
+ * alone keeps a list named after its folder, which only follows it: what it
+ * lost stays listed there, to be restored (SessionVault_Restore).
  */
 #include "app.h"
+#include "resource.h"
+#include <objbase.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 #define VAULT_DIR             L"vault"
@@ -43,6 +53,9 @@
 #define UNIX_EPOCH_TICKS      116444736000000000ULL
 #define TICKS_PER_MILLISECOND (TICKS_PER_SECOND / 1000)
 #define LINE_CCH              (FOLDER_CCH + SESSION_ID_CCH + 96)
+#define LAYOUT_KEY            L"layout"
+#define TRANSCRIPT_MAX_BYTES  (512u * 1024u * 1024u)   /* larger, a conversation is not forked: it stays one session */
+#define GUID_TEXT_CCH         39
 
 typedef struct VaultItem {          /* a session a version lists */
     WCHAR     key[SESSION_ID_CCH];
@@ -59,6 +72,7 @@ typedef struct VaultMember {        /* a profile that had the version's list */
 typedef struct VaultList {
     BOOL        found;
     ULONGLONG   index;              /* Claude's list of archived sessions; 0 for none */
+    ULONGLONG   layout;             /* the pins and groups of Claude's sidebar (LayoutOf); 0 for none */
     VaultMember members[MAX_PROFILES];
     int         memberCount;
     VaultItem  *items;
@@ -238,15 +252,67 @@ static BOOL DecimalNumber(const WCHAR *text, ULONGLONG *value)
 
 /* ------------------------------------------------------------- entries */
 
-/* An entry's hash, without its own id: the same session's entry in two
- * profiles differs only there. Never 0, which stands for none. */
+static BOOL MemberString(const char *json, size_t length, const char *key, WCHAR *out, size_t cch)
+{
+    const char *value;
+    size_t valueLength;
+    if (cch) out[0] = 0;
+    return Core_JsonMember(json, length, key, &value, &valueLength) && Core_JsonString(value, valueLength, out, cch);
+}
+
+/* `json` (a heap block of `*length` bytes, freed) with member `key` set to
+ * the JSON string of `text`; NULL, freed, when it cannot be. */
+static char *SetString(char *json, size_t *length, const char *key, const WCHAR *text)
+{
+    char quoted[MAX_PATH * 6 + 3], *out;
+    size_t capacity, written = 0;
+    if (!json || !Core_JsonQuote(text, quoted, sizeof quoted)) {
+        Free(json);
+        return NULL;
+    }
+    capacity = *length + strlen(key) + strlen(quoted) + 8;
+    if ((out = (char *)HeapAlloc(GetProcessHeap(), 0, capacity + 1)) != NULL &&
+        Core_JsonSetMember(json, *length, key, quoted, out, capacity, &written)) {
+        out[written] = 0;
+        *length = written;
+    } else {
+        Free(out);
+        out = NULL;
+    }
+    Free(json);
+    return out;
+}
+
+static char *CopyOf(const char *data, size_t length)
+{
+    char *copy = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1);
+    if (copy) {
+        memcpy(copy, data, length);
+        copy[length] = 0;
+    }
+    return copy;
+}
+
+/* An entry's hash, without its own id and with a working folder in a "no
+ * folder" area named only by its folder: the same session's entry in two
+ * profiles differs there alone. Never 0, which stands for none. */
 static ULONGLONG EntryHash(const char *json, size_t length)
 {
+    static const char *const kFolders[] = { "cwd", "originCwd" };
+    WCHAR cwd[MAX_PATH], name[MAX_PATH], canonical[MAX_PATH + 16];
     char *without = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1);
-    size_t used = 0;
+    size_t used = 0, i;
     ULONGLONG hash;
-    if (without && Core_JsonRemoveMember(json, length, "sessionId", without, length + 1, &used)) hash = Core_HashBytes(CORE_HASH_START, without, used);
-    else hash = Core_HashBytes(CORE_HASH_START, json, length);
+    if (!without || !Core_JsonRemoveMember(json, length, "sessionId", without, length + 1, &used)) {
+        Free(without);
+        hash = Core_HashBytes(CORE_HASH_START, json, length);
+        return hash ? hash : 1;
+    }
+    for (i = 0; i < ARRAYSIZE(kFolders) && without; i++)
+        if (MemberString(without, used, kFolders[i], cwd, ARRAYSIZE(cwd)) && Core_ScratchFolderName(cwd, name, ARRAYSIZE(name)) &&
+            SUCCEEDED(StringCchPrintfW(canonical, ARRAYSIZE(canonical), L"<no folder>\\%s", name)))
+            without = SetString(without, &used, kFolders[i], canonical);
+    hash = without ? Core_HashBytes(CORE_HASH_START, without, used) : Core_HashBytes(CORE_HASH_START, json, length);
     Free(without);
     return hash ? hash : 1;
 }
@@ -500,6 +566,8 @@ static BOOL ParseVersion(WCHAR *text, VaultList *list)
             member->created = b;
         } else if (n == 2 && wcscmp(fields[0], L"index") == 0 && HexNumber(fields[1], &a)) {
             list->index = a;
+        } else if (n == 2 && wcscmp(fields[0], LAYOUT_KEY) == 0 && HexNumber(fields[1], &a)) {
+            list->layout = a;
         }
     }
     list->found = TRUE;
@@ -553,6 +621,10 @@ static WCHAR *VersionText(VaultList *list)
     StringCchCopyW(text, cch, VERSION_HEADER L"\n");
     if (list->index) {
         StringCchPrintfW(line, ARRAYSIZE(line), L"index\t%016I64x\n", list->index);
+        StringCchCatW(text, cch, line);
+    }
+    if (list->layout) {
+        StringCchPrintfW(line, ARRAYSIZE(line), LAYOUT_KEY L"\t%016I64x\n", list->layout);
         StringCchCatW(text, cch, line);
     }
     for (i = 0; i < list->memberCount; i++) {
@@ -611,7 +683,29 @@ typedef struct Member {
     BOOL        taker;               /* it has an entries folder, read whole */
     ULONGLONG   entries, created;
     DatedSet    marks;
+    SyncOp     *queued;              /* what waits for it to close (sessionsync.c), sent by the last syncs */
+    int         queuedCount;
 } Member;
+
+/* How far a sync is, for its progress bar. */
+typedef struct Progress {
+    SyncProgress report;
+    void        *context;
+    int          done, total;
+} Progress;
+
+static void Step(Progress *progress, int steps)
+{
+    if (!progress || !progress->report) return;
+    progress->done += steps;
+    if (progress->done > progress->total) progress->total = progress->done;
+    progress->report(progress->context, progress->done, progress->total);
+}
+
+static void StepOnce(void *context)
+{
+    Step((Progress *)context, 1);
+}
 
 /* `profiles` of `list`, in order. */
 static int Subset(const ProfileList *list, DWORD profiles, ProfileList *out)
@@ -643,6 +737,22 @@ static void ReadMember(const SessionSet *set, int m, const VaultList *base, Memb
     }
     /* Sessions it could not read are not taken for gone. */
     if (source->unreadable && member->state == MEMBER_KEPT) member->state = MEMBER_LOST;
+    member->queuedCount = max(SessionSync_Queued(&set->profiles.items[m], &member->queued), 0);
+}
+
+/* The change waiting for `member` that sets what `kind` and `key` name (the
+ * latest replaces the others, Core_SyncOpReplaces); NULL for none. Until it
+ * is made, the member holds what the vault sent, not what it shows. */
+static const SyncOp *Queued(const Member *member, SyncOpKind kind, const WCHAR *key)
+{
+    SyncOp wanted;
+    int i;
+    ZeroMemory(&wanted, sizeof wanted);
+    wanted.kind = kind;
+    StringCchCopyW(wanted.key, ARRAYSIZE(wanted.key), key);
+    for (i = member->queuedCount - 1; i >= 0; i--)
+        if (Core_SyncOpReplaces(&member->queued[i], &wanted)) return &member->queued[i];
+    return NULL;
 }
 
 /* A change for the sync's send, its content kept until then. */
@@ -650,6 +760,7 @@ typedef struct Changes {
     SyncSend *items;
     char    **owned;
     int       count, capacity, ownedCount, ownedCapacity;
+    int       forked;                /* sessions kept as two */
 } Changes;
 
 static char *Own(Changes *changes, char *content)
@@ -711,6 +822,201 @@ static char *ReadEntry(const WCHAR *file, DWORD *length, ULONGLONG *written)
     return content;
 }
 
+/* ------------------------------------------- sessions without a folder */
+
+/* What `from` holds copied into `to` (made when missing): a file missing
+ * there, or older there; nothing is deleted, and a link is not followed. */
+static void CopyNewer(const WCHAR *from, const WCHAR *to, int depth)
+{
+    WCHAR source[LONG_PATH_CCH], target[LONG_PATH_CCH], extendedSource[LONG_PATH_CCH], extendedTarget[LONG_PATH_CCH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    if (depth > 32 || !Util_EnsureDir(to) || (find = Util_FindFiles(from, L"*", &found, FALSE)) == INVALID_HANDLE_VALUE) return;
+    do {
+        WIN32_FILE_ATTRIBUTE_DATA there;
+        if (wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0 || (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            FAILED(StringCchPrintfW(source, ARRAYSIZE(source), L"%s\\%s", from, found.cFileName)) ||
+            FAILED(StringCchPrintfW(target, ARRAYSIZE(target), L"%s\\%s", to, found.cFileName)))
+            continue;
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            CopyNewer(source, target, depth + 1);
+            continue;
+        }
+        if (!Util_ExtendedPath(source, extendedSource, ARRAYSIZE(extendedSource)) ||
+            !Util_ExtendedPath(target, extendedTarget, ARRAYSIZE(extendedTarget)) ||
+            (GetFileAttributesExW(extendedTarget, GetFileExInfoStandard, &there) &&
+             CompareFileTime(&there.ftLastWriteTime, &found.ftLastWriteTime) >= 0))
+            continue;
+        if (!CopyFileW(extendedSource, extendedTarget, FALSE)) Util_Log(L"session vault: %s not copied to %s (error %lu)", source, target, GetLastError());
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+}
+
+char *SessionVault_ForProfile(const SessionSet *set, int target, const char *content, size_t length, size_t *outLength)
+{
+    static const char *const kFolders[] = { "cwd", "originCwd" };
+    WCHAR cwd[MAX_PATH], name[MAX_PATH], mapped[MAX_PATH], from[MAX_PATH], to[MAX_PATH];
+    char *out = NULL;
+    size_t i, used = length;
+    *outLength = 0;
+    if (target < 0 || target >= set->profiles.count || !set->source[target].scratchDir[0]) return NULL;
+    for (i = 0; i < ARRAYSIZE(kFolders); i++) {
+        if (!MemberString(content, length, kFolders[i], cwd, ARRAYSIZE(cwd)) || !Core_ScratchFolderName(cwd, name, ARRAYSIZE(name)) ||
+            FAILED(StringCchPrintfW(mapped, ARRAYSIZE(mapped), L"%s\\%s", set->source[target].scratchDir, name)) || Core_PathEquals(cwd, mapped))
+            continue;
+        if (!out && (out = CopyOf(content, length)) == NULL) return NULL;
+        if ((out = SetString(out, &used, kFolders[i], mapped)) == NULL) return NULL;
+        /* Its working folder there, with the files of the one it came from. */
+        if (i == 0 && SessionStore_WorkingDir(set, cwd, from, ARRAYSIZE(from)) &&
+            Core_ProfileFilePath(&set->profiles.items[target], mapped, to, ARRAYSIZE(to))) {
+            if (Util_DirExists(from)) CopyNewer(from, to, 0);
+            else if (!Util_EnsureDir(to)) Util_Log(L"session vault: %s could not be made (error %lu)", to, GetLastError());
+        }
+    }
+    if (out) *outLength = used;
+    return out;
+}
+
+/* Member `m`'s entry `content` works in a "no folder" area that is not its own. */
+static BOOL InOthersArea(const SessionSet *set, int m, const char *content, size_t length)
+{
+    WCHAR cwd[MAX_PATH], name[MAX_PATH], own[MAX_PATH];
+    return content && set->source[m].scratchDir[0] && MemberString(content, length, "cwd", cwd, ARRAYSIZE(cwd)) &&
+           Core_ScratchFolderName(cwd, name, ARRAYSIZE(name)) &&
+           SUCCEEDED(StringCchPrintfW(own, ARRAYSIZE(own), L"%s\\%s", set->source[m].scratchDir, name)) && !Core_PathEquals(cwd, own);
+}
+
+/* `content` as member `m` gets it (SessionVault_ForProfile), owned by
+ * `changes`; NULL without memory. */
+static const char *ContentFor(const SessionSet *set, int m, const char *content, size_t length, Changes *changes, size_t *outLength)
+{
+    char *mapped = SessionVault_ForProfile(set, m, content, length, outLength);
+    if (!mapped) {
+        *outLength = length;
+        return content;
+    }
+    return Own(changes, mapped);
+}
+
+/* ------------------------------------------- sessions gone on with apart */
+
+/* A new id as Claude names its sessions: lower-case hex. */
+static BOOL NewId(WCHAR *out, size_t cch)
+{
+    GUID guid;
+    WCHAR text[GUID_TEXT_CCH];
+    size_t i;
+    if (FAILED(CoCreateGuid(&guid)) || StringFromGUID2(&guid, text, ARRAYSIZE(text)) != ARRAYSIZE(text)) return FALSE;
+    text[ARRAYSIZE(text) - 2] = 0;   /* the closing brace */
+    for (i = 1; text[i]; i++) text[i] = (WCHAR)towlower(text[i]);
+    return SUCCEEDED(StringCchCopyW(out, cch, text + 1));
+}
+
+/* A new file `path` holding `data`, at any path length, through a file
+ * beside it put in place: never over one there. */
+static BOOL WriteNew(const WCHAR *path, const char *data, size_t length)
+{
+    WCHAR target[LONG_PATH_CCH], temporary[LONG_PATH_CCH];
+    HANDLE file;
+    DWORD written = 0, error;
+    BOOL ok;
+    if (length > MAXDWORD || !Util_ExtendedPath(path, target, ARRAYSIZE(target)) ||
+        FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" TEMPORARY_SUFFIX, target)))
+        return FALSE;
+    file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    ok = (length == 0 || (WriteFile(file, data, (DWORD)length, &written, NULL) && written == length)) && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (ok) ok = MoveFileExW(temporary, target, MOVEFILE_WRITE_THROUGH);
+    if (!ok) {
+        error = GetLastError();
+        DeleteFileW(temporary);
+        SetLastError(error);
+    }
+    return ok;
+}
+
+/* Row `row` went on in two profiles apart since `since` (ms): `keep`'s went
+ * on last, at `keepTime`, `other`'s at `otherTime`. When its transcript holds
+ * a branch for each, `other`'s becomes a session of its own: the transcript
+ * without the lines of `keep`'s branch alone, under a new id (Claude goes on
+ * with the latest branch of the original), and `other`'s entry for it under
+ * new ids, titled with the profile's name. TRUE with its id in `forkKey` and
+ * its entry (a heap block) in `entry` when it was made. */
+static BOOL ForkSession(const SessionSet *set, int row, int other, const char *otherEntry, size_t otherLength, ULONGLONG keepTime,
+                        ULONGLONG otherTime, ULONGLONG since, WCHAR *forkKey, size_t keyCch, char **entry, size_t *entryLength)
+{
+    static const char *const kOthers[] = { "priorCliSessionIds", "preClearCliSessionId", "unarchivedCliSessionId", "stagedTranscriptPath" };
+    const SessionRow *session = &set->rows[row];
+    WCHAR dir[LONG_PATH_CCH], path[LONG_PATH_CCH], localId[SESSION_ID_CCH], title[SESSION_TITLE_CCH], titled[SESSION_TITLE_CCH + LABEL_CCH + 8];
+    WCHAR *slash;
+    char fromId[SESSION_ID_CCH + 16], toId[SESSION_ID_CCH + 16], *text = NULL, *kept = NULL, *swapped = NULL, *out = NULL;
+    BOOL *excluded = NULL, ok = FALSE;
+    CoreSwap swap;
+    DWORD length = 0;
+    size_t at = 0, n = 0, used = 0, written, i;
+    int lines = 0, line;
+    *entry = NULL;
+    *entryLength = 0;
+    if (!session->transcript || !Core_IsUuid(session->key) || !session->transcriptPath[0]) return FALSE;
+    if ((text = Util_ReadFile(session->transcriptPath, TRANSCRIPT_MAX_BYTES, FALSE, &length)) == NULL) return FALSE;
+    if (!Core_TranscriptBranches(text, length, keepTime, otherTime, since, &excluded, &lines)) goto done;
+    if ((kept = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)length + 1)) == NULL) goto done;
+    for (line = 0; at < length && line < lines; line++) {
+        const char *end = (const char *)memchr(text + at, '\n', length - at);
+        size_t piece = end ? (size_t)(end - (text + at)) + 1 : length - at;
+        if (!excluded[line]) {
+            memcpy(kept + n, text + at, piece);
+            n += piece;
+        }
+        at += piece;
+    }
+    if (!NewId(forkKey, keyCch) || FAILED(StringCchPrintfA(fromId, sizeof fromId, "\"sessionId\":\"%ls\"", session->key)) ||
+        FAILED(StringCchPrintfA(toId, sizeof toId, "\"sessionId\":\"%ls\"", forkKey)) || strlen(fromId) != strlen(toId))
+        goto done;
+    swap.from = fromId;
+    swap.to = toId;
+    if ((swapped = (char *)HeapAlloc(GetProcessHeap(), 0, n + 1)) == NULL) goto done;
+    written = Core_ReplaceChunk(kept, n, &swap, 1, TRUE, swapped, &used);
+    StringCchCopyW(dir, ARRAYSIZE(dir), session->transcriptPath);
+    if ((slash = wcsrchr(dir, L'\\')) == NULL) goto done;
+    *slash = 0;
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s.jsonl", dir, forkKey)) || !WriteNew(path, swapped, written)) {
+        Util_Log(L"session vault: %s could not be written (error %lu)", path, GetLastError());
+        goto done;
+    }
+    /* Its entry: the other profile's, under its own ids, its title saying whose branch it is. */
+    used = otherLength;
+    if (!MemberString(otherEntry, otherLength, "title", title, ARRAYSIZE(title)) || !title[0]) StringCchCopyW(title, ARRAYSIZE(title), session->key);
+    StringCchPrintfW(titled, ARRAYSIZE(titled), L"%s (%s)", title, set->profiles.items[other].name);
+    if (FAILED(StringCchPrintfW(localId, ARRAYSIZE(localId), L"local_%s", forkKey)) ||
+        (out = CopyOf(otherEntry, otherLength)) == NULL || (out = SetString(out, &used, "sessionId", localId)) == NULL ||
+        (out = SetString(out, &used, "cliSessionId", forkKey)) == NULL || (out = SetString(out, &used, "title", titled)) == NULL ||
+        (out = SetString(out, &used, "titleSource", L"user")) == NULL) {
+        DeleteFileW(path);
+        goto done;
+    }
+    for (i = 0; i < ARRAYSIZE(kOthers); i++) {
+        size_t shorter = used;
+        if (Core_JsonRemoveMember(out, used, kOthers[i], out, used + 1, &shorter)) used = shorter;
+    }
+    out[used] = 0;
+    *entry = out;
+    *entryLength = used;
+    out = NULL;
+    ok = TRUE;
+    Util_Log(L"session vault: %s went on in two profiles apart: %s's branch is now %s", session->key, set->profiles.items[other].folder, forkKey);
+done:
+    Free(out);
+    Free(excluded);
+    Free(swapped);
+    Free(kept);
+    Free(text);
+    return ok;
+}
+
+/* ------------------------------------------------------ one session */
+
 /* One session made the same in every member: `row` of `set` (-1: listed by
  * none, only by the base, as `key`). */
 static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, const Member *members, const VaultList *base,
@@ -719,12 +1025,15 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
     MirrorSide sides[MAX_PROFILES], baseSide;
     char *contents[MAX_PROFILES], *content = NULL;
     DWORD lengths[MAX_PROFILES], length = 0;
+    ULONGLONG holds[MAX_PROFILES];   /* a member that `waits`: the hash of what it gets, 0 for a removal */
+    BOOL waits[MAX_PROFILES];
     int n = set->profiles.count, m, at = FindItem(base, key), deleted = FindDated(ledger, key), winner;
     BOOL ok = TRUE;
     ZeroMemory(contents, sizeof contents);
     ZeroMemory(lengths, sizeof lengths);
     for (m = 0; m < n; m++) {
         int entry = row >= 0 ? set->rows[row].entry[m] : -1;
+        const SyncOp *queued;
         ULONGLONG marked;
         ZeroMemory(&sides[m], sizeof sides[m]);
         if (entry >= 0 && (contents[m] = ReadEntry(set->entries[entry].file, &lengths[m], &sides[m].time)) != NULL) {
@@ -738,6 +1047,59 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
         } else {
             sides[m].state = members[m].state == MEMBER_KEPT && at >= 0 ? MIRROR_REMOVED : MIRROR_MISSING;
         }
+        /* Sent to it while it was open, and not used there since: what it
+         * shows is no change, it gets what the base says once it closes. */
+        waits[m] = FALSE;
+        holds[m] = 0;
+        if ((queued = Queued(&members[m], SYNC_PUT, key)) != NULL &&
+            (entry >= 0 ? set->entries[entry].lastActivity <= queued->seen : queued->seen == 0)) {
+            waits[m] = TRUE;
+            if (queued->kind == SYNC_PUT && at >= 0) holds[m] = base->items[at].hash;
+            sides[m].state = MIRROR_MISSING;
+            Free(contents[m]);
+            contents[m] = NULL;
+            lengths[m] = 0;
+        }
+    }
+    /* Two profiles went on with it apart since the last sync: the branch of
+     * the one that went on first becomes a session of its own, in each. */
+    if (same && row >= 0 && at >= 0 && base->items[at].activity) {
+        ULONGLONG since = base->items[at].activity, firstTime = 0, secondTime = 0;
+        int first = -1, second = -1;
+        for (m = 0; m < n; m++) {
+            ULONGLONG activity;
+            if (sides[m].state != MIRROR_LISTED || sides[m].hash == base->items[at].hash) continue;
+            if ((activity = EntryActivity(contents[m], lengths[m])) <= since) continue;   /* changed, not gone on with */
+            if (first < 0 || activity > firstTime) {
+                second = first;
+                secondTime = firstTime;
+                first = m;
+                firstTime = activity;
+            } else if (second < 0 || activity > secondTime) {
+                second = m;
+                secondTime = activity;
+            }
+        }
+        if (first >= 0 && second >= 0 && sides[first].hash != sides[second].hash) {
+            WCHAR forkKey[SESSION_ID_CCH];
+            char *fork = NULL;
+            size_t forkLength = 0;
+            if (ForkSession(set, row, second, contents[second], lengths[second], firstTime, secondTime, since, forkKey, ARRAYSIZE(forkKey),
+                            &fork, &forkLength) &&
+                Own(changes, fork) != NULL) {
+                ULONGLONG hash = EntryHash(fork, forkLength), activity = EntryActivity(fork, forkLength);
+                ok = SaveObject(hash, fork, forkLength);
+                for (m = 0; ok && m < n; m++) {
+                    const char *mapped;
+                    size_t mappedLength = 0;
+                    if (!members[m].taker) continue;
+                    ok = (mapped = ContentFor(set, m, fork, forkLength, changes, &mappedLength)) != NULL &&
+                         AddChange(changes, m, SYNC_PUT, SYNC_UNDELETE, forkKey, activity, 0, mapped, mappedLength);
+                }
+                if (ok) ok = AddItem(next, forkKey, hash, activity);
+                changes->forked++;
+            }
+        }
     }
     ZeroMemory(&baseSide, sizeof baseSide);
     baseSide.state = at >= 0 ? MIRROR_LISTED : MIRROR_DELETED;
@@ -749,18 +1111,25 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
             length = lengths[winner];
             content = Own(changes, contents[winner]);   /* sent: kept until then */
             contents[winner] = NULL;
-            ok = content && SaveObject(hash, content, length);
+            ok = ok && content && SaveObject(hash, content, length);
         } else if ((content = Own(changes, LoadObject(hash, &length))) == NULL) {
             /* The base's entry is gone from the vault: nothing to give, the list kept as it was. */
             Util_Log(L"session vault: the entry of %s is missing", key);
-            ok = AddItem(next, key, base->items[at].hash, base->items[at].activity);
+            ok = ok && AddItem(next, key, base->items[at].hash, base->items[at].activity);
             goto done;
         }
         for (m = 0; ok && same && m < n; m++) {
             int entry = row >= 0 ? set->rows[row].entry[m] : -1;
-            if (!members[m].taker || (sides[m].state == MIRROR_LISTED && sides[m].hash == hash)) continue;
-            ok = AddChange(changes, m, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, key, EntryActivity(content, length),
-                           entry >= 0 ? set->entries[entry].lastActivity : 0, content, length);
+            const char *mapped, *own = m == winner ? content : contents[m];
+            size_t mappedLength = 0;
+            DWORD ownLength = m == winner ? length : lengths[m];
+            /* The same entry, but working in another profile's "no folder" area: it moves to its own. */
+            if (!members[m].taker || (waits[m] ? holds[m] == hash
+                                               : sides[m].state == MIRROR_LISTED && sides[m].hash == hash && !InOthersArea(set, m, own, ownLength)))
+                continue;
+            ok = (mapped = ContentFor(set, m, content, length, changes, &mappedLength)) != NULL &&
+                 AddChange(changes, m, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, key, EntryActivity(content, length),
+                           entry >= 0 ? set->entries[entry].lastActivity : 0, mapped, mappedLength);
         }
         if (ok) ok = AddItem(next, key, hash, EntryActivity(content, length));
         RemoveDated(ledger, key);
@@ -774,8 +1143,8 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
         for (m = 0; m < n; m++) {
             int entry = row >= 0 ? set->rows[row].entry[m] : -1;
             if (contents[m]) EntryIds(contents[m], lengths[m], AddToLedger, &add);
-            if (ok && same && members[m].taker && entry >= 0 && sides[m].state == MIRROR_LISTED)
-                ok = AddChange(changes, m, SYNC_REMOVE, 0, key, 0, set->entries[entry].lastActivity, NULL, 0);
+            if (ok && same && members[m].taker && (waits[m] ? holds[m] != 0 : entry >= 0 && sides[m].state == MIRROR_LISTED))
+                ok = AddChange(changes, m, SYNC_REMOVE, 0, key, 0, entry >= 0 ? set->entries[entry].lastActivity : 0, NULL, 0);
         }
         if (at >= 0 && (content = LoadObject(base->items[at].hash, &length)) != NULL) {
             EntryIds(content, length, AddToLedger, &add);
@@ -804,6 +1173,10 @@ static BOOL ResolveIndex(const SessionSet *set, const Member *members, const Vau
     ZeroMemory(sides, sizeof sides);
     for (m = 0; m < n; m++) {
         sides[m].state = members[m].state == MEMBER_KEPT && base->index ? MIRROR_REMOVED : MIRROR_MISSING;
+        if (Queued(&members[m], SYNC_INDEX, ARCHIVED_INDEX)) {
+            sides[m].state = MIRROR_MISSING;   /* it gets the base's once it closes */
+            continue;
+        }
         if (!members[m].taker || FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" ARCHIVED_INDEX, set->source[m].entriesDir)) ||
             (contents[m] = ReadEntry(path, &lengths[m], &sides[m].time)) == NULL)
             continue;
@@ -826,15 +1199,234 @@ static BOOL ResolveIndex(const SessionSet *set, const Member *members, const Vau
         goto done;   /* the base's list gone from the vault: none given */
     }
     if (ok) next->index = hash;
-    for (m = 0; ok && same && m < n; m++)
-        if (members[m].taker && !(sides[m].state == MIRROR_LISTED && sides[m].hash == hash))
-            ok = AddChange(changes, m, SYNC_INDEX, 0, ARCHIVED_INDEX, 0, 0, content, length);
+    for (m = 0; ok && same && m < n; m++) {
+        BOOL holds = Queued(&members[m], SYNC_INDEX, ARCHIVED_INDEX) ? hash == base->index : sides[m].state == MIRROR_LISTED && sides[m].hash == hash;
+        if (members[m].taker && !holds) ok = AddChange(changes, m, SYNC_INDEX, 0, ARCHIVED_INDEX, 0, 0, content, length);
+    }
 done:
     for (m = 0; m < n; m++) Free(contents[m]);
     return ok;
 }
 
-BOOL SessionVault_Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same, SyncReport *report)
+/* ------------------------------------------------ the sidebar's layout */
+
+/* The pins and groups of Claude's sidebar name sessions by their entry's own
+ * id ("local_<id>", "code:local_<id>"), which two profiles can give one
+ * session differently: the vault names them by the session's transcript
+ * ("cli:<id>"), and gives each profile its own id back. */
+#define LOCAL_ID_PREFIX "local_"
+#define CODE_PREFIX     "code:"
+#define CLI_PREFIX      "cli:"
+
+typedef struct LayoutIds {
+    const SessionSet *set;
+    int               profile;   /* whose ids the layout holds, or gets */
+} LayoutIds;
+
+/* The text of `length` bytes after an optional "code:", and that prefix's length. */
+static size_t CodePrefix(const char *text, size_t length)
+{
+    size_t prefix = sizeof CODE_PREFIX - 1;
+    return length > prefix && memcmp(text, CODE_PREFIX, prefix) == 0 ? prefix : 0;
+}
+
+static BOOL AsciiId(const char *text, size_t length, WCHAR *out, size_t cch)
+{
+    size_t i;
+    if (length + 1 > cch) return FALSE;
+    for (i = 0; i < length; i++) {
+        if ((unsigned char)text[i] >= 0x80) return FALSE;
+        out[i] = (WCHAR)text[i];
+    }
+    out[length] = 0;
+    return TRUE;
+}
+
+/* "local_<id>" of the profile: "cli:<the session's transcript>". */
+static size_t ToSessionIds(void *context, const char *text, size_t length, char *out, size_t cap)
+{
+    const LayoutIds *ids = (const LayoutIds *)context;
+    WCHAR local[SESSION_ID_CCH];
+    size_t prefix = CodePrefix(text, length);
+    int row;
+    if (length - prefix <= sizeof LOCAL_ID_PREFIX - 1 || memcmp(text + prefix, LOCAL_ID_PREFIX, sizeof LOCAL_ID_PREFIX - 1) != 0 ||
+        !AsciiId(text + prefix, length - prefix, local, ARRAYSIZE(local)) || SessionStore_FindEntry(ids->set, ids->profile, local, &row) < 0 ||
+        row < 0)
+        return (size_t)-1;
+    if (FAILED(StringCchPrintfA(out, cap, "%.*s" CLI_PREFIX "%ls", (int)prefix, text, ids->set->rows[row].key))) return (size_t)-1;
+    return strlen(out);
+}
+
+/* "cli:<id>": the profile's own entry id for that session; one it does not
+ * list yet gets the id of another profile's entry, which a sync gives it. */
+static size_t ToEntryIds(void *context, const char *text, size_t length, char *out, size_t cap)
+{
+    const LayoutIds *ids = (const LayoutIds *)context;
+    WCHAR key[SESSION_ID_CCH];
+    const WCHAR *local = NULL;
+    size_t prefix = CodePrefix(text, length), cli = sizeof CLI_PREFIX - 1;
+    int row, m;
+    if (length - prefix <= cli || memcmp(text + prefix, CLI_PREFIX, cli) != 0 ||
+        !AsciiId(text + prefix + cli, length - prefix - cli, key, ARRAYSIZE(key)) || (row = SessionStore_FindRow(ids->set, key)) < 0)
+        return (size_t)-1;
+    if (ids->set->rows[row].entry[ids->profile] >= 0) local = ids->set->entries[ids->set->rows[row].entry[ids->profile]].localId;
+    for (m = 0; !local && m < ids->set->profiles.count; m++)
+        if (ids->set->rows[row].entry[m] >= 0) local = ids->set->entries[ids->set->rows[row].entry[m]].localId;
+    if (!local || FAILED(StringCchPrintfA(out, cap, "%.*s%ls", (int)prefix, text, local))) return (size_t)-1;
+    return strlen(out);
+}
+
+/* Member `m`'s layout, its sessions by transcript (a heap block); NULL for none. */
+static char *LayoutOf(const SessionSet *set, int m, size_t *length, ULONGLONG *written)
+{
+    LayoutIds ids;
+    size_t rawLength = 0;
+    char *raw, *mapped;
+    *length = 0;
+    if (!set->source[m].entriesDir[0] || (raw = SessionSync_ReadLayout(&set->profiles.items[m], set->source[m].entriesDir, &rawLength, written)) == NULL)
+        return NULL;
+    ids.set = set;
+    ids.profile = m;
+    mapped = Core_JsonMapStrings(raw, rawLength, ToSessionIds, &ids, length);
+    Free(raw);
+    return mapped;
+}
+
+/* The parts of a layout (SessionSync_ReadLayout), each made the same on its
+ * own: a running Claude rewrites its settings all the time, and a part it
+ * rewrote changes none of the others. */
+static const char *const kLayoutParts[] = { "starred", "slice", "starredGroups", "groups", "sections", "order" };
+
+/* Part `part` of `layout`: its hash, 0 when it has none; where its value is. */
+static ULONGLONG PartOf(const char *layout, size_t length, const char *part, const char **value, size_t *valueLength)
+{
+    const char *found;
+    size_t foundLength;
+    ULONGLONG hash;
+    if (!layout || !Core_JsonMember(layout, length, part, &found, &foundLength)) return 0;
+    if (value) {
+        *value = found;
+        *valueLength = foundLength;
+    }
+    hash = Core_HashBytes(CORE_HASH_START, found, foundLength);
+    return hash ? hash : 1;
+}
+
+/* `json` (a heap block, freed) with its member `key` set to `length` bytes
+ * of `raw`; NULL when it cannot be. */
+static char *WithPart(char *json, size_t *used, const char *key, const char *raw, size_t length)
+{
+    const char *keys[1];
+    char *text, *out = NULL;
+    size_t written = 0;
+    keys[0] = key;
+    if (json && (text = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1)) != NULL) {
+        memcpy(text, raw, length);
+        text[length] = 0;
+        if ((out = Core_JsonSetNested(json, *used, keys, 1, text, &written)) != NULL) *used = written;
+        Free(text);
+    }
+    Free(json);
+    return out;
+}
+
+/* The pins and groups of the sidebar, the same in every member: each part
+ * the latest changed since the base, as the archived sessions are. */
+static BOOL ResolveLayout(const SessionSet *set, const Member *members, const VaultList *base, BOOL same, Changes *changes, VaultList *next)
+{
+    MirrorSide sides[MAX_PROFILES], baseSide;
+    char *contents[MAX_PROFILES], *baseContent = NULL, *content, *layout;
+    size_t lengths[MAX_PROFILES], used = 2;
+    ULONGLONG written[MAX_PROFILES], hashes[ARRAYSIZE(kLayoutParts)], hash;
+    DWORD baseLength = 0;
+    BOOL waits[MAX_PROFILES], ok = TRUE;
+    int n = set->profiles.count, m, p;
+    ZeroMemory(contents, sizeof contents);
+    ZeroMemory(lengths, sizeof lengths);
+    ZeroMemory(written, sizeof written);
+    ZeroMemory(hashes, sizeof hashes);
+    for (m = 0; m < n; m++) {
+        /* Sent to it while it was open: what it shows is no change, it gets
+         * the base's once it closes. */
+        waits[m] = members[m].taker && Queued(&members[m], SYNC_LAYOUT, LAYOUT_KEY) != NULL;
+        if (members[m].taker && !waits[m]) contents[m] = LayoutOf(set, m, &lengths[m], &written[m]);
+    }
+    if (base->layout) baseContent = LoadObject(base->layout, &baseLength);
+    if ((content = CopyOf("{}", 2)) == NULL) {
+        ok = FALSE;
+        goto done;
+    }
+    for (p = 0; p < (int)ARRAYSIZE(kLayoutParts) && content; p++) {
+        const char *value = NULL, *baseValue = NULL;
+        size_t valueLength = 0, baseValueLength = 0, longest = 0;
+        ULONGLONG baseHash = PartOf(baseContent, baseLength, kLayoutParts[p], &baseValue, &baseValueLength);
+        int winner = -1;
+        for (m = 0; m < n; m++) {
+            ZeroMemory(&sides[m], sizeof sides[m]);
+            sides[m].state = MIRROR_MISSING;
+            if ((sides[m].hash = PartOf(contents[m], lengths[m], kLayoutParts[p], &value, &valueLength)) == 0) continue;
+            sides[m].state = MIRROR_LISTED;
+            sides[m].time = written[m];
+            /* Kept for the first time: no change to go by, and a running
+             * Claude writes its settings all the time. The fullest part is
+             * the one the user built: it goes to the others. */
+            if (!baseContent && (winner < 0 || valueLength > longest)) {
+                winner = m;
+                longest = valueLength;
+            }
+        }
+        if (baseContent) {
+            ZeroMemory(&baseSide, sizeof baseSide);
+            baseSide.state = MIRROR_LISTED;
+            baseSide.hash = baseHash;
+            winner = Core_MirrorResolve(sides, n, baseHash ? &baseSide : NULL);
+        }
+        value = NULL;
+        if (winner >= 0 && winner < n) {
+            hashes[p] = PartOf(contents[winner], lengths[winner], kLayoutParts[p], &value, &valueLength);
+        } else if (winner == n && baseHash) {
+            hashes[p] = baseHash;
+            value = baseValue;
+            valueLength = baseValueLength;
+        }
+        if (value) content = WithPart(content, &used, kLayoutParts[p], value, valueLength);
+    }
+    if (!content) {
+        ok = FALSE;
+        goto done;
+    }
+    if (used <= 2) goto done;   /* no member has one */
+    hash = Core_HashBytes(CORE_HASH_START, content, used);
+    if (!hash) hash = 1;
+    layout = Own(changes, content);   /* sent: kept until then */
+    content = NULL;
+    ok = layout && SaveObject(hash, layout, used);
+    if (ok) next->layout = hash;
+    for (m = 0; ok && same && m < n; m++) {
+        LayoutIds ids;
+        size_t mappedLength = 0;
+        char *mapped;
+        BOOL holds = TRUE;
+        if (!members[m].taker) continue;
+        for (p = 0; p < (int)ARRAYSIZE(kLayoutParts); p++)
+            if (hashes[p] && PartOf(waits[m] ? baseContent : contents[m], waits[m] ? baseLength : lengths[m], kLayoutParts[p], NULL, NULL) != hashes[p])
+                holds = FALSE;
+        if (holds) continue;
+        ids.set = set;
+        ids.profile = m;
+        ok = (mapped = Own(changes, Core_JsonMapStrings(layout, used, ToEntryIds, &ids, &mappedLength))) != NULL &&
+             AddChange(changes, m, SYNC_LAYOUT, 0, LAYOUT_KEY, 0, 0, mapped, mappedLength);
+    }
+done:
+    Free(content);
+    Free(baseContent);
+    for (m = 0; m < n; m++) Free(contents[m]);
+    return ok;
+}
+
+/* ------------------------------------------------------------ the list */
+
+static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same, SyncReport *report, Progress *progress)
 {
     ProfileList members;
     SessionSet set;
@@ -843,7 +1435,7 @@ BOOL SessionVault_Keep(const ProfileList *list, DWORD profiles, const WCHAR *lis
     Member member[MAX_PROFILES];
     Changes changes;
     WCHAR latest[MAX_PATH];
-    int n, m, r, i;
+    int n, m, r, i, baseOnly = 0;
     BOOL ok = TRUE;
 
     if ((n = Subset(list, profiles, &members)) == 0) return TRUE;
@@ -856,18 +1448,39 @@ BOOL SessionVault_Keep(const ProfileList *list, DWORD profiles, const WCHAR *lis
     ZeroMemory(&next, sizeof next);
     ZeroMemory(&changes, sizeof changes);
     for (m = 0; m < n; m++) ReadMember(&set, m, &base, &member[m]);
+    for (i = 0; i < base.count; i++)
+        if (SessionStore_FindRow(&set, base.items[i].key) < 0) baseOnly++;
+    if (progress) {
+        progress->total += set.rowCount + baseOnly + 1;
+        Step(progress, 0);
+    }
 
-    for (r = 0; r < set.rowCount && ok; r++) ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, &changes, &next);
+    for (r = 0; r < set.rowCount && ok; r++) {
+        ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, &changes, &next);
+        Step(progress, 1);
+    }
     for (i = 0; i < base.count && ok; i++)
-        if (SessionStore_FindRow(&set, base.items[i].key) < 0)
+        if (SessionStore_FindRow(&set, base.items[i].key) < 0) {
             ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, &changes, &next);
+            Step(progress, 1);
+        }
     if (ok) ok = ResolveIndex(&set, member, &base, same, &changes, &next);
+    if (ok) ok = ResolveLayout(&set, member, &base, same, &changes, &next);
+    Step(progress, 1);
     /* Sessions Claude marked deleted that no list names: deleted before the vault knew them. */
     for (m = 0; m < n && ok; m++)
         for (i = 0; i < member[m].marks.count; i++)
             if (FindItem(&next, member[m].marks.items[i].id) < 0) AddDated(&ledger, member[m].marks.items[i].id, member[m].marks.items[i].time);
 
-    if (ok && changes.count) ok = SessionSync_Send(&set, changes.items, changes.count, report);
+    report->forked += changes.forked;
+    if (ok && changes.count) {
+        if (progress) {
+            progress->total += changes.count;
+            SessionSync_OnEachChange(StepOnce, progress);
+        }
+        ok = SessionSync_Send(&set, changes.items, changes.count, report);
+        SessionSync_OnEachChange(NULL, NULL);
+    }
     if (ok && !report->failed) {
         for (m = 0; m < n; m++) {
             if (!member[m].taker) continue;   /* not signed in yet: it gets the list once it is */
@@ -881,7 +1494,10 @@ BOOL SessionVault_Keep(const ProfileList *list, DWORD profiles, const WCHAR *lis
         ok = FALSE;
     }
     if (changes.count) Util_Log(L"session vault: %s made the same, %d change(s) sent", listName, changes.count);
-    for (m = 0; m < n; m++) Free(member[m].marks.items);
+    for (m = 0; m < n; m++) {
+        Free(member[m].marks.items);
+        Free(member[m].queued);
+    }
     Free(ledger.items);
     FreeChanges(&changes);
     FreeList(&base);
@@ -890,57 +1506,116 @@ BOOL SessionVault_Keep(const ProfileList *list, DWORD profiles, const WCHAR *lis
     return ok;
 }
 
-DWORD SessionVault_Group(const ProfileList *list)
+BOOL SessionVault_Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same, SyncReport *report)
 {
-    DWORD group = 0;
+    return Keep(list, profiles, listName, same, report, NULL);
+}
+
+/* ------------------------------------------------------------ the groups */
+
+DWORD SessionVault_Group(const ProfileList *list, int group)
+{
+    DWORD members = 0;
     int i;
-    for (i = 0; i < list->count; i++)
-        if (list->items[i].syncSessions) group |= 1u << i;
-    return group;
+    for (i = 0; group > 0 && i < list->count; i++)
+        if (list->items[i].syncGroup == group) members |= 1u << i;
+    return members;
+}
+
+int SessionVault_NewGroup(const ProfileList *list)
+{
+    int group, i;
+    for (group = 1; group <= MAX_PROFILES; group++) {
+        for (i = 0; i < list->count && list->items[i].syncGroup != group; i++) {}
+        if (i == list->count) return group;
+    }
+    return 0;
+}
+
+BOOL SessionVault_GroupListName(int group, WCHAR *out, size_t cch)
+{
+    if (group < 1) return FALSE;
+    /* Group 1 keeps the name the first version gave its only group. */
+    return group == 1 ? SUCCEEDED(StringCchCopyW(out, cch, VAULT_GROUP_LIST))
+                      : SUCCEEDED(StringCchPrintfW(out, cch, VAULT_GROUP_LIST L"-%d", group));
 }
 
 BOOL SessionVault_ListName(const ProfileList *list, int index, WCHAR *out, size_t cch)
 {
     if (index < 0 || index >= list->count) return FALSE;
-    return SUCCEEDED(StringCchCopyW(out, cch, list->items[index].syncSessions ? VAULT_GROUP_LIST : list->items[index].folder));
+    if (list->items[index].syncGroup) return SessionVault_GroupListName(list->items[index].syncGroup, out, cch);
+    return SUCCEEDED(StringCchCopyW(out, cch, list->items[index].folder));
 }
 
-/* The list profile `index` belongs to kept: the group's made the same. */
-static BOOL KeepFor(const ProfileList *list, int index)
+/* The list profile `index` belongs to kept: its group's made the same. */
+static BOOL KeepFor(const ProfileList *list, int index, SyncReport *report, Progress *progress)
 {
-    SyncReport report;
-    ZeroMemory(&report, sizeof report);
-    if (index < 0 || index >= list->count) return FALSE;
-    if (list->items[index].syncSessions) return SessionVault_Keep(list, SessionVault_Group(list), VAULT_GROUP_LIST, TRUE, &report);
-    return SessionVault_Keep(list, 1u << index, list->items[index].folder, FALSE, &report);
+    WCHAR name[FOLDER_CCH];
+    if (index < 0 || index >= list->count || !SessionVault_ListName(list, index, name, ARRAYSIZE(name))) return FALSE;
+    if (list->items[index].syncGroup)
+        return Keep(list, SessionVault_Group(list, list->items[index].syncGroup), name, TRUE, report, progress);
+    return Keep(list, 1u << index, name, FALSE, report, progress);
+}
+
+BOOL SessionVault_KeepGroups(const ProfileList *list, DWORD profiles, SyncProgress report, void *context, SyncReport *result)
+{
+    Progress progress;
+    DWORD kept = 0;
+    BOOL ok = TRUE;
+    int i;
+    ZeroMemory(&progress, sizeof progress);
+    progress.report = report;
+    progress.context = context;
+    for (i = 0; i < list->count; i++) {
+        if (!(profiles & (1u << i)) || (kept & (1u << i))) continue;
+        /* A profile alone is kept only closed: Claude writes the list of one that runs. */
+        if (!list->items[i].syncGroup && Claude_IsRunning(&list->items[i])) continue;
+        if (!KeepFor(list, i, result, &progress)) ok = FALSE;
+        kept |= list->items[i].syncGroup ? SessionVault_Group(list, list->items[i].syncGroup) : 1u << i;
+    }
+    if (report) report(context, progress.total, progress.total);
+    return ok;
 }
 
 void SessionVault_KeepAll(const ProfileList *list)
 {
+    SyncReport report;
+    DWORD all = 0;
     int i;
-    BOOL groupKept = FALSE;
-    for (i = 0; i < list->count; i++) {
-        if (list->items[i].syncSessions) {
-            if (!groupKept) KeepFor(list, i);
-            groupKept = TRUE;
-        } else if (!Claude_IsRunning(&list->items[i])) {
-            KeepFor(list, i);
-        }
-    }
+    ZeroMemory(&report, sizeof report);
+    for (i = 0; i < list->count; i++) all |= 1u << i;
+    SessionVault_KeepGroups(list, all, NULL, NULL, &report);
 }
 
 void SessionVault_BeforeOpen(const ProfileList *list, int index)
 {
-    KeepFor(list, index);
+    SyncReport report;
+    ZeroMemory(&report, sizeof report);
+    KeepFor(list, index, &report, NULL);
+}
+
+/* The manager's progress bar, from the watcher's process: how far, and 0 of 0 once done. */
+static void TellManager(void *context, int done, int total)
+{
+    HWND manager = FindWindowW(APP_WINDOW_CLASS, NULL);
+    (void)context;
+    if (manager) PostMessageW(manager, WM_APP_SYNC_PROGRESS, (WPARAM)done, (LPARAM)total);
 }
 
 void SessionVault_AfterClose(const WCHAR *folder)
 {
     ProfileList list;
+    SyncReport report;
+    Progress progress;
     int i;
     SessionEdit_ApplyPendingFor(folder);
     Profiles_Load(&list, NULL);
-    if ((i = Profiles_Find(&list, folder)) >= 0) KeepFor(&list, i);
+    if ((i = Profiles_Find(&list, folder)) < 0) return;
+    ZeroMemory(&report, sizeof report);
+    ZeroMemory(&progress, sizeof progress);
+    progress.report = TellManager;
+    KeepFor(&list, i, &report, &progress);
+    TellManager(NULL, 0, 0);
 }
 
 /* ---------------------------------------------------------------- restoring */
@@ -1013,8 +1688,12 @@ BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listN
             if (!report->error[0]) StringCchPrintfW(report->error, ARRAYSIZE(report->error), TR(L"%s could not be read (error %lu)."), kept.items[i].key, (DWORD)ERROR_FILE_NOT_FOUND);
             continue;
         }
-        ok = AddChange(&changes, 0, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, kept.items[i].key, EntryActivity(content, length),
-                       entry >= 0 ? set.entries[entry].lastActivity : 0, content, length);
+        {
+            size_t mappedLength = 0;
+            const char *mapped = ContentFor(&set, 0, content, length, &changes, &mappedLength);
+            ok = mapped && AddChange(&changes, 0, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, kept.items[i].key, EntryActivity(content, length),
+                                     entry >= 0 ? set.entries[entry].lastActivity : 0, mapped, mappedLength);
+        }
     }
     if (ok && kept.index && SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" ARCHIVED_INDEX, set.source[0].entriesDir))) {
         DWORD length = 0, currentLength = 0;
@@ -1023,6 +1702,20 @@ BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listN
         Free(current);
         if (hash != kept.index && (content = Own(&changes, LoadObject(kept.index, &length))) != NULL)
             ok = AddChange(&changes, 0, SYNC_INDEX, 0, ARCHIVED_INDEX, 0, 0, content, length);
+    }
+    /* The pins and groups of the sidebar as they were then. */
+    if (ok && kept.layout) {
+        size_t currentLength = 0, mappedLength = 0;
+        char *current = LayoutOf(&set, 0, &currentLength, NULL), *content, *mapped;
+        DWORD length = 0;
+        ULONGLONG hash = current ? Core_HashBytes(CORE_HASH_START, current, currentLength) : 0;
+        LayoutIds ids;
+        Free(current);
+        ids.set = &set;
+        ids.profile = 0;
+        if (hash != kept.layout && (content = Own(&changes, LoadObject(kept.layout, &length))) != NULL &&
+            (mapped = Own(&changes, Core_JsonMapStrings(content, length, ToEntryIds, &ids, &mappedLength))) != NULL)
+            ok = AddChange(&changes, 0, SYNC_LAYOUT, 0, LAYOUT_KEY, 0, 0, mapped, mappedLength);
     }
     /* Claude's marks of the sessions deleted: its own import of Claude Code's sessions leaves them out. */
     for (i = 0; i < ledger.count && ok; i++)
@@ -1035,7 +1728,7 @@ BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listN
     FreeList(&kept);
     SessionStore_Free(&set);
     /* A member restored to an older version: the others follow. */
-    if (ok && list->items[index].syncSessions && !Claude_IsRunning(&list->items[index])) KeepFor(list, index);
+    if (ok && list->items[index].syncGroup && !Claude_IsRunning(&list->items[index])) KeepFor(list, index, report, NULL);
     return ok;
 }
 

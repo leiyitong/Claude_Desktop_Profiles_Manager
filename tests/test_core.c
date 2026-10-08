@@ -946,6 +946,21 @@ static void TestSessionSync(void)
     Check("sync plan: a mark replaces its removal", Core_SyncOpReplaces(&queued, &added));
     queued.kind = added.kind = SYNC_INDEX;
     Check("sync plan: a list of archived sessions replaces the one before", Core_SyncOpReplaces(&queued, &added));
+    queued.kind = SYNC_INDEX;
+    added.kind = SYNC_LAYOUT;
+    Check("sync plan: the sidebar's layout and the archived list are apart", !Core_SyncOpReplaces(&queued, &added));
+    queued.kind = SYNC_LAYOUT;
+    Check("sync plan: a layout replaces the one before", Core_SyncOpReplaces(&queued, &added));
+    added.flags = SYNC_MARKED;
+    added.kind = SYNC_REMOVE;
+    added.time = added.seen = 0;
+    StringCchCopyW(added.key, ARRAYSIZE(added.key), kId);
+    added.content[0] = 0;
+    Check("sync plan: a layout and a marked removal written and read back",
+          Core_SyncOpFormat(&added, text, ARRAYSIZE(text)) && Core_SyncOpParse(text, &back) && back.kind == SYNC_REMOVE &&
+          back.flags == SYNC_MARKED && Core_SyncOpParse(L"layout\t0\t0\t0\tlayout\t2.json", &back) && back.kind == SYNC_LAYOUT &&
+          wcscmp(back.content, L"2.json") == 0);
+    StringCchCopyW(added.key, ARRAYSIZE(added.key), L"SESSION");
     queued.kind = added.kind = SYNC_PUT;
     StringCchCopyW(added.key, ARRAYSIZE(added.key), L"Other");
     Check("sync plan: another session's change replaces nothing", !Core_SyncOpReplaces(&queued, &added));
@@ -1057,6 +1072,117 @@ static void TestMirror(void)
           wcscmp(name, L".claude_20261007_3") == 0);
     Check("dated copy: no name, no copy", !Core_DatedCopyName(L"", &day, 1, name, ARRAYSIZE(name)) &&
           !Core_DatedCopyName(L".claude", &day, 0, name, ARRAYSIZE(name)));
+}
+
+/* A transcript line: `uuid` after `parent` ("" for none), written at second `second` of a day. */
+static void TranscriptLine(char *text, size_t cap, const char *type, const char *uuid, const char *parent, int second, BOOL sidechain)
+{
+    char line[512];
+    if (parent[0])
+        StringCchPrintfA(line, sizeof line, "{\"type\":\"%s\",\"uuid\":\"%s\",\"parentUuid\":\"%s\",\"isSidechain\":%s,"
+                         "\"timestamp\":\"2026-10-08T10:00:%02d.000Z\",\"sessionId\":\"s\"}\n", type, uuid, parent, sidechain ? "true" : "false", second);
+    else
+        StringCchPrintfA(line, sizeof line, "{\"type\":\"%s\",\"uuid\":\"%s\",\"parentUuid\":null,\"isSidechain\":false,"
+                         "\"timestamp\":\"2026-10-08T10:00:%02d.000Z\",\"sessionId\":\"s\"}\n", type, uuid, second);
+    StringCchCatA(text, cap, line);
+}
+
+/* 2026-10-08T10:00:<second>Z in ms since 1970. */
+static ULONGLONG AtSecond(int second)
+{
+    SYSTEMTIME at;
+    FILETIME time;
+    ZeroMemory(&at, sizeof at);
+    at.wYear = 2026;
+    at.wMonth = 10;
+    at.wDay = 8;
+    at.wHour = 10;
+    at.wSecond = (WORD)second;
+    SystemTimeToFileTime(&at, &time);
+    return ((((ULONGLONG)time.dwHighDateTime << 32) | time.dwLowDateTime) - 116444736000000000ULL) / 10000;
+}
+
+static size_t MapCodeIds(void *context, const char *text, size_t length, char *out, size_t cap)
+{
+    (void)context;
+    if (length < 6 || memcmp(text, "local_", 6) != 0) return (size_t)-1;
+    if (FAILED(StringCchPrintfA(out, cap, "cli:%.*s", (int)(length - 6), text + 6))) return (size_t)-1;
+    return strlen(out);
+}
+
+static void TestSessionsKeptTheSame(void)
+{
+    char text[4096], iso[32];
+    const char *keys[3] = { "preferences", "epitaxyPrefs", "starred-local-code-sessions" };
+    char *set, *mapped;
+    BOOL *excluded = NULL;
+    WCHAR name[MAX_PATH], stamp[32];
+    size_t length = 0;
+    int lines = 0;
+
+    Check("scratch: a folder in a profile's no-folder area",
+          Core_ScratchFolderName(L"C:\\Users\\a\\AppData\\Roaming\\Claude\\scratch-workspaces\\acc\\org\\scratch-2026-10-07-8e3fb5", name,
+                                 ARRAYSIZE(name)) && wcscmp(name, L"scratch-2026-10-07-8e3fb5") == 0);
+    Check("scratch: a subfolder of it names the same folder",
+          Core_ScratchFolderName(L"D:\\p\\Claude-Work\\SCRATCH-WORKSPACES\\a\\o\\scratch-x\\src", name, ARRAYSIZE(name)) &&
+          wcscmp(name, L"scratch-x") == 0);
+    Check("scratch: a project folder is none", !Core_ScratchFolderName(L"C:\\Users\\a\\Desktop\\work", name, ARRAYSIZE(name)) && !name[0]);
+    Check("scratch: the area itself, or its account, is none",
+          !Core_ScratchFolderName(L"C:\\d\\scratch-workspaces\\acc\\org", name, ARRAYSIZE(name)) &&
+          !Core_ScratchFolderName(L"C:\\d\\scratch-workspaces\\acc", name, ARRAYSIZE(name)) &&
+          !Core_ScratchFolderName(L"C:\\d\\scratch-workspaces\\acc\\org\\..", name, ARRAYSIZE(name)));
+
+    set = Core_JsonSetNested("{\"a\":1}", 7, keys, 3, "[\"local_1\"]", &length);
+    Check("json nested: the objects on the way are made",
+          set && strcmp(set, "{\"a\":1,\"preferences\":{\"epitaxyPrefs\":{\"starred-local-code-sessions\":[\"local_1\"]}}}") == 0);
+    if (set) HeapFree(GetProcessHeap(), 0, set);
+    StringCchCopyA(text, sizeof text, "{\"preferences\":{\"x\":true,\"epitaxyPrefs\":{\"starred-local-code-sessions\":[],\"y\":2}},\"z\":3}");
+    set = Core_JsonSetNested(text, strlen(text), keys, 3, "[\"local_2\"]", &length);
+    Check("json nested: what is there is replaced, the rest kept",
+          set && strcmp(set, "{\"preferences\":{\"x\":true,\"epitaxyPrefs\":{\"starred-local-code-sessions\":[\"local_2\"],\"y\":2}},\"z\":3}") == 0 &&
+          length == strlen(set));
+    if (set) HeapFree(GetProcessHeap(), 0, set);
+    Check("json nested: no object on the way, nothing", Core_JsonSetNested("{\"preferences\":[1]}", 19, keys, 3, "1", &length) == NULL);
+
+    StringCchCopyA(text, sizeof text, "{\"local_9\":[\"local_1\",\"code:local_2\",\"x\\\"local_3\"],\"n\":1}");
+    mapped = Core_JsonMapStrings(text, strlen(text), MapCodeIds, NULL, &length);
+    Check("json strings: keys and values mapped, the rest kept",
+          mapped && strcmp(mapped, "{\"cli:9\":[\"cli:1\",\"code:local_2\",\"x\\\"local_3\"],\"n\":1}") == 0 && length == strlen(mapped));
+    if (mapped) HeapFree(GetProcessHeap(), 0, mapped);
+    Check("json strings: a string left open is refused", Core_JsonMapStrings("[\"abc", 5, MapCodeIds, NULL, &length) == NULL);
+
+    Check("iso time: as transcripts write it", Core_IsoTime(AtSecond(7) + 45, iso, sizeof iso) && strcmp(iso, "2026-10-08T10:00:07.045Z") == 0);
+
+    /* A conversation both profiles went on with from line b, apart: a -> b -> c1 -> d1 (keep) and b -> c2 (drop). */
+    text[0] = 0;
+    TranscriptLine(text, sizeof text, "user", "a", "", 1, FALSE);
+    TranscriptLine(text, sizeof text, "assistant", "b", "a", 2, FALSE);
+    TranscriptLine(text, sizeof text, "user", "c1", "b", 10, FALSE);
+    TranscriptLine(text, sizeof text, "user", "c2", "b", 11, FALSE);
+    TranscriptLine(text, sizeof text, "progress", "p1", "c1", 12, FALSE);
+    TranscriptLine(text, sizeof text, "assistant", "d1", "c1", 13, FALSE);
+    TranscriptLine(text, sizeof text, "assistant", "x", "c2", 14, TRUE);
+    Check("branches: two lines of conversation since the last sync",
+          Core_TranscriptBranches(text, strlen(text), AtSecond(13), AtSecond(11), AtSecond(5), &excluded, &lines) && lines == 7);
+    if (excluded)
+        Check("branches: the copy leaves out the other branch alone and what follows it",
+              !excluded[0] && !excluded[1] && excluded[2] && !excluded[3] && excluded[4] && excluded[5] && !excluded[6]);
+    if (excluded) HeapFree(GetProcessHeap(), 0, excluded);
+    excluded = NULL;
+    /* Its last use a second before c1 (a use takes in what was written a second after it). */
+    Check("branches: one went on from the other, one conversation",
+          !Core_TranscriptBranches(text, strlen(text), AtSecond(13), AtSecond(9), AtSecond(5), &excluded, &lines) && !excluded);
+    Check("branches: nothing new since the last sync, nothing to keep apart",
+          !Core_TranscriptBranches(text, strlen(text), AtSecond(13), AtSecond(11), AtSecond(20), &excluded, &lines));
+    Check("branches: the same line, nothing to keep apart",
+          !Core_TranscriptBranches(text, strlen(text), AtSecond(13), AtSecond(13), AtSecond(5), &excluded, &lines));
+
+    Check("build stamp: the compiler's date and time", Core_BuildStamp("Oct  8 2026", "17:20:33", stamp, ARRAYSIZE(stamp)) &&
+          wcscmp(stamp, L"2026.10.08 17:20") == 0);
+    Check("build stamp: two-digit days", Core_BuildStamp("Dec 31 2026", "00:05:00", stamp, ARRAYSIZE(stamp)) &&
+          wcscmp(stamp, L"2026.12.31 00:05") == 0);
+    Check("build stamp: anything else is refused", !Core_BuildStamp("Foo  8 2026", "17:20:33", stamp, ARRAYSIZE(stamp)) &&
+          !Core_BuildStamp("Oct  8 2026", "7:20", stamp, ARRAYSIZE(stamp)) && !Core_BuildStamp(NULL, "17:20:33", stamp, ARRAYSIZE(stamp)));
 }
 
 static void TestDeflate(void)
@@ -1183,6 +1309,7 @@ int wmain(void)
     TestSessionEdits();
     TestSessionSync();
     TestMirror();
+    TestSessionsKeptTheSame();
     TestDrawingMath();
     TestDeflate();
     TestProcessTree();

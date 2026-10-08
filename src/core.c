@@ -1121,8 +1121,8 @@ BOOL Core_PendingReplaces(const PendingEdit *queued, const PendingEdit *added)
 
 /* A profile's plan of changes sent to it (sessionsync.c): UTF-8, one change
  * a line, "<kind>\t<flags>\t<time>\t<seen>\t<key>\t<content>". */
-static const WCHAR *const kSyncOps[] = { L"put", L"remove", L"mark", L"unmark", L"index" };
-C_ASSERT(ARRAYSIZE(kSyncOps) == SYNC_INDEX + 1);
+static const WCHAR *const kSyncOps[] = { L"put", L"remove", L"mark", L"unmark", L"index", L"layout" };
+C_ASSERT(ARRAYSIZE(kSyncOps) == SYNC_LAYOUT + 1);
 
 /* A name of a file in a folder of ours: no path, no dots of its own. */
 static BOOL IsPlainContentName(const WCHAR *name)
@@ -1183,13 +1183,22 @@ BOOL Core_SyncOpParse(const WCHAR *line, SyncOp *op)
     return TRUE;
 }
 
+static int SyncOpFamily(SyncOpKind kind)
+{
+    switch (kind) {
+    case SYNC_PUT: case SYNC_REMOVE: return 0;
+    case SYNC_MARK: case SYNC_UNMARK: return 1;
+    case SYNC_INDEX: return 2;
+    default: return 3;
+    }
+}
+
 /* A change sent after `queued` replaces it: a put or a removal of the same
- * session, a mark or its removal for the same id, a list of archived sessions. */
+ * session, a mark or its removal for the same id, a list of archived
+ * sessions, the sessions' pins and groups. */
 BOOL Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added)
 {
-    int a = queued->kind == SYNC_PUT || queued->kind == SYNC_REMOVE ? 0 : queued->kind == SYNC_INDEX ? 2 : 1;
-    int b = added->kind == SYNC_PUT || added->kind == SYNC_REMOVE ? 0 : added->kind == SYNC_INDEX ? 2 : 1;
-    return a == b && EqualsI(queued->key, -1, added->key, -1);
+    return SyncOpFamily(queued->kind) == SyncOpFamily(added->kind) && EqualsI(queued->key, -1, added->key, -1);
 }
 
 /* What every profile of a group keeping the same sessions gets of one
@@ -1234,6 +1243,283 @@ BOOL Core_DatedCopyName(const WCHAR *name, const SYSTEMTIME *day, int copy, WCHA
     if (!name[0] || copy < 1) return FALSE;
     if (copy == 1) return SUCCEEDED(StringCchPrintfW(out, cch, L"%s_%04u%02u%02u", name, day->wYear, day->wMonth, day->wDay));
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s_%04u%02u%02u_%d", name, day->wYear, day->wMonth, day->wDay, copy));
+}
+
+/* The version the manager shows, the time this copy was built: the
+ * compiler's __DATE__ ("Oct  8 2026") and __TIME__ ("17:20:33") as
+ * "2026.10.08 17:20". */
+static int Digits(const char *text, int count)
+{
+    int value = 0, i;
+    for (i = 0; i < count; i++) {
+        if (text[i] == ' ' && value == 0) continue;
+        if (text[i] < '0' || text[i] > '9') return -1;
+        value = value * 10 + (text[i] - '0');
+    }
+    return value;
+}
+
+BOOL Core_BuildStamp(const char *date, const char *time, WCHAR *out, size_t cch)
+{
+    static const char kMonths[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    int month, day, year, hour, minute;
+    if (cch) out[0] = 0;
+    if (!date || !time || strlen(date) != 11 || strlen(time) != 8 || date[3] != ' ' || date[6] != ' ' || time[2] != ':' || time[5] != ':')
+        return FALSE;
+    for (month = 0; month < 12 && memcmp(kMonths + 3 * month, date, 3) != 0; month++) {}
+    day = Digits(date + 4, 2);
+    year = Digits(date + 7, 4);
+    hour = Digits(time, 2);
+    minute = Digits(time + 3, 2);
+    if (month == 12 || day < 1 || day > 31 || year < 0 || hour < 0 || hour > 23 || minute < 0 || minute > 59) return FALSE;
+    return SUCCEEDED(StringCchPrintfW(out, cch, L"%04d.%02d.%02d %02d:%02d", year, month + 1, day, hour, minute));
+}
+
+/* The name of the "no folder" working folder `cwd` is, in whichever
+ * profile's area it is: the folder after scratch-workspaces\<account>\
+ * <organization>\. FALSE when `cwd` is in no such area. */
+BOOL Core_ScratchFolderName(const WCHAR *cwd, WCHAR *out, size_t cch)
+{
+    static const WCHAR kArea[] = L"\\scratch-workspaces\\";
+    const size_t areaLength = ARRAYSIZE(kArea) - 1;
+    const WCHAR *at, *name = NULL, *end;
+    int skipped;
+    if (cch) out[0] = 0;
+    for (at = cwd; *at && !name; at++)
+        if (_wcsnicmp(at, kArea, areaLength) == 0) name = at + areaLength;
+    if (!name) return FALSE;
+    for (skipped = 0; skipped < 2; skipped++) {
+        const WCHAR *slash = wcschr(name, L'\\');
+        if (!slash || slash == name) return FALSE;
+        name = slash + 1;
+    }
+    end = wcschr(name, L'\\');
+    if (!end) end = name + wcslen(name);
+    if (end == name || (end - name == 1 && name[0] == L'.') || (end - name == 2 && name[0] == L'.' && name[1] == L'.')) return FALSE;
+    return SUCCEEDED(StringCchCopyNW(out, cch, name, (size_t)(end - name)));
+}
+
+/* `json` with the member reached through `keys` (an object at each level,
+ * one made where it is missing) set to `raw` (NUL-terminated): a heap block
+ * with a NUL after it (HeapFree it); NULL when `json` holds something else
+ * than an object on the way, or without memory. */
+char *Core_JsonSetNested(const char *json, size_t len, const char *const *keys, int depth, const char *raw, size_t *outLen)
+{
+    const char *inner;
+    size_t innerLength, setLength = 0, cap;
+    char *set = NULL, *out;
+    BOOL ok;
+    *outLen = 0;
+    if (depth < 1) return NULL;
+    if (depth == 1) {
+        set = (char *)raw;
+        setLength = strlen(raw);
+    } else {
+        if (!Core_JsonMember(json, len, keys[0], &inner, &innerLength)) {
+            inner = "{}";
+            innerLength = 2;
+        }
+        if ((set = Core_JsonSetNested(inner, innerLength, keys + 1, depth - 1, raw, &setLength)) == NULL) return NULL;
+    }
+    cap = len + setLength + strlen(keys[0]) + 8;
+    out = (char *)HeapAlloc(GetProcessHeap(), 0, cap + 1);
+    ok = out && Core_JsonSetMember(json, len, keys[0], set, out, cap, outLen);
+    if (depth > 1) HeapFree(GetProcessHeap(), 0, set);
+    if (!ok) {
+        if (out) HeapFree(GetProcessHeap(), 0, out);
+        *outLen = 0;
+        return NULL;
+    }
+    out[*outLen] = 0;
+    return out;
+}
+
+/* `json` with the text of each of its strings, keys too, that `map`
+ * replaces: `map` gets a string's raw text (between its quotes) and writes
+ * its replacement into `out` (`cap` bytes), returning its length, or
+ * returns (size_t)-1 to keep it. A heap block with a NUL after it (HeapFree
+ * it), NULL without memory or for a string left open. */
+char *Core_JsonMapStrings(const char *json, size_t len, CoreStringMap map, void *context, size_t *outLen)
+{
+    char replacement[512], *out, *grown;
+    size_t cap = len + 64, n = 0, i = 0;
+    *outLen = 0;
+    if ((out = (char *)HeapAlloc(GetProcessHeap(), 0, cap + 1)) == NULL) return NULL;
+    while (i < len) {
+        size_t piece, end, mapped;
+        const char *from;
+        if (json[i] == '"') {
+            if ((end = StringEnd(json, len, i)) == 0) {
+                HeapFree(GetProcessHeap(), 0, out);
+                return NULL;
+            }
+            mapped = map(context, json + i + 1, end - i - 2, replacement, sizeof replacement);
+            if (mapped != (size_t)-1 && mapped <= sizeof replacement) {
+                if (n + mapped + 2 > cap) goto grow;
+                out[n++] = '"';
+                memcpy(out + n, replacement, mapped);
+                n += mapped;
+                out[n++] = '"';
+                i = end;
+                continue;
+            }
+            from = json + i;
+            piece = end - i;
+        } else {
+            from = json + i;
+            piece = 1;
+        }
+        if (n + piece > cap) goto grow;
+        memcpy(out + n, from, piece);
+        n += piece;
+        i += piece;
+        continue;
+grow:
+        if (cap > ((size_t)-1 - 1) / 2 || (grown = (char *)HeapReAlloc(GetProcessHeap(), 0, out, cap * 2 + 1)) == NULL) {
+            HeapFree(GetProcessHeap(), 0, out);
+            return NULL;
+        }
+        out = grown;
+        cap *= 2;
+    }
+    out[n] = 0;
+    *outLen = n;
+    return out;
+}
+
+/* A time in ms since 1970 as transcripts write theirs: ISO 8601 in UTC with
+ * milliseconds, "2026-10-08T08:55:12.345Z", which sorts as the time does. */
+BOOL Core_IsoTime(ULONGLONG ms, char *out, size_t cap)
+{
+    ULONGLONG ticks = ms * 10000ULL + 116444736000000000ULL;
+    FILETIME time;
+    SYSTEMTIME utc;
+    time.dwLowDateTime = (DWORD)ticks;
+    time.dwHighDateTime = (DWORD)(ticks >> 32);
+    return FileTimeToSystemTime(&time, &utc) &&
+           SUCCEEDED(StringCchPrintfA(out, cap, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ", utc.wYear, utc.wMonth, utc.wDay, utc.wHour,
+                                      utc.wMinute, utc.wSecond, utc.wMilliseconds));
+}
+
+/* One line of a transcript, as the branch analysis reads it. */
+typedef struct TranscriptLine {
+    size_t start, length;   /* in the text, without its line break */
+    char   uuid[40], parent[40], time[32];
+    BOOL   message;         /* a user or assistant message of the main conversation */
+    int    parentLine;      /* -1: none found */
+} TranscriptLine;
+
+static void LineString(const char *line, size_t length, const char *key, char *out, size_t cap)
+{
+    const char *value;
+    size_t valueLength;
+    out[0] = 0;
+    if (Core_JsonMember(line, length, key, &value, &valueLength) && valueLength >= 2 && value[0] == '"' && valueLength - 2 < cap &&
+        !memchr(value + 1, '\\', valueLength - 2)) {
+        memcpy(out, value + 1, valueLength - 2);
+        out[valueLength - 2] = 0;
+    }
+}
+
+/* The last message of the main conversation written at `until` (with a
+ * second's slack) or before, and after `since`: -1 for none. */
+static int LastMessageBy(const TranscriptLine *lines, int count, const char *since, const char *until)
+{
+    int i, best = -1;
+    for (i = 0; i < count; i++) {
+        if (!lines[i].message || !lines[i].time[0] || strcmp(lines[i].time, since) <= 0 || strcmp(lines[i].time, until) > 0) continue;
+        if (best < 0 || strcmp(lines[i].time, lines[best].time) >= 0) best = i;
+    }
+    return best;
+}
+
+/* Marks `line` and every line it goes on from. */
+static void MarkChain(const TranscriptLine *lines, int count, int line, BOOL *marked)
+{
+    int steps;
+    for (steps = 0; line >= 0 && line < count && !marked[line] && steps <= count; steps++) {
+        marked[line] = TRUE;
+        line = lines[line].parentLine;
+    }
+}
+
+/* A transcript two profiles both went on with, apart: `keepTime` and
+ * `dropTime` (ms since 1970) are when each one last used it, `since` when
+ * the profiles last had it alike. TRUE when it holds two branches written
+ * after `since`, the one each went on with: `excluded` (a heap array, one
+ * flag per line, HeapFree it) then marks the lines a copy going on from the
+ * `drop` branch leaves out, the ones of the `keep` branch alone and what
+ * follows them; `lineCount` gets the lines. FALSE for one line of
+ * conversation (one went on from the other), or no line new since then. */
+BOOL Core_TranscriptBranches(const char *text, size_t len, ULONGLONG keepTime, ULONGLONG dropTime, ULONGLONG since, BOOL **excluded,
+                             int *lineCount)
+{
+    TranscriptLine *lines;
+    BOOL *keepChain = NULL, *dropChain = NULL, *out = NULL, ok = FALSE;
+    char sinceText[32], keepText[32], dropText[32];
+    size_t at = 0;
+    int count = 0, capacity = 0, i, j, keep, drop;
+    *excluded = NULL;
+    *lineCount = 0;
+    if (!Core_IsoTime(since, sinceText, sizeof sinceText) || !Core_IsoTime(keepTime + 1000, keepText, sizeof keepText) ||
+        !Core_IsoTime(dropTime + 1000, dropText, sizeof dropText))
+        return FALSE;
+    for (i = 0; (size_t)i < len; i++)
+        if (text[i] == '\n') capacity++;
+    capacity++;
+    if ((lines = (TranscriptLine *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)capacity * sizeof *lines)) == NULL) return FALSE;
+    while (at < len && count < capacity) {
+        const char *end = (const char *)memchr(text + at, '\n', len - at), *value;
+        TranscriptLine *line = &lines[count++];
+        char type[24], sidechain[8];
+        size_t valueLength;
+        line->start = at;
+        line->length = end ? (size_t)(end - (text + at)) : len - at;
+        if (line->length && text[at + line->length - 1] == '\r') line->length--;
+        LineString(text + at, line->length, "uuid", line->uuid, sizeof line->uuid);
+        LineString(text + at, line->length, "parentUuid", line->parent, sizeof line->parent);
+        if (!line->parent[0]) LineString(text + at, line->length, "logicalParentUuid", line->parent, sizeof line->parent);
+        LineString(text + at, line->length, "timestamp", line->time, sizeof line->time);
+        LineString(text + at, line->length, "type", type, sizeof type);
+        sidechain[0] = 0;
+        if (Core_JsonMember(text + at, line->length, "isSidechain", &value, &valueLength) && Core_JsonTrue(value, valueLength))
+            StringCchCopyA(sidechain, sizeof sidechain, "true");
+        line->message = line->uuid[0] && !sidechain[0] && (strcmp(type, "user") == 0 || strcmp(type, "assistant") == 0);
+        line->parentLine = -1;
+        at = end ? (size_t)(end - text) + 1 : len;
+    }
+    /* Each line's parent, found among the lines before it (a transcript is written in order). */
+    for (i = 0; i < count; i++) {
+        if (!lines[i].parent[0]) continue;
+        for (j = i - 1; j >= 0; j--)
+            if (lines[j].uuid[0] && strcmp(lines[j].uuid, lines[i].parent) == 0) {
+                lines[i].parentLine = j;
+                break;
+            }
+    }
+    keep = LastMessageBy(lines, count, sinceText, keepText);
+    drop = LastMessageBy(lines, count, sinceText, dropText);
+    if (keep < 0 || drop < 0 || keep == drop) goto done;
+    keepChain = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *keepChain);
+    dropChain = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *dropChain);
+    out = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *out);
+    if (!keepChain || !dropChain || !out) goto done;
+    MarkChain(lines, count, keep, keepChain);
+    MarkChain(lines, count, drop, dropChain);
+    /* One went on from the other: a single line of conversation. */
+    if (keepChain[drop] || dropChain[keep]) goto done;
+    for (i = 0; i < count; i++)
+        out[i] = (keepChain[i] && !dropChain[i]) || (lines[i].parentLine >= 0 && out[lines[i].parentLine] && !dropChain[i]);
+    *excluded = out;
+    *lineCount = count;
+    out = NULL;
+    ok = TRUE;
+done:
+    if (keepChain) HeapFree(GetProcessHeap(), 0, keepChain);
+    if (dropChain) HeapFree(GetProcessHeap(), 0, dropChain);
+    if (out) HeapFree(GetProcessHeap(), 0, out);
+    HeapFree(GetProcessHeap(), 0, lines);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- archives */

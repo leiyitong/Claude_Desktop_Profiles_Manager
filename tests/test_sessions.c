@@ -3,8 +3,10 @@
  * temporary fixture: where a profile's sessions are stored and how they are
  * read (sessionstore.c); copies, changes waiting for a running profile,
  * removals and Delete session everywhere, with a stand-in for the Recycle
- * Bin (sessionedit.c); sessions merged, overwritten, shared to a running
- * profile, exported and imported (sessionsync.c); paths past MAX_PATH; reads
+ * Bin (sessionedit.c); sessions merged, shared to a running profile, moved,
+ * exported and imported (sessionsync.c); sessions kept the same in groups,
+ * with the sidebar's pins and groups, sessions without a folder and sessions
+ * gone on with apart (sessionvault.c); paths past MAX_PATH; reads
  * cancelled or made at once; the sessions view's background snapshots
  * (sessions.c). Built and run by build.cmd; exits non-zero when a check fails.
  */
@@ -2385,26 +2387,18 @@ static void TestSessionSync(const WCHAR *projects)
           loaded && SessionSync_Merge(&set, 0x7, &report) && report.added == 0 && report.updated == 0 && report.failed == 0);
     SessionStore_Free(&set);
 
-    /* Overwrite: the source's sessions and its marks of deleted ones; exact also takes the others away. */
-    ready = WriteSyncEntry(entries[1], g_syncIds[3], "B four", 50) && MarkPath(entries[0], g_syncIds[4], path, ARRAYSIZE(path)) &&
-            Save(path, "777");
-    Check("overwrite fixtures created", ready);
+    /* Moved out of a profile: its entry goes to the backup, Claude's marks stay so that it does not take it in again. */
+    ready = WriteSyncEntry(entries[1], g_syncIds[3], "B four", 50);
+    Check("removal fixtures created", ready);
     if (!ready) return;
     loaded = SessionStore_LoadProfiles(&set, &profiles);
+    rows[0] = loaded ? FindRow(&set, g_syncIds[3]) : -1;
     ZeroMemory(&report, sizeof report);
-    Check("overwriting with a profile succeeds", loaded && SessionSync_Overwrite(&set, 0, 0x6, FALSE, &report) && report.failed == 0);
-    Check("overwriting keeps the targets' own sessions", report.removed == 0 && EntryThere(entries[1], g_syncIds[3]));
-    Check("overwriting carries the source's marks of deleted sessions",
-          MarkPath(entries[2], g_syncIds[4], path, ARRAYSIZE(path)) && FileThere(path));
-    SessionStore_Free(&set);
-    loaded = SessionStore_LoadProfiles(&set, &profiles);
-    ZeroMemory(&report, sizeof report);
-    Check("an exact overwrite succeeds", loaded && SessionSync_Overwrite(&set, 0, 0x2, TRUE, &report) && report.failed == 0);
-    Check("an exact overwrite takes away what the source does not list", report.removed == 1 && !EntryThere(entries[1], g_syncIds[3]));
-    Check("an overwritten-away entry is kept in the backup", BackedUp(&report, &profiles.items[1], g_syncIds[3], path, ARRAYSIZE(path)));
-    Check("an exact overwrite keeps the marks the source has",
-          MarkPath(entries[1], g_syncIds[4], path, ARRAYSIZE(path)) && FileThere(path));
-    SessionStore_Free(&set);
+    Check("taking a session out of a profile succeeds", rows[0] >= 0 && SessionSync_Remove(&set, 0x2, rows, 1, &report) && report.failed == 0);
+    Check("the session is taken out, kept in the backup", report.removed == 1 && !EntryThere(entries[1], g_syncIds[3]) &&
+          BackedUp(&report, &profiles.items[1], g_syncIds[3], path, ARRAYSIZE(path)));
+    Check("Claude's mark that it was deleted there is written", MarkPath(entries[1], g_syncIds[3], path, ARRAYSIZE(path)) && FileThere(path));
+    if (loaded) SessionStore_Free(&set);
 
     /* Share to a running profile: it waits for that profile to close. */
     ready = WriteSyncEntry(entries[0], g_syncIds[5], "A six", 600);
@@ -2539,13 +2533,13 @@ static void TestVault(const WCHAR *projects)
     profiles.count = 3;
     for (p = 0; p < profiles.count && ready; p++)
         ready = PrepareProfile(&profiles.items[p], labels[p], leaves[p], accounts[p], L"vault-organization", entries[p], ARRAYSIZE(entries[p]));
-    profiles.items[0].syncSessions = profiles.items[1].syncSessions = TRUE;
+    profiles.items[0].syncGroup = profiles.items[1].syncGroup = 1;
     ready = ready && WriteVaultEntry(entries[0], g_vaultIds[0], "A one", 100, FALSE) && WriteVaultEntry(entries[1], g_vaultIds[1], "B two", 200, FALSE);
     Check("vault fixtures created", ready);
     if (!ready) return;
 
     /* The first sync: each one gets the other's. */
-    Check("the group is the profiles that keep the same sessions", SessionVault_Group(&profiles) == 0x3);
+    Check("the group is the profiles that keep the same sessions", SessionVault_Group(&profiles, 1) == 0x3 && SessionVault_Group(&profiles, 2) == 0);
     Check("a first sync of the group succeeds", KeepGroup(&profiles, 0x3, &report));
     Check("a first sync gives each one the other's sessions", report.added == 2 && EntryTitled(entries[1], g_vaultIds[0], L"A one") &&
           EntryTitled(entries[0], g_vaultIds[1], L"B two"));
@@ -2599,6 +2593,8 @@ static void TestVault(const WCHAR *projects)
     if (window) {
         Check("the change waits for the running profile", KeepGroup(&profiles, 0x3, &report) && (report.waiting & 0x2) &&
               EntryTitled(entries[1], g_vaultIds[0], L"A one renamed"));
+        Check("kept again while it runs, what it still shows is no change", KeepGroup(&profiles, 0x3, &report) &&
+              EntryTitled(entries[0], g_vaultIds[0], L"A one again") && EntryTitled(entries[1], g_vaultIds[0], L"A one renamed"));
         StopFakeClaude(window);
         Check("it is made once that profile closed",
               SessionEdit_ApplyPending(NULL, &profiles.items[1]) > 0 && EntryTitled(entries[1], g_vaultIds[0], L"A one again"));
@@ -2652,6 +2648,256 @@ static void TestVault(const WCHAR *projects)
     Check("the folder is copied whole", ready && SessionPurge_BackUp(NULL, copy, &copyError) == COPY_MADE &&
           SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\projects\\fixture\\%s.jsonl", copy, g_vaultIds[1])) && FileThere(path));
     Check("the next copy that day gets another name", SessionPurge_BackupName(path, ARRAYSIZE(path)) && !Core_PathEquals(path, copy));
+}
+
+/* ------------------------------------------------ groups, layouts, forks */
+
+static const WCHAR *const g_keptIds[4] = {
+    L"cdcdcdcd-0000-4000-8000-000000000001", L"cdcdcdcd-0000-4000-8000-000000000002", L"cdcdcdcd-0000-4000-8000-000000000003",
+    L"cdcdcdcd-0000-4000-8000-000000000004"
+};
+
+/* 2026-10-08T10:00:<second>Z in ms since 1970. */
+static ULONGLONG AtSecond(int second)
+{
+    SYSTEMTIME at;
+    FILETIME time;
+    ZeroMemory(&at, sizeof at);
+    at.wYear = 2026;
+    at.wMonth = 10;
+    at.wDay = 8;
+    at.wHour = 10;
+    at.wSecond = (WORD)second;
+    SystemTimeToFileTime(&at, &time);
+    return ((((ULONGLONG)time.dwHighDateTime << 32) | time.dwLowDateTime) - 116444736000000000ULL) / 10000;
+}
+
+/* An entry of session `id` named `title`, working in `cwd`, last used at `activity` (ms). */
+static BOOL WriteKeptEntry(const WCHAR *entries, const WCHAR *id, const char *title, const WCHAR *cwd, ULONGLONG activity)
+{
+    WCHAR file[MAX_PATH];
+    char quoted[MAX_PATH * 6 + 4], json[2048];
+    return Core_JsonQuote(cwd, quoted, sizeof quoted) &&
+           SUCCEEDED(StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"cwd\":%s,\"originCwd\":%s,"
+                                                         "\"title\":\"%s\",\"lastActivityAt\":%I64u}", id, id, quoted, quoted, title, activity)) &&
+           EntryPath(entries, id, file, ARRAYSIZE(file)) && Save(file, json);
+}
+
+static void AddLine(char *text, size_t cap, const WCHAR *session, const char *type, const char *uuid, const char *parent, int second)
+{
+    char line[512];
+    if (parent)
+        StringCchPrintfA(line, sizeof line, "{\"type\":\"%s\",\"uuid\":\"%s\",\"parentUuid\":\"%s\",\"timestamp\":\"2026-10-08T10:00:%02d.000Z\","
+                         "\"sessionId\":\"%ls\"}\n", type, uuid, parent, second, session);
+    else
+        StringCchPrintfA(line, sizeof line, "{\"type\":\"%s\",\"uuid\":\"%s\",\"parentUuid\":null,\"timestamp\":\"2026-10-08T10:00:%02d.000Z\","
+                         "\"sessionId\":\"%ls\"}\n", type, uuid, second, session);
+    StringCchCatA(text, cap, line);
+}
+
+static BOOL FileHas(const WCHAR *path, const char *part)
+{
+    DWORD length = 0;
+    char *text = Util_ReadFile(path, TRANSCRIPT_READ_MAX, FALSE, &length);
+    BOOL has = text && strstr(text, part) != NULL;
+    if (text) HeapFree(GetProcessHeap(), 0, text);
+    return has;
+}
+
+/* The entry of `entries` whose title is `title` (a session kept as two): its transcript's id. */
+static BOOL FindTitled(const WCHAR *entries, const WCHAR *title, WCHAR *id, size_t cch)
+{
+    WCHAR path[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE find = Util_FindFiles(entries, L"local_*.json", &found, FALSE);
+    BOOL seen = FALSE;
+    if (find == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (Join(entries, found.cFileName, path, ARRAYSIZE(path)) && TitledAs(path, title) && ReadString(path, "cliSessionId", id, cch)) seen = TRUE;
+    } while (!seen && FindNextFileW(find, &found));
+    FindClose(find);
+    return seen;
+}
+
+static int g_steps, g_lastTotal;
+
+static void CountSteps(void *context, int done, int total)
+{
+    (void)context;
+    g_steps++;
+    g_lastTotal = total;
+    if (done > total) g_lastTotal = -1;
+}
+
+/* Two groups apart; the pins and groups of Claude's sidebar kept the same,
+ * in each profile's own account; a session without a folder working in each
+ * profile's own area; a session two profiles went on with apart, kept as two. */
+static void TestKeptGroups(const WCHAR *projects)
+{
+    static const WCHAR *const labels[4] = { L"Kept-A", L"Kept-B", L"Kept-C", L"Kept-D" };
+    static const WCHAR *const leaves[4] = { L"kept\\A", L"kept\\B", L"kept\\C", L"kept\\D" };
+    static const WCHAR *const accounts[4] = { L"kept-a", L"kept-b", L"kept-c", L"kept-d" };
+    ProfileList profiles;
+    SyncReport report;
+    WCHAR entries[4][MAX_PATH], configs[4][MAX_PATH], scratch[2][MAX_PATH], path[MAX_PATH], list[FOLDER_CCH], forkId[SESSION_ID_CCH];
+    WCHAR transcript[MAX_PATH], forked[MAX_PATH], cwd[MAX_PATH];
+    char layout[2048], text[4096], scope[128];
+    HWND window;
+    int i;
+    BOOL ready = TRUE;
+
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 4;
+    for (i = 0; i < profiles.count && ready; i++)
+        ready = PrepareProfile(&profiles.items[i], labels[i], leaves[i], accounts[i], L"kept-organization", entries[i], ARRAYSIZE(entries[i])) &&
+                Join(profiles.items[i].storageDir, L"claude_desktop_config.json", configs[i], ARRAYSIZE(configs[i]));
+    profiles.items[0].syncGroup = profiles.items[1].syncGroup = 2;
+    profiles.items[2].syncGroup = profiles.items[3].syncGroup = 3;
+    ready = ready && WriteKeptEntry(entries[0], g_keptIds[0], "A one", L"C:\\Fixture", AtSecond(2)) &&
+            WriteKeptEntry(entries[2], g_keptIds[1], "C one", L"C:\\Fixture", AtSecond(2)) &&
+            SessionVault_GroupListName(2, list, ARRAYSIZE(list)) && wcscmp(list, L"group-2") == 0;
+    Check("kept groups: fixtures created", ready);
+    if (!ready) return;
+    Check("kept groups: each group is its profiles", SessionVault_Group(&profiles, 2) == 0x3 && SessionVault_Group(&profiles, 3) == 0xC &&
+          SessionVault_NewGroup(&profiles) == 1);
+
+    /* Both groups kept at once, each apart. */
+    ZeroMemory(&report, sizeof report);
+    g_steps = g_lastTotal = 0;
+    Check("kept groups: every group kept", SessionVault_KeepGroups(&profiles, 0xF, CountSteps, NULL, &report) && report.failed == 0);
+    Check("kept groups: each group got its own sessions", EntryThere(entries[1], g_keptIds[0]) && EntryThere(entries[3], g_keptIds[1]));
+    Check("kept groups: nothing crossed between groups", !EntryThere(entries[2], g_keptIds[0]) && !EntryThere(entries[0], g_keptIds[1]));
+    Check("kept groups: the progress went forward to its end", g_steps > 0 && g_lastTotal > 0);
+
+    /* The sidebar's pins and groups of A, for its account, go to B for B's; what else B's settings hold stays. */
+    StringCchPrintfA(layout, sizeof layout,
+        "{\"preferences\":{\"epitaxyPrefs\":{\"starred-local-code-sessions\":[\"local_%ls\"],"
+        "\"dframe-local-slice\":{\"pinnedOrder\":[\"code:local_%ls\"]},"
+        "\"dframe-group-scopes\":{\"%ls/kept-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"Lunwen\"}],"
+        "\"assignments\":{\"code:local_%ls\":\"cg-1\"}},\"other/org\":{\"groups\":[]}},"
+        "\"code-projects-order.%ls\":[\"C:\\\\Work\"],\"unrelated\":1}},\"window\":2}",
+        g_keptIds[0], g_keptIds[0], accounts[0], g_keptIds[0], accounts[0]);
+    ready = Save(configs[0], layout) && Save(configs[1], "{\"preferences\":{\"keep\":1},\"other\":true}");
+    Check("kept layouts: fixtures created", ready);
+    ZeroMemory(&report, sizeof report);
+    Check("kept layouts: the group is kept", ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
+    StringCchPrintfA(scope, sizeof scope, "\"%ls/kept-organization\":{\"groups\":[{\"id\":\"cg-1\"", accounts[1]);
+    Check("kept layouts: the pins went across", FileHas(configs[1], "\"starred-local-code-sessions\":[\"local_cdcdcdcd-0000-4000-8000-000000000001\"]") &&
+          FileHas(configs[1], "\"pinnedOrder\":[\"code:local_cdcdcdcd-0000-4000-8000-000000000001\"]"));
+    Check("kept layouts: the groups went across, for the other profile's account", FileHas(configs[1], scope) &&
+          FileHas(configs[1], "\"code-projects-order.kept-b\":[\"C:\\\\Work\"]"));
+    Check("kept layouts: what else the settings hold stays", FileHas(configs[1], "\"keep\":1") && FileHas(configs[1], "\"other\":true") &&
+          !FileHas(configs[1], "\"unrelated\"") && !FileHas(configs[1], "other/org"));
+    ZeroMemory(&report, sizeof report);
+    Check("kept layouts: kept again, nothing changes",
+          SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && report.added + report.updated == 0);
+    Sleep(30);
+    ready = Save(configs[1], "{\"preferences\":{\"keep\":1,\"epitaxyPrefs\":{\"starred-local-code-sessions\":[]}},\"other\":true}");
+    ZeroMemory(&report, sizeof report);
+    Check("kept layouts: a pin taken away in one goes from the other",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && FileHas(configs[0], "\"starred-local-code-sessions\":[]") &&
+          FileHas(configs[0], "\"window\":2"));
+
+    /* Each part on its own: a pin added in one, then the sections rewritten in the other (as a running Claude does): both kept. */
+    Sleep(30);
+    StringCchPrintfA(layout, sizeof layout, "{\"preferences\":{\"epitaxyPrefs\":{\"starred-local-code-sessions\":[\"local_%ls\"]}},\"window\":2}",
+                     g_keptIds[0]);
+    ready = Save(configs[0], layout);
+    Sleep(30);
+    StringCchPrintfA(layout, sizeof layout,
+        "{\"preferences\":{\"epitaxyPrefs\":{\"dframe-code-sections\":{\"%ls/kept-organization\":{\"sections\":[{\"id\":\"pinned\",\"hidden\":false}]}}}},"
+        "\"other\":true}", accounts[1]);
+    ready = ready && Save(configs[1], layout);
+    ZeroMemory(&report, sizeof report);
+    Check("kept layouts: parts changed in two profiles are kept", ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
+    StringCchPrintfA(scope, sizeof scope, "\"%ls/kept-organization\":{\"sections\":[{\"id\":\"pinned\",\"hidden\":false}]", accounts[0]);
+    Check("kept layouts: the pin of one went to the other, rewritten later",
+          FileHas(configs[1], "\"starred-local-code-sessions\":[\"local_cdcdcdcd-0000-4000-8000-000000000001\"]"));
+    Check("kept layouts: the sections of the other went to the first, for its account", FileHas(configs[0], scope));
+    Check("kept layouts: a part neither changed is given back where it was missing",
+          FileHas(configs[0], "\"code-projects-order.kept-a\":[\"C:\\\\Work\"]") &&
+          FileHas(configs[1], "\"code-projects-order.kept-b\":[\"C:\\\\Work\"]"));
+
+    /* A change sent to a running profile, which Claude rewrites there before it closes: what it still shows is no change. */
+    window = StartFakeClaude(&profiles.items[1]);
+    Sleep(30);
+    ready = window && Save(configs[0], "{\"preferences\":{\"epitaxyPrefs\":{\"starred-local-code-sessions\":[]}},\"window\":2}");
+    ZeroMemory(&report, sizeof report);
+    Check("kept layouts: a pin taken away waits for the running profile",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && (report.waiting & 0x2) &&
+          FileHas(configs[1], "\"starred-local-code-sessions\":[\"local_cdcdcdcd-0000-4000-8000-000000000001\"]"));
+    Sleep(30);
+    StringCchPrintfA(layout, sizeof layout,
+        "{\"preferences\":{\"epitaxyPrefs\":{\"starred-local-code-sessions\":[\"local_%ls\"],"
+        "\"dframe-code-sections\":{\"%ls/kept-organization\":{\"sections\":[{\"id\":\"pinned\",\"hidden\":true}]}}}},\"other\":true}",
+        g_keptIds[0], accounts[1]);
+    ready = window && Save(configs[1], layout);
+    ZeroMemory(&report, sizeof report);
+    Check("kept layouts: kept again while it runs, its old pins are no change",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
+          FileHas(configs[0], "\"starred-local-code-sessions\":[]"));
+    StopFakeClaude(window);
+    Check("kept layouts: it gets the pins once it closes",
+          SessionEdit_ApplyPending(NULL, &profiles.items[1]) > 0 && FileHas(configs[1], "\"starred-local-code-sessions\":[]"));
+
+    /* A session without a folder: in the other profile, it works in that one's own area, its files with it. */
+    ready = Core_ScratchDirFor(profiles.items[0].dataDir, entries[0], scratch[0], ARRAYSIZE(scratch[0])) &&
+            Core_ScratchDirFor(profiles.items[1].dataDir, entries[1], scratch[1], ARRAYSIZE(scratch[1])) &&
+            Join(scratch[0], L"scratch-2026-10-07-abcdef", cwd, ARRAYSIZE(cwd)) && MakeDir(cwd) && SaveIn(cwd, L"notes.txt", "kept") &&
+            WriteKeptEntry(entries[0], g_keptIds[2], "Scratch one", cwd, AtSecond(3));
+    Check("kept scratch: fixtures created", ready);
+    ZeroMemory(&report, sizeof report);
+    Check("kept scratch: the group is kept", ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
+    Check("kept scratch: the other profile's entry works in its own area",
+          EntryPath(entries[1], g_keptIds[2], path, ARRAYSIZE(path)) && ReadString(path, "cwd", forked, ARRAYSIZE(forked)) &&
+          Join(scratch[1], L"scratch-2026-10-07-abcdef", cwd, ARRAYSIZE(cwd)) && Core_PathEquals(forked, cwd) &&
+          ReadString(path, "originCwd", forked, ARRAYSIZE(forked)) && Core_PathEquals(forked, cwd));
+    Check("kept scratch: its working folder is there, with the files", Join(cwd, L"notes.txt", path, ARRAYSIZE(path)) && FileThere(path));
+    ZeroMemory(&report, sizeof report);
+    Check("kept scratch: the two entries count as the same", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) &&
+          report.added + report.updated == 0);
+    /* Sent by an earlier version as it was, the same entry in both: the other profile's moves to its own area. */
+    ready = Join(scratch[0], L"scratch-2026-10-07-fedcba", cwd, ARRAYSIZE(cwd)) && MakeDir(cwd) &&
+            WriteKeptEntry(entries[0], g_keptIds[1], "Scratch two", cwd, AtSecond(4)) &&
+            WriteKeptEntry(entries[1], g_keptIds[1], "Scratch two", cwd, AtSecond(4));
+    ZeroMemory(&report, sizeof report);
+    Check("kept scratch: an entry working in the other's area moves to its own",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.updated == 1 &&
+          EntryPath(entries[1], g_keptIds[1], path, ARRAYSIZE(path)) && ReadString(path, "cwd", forked, ARRAYSIZE(forked)) &&
+          Join(scratch[1], L"scratch-2026-10-07-fedcba", cwd, ARRAYSIZE(cwd)) && Core_PathEquals(forked, cwd) && DirThere(cwd));
+    ZeroMemory(&report, sizeof report);
+    Check("kept scratch: then each works in its own, nothing changes", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) &&
+          report.added + report.updated == 0);
+
+    /* One conversation, gone on with in both profiles apart since the last sync: the branch of the one that went on first is kept as its own session. */
+    text[0] = 0;
+    AddLine(text, sizeof text, g_keptIds[3], "user", "a", NULL, 1);
+    AddLine(text, sizeof text, g_keptIds[3], "assistant", "b", "a", 2);
+    ready = SUCCEEDED(StringCchPrintfW(transcript, ARRAYSIZE(transcript), L"%s\\fixture\\%s.jsonl", projects, g_keptIds[3])) && Save(transcript, text) &&
+            WriteKeptEntry(entries[0], g_keptIds[3], "Shared", L"C:\\Fixture", AtSecond(2));
+    ZeroMemory(&report, sizeof report);
+    ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && EntryThere(entries[1], g_keptIds[3]);
+    AddLine(text, sizeof text, g_keptIds[3], "user", "c1", "b", 10);
+    AddLine(text, sizeof text, g_keptIds[3], "user", "c2", "b", 11);
+    AddLine(text, sizeof text, g_keptIds[3], "assistant", "d1", "c1", 13);
+    Sleep(30);
+    ready = ready && Save(transcript, text) && WriteKeptEntry(entries[0], g_keptIds[3], "Shared", L"C:\\Fixture", AtSecond(13)) &&
+            WriteKeptEntry(entries[1], g_keptIds[3], "Shared", L"C:\\Fixture", AtSecond(11));
+    Check("kept forks: fixtures created", ready);
+    ZeroMemory(&report, sizeof report);
+    Check("kept forks: the group is kept", ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
+    Check("kept forks: the session is kept as two", report.forked == 1);
+    Check("kept forks: both profiles list the other branch, titled with its profile",
+          FindTitled(entries[0], L"Shared (Kept-B)", forkId, ARRAYSIZE(forkId)) && Core_IsUuid(forkId) &&
+          FindTitled(entries[1], L"Shared (Kept-B)", path, ARRAYSIZE(path)) && wcscmp(path, forkId) == 0);
+    Check("kept forks: the original goes on, in both", EntryTitled(entries[0], g_keptIds[3], L"Shared") && EntryTitled(entries[1], g_keptIds[3], L"Shared"));
+    ready = SUCCEEDED(StringCchPrintfW(forked, ARRAYSIZE(forked), L"%s\\fixture\\%s.jsonl", projects, forkId)) && FileThere(forked);
+    Check("kept forks: the other branch has a transcript of its own", ready);
+    Check("kept forks: it holds that branch, under its own id", ready && FileHas(forked, "\"uuid\":\"c2\"") && FileHas(forked, "\"uuid\":\"b\"") &&
+          !FileHas(forked, "\"uuid\":\"c1\"") && !FileHas(forked, "\"uuid\":\"d1\"") && !FileHas(forked, "cdcdcdcd-0000-4000-8000-000000000004"));
+    Check("kept forks: the original transcript is left as it was", FileHas(transcript, "\"uuid\":\"c1\"") && FileHas(transcript, "\"uuid\":\"c2\""));
+    ZeroMemory(&report, sizeof report);
+    Check("kept forks: kept again, no other fork", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.forked == 0);
 }
 
 /* Environment variable `name` kept to be put back: `*kept` NULL when it is
@@ -2721,6 +2967,7 @@ int wmain(int argc, WCHAR **argv)
             TestGroupAliases();
             TestSessionSync(projects);
             TestVault(projects);
+            TestKeptGroups(projects);
         }
         Check("nothing outside the fixture was given to the Recycle Bin", !g_recycle.escaped);
         StopStartedClaude();

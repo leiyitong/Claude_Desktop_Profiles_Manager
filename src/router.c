@@ -204,12 +204,13 @@ static void KeepBeforeOpen(const ClaudePackage *pkg, const Profile *p, const WCH
     int index, i;
     Profiles_Load(&list, pkg);
     if ((index = Profiles_Find(&list, p->folder)) < 0) return;
-    for (i = 0; !url && list.items[index].syncSessions && i < list.count; i++) {
-        if (i == index || !list.items[i].syncSessions || !Claude_IsRunning(&list.items[i])) continue;
+    for (i = 0; !url && list.items[index].syncGroup && i < list.count; i++) {
+        if (i == index || list.items[i].syncGroup != list.items[index].syncGroup || !Claude_IsRunning(&list.items[i])) continue;
         StringCchPrintfW(text, ARRAYSIZE(text),
                          TR(L"\x201C%s\x201D is open: the sessions of \x201C%s\x201D are made the same as its own only once it closes.\n\nQuit it first?"),
                          list.items[i].name, list.items[index].name);
         if (!Ui_Ask(NULL, IDI_QUESTION, text, TR(L"Quit it"), TR(L"Open anyway"), FALSE)) break;
+        Taskbar_QuitComing(&list.items[i]);
         if (!Claude_Quit(&list.items[i], &error))
             Ui_Message(NULL, MB_ICONWARNING, TR(L"Claude for \x201C%s\x201D could not be closed (error %lu)."), list.items[i].name, error);
     }
@@ -222,7 +223,7 @@ static void KeepBeforeOpen(const ClaudePackage *pkg, const Profile *p, const WCH
  * to start first gets the session changes waiting for it (sessionedit.c) and
  * its list of sessions (KeepBeforeOpen): its Claude reads its sessions as it
  * starts. */
-HRESULT Launcher_Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *url, DWORD *pid, BOOL *identity)
+static HRESULT Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *url, DWORD *pid, BOOL *identity, BOOL keep)
 {
     Profile watched = *p;
     DWORD launched = 0;
@@ -230,7 +231,7 @@ HRESULT Launcher_Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *u
     Claude_RefreshRunning(&watched);
     if (!watched.running) {
         SessionEdit_ApplyPending(NULL, p);
-        KeepBeforeOpen(pkg, p, url);
+        if (keep) KeepBeforeOpen(pkg, p, url);
     }
     hr = Claude_Launch(pkg, p, url, &launched, identity);
     if (pid) *pid = launched;
@@ -239,6 +240,18 @@ HRESULT Launcher_Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *u
         if (!watched.running || !Taskbar_IsWatched(&watched)) Taskbar_Watch(&watched);
     }
     return hr;
+}
+
+HRESULT Launcher_Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *url, DWORD *pid, BOOL *identity)
+{
+    return Open(pkg, p, url, pid, identity, TRUE);
+}
+
+/* The manager's own opening: it made the profile's sessions the same first,
+ * with its progress shown, and asks nothing on the way. */
+HRESULT Launcher_OpenSynced(const ClaudePackage *pkg, const Profile *p, DWORD *pid, BOOL *identity)
+{
+    return Open(pkg, p, NULL, pid, identity, FALSE);
 }
 
 int Launcher_Run(const WCHAR *folder)

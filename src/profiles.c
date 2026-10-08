@@ -15,7 +15,7 @@
 #define VALUE_COLOR           L"Color"
 #define VALUE_BADGE           L"Badge"            /* the badge's own text, absent for the initial */
 #define VALUE_PICTURE         L"Picture"          /* the stamp of its own picture (icons.c), absent for none */
-#define VALUE_SYNC_SESSIONS   L"SyncSessions"     /* 1: its sessions are kept the same as the others' that have it */
+#define VALUE_SYNC_SESSIONS   L"SyncSessions"     /* the group whose sessions it keeps the same (1 to MAX_PROFILES), absent for none */
 #define VALUE_DEFAULT_PROFILE L"DefaultProfile"   /* under REG_ROOT */
 
 static void ProfileKey(const WCHAR *folder, WCHAR *out, size_t cch)
@@ -76,15 +76,15 @@ static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isS
     p->color = (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_COLOR, &color) && color < PALETTE_SIZE) ? (int)color : -1;
     if (Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_BADGE, badge, ARRAYSIZE(badge))) Core_CleanBadge(badge, p->badge, ARRAYSIZE(p->badge));
     if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_PICTURE, &picture)) p->picture = picture;
-    p->syncSessions = Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, &sync) && sync == 1;
+    p->syncGroup = Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, &sync) && sync >= 1 && sync <= MAX_PROFILES ? (int)sync : 0;
 }
 
-BOOL Profiles_SetSyncSessions(const WCHAR *folder, BOOL on)
+BOOL Profiles_SetSyncGroup(const WCHAR *folder, int group)
 {
     WCHAR key[MAX_PATH];
     LSTATUS status;
     ProfileKey(folder, key, ARRAYSIZE(key));
-    if (on) return Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, 1);
+    if (group >= 1 && group <= MAX_PROFILES) return Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, (DWORD)group);
     status = Util_RegDeleteValue(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS);
     return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
 }

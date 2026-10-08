@@ -18,32 +18,40 @@
 #define IDD_RESTORE       108
 #define IDD_PURGE         109
 
-/* main window */
-#define IDC_STATUS        1000
-#define IDC_STATUS_ACTION 1001
-#define IDC_LIST          1002
-#define IDC_OPEN          1003
-#define IDC_NEW           1004
-#define IDC_EDIT          1005
-#define IDC_DELETE        1006
-#define IDC_DEFAULT       1007
-#define IDC_NOTE          1008
-#define IDC_SC_GROUP      1009
-#define IDC_SC_DESKTOP    1010
-#define IDC_SC_SAVEAS     1011
-#define IDC_SC_PIN        1012
-#define IDC_UNINSTALL     1013
-#define IDC_ABOUT         1014
-#define IDC_UPDATE        1015
-#define IDC_SC_START      1016
-#define IDC_SESSIONS      1017
-#define IDC_LANGUAGE      1018
-#define IDC_MERGE         1019
-#define IDC_OVERWRITE        1020
-#define IDC_STOP          1021
-#define IDC_RESTORE       1022
-#define IDC_PURGE         1023
-#define IDC_BACKUP_CODE   1024
+/* main window; the ids of the commands its menus give are the buttons' they stand for */
+#define IDC_STATUS         1000
+#define IDC_STATUS_ACTION  1001
+#define IDC_LIST           1002
+#define IDC_OPEN           1003
+#define IDC_NEW            1004
+#define IDC_EDIT           1005
+#define IDC_DELETE         1006
+#define IDC_DEFAULT        1007
+#define IDC_NOTE           1008
+#define IDC_SC_DESKTOP     1010   /* the shortcuts menu */
+#define IDC_SC_SAVEAS      1011
+#define IDC_SC_PIN         1012
+#define IDC_UNINSTALL      1013   /* the program menu */
+#define IDC_UPDATE         1015
+#define IDC_SC_START       1016
+#define IDC_SESSIONS       1017
+#define IDC_MERGE          1019   /* the sessions menu */
+#define IDC_STOP           1021
+#define IDC_RESTORE        1022
+#define IDC_PURGE          1023
+#define IDC_BACKUP_CODE    1024
+#define IDC_MENU_APP       1025
+#define IDC_MENU_SESSIONS  1026
+#define IDC_MENU_SHORTCUTS 1027
+#define IDC_RESTART        1028
+#define IDC_SYNC           1029
+#define IDC_REPAIR         1030
+#define IDC_VERSION        1031
+#define IDC_PROGRESS       1032
+#define IDC_COPY_ALL       1033   /* the sessions menu */
+#define IDC_MOVE_ALL       1034
+#define IDC_SET_UP_LINKS   1035   /* the program menu */
+#define IDC_SAME_STOP      1036   /* the sessions menu */
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -69,6 +77,11 @@
 #define IDC_P_BADGE       1108
 #define IDC_P_PICTURE     1109
 #define IDC_P_NO_PICTURE  1110
+#define IDC_P_SYNC        1111
+#define IDC_P_SYNC_LABEL  1112
+#define IDC_P_NAME_LABEL  1113
+#define IDC_P_COLOR_LABEL 1114
+#define IDC_P_BADGE_LABEL 1115
 
 /* uninstall dialog */
 #define IDC_U_KEEP        1200
@@ -78,11 +91,8 @@
 
 /* sessions sent between profiles */
 #define IDC_Y_TEXT        1600
-#define IDC_Y_FROM_LABEL  1601
-#define IDC_Y_FROM        1602
 #define IDC_Y_TO_LABEL    1603
 #define IDC_Y_LIST        1604
-#define IDC_Y_EXACT       1605
 #define IDC_Y_NOTE        1606
 
 /* the profile that opens a claude:// link */

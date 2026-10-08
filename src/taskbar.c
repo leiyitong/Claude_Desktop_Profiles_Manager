@@ -32,6 +32,7 @@
 #define WM_WATCH_TRAY     (WM_APP + 3)   /* the notification-area icon needs its color */
 #define WM_WATCH_RETAGGED (WM_APP + 4)   /* the taskbar shows the temporary ID's button */
 #define WM_WATCH_REOPENED (WM_APP + 5)   /* from a newer watcher: the profile opened again (wParam: its Claude's pid) */
+#define WM_WATCH_QUITTING (WM_APP + 6)   /* from the manager: it quits the profile's Claude, whose close is then no update */
 #define TIMER_RETAG       1
 #define TIMER_APPS        2
 #define RETAG_MS          1500   /* without UI Automation: time for the taskbar to show the temporary ID's button */
@@ -40,6 +41,7 @@
 #define START_WAIT_MS     90000  /* Claude takes a moment to start */
 #define START_RECHECK_MS  100    /* one more look after its folder changed: its window follows at once */
 #define UPDATE_WAIT_MS    120000 /* Windows installs the new package after closing Claude */
+#define QUIT_TOLD_MS      60000  /* a quit the manager told of explains a close this long after */
 #define REOPEN_WAIT_MS    60000  /* Windows opens Claude again by itself (measured: 1 to 33 s) */
 #define WATCH_STOP_MS     10000  /* includes a watcher's bounded notification-area calls */
 #define WATCH_REGISTRATION_MUTEX L"Local\\ClaudeDesktopProfilesManager.WatcherRegistration"
@@ -68,6 +70,7 @@ static ClaudePackage g_watchPkg;
 static HWND g_watchWindow;
 static UINT g_taskbarCreated;
 static BOOL g_waitingForApps, g_trayScheduled;
+static ULONGLONG g_quitTold;   /* when the manager last said it quits the profile's Claude (GetTickCount64), 0 for never */
 static HANDLE g_started;                /* the profile's Claude has started */
 static WCHAR g_startedDir[MAX_PATH];    /* ...the data folder it runs */
 static HANDLE g_appsChanged;            /* the Apps folder changed */
@@ -343,6 +346,15 @@ void Taskbar_Refresh(const Profile *profile, BOOL linksChanged)
 {
     HWND watcher = FindWindowW(WATCH_CLASS, profile->folder);
     if (watcher) PostMessageW(watcher, WM_WATCH_REFRESH, (WPARAM)linksChanged, 0);
+}
+
+/* The manager quits the profile's Claude: told first, its watcher does not
+ * take the close for an update. The manager's quit asks the way Windows
+ * does before an update, so Claude logs the same line. */
+void Taskbar_QuitComing(const Profile *profile)
+{
+    HWND watcher = FindWindowW(WATCH_CLASS, profile->folder);
+    if (watcher) SendMessageTimeoutW(watcher, WM_WATCH_QUITTING, 0, 0, SMTO_ABORTIFHUNG, 2000, NULL);
 }
 
 static BOOL WatchMutexName(const WCHAR *folder, WCHAR *out, size_t cch)
@@ -684,6 +696,10 @@ static void StartRefresh(BOOL linksChanged)
 
 static LRESULT CALLBACK WatchProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    if (message == WM_WATCH_QUITTING) {
+        g_quitTold = GetTickCount64();
+        return 0;
+    }
     if (message == WM_WATCH_REOPENED) {
         g_reopenedPid = (DWORD)wParam;
         if (g_reopened) SetEvent(g_reopened);
@@ -1028,6 +1044,11 @@ static BOOL ReopenAfterUpdate(const WCHAR *folder, const WCHAR *ran, HANDLE quit
     *pid = 0;
     Profiles_Load(&list, &g_watchPkg);
     i = Profiles_Find(&list, folder);
+    if (g_quitTold && GetTickCount64() - g_quitTold < QUIT_TOLD_MS) {
+        g_quitTold = 0;
+        Util_Log(L"%s was quit from the manager", folder);
+        return FALSE;
+    }
     if (i < 0 || !Claude_ClosedForUpdate(&g_watchPkg, &list.items[i])) return FALSE;
     Util_Log(L"%s closed for a Claude update", folder);
 

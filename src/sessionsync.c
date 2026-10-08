@@ -1,7 +1,8 @@
 /*
- * Sessions sent between profiles in numbers: every profile's merged, one
- * profile's written over others, several shared or copied at once, and
- * sessions exported to an archive or imported from one.
+ * Sessions sent between profiles in numbers: every profile's merged,
+ * several shared, copied or taken out at once, sessions exported to an
+ * archive or imported from one, and the pins and groups of Claude's sidebar
+ * (for sessionvault.c).
  *
  * A profile lists a session through an entry of its own (sessionstore.c), so
  * a session sent to a profile is an entry written there as Claude writes its
@@ -378,6 +379,15 @@ int SessionSync_PendingCount(const Profile *p)
     return max(count, 0);
 }
 
+int SessionSync_Queued(const Profile *p, SyncOp **ops)
+{
+    Plan plan;
+    int count = LoadPlan(p, &plan);
+    *ops = count > 0 ? plan.ops : NULL;
+    if (count <= 0) Free(plan.ops);
+    return count;
+}
+
 /* A content file's number: "<n>.json". */
 static int ContentNumber(const WCHAR *name)
 {
@@ -673,10 +683,26 @@ done:
     return result;
 }
 
-/* A session taken away from `p`: its entries to the backup, unless it was used there since. */
-static OpResult ApplyRemove(const Profile *p, const SessionSet *entries, const SyncOp *op, SyncReport *report)
+static ULONGLONG NowMs(void);
+
+/* Claude's mark that session `id` (an id, or an entry's own) was deleted
+ * from the entries folder `dir`, holding the time in ms. */
+static BOOL WriteMark(const Profile *p, const WCHAR *dir, const WCHAR *id, ULONGLONG time)
 {
-    int entry = SessionStore_FindEntry(entries, 0, op->key, NULL);
+    WCHAR path[LONG_PATH_CCH];
+    char text[TIME_TEXT_BYTES];
+    if (!TombstonePath(dir, id, path, ARRAYSIZE(path)) || Present(path)) return TRUE;
+    StringCchPrintfA(text, sizeof text, "%I64u", time);
+    return WriteFileAt(path, text, strlen(text), p, FALSE);
+}
+
+/* A session taken away from `p`: its entries to the backup, unless it was
+ * used there since; with SYNC_MARKED, Claude's marks that it was deleted
+ * there written too, so that Claude does not take it in again. */
+static OpResult ApplyRemove(const Profile *p, const SessionSet *entries, const WCHAR *dir, const SyncOp *op, SyncReport *report)
+{
+    WCHAR ids[MAX_PROFILES][SESSION_ID_CCH];
+    int entry = SessionStore_FindEntry(entries, 0, op->key, NULL), count = 0, i;
     if (entry < 0) return OP_SAME;
     if (entries->entries[entry].lastActivity > op->seen) {
         Util_Log(L"session %s in %s: kept, used there since", op->key, p->folder);
@@ -684,10 +710,16 @@ static OpResult ApplyRemove(const Profile *p, const SessionSet *entries, const S
     }
     for (; entry >= 0; entry = entries->entries[entry].duplicate) {
         if (SessionLink_Busy(p)) return OP_STOPPED;
+        if (count < MAX_PROFILES) StringCchCopyW(ids[count++], SESSION_ID_CCH, entries->entries[entry].localId);
         if (!BackUp(p, entries->entries[entry].file, TRUE, report)) {
             CannotWrite(report, entries->entries[entry].file, GetLastError());
             return OP_FAILED;
         }
+    }
+    if (op->flags & SYNC_MARKED) {
+        ULONGLONG now = NowMs();
+        WriteMark(p, dir, op->key, now);
+        for (i = 0; i < count; i++) WriteMark(p, dir, ids[i], now);
     }
     report->removed++;
     Util_Log(L"session %s in %s: entry removed", op->key, p->folder);
@@ -742,6 +774,200 @@ static OpResult ApplyIndex(const Profile *p, const WCHAR *dir, const char *conte
     return OP_FAILED;
 }
 
+/* ----------------------------------------------------- the sidebar's layout */
+
+/* The pins and groups of Claude's sidebar, in claude_desktop_config.json
+ * under preferences.epitaxyPrefs: each part by its name in a layout of ours,
+ * the name Claude gives it, and whether Claude keeps it for every account,
+ * per account and organization (its member "<account>/<organization>"), or
+ * per account (the account's id after the name). */
+typedef enum LayoutScope { LAYOUT_ANY, LAYOUT_ORGANIZATION, LAYOUT_ACCOUNT } LayoutScope;
+static const struct { const char *part, *name; LayoutScope scope; } kLayoutParts[] = {
+    { "starred", "starred-local-code-sessions", LAYOUT_ANY },
+    { "slice", "dframe-local-slice", LAYOUT_ANY },
+    { "starredGroups", "starred-session-groups", LAYOUT_ANY },
+    { "groups", "dframe-group-scopes", LAYOUT_ORGANIZATION },
+    { "sections", "dframe-code-sections", LAYOUT_ORGANIZATION },
+    { "order", "code-projects-order.", LAYOUT_ACCOUNT },
+};
+
+/* The account and organization an entries folder is for (its last two
+ * folders), as UTF-8. */
+static BOOL LayoutScopeOf(const WCHAR *entriesDir, char *account, size_t accountCap, char *organization, size_t organizationCap)
+{
+    const WCHAR *last = wcsrchr(entriesDir, L'\\'), *before;
+    WCHAR accountName[SESSION_ID_CCH];
+    if (!last || last == entriesDir || !last[1]) return FALSE;
+    for (before = last - 1; before > entriesDir && *before != L'\\'; before--) {}
+    if (*before != L'\\' || before + 1 == last || FAILED(StringCchCopyNW(accountName, ARRAYSIZE(accountName), before + 1, (size_t)(last - before - 1))))
+        return FALSE;
+    return WideCharToMultiByte(CP_UTF8, 0, accountName, -1, account, (int)accountCap, NULL, NULL) > 0 &&
+           WideCharToMultiByte(CP_UTF8, 0, last + 1, -1, organization, (int)organizationCap, NULL, NULL) > 0;
+}
+
+/* `json` (a heap block, freed) with its member `key` set to `raw` (`length`
+ * bytes); NULL, freed, when it cannot be. */
+static char *SetRaw(char *json, size_t *used, const char *key, const char *raw, size_t length)
+{
+    size_t capacity, written = 0;
+    char *text = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1), *out = NULL;
+    if (json && text) {
+        memcpy(text, raw, length);
+        text[length] = 0;
+        capacity = *used + length + strlen(key) + 8;
+        if ((out = (char *)HeapAlloc(GetProcessHeap(), 0, capacity + 1)) != NULL && Core_JsonSetMember(json, *used, key, text, out, capacity, &written)) {
+            out[written] = 0;
+            *used = written;
+        } else {
+            Free(out);
+            out = NULL;
+        }
+    }
+    Free(text);
+    Free(json);
+    return out;
+}
+
+static char *EmptyObject(size_t *used)
+{
+    char *json = (char *)HeapAlloc(GetProcessHeap(), 0, 3);
+    if (json) memcpy(json, "{}", 3);
+    *used = 2;
+    return json;
+}
+
+char *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *length, ULONGLONG *written)
+{
+    WCHAR path[LONG_PATH_CCH];
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    char account[SESSION_ID_CCH * 3], organization[SESSION_ID_CCH * 3], name[128], *config, *layout = NULL;
+    const char *prefs, *epitaxy, *value, *inner;
+    size_t prefsLength, epitaxyLength, valueLength, innerLength, used = 0, i;
+    DWORD size = 0;
+    *length = 0;
+    if (written) *written = 0;
+    if (!p->storageDir[0] || !LayoutScopeOf(entriesDir, account, sizeof account, organization, sizeof organization) ||
+        FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir)) ||
+        (config = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &size)) == NULL)
+        return NULL;
+    if (written && GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) {
+        ULONGLONG ticks = ((ULONGLONG)attributes.ftLastWriteTime.dwHighDateTime << 32) | attributes.ftLastWriteTime.dwLowDateTime;
+        *written = ticks > UNIX_EPOCH_TICKS ? (ticks - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND : 0;
+    }
+    if (Core_JsonMember(config, size, "preferences", &prefs, &prefsLength) &&
+        Core_JsonMember(prefs, prefsLength, "epitaxyPrefs", &epitaxy, &epitaxyLength) && (layout = EmptyObject(&used)) != NULL) {
+        for (i = 0; i < ARRAYSIZE(kLayoutParts) && layout; i++) {
+            if (FAILED(StringCchPrintfA(name, sizeof name, "%s%s", kLayoutParts[i].name, kLayoutParts[i].scope == LAYOUT_ACCOUNT ? account : "")) ||
+                !Core_JsonMember(epitaxy, epitaxyLength, name, &value, &valueLength))
+                continue;
+            if (kLayoutParts[i].scope == LAYOUT_ORGANIZATION) {
+                char scope[sizeof account + sizeof organization + 2];
+                if (FAILED(StringCchPrintfA(scope, sizeof scope, "%s/%s", account, organization)) ||
+                    !Core_JsonMember(value, valueLength, scope, &inner, &innerLength))
+                    continue;
+                value = inner;
+                valueLength = innerLength;
+            }
+            layout = SetRaw(layout, &used, kLayoutParts[i].part, value, valueLength);
+        }
+        if (layout && used <= 2) {
+            Free(layout);
+            layout = NULL;
+        }
+    }
+    Free(config);
+    if (layout) *length = used;
+    return layout;
+}
+
+/* The pins and groups of `content` (a layout of ours) put in the sidebar of
+ * `p`, for the account and organization of its entries folder `dir`; what
+ * else claude_desktop_config.json holds stays as it is. */
+static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *content, size_t contentLength, SyncReport *report)
+{
+    WCHAR path[LONG_PATH_CCH];
+    char account[SESSION_ID_CCH * 3], organization[SESSION_ID_CCH * 3], name[128], scope[SESSION_ID_CCH * 6 + 2], *json, *next;
+    const char *value;
+    size_t valueLength, used = 0, i;
+    DWORD currentLength = 0;
+    char *current;
+    BOOL there;
+    OpResult result = OP_FAILED;
+    if (!p->storageDir[0] || !LayoutScopeOf(dir, account, sizeof account, organization, sizeof organization) ||
+        FAILED(StringCchPrintfA(scope, sizeof scope, "%s/%s", account, organization)) ||
+        FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir))) {
+        CannotWrite(report, p->folder, ERROR_INVALID_DATA);
+        return OP_FAILED;
+    }
+    current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength);
+    there = current != NULL;
+    if (current) {
+        json = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)currentLength + 1);
+        if (json) {
+            memcpy(json, current, currentLength);
+            json[currentLength] = 0;
+            used = currentLength;
+        }
+    } else {
+        json = EmptyObject(&used);
+    }
+    for (i = 0; i < ARRAYSIZE(kLayoutParts) && json; i++) {
+        const char *keys[4] = { "preferences", "epitaxyPrefs", name, scope };
+        char *raw;
+        if (!Core_JsonMember(content, contentLength, kLayoutParts[i].part, &value, &valueLength) ||
+            FAILED(StringCchPrintfA(name, sizeof name, "%s%s", kLayoutParts[i].name, kLayoutParts[i].scope == LAYOUT_ACCOUNT ? account : "")) ||
+            (raw = (char *)HeapAlloc(GetProcessHeap(), 0, valueLength + 1)) == NULL)
+            continue;
+        memcpy(raw, value, valueLength);
+        raw[valueLength] = 0;
+        next = Core_JsonSetNested(json, used, keys, kLayoutParts[i].scope == LAYOUT_ORGANIZATION ? 4 : 3, raw, &used);
+        Free(raw);
+        Free(json);
+        json = next;
+    }
+    if (!json) {
+        CannotWrite(report, path, ERROR_INVALID_DATA);
+        goto done;
+    }
+    if (current && used == currentLength && memcmp(current, json, used) == 0) {
+        result = OP_SAME;
+        goto done;
+    }
+    if (SessionLink_Busy(p)) {
+        result = OP_STOPPED;
+        goto done;
+    }
+    if (there && !BackUp(p, path, FALSE, report)) {
+        CannotWrite(report, path, GetLastError());
+        goto done;
+    }
+    if (WriteFileAt(path, json, used, p, there)) {
+        result = OP_MADE;
+        Util_Log(L"the sidebar's pins and groups in %s: replaced", p->folder);
+    } else if (GetLastError() == ERROR_BUSY) {
+        result = OP_STOPPED;
+    } else {
+        CannotWrite(report, path, GetLastError());
+    }
+done:
+    Free(json);
+    Free(current);
+    return result;
+}
+
+/* Each change this thread makes, told to a progress bar. */
+typedef struct ChangeHook {
+    void (*step)(void *context);
+    void *context;
+} ChangeHook;
+static __declspec(thread) ChangeHook g_onChange;
+
+void SessionSync_OnEachChange(void (*step)(void *context), void *context)
+{
+    g_onChange.step = step;
+    g_onChange.context = context;
+}
+
 static OpResult ApplyOp(const Profile *p, const SessionSet *entries, const WCHAR *dir, const WCHAR *staging, const SyncOp *op,
                         SyncReport *report)
 {
@@ -749,7 +975,7 @@ static OpResult ApplyOp(const Profile *p, const SessionSet *entries, const WCHAR
     DWORD length = 0;
     char *content = NULL;
     OpResult result;
-    if (op->kind == SYNC_PUT || op->kind == SYNC_INDEX) {
+    if (op->kind == SYNC_PUT || op->kind == SYNC_INDEX || op->kind == SYNC_LAYOUT) {
         if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", staging, op->content)) ||
             (content = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &length)) == NULL) {
             CannotRead(report, path, GetLastError());
@@ -758,10 +984,12 @@ static OpResult ApplyOp(const Profile *p, const SessionSet *entries, const WCHAR
     }
     switch (op->kind) {
     case SYNC_PUT:    result = ApplyPut(p, entries, dir, op, content, length, report); break;
-    case SYNC_REMOVE: result = ApplyRemove(p, entries, op, report); break;
+    case SYNC_REMOVE: result = ApplyRemove(p, entries, dir, op, report); break;
     case SYNC_INDEX:  result = ApplyIndex(p, dir, content, length, report); break;
+    case SYNC_LAYOUT: result = ApplyLayout(p, dir, content, length, report); break;
     default:          result = ApplyMark(p, entries, dir, op, report); break;
     }
+    if (g_onChange.step) g_onChange.step(g_onChange.context);
     if (result == OP_SKIPPED && (op->kind == SYNC_PUT || op->kind == SYNC_REMOVE)) report->skipped++;
     Free(content);
     return result;
@@ -876,6 +1104,16 @@ static char *ReadEntry(Outbox *box, const WCHAR *file, size_t *length, SyncRepor
     return Keep(box, data);
 }
 
+/* `content` as profile `t` gets it (SessionVault_ForProfile), owned by
+ * `box`: in a "no folder" area, its own. */
+static const char *ContentFor(Outbox *box, const SessionSet *set, int t, const char *content, size_t length, size_t *outLength)
+{
+    char *mapped = SessionVault_ForProfile(set, t, content, length, outLength);
+    if (mapped && Keep(box, mapped)) return mapped;
+    *outLength = length;
+    return content;
+}
+
 static void MakeOp(SyncOp *op, SyncOpKind kind, DWORD flags, const WCHAR *key, ULONGLONG time, ULONGLONG seen)
 {
     ZeroMemory(op, sizeof *op);
@@ -917,12 +1155,15 @@ BOOL SessionSync_Merge(const SessionSet *set, DWORD profiles, SyncReport *report
         newest = &set->entries[row->entry[best]];
         for (t = 0; t < set->profiles.count; t++) {
             const SessionEntry *there = EntryIn(set, row, t);
+            const char *mapped;
+            size_t mappedLength = 0;
             SyncOp op;
             if (t == best || !(takers & (1u << t))) continue;
             if (there && (there->pendingRemove || there->lastActivity >= newest->lastActivity)) continue;
             if (!content && (content = ReadEntry(&box, newest->file, &length, report)) == NULL) break;
+            mapped = ContentFor(&box, set, t, content, length, &mappedLength);
             MakeOp(&op, SYNC_PUT, 0, row->key, newest->lastActivity, there ? there->lastActivity : 0);
-            if (!AddSent(&box.sent[t], &op, content, length)) {
+            if (!AddSent(&box.sent[t], &op, mapped, mappedLength)) {
                 FreeOutbox(&box);
                 return OutOfMemory(report);
             }
@@ -956,49 +1197,6 @@ BOOL SessionSync_Send(const SessionSet *set, const SyncSend *changes, int count,
     return TRUE;
 }
 
-/* A profile lists the session of id `id` (its id, or an entry's own id without local_). */
-static BOOL Lists(const SessionSet *set, int p, const WCHAR *id)
-{
-    WCHAR local[SESSION_ID_CCH];
-    return SessionStore_FindEntry(set, p, id, NULL) >= 0 ||
-           (SUCCEEDED(StringCchPrintfW(local, ARRAYSIZE(local), LOCAL_PREFIX L"%s", id)) && SessionStore_FindEntry(set, p, local, NULL) >= 0);
-}
-
-/* The ids of Claude's marks in `dir`, as a heap array; their times in `times` when wanted. */
-static int Tombstones(const WCHAR *dir, WCHAR (**ids)[SESSION_ID_CCH], ULONGLONG **times)
-{
-    WIN32_FIND_DATAW found;
-    HANDLE find = Util_FindFiles(dir, TOMBSTONE_PREFIX L"*", &found, FALSE);
-    int count = 0, capacity = 0, timeCapacity = 0;
-    *ids = NULL;
-    if (times) *times = NULL;
-    if (find == INVALID_HANDLE_VALUE) return 0;
-    do {
-        const WCHAR *id = found.cFileName + ARRAYSIZE(TOMBSTONE_PREFIX) - 1;
-        WCHAR (*grown)[SESSION_ID_CCH];
-        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !Core_IsUuid(id)) continue;
-        if ((grown = (WCHAR (*)[SESSION_ID_CCH])Grow(*ids, &capacity, count + 1, sizeof **ids)) == NULL) break;
-        *ids = grown;
-        if (times) {
-            WCHAR path[LONG_PATH_CCH];
-            ULONGLONG *grownTimes = (ULONGLONG *)Grow(*times, &timeCapacity, count + 1, sizeof **times);
-            DWORD length = 0;
-            char *text;
-            if (!grownTimes) break;
-            *times = grownTimes;
-            (*times)[count] = 0;
-            if (SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", dir, found.cFileName)) &&
-                (text = Util_ReadFile(path, TIME_TEXT_BYTES, FALSE, &length)) != NULL) {
-                Core_JsonNumber(text, length, &(*times)[count]);
-                Free(text);
-            }
-        }
-        StringCchCopyW((*ids)[count++], SESSION_ID_CCH, id);
-    } while (FindNextFileW(find, &found));
-    FindClose(find);
-    return count;
-}
-
 static ULONGLONG NowMs(void)
 {
     FILETIME now;
@@ -1006,85 +1204,30 @@ static ULONGLONG NowMs(void)
     return ((((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND;
 }
 
-BOOL SessionSync_Overwrite(const SessionSet *set, int source, DWORD targets, BOOL exact, SyncReport *report)
+BOOL SessionSync_Remove(const SessionSet *set, DWORD profiles, const int *rows, int rowCount, SyncReport *report)
 {
     Outbox box;
-    WCHAR (*marks)[SESSION_ID_CCH] = NULL, (*theirs)[SESSION_ID_CCH] = NULL, path[LONG_PATH_CCH];
-    ULONGLONG *times = NULL;
-    DWORD takers;
-    int r, t, i, j, markCount, theirCount;
-    BOOL ok = TRUE;
-    if (source < 0 || source >= set->profiles.count || !set->source[source].entriesDir[0]) return FALSE;
+    int i, p;
     ZeroMemory(&box, sizeof box);
-    targets = ValidProfiles(set, targets) & ~(1u << source);
-    takers = targets & SessionSync_Takers(set);
-    report->unavailable |= targets & ~takers;
-    for (r = 0; r < set->rowCount && ok; r++) {
-        const SessionRow *row = &set->rows[r];
-        const SessionEntry *kept = Kept(set, row, source);
-        const char *content = NULL;
-        size_t length = 0;
-        for (t = 0; t < set->profiles.count && ok; t++) {
-            const SessionEntry *there = EntryIn(set, row, t);
+    profiles = ValidProfiles(set, profiles);
+    for (i = 0; i < rowCount; i++) {
+        const SessionRow *row;
+        if (rows[i] < 0 || rows[i] >= set->rowCount) continue;
+        row = &set->rows[rows[i]];
+        for (p = 0; p < set->profiles.count; p++) {
+            const SessionEntry *there = EntryIn(set, row, p);
             SyncOp op;
-            if (!(takers & (1u << t))) continue;
-            if (kept) {
-                if (there && there->pendingRemove) {   /* removed there by the user: it goes when that profile closes */
-                    report->skipped++;
-                    continue;
-                }
-                if (!content && (content = ReadEntry(&box, set->entries[row->entry[source]].file, &length, report)) == NULL) break;
-                MakeOp(&op, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, row->key, kept->lastActivity, there ? there->lastActivity : 0);
-                ok = AddSent(&box.sent[t], &op, content, length);
-            } else if (exact && there) {
-                MakeOp(&op, SYNC_REMOVE, 0, row->key, 0, there->lastActivity);
-                ok = AddSent(&box.sent[t], &op, NULL, 0);
+            if (!(profiles & (1u << p)) || !there || there->pendingRemove) continue;
+            MakeOp(&op, SYNC_REMOVE, SYNC_MARKED, row->key, 0, there->lastActivity);
+            if (!AddSent(&box.sent[p], &op, NULL, 0)) {
+                FreeOutbox(&box);
+                return OutOfMemory(report);
             }
         }
     }
-    /* Claude's marks of the sessions deleted from the source, where those
-     * sessions are not kept. */
-    markCount = Tombstones(set->source[source].entriesDir, &marks, &times);
-    for (i = 0; i < markCount && ok; i++) {
-        if (Lists(set, source, marks[i])) continue;
-        for (t = 0; t < set->profiles.count && ok; t++) {
-            SyncOp op;
-            if (!(takers & (1u << t)) || (!exact && Lists(set, t, marks[i]))) continue;
-            MakeOp(&op, SYNC_MARK, 0, marks[i], times && times[i] ? times[i] : NowMs(), 0);
-            ok = AddSent(&box.sent[t], &op, NULL, 0);
-        }
-    }
-    if (exact) {
-        DWORD length = 0;
-        char *index = NULL;
-        for (t = 0; t < set->profiles.count && ok; t++) {
-            if (!(takers & (1u << t))) continue;
-            theirCount = Tombstones(set->source[t].entriesDir, &theirs, NULL);
-            for (j = 0; j < theirCount && ok; j++) {
-                SyncOp op;
-                for (i = 0; i < markCount && !Core_EqualsI(marks[i], theirs[j]); i++) {}
-                if (i < markCount) continue;
-                MakeOp(&op, SYNC_UNMARK, 0, theirs[j], 0, 0);
-                ok = AddSent(&box.sent[t], &op, NULL, 0);
-            }
-            Free(theirs);
-            theirs = NULL;
-        }
-        if (SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" ARCHIVED_INDEX, set->source[source].entriesDir)) &&
-            (index = Keep(&box, Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &length))) != NULL) {
-            for (t = 0; t < set->profiles.count && ok; t++) {
-                SyncOp op;
-                if (!(takers & (1u << t))) continue;
-                MakeOp(&op, SYNC_INDEX, 0, ARCHIVED_INDEX, 0, 0);
-                ok = AddSent(&box.sent[t], &op, index, length);
-            }
-        }
-    }
-    Free(marks);
-    Free(times);
-    if (ok) Send(&box, set, report);
+    Send(&box, set, report);
     FreeOutbox(&box);
-    return ok || OutOfMemory(report);
+    return TRUE;
 }
 
 BOOL SessionSync_Share(const SessionSet *set, int from, const int *rows, int rowCount, DWORD targets, SyncReport *report)
@@ -1109,6 +1252,8 @@ BOOL SessionSync_Share(const SessionSet *set, int from, const int *rows, int row
         }
         for (t = 0; t < set->profiles.count; t++) {
             const SessionEntry *there = EntryIn(set, row, t);
+            const char *mapped;
+            size_t mappedLength = 0;
             SyncOp op;
             if (!(takers & (1u << t)) || (there && !there->pendingRemove)) continue;   /* it has it already */
             if (there) {   /* its removal waits there: it goes when that profile closes */
@@ -1116,8 +1261,9 @@ BOOL SessionSync_Share(const SessionSet *set, int from, const int *rows, int row
                 continue;
             }
             if (!content && (content = ReadEntry(&box, set->entries[row->entry[source]].file, &length, report)) == NULL) break;
+            mapped = ContentFor(&box, set, t, content, length, &mappedLength);
             MakeOp(&op, SYNC_PUT, SYNC_UNDELETE, row->key, set->entries[row->entry[source]].lastActivity, 0);
-            if (!AddSent(&box.sent[t], &op, content, length)) {
+            if (!AddSent(&box.sent[t], &op, mapped, mappedLength)) {
                 FreeOutbox(&box);
                 return OutOfMemory(report);
             }

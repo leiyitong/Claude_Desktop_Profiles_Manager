@@ -1,8 +1,8 @@
 /*
  * What the user does with sessions sent between profiles (sessionsync.c):
- * merge every profile's, overwrite others with one profile's, share or copy the
- * sessions chosen in the sessions view, export sessions to an archive and
- * import one. The profiles taking part are chosen in one dialog (IDD_SYNC),
+ * merge every profile's, copy or move every session of some profiles to
+ * others, share or copy the sessions chosen in the sessions view, export
+ * sessions to an archive and import one. The profiles taking part are chosen in one dialog (IDD_SYNC),
  * which says what will happen; what was done is said once it is. Also a list
  * of sessions recovered from the vault (sessionvault.c, IDD_RESTORE), the
  * conversations no profile lists cleaned up and Claude Code's folder copied
@@ -20,20 +20,18 @@
 #define NAMES_CCH         (MAX_PROFILES * (LABEL_CCH + 16))
 #define REPORT_CCH        (4 * LONG_PATH_CCH)
 
-typedef enum SyncKind { SYNC_UI_MERGE, SYNC_UI_OVERWRITE, SYNC_UI_SHARE, SYNC_UI_COPY, SYNC_UI_IMPORT } SyncKind;
+typedef enum SyncKind { SYNC_UI_MERGE, SYNC_UI_COPY_ALL, SYNC_UI_MOVE_ALL, SYNC_UI_SHARE, SYNC_UI_COPY, SYNC_UI_IMPORT } SyncKind;
 
 typedef struct SyncDialog {
     SyncKind           kind;
     const ProfileList *profiles;
     DWORD              takers;          /* the profiles whose entries can take sessions */
     DWORD              chosen;          /* checked at first; once it closed, the profiles chosen */
-    int                source;          /* the profile the sessions come from, never a target; -1 for none */
-    BOOL               exact;           /* overwrite: what the source does not list is taken out of the others */
+    DWORD              sources;         /* the profiles the sessions come from, never targets */
     const WCHAR       *archive;         /* import: the archive's name */
     HWND               rows;            /* the profiles as check boxes (in the view it scrolls in, which has its id) */
     int                rowProfile[MAX_PROFILES];
     int                rowCount;
-    int                sourceProfile[MAX_PROFILES];   /* overwrite: each item's profile in the From box */
     BOOL               filling;
 } SyncDialog;
 
@@ -64,7 +62,8 @@ static const WCHAR *Title(SyncKind kind)
 {
     switch (kind) {
     case SYNC_UI_MERGE:  return TR(L"Merge all sessions");
-    case SYNC_UI_OVERWRITE: return TR(L"Overwrite sessions");
+    case SYNC_UI_COPY_ALL: return TR(L"Copy all sessions");
+    case SYNC_UI_MOVE_ALL: return TR(L"Move all sessions");
     case SYNC_UI_SHARE:  return TR(L"Share sessions");
     case SYNC_UI_COPY:   return TR(L"Copy sessions");
     default:             return TR(L"Import sessions");
@@ -75,7 +74,8 @@ static const WCHAR *ActionCaption(SyncKind kind)
 {
     switch (kind) {
     case SYNC_UI_MERGE:  return TR(L"Merge");
-    case SYNC_UI_OVERWRITE: return TR(L"Overwrite");
+    case SYNC_UI_COPY_ALL: return TR(L"Copy");
+    case SYNC_UI_MOVE_ALL: return TR(L"Move");
     case SYNC_UI_SHARE:  return TR(L"Share");
     case SYNC_UI_COPY:   return TR(L"Copy");
     default:             return TR(L"Import");
@@ -85,15 +85,20 @@ static const WCHAR *ActionCaption(SyncKind kind)
 /* What the dialog will do, above the profiles. */
 static void Explain(HWND dialog, const SyncDialog *state)
 {
-    WCHAR text[1024 + MAX_PATH];
+    WCHAR text[1024 + MAX_PATH + NAMES_CCH], names[NAMES_CCH];
+    NamesOf(state->profiles, state->sources, names, ARRAYSIZE(names));
     switch (state->kind) {
     case SYNC_UI_MERGE:
         StringCchCopyW(text, ARRAYSIZE(text), TR(L"Each profile checked gets the sessions the others list, in their latest state. "
                                                  L"A session deleted in a profile stays deleted there."));
         break;
-    case SYNC_UI_OVERWRITE:
-        StringCchCopyW(text, ARRAYSIZE(text), TR(L"The profiles checked get every session of the profile chosen, in its state there, "
-                                                 L"even the ones they deleted."));
+    case SYNC_UI_COPY_ALL:
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"The profiles checked get every session %s lists: the same conversations, "
+                                                   L"which go on from any of them."), names);
+        break;
+    case SYNC_UI_MOVE_ALL:
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"The profiles checked get every session %s lists, which then leaves it. "
+                                                   L"The conversations stay on this PC."), names);
         break;
     case SYNC_UI_SHARE:
         StringCchCopyW(text, ARRAYSIZE(text), TR(L"The sessions selected will also be listed in the profiles checked: "
@@ -124,7 +129,7 @@ static void FillRows(SyncDialog *state)
     state->rowCount = 0;
     for (p = 0; p < state->profiles->count; p++) {
         const Profile *profile = &state->profiles->items[p];
-        if (!(state->takers & (1u << p)) || p == state->source) continue;
+        if (!(state->takers & (1u << p)) || (state->sources & (1u << p))) continue;
         if (Claude_IsRunning(profile)) StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s   (open now: gets them once it closes)"), profile->name);
         else StringCchCopyW(text, ARRAYSIZE(text), profile->name);
         ZeroMemory(&item, sizeof item);
@@ -147,19 +152,6 @@ static void ReadChosen(HWND dialog, SyncDialog *state)
     EnableWindow(GetDlgItem(dialog, IDOK), state->chosen != 0);
 }
 
-/* Overwrite: the profiles in the From box, the source selected. */
-static void FillSources(HWND dialog, SyncDialog *state)
-{
-    HWND box = GetDlgItem(dialog, IDC_Y_FROM);
-    int p, count = 0;
-    for (p = 0; p < state->profiles->count; p++) {
-        if (!(state->takers & (1u << p))) continue;
-        SendMessageW(box, CB_ADDSTRING, 0, (LPARAM)state->profiles->items[p].name);
-        if (p == state->source) SendMessageW(box, CB_SETCURSEL, (WPARAM)count, 0);
-        state->sourceProfile[count++] = p;
-    }
-}
-
 static INT_PTR CALLBACK SyncProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
     SyncDialog *state = (SyncDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
@@ -174,14 +166,6 @@ static INT_PTR CALLBACK SyncProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         Explain(dialog, state);
         SetDlgItemTextW(dialog, IDOK, ActionCaption(state->kind));
         SetDlgItemTextW(dialog, IDC_Y_TO_LABEL, state->kind == SYNC_UI_MERGE ? TR(L"&Merge these profiles:") : TR(L"&To these profiles:"));
-        /* What the dialog does not offer leaves no empty row (Theme_FitDialog closes it). */
-        if (state->kind == SYNC_UI_OVERWRITE) {
-            FillSources(dialog, state);
-        } else {
-            ShowWindow(GetDlgItem(dialog, IDC_Y_FROM_LABEL), SW_HIDE);
-            ShowWindow(GetDlgItem(dialog, IDC_Y_FROM), SW_HIDE);
-            ShowWindow(GetDlgItem(dialog, IDC_Y_EXACT), SW_HIDE);
-        }
         list = state->rows = GetDlgItem(dialog, IDC_Y_LIST);
         ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
         ZeroMemory(&column, sizeof column);
@@ -203,24 +187,9 @@ static INT_PTR CALLBACK SyncProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
     case WM_COMMAND:
         if (!state) break;
         switch (LOWORD(wp)) {
-        case IDC_Y_FROM:
-            if (HIWORD(wp) == CBN_SELCHANGE) {
-                LRESULT i = SendDlgItemMessageW(dialog, IDC_Y_FROM, CB_GETCURSEL, 0, 0);
-                if (i >= 0 && i < MAX_PROFILES) {
-                    ReadChosen(dialog, state);
-                    /* The source chosen before takes part again; the new one gives. */
-                    if (state->source >= 0) state->chosen |= 1u << state->source;
-                    state->source = state->sourceProfile[i];
-                    state->chosen &= ~(1u << state->source);
-                    FillRows(state);
-                    ReadChosen(dialog, state);
-                }
-            }
-            return TRUE;
         case IDOK:
             ReadChosen(dialog, state);
             if (!state->chosen) return TRUE;
-            state->exact = state->kind == SYNC_UI_OVERWRITE && IsDlgButtonChecked(dialog, IDC_Y_EXACT) == BST_CHECKED;
             EndDialog(dialog, IDOK);
             return TRUE;
         case IDCANCEL:
@@ -257,7 +226,7 @@ static void AddCount(WCHAR *text, size_t cch, const WCHAR *format, int count)
 /* What was done, and what was not: added, updated, removed, left as it
  * was, waiting for its profile to close, left out, failed; `first`, when
  * given, opens it. */
-static void ShowReport(HWND owner, const ProfileList *profiles, const SyncReport *report, const WCHAR *first)
+void SyncUi_ShowReport(HWND owner, const ProfileList *profiles, const SyncReport *report, const WCHAR *first)
 {
     WCHAR text[REPORT_CCH], line[LONG_PATH_CCH + 256], names[NAMES_CCH];
     text[0] = 0;
@@ -265,6 +234,7 @@ static void ShowReport(HWND owner, const ProfileList *profiles, const SyncReport
     AddCount(text, ARRAYSIZE(text), TR(L"Sessions added: %d"), report->added);
     AddCount(text, ARRAYSIZE(text), TR(L"Sessions updated: %d"), report->updated);
     AddCount(text, ARRAYSIZE(text), TR(L"Sessions removed: %d"), report->removed);
+    AddCount(text, ARRAYSIZE(text), TR(L"Sessions two profiles went on with apart, now kept as two: %d"), report->forked);
     AddCount(text, ARRAYSIZE(text), TR(L"Left as they were (newer or deleted there): %d"), report->skipped);
     if (report->waiting) {
         NamesOf(profiles, report->waiting, names, ARRAYSIZE(names));
@@ -286,7 +256,7 @@ static void ShowReport(HWND owner, const ProfileList *profiles, const SyncReport
         AddLine(text, ARRAYSIZE(text), report->backup);
     }
     if (!report->added && !report->updated && !report->removed && !report->skipped && !report->failed && !report->waiting &&
-        !report->unavailable)
+        !report->unavailable && !report->forked)
         AddLine(text, ARRAYSIZE(text), TR(L"Nothing needed changing."));
     Ui_Message(owner, report->failed ? MB_ICONWARNING : MB_ICONINFORMATION, L"%s", text);
 }
@@ -329,55 +299,81 @@ BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles)
     dialog.kind = SYNC_UI_MERGE;
     dialog.profiles = profiles;
     dialog.takers = dialog.chosen = takers;
-    dialog.source = -1;
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
     /* Read again: the dialog may have been open a while. */
     if (!LoadSessions(owner, profiles, &set)) return FALSE;
     ZeroMemory(&report, sizeof report);
     SessionSync_Merge(&set, dialog.chosen, &report);
     SessionStore_Free(&set);
-    ShowReport(owner, profiles, &report, NULL);
+    SyncUi_ShowReport(owner, profiles, &report, NULL);
     return TRUE;
 }
 
-BOOL SyncUi_Overwrite(HWND owner, const ProfileList *profiles, const WCHAR *selected)
+BOOL SyncUi_CopyAll(HWND owner, const ProfileList *profiles, DWORD sources, BOOL move)
 {
+    WCHAR names[NAMES_CCH];
     SessionSet set;
     SyncDialog dialog;
     SyncReport report;
     DWORD takers;
-    int p;
+    int *rows, r, p, count = 0;
+    sources &= profiles->count >= 32 ? (DWORD)-1 : (1u << profiles->count) - 1;
+    if (!sources) return FALSE;
+    for (p = 0; move && p < profiles->count; p++)
+        if ((sources & (1u << p)) && profiles->items[p].syncGroup) {
+            Ui_Message(owner, MB_ICONINFORMATION,
+                       TR(L"The sessions of \x201C%s\x201D are kept the same as other profiles': taking them out of it would take them out "
+                          L"of those too. Stop keeping its sessions the same first."),
+                       profiles->items[p].name);
+            return FALSE;
+        }
     if (!LoadSessions(owner, profiles, &set)) return FALSE;
-    if (!EnoughTakers(owner, &set, &takers)) {
-        SessionStore_Free(&set);
+    takers = SessionSync_Takers(&set) & ~sources;
+    SessionStore_Free(&set);
+    if (!takers) {
+        Ui_Message(owner, MB_ICONINFORMATION, TR(L"This needs at least two profiles signed in to Claude: "
+                                                 L"a profile keeps sessions only once it is signed in."));
         return FALSE;
     }
-    SessionStore_Free(&set);
     ZeroMemory(&dialog, sizeof dialog);
-    dialog.kind = SYNC_UI_OVERWRITE;
+    dialog.kind = move ? SYNC_UI_MOVE_ALL : SYNC_UI_COPY_ALL;
     dialog.profiles = profiles;
     dialog.takers = takers;
-    dialog.source = -1;
-    p = selected ? Profiles_Find(profiles, selected) : -1;
-    if (p >= 0 && (takers & (1u << p))) dialog.source = p;
-    for (p = 0; p < profiles->count && dialog.source < 0; p++)
-        if (takers & (1u << p)) dialog.source = p;
-    dialog.chosen = takers & ~(1u << dialog.source);
+    dialog.sources = sources;
+    dialog.chosen = BitCount(takers) == 1 ? takers : 0;   /* one to choose: it is */
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
-    if (dialog.exact && !Ui_Ask(owner, IDI_WARNING,
-                                TR(L"The sessions the source does not list will be taken out of the profiles checked. "
-                                   L"Their entries are kept in a backup first, and their conversations stay on this PC.\n\nOverwrite anyway?"),
-                                TR(L"Overwrite"), TR(L"Cancel"), TRUE))
+    NamesOf(profiles, sources, names, ARRAYSIZE(names));
+    if (move && !Ui_Ask(owner, IDI_QUESTION, TR(L"The sessions will be taken out of the profiles they come from once the others list them. "
+                                                L"What is taken out is kept in a backup first.\n\nMove them?"),
+                        TR(L"Move"), TR(L"Cancel"), FALSE))
         return FALSE;
     if (!LoadSessions(owner, profiles, &set)) return FALSE;
-    ZeroMemory(&report, sizeof report);
-    if (!SessionSync_Overwrite(&set, dialog.source, dialog.chosen, dialog.exact, &report) && !report.failed) {
-        report.failed++;
-        StringCchPrintfW(report.error, ARRAYSIZE(report.error), TR(L"\x201C%s\x201D is not signed in to Claude yet: sign in there first."),
-                         profiles->items[dialog.source].name);
+    rows = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)max(set.rowCount, 1) * sizeof *rows);
+    if (!rows) {
+        SessionStore_Free(&set);
+        Ui_Message(owner, MB_ICONERROR, TR(L"Sessions could not be loaded."));
+        return FALSE;
     }
+    for (r = 0; r < set.rowCount; r++)
+        for (p = 0; p < set.profiles.count; p++)
+            if ((sources & (1u << p)) && set.rows[r].entry[p] >= 0 && !set.entries[set.rows[r].entry[p]].pendingRemove) {
+                rows[count++] = r;
+                break;
+            }
+    ZeroMemory(&report, sizeof report);
+    if (count) {
+        HCURSOR old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+        SessionSync_Share(&set, -1, rows, count, dialog.chosen, &report);
+        if (move && !report.failed) SessionSync_Remove(&set, sources, rows, count, &report);
+        SetCursor(old);
+    }
+    HeapFree(GetProcessHeap(), 0, rows);
     SessionStore_Free(&set);
-    ShowReport(owner, profiles, &report, NULL);
+    if (!count) {
+        Ui_Message(owner, MB_ICONINFORMATION, TR(L"%s lists no session yet."), names);
+        return FALSE;
+    }
+    SyncUi_ShowReport(owner, profiles, &report, NULL);
     return TRUE;
 }
 
@@ -397,7 +393,7 @@ BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *
     dialog.profiles = &set->profiles;
     dialog.takers = takers;
     dialog.chosen = BitCount(takers) == 1 ? takers : 0;   /* one to choose: it is */
-    dialog.source = from;
+    dialog.sources = from >= 0 ? 1u << from : 0;
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
     ZeroMemory(&report, sizeof report);
     if (copy) {
@@ -406,7 +402,7 @@ BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *
     } else {
         SessionSync_Share(set, from, rows, rowCount, dialog.chosen, &report);
     }
-    ShowReport(owner, &set->profiles, &report, NULL);
+    SyncUi_ShowReport(owner, &set->profiles, &report, NULL);
     return TRUE;
 }
 
@@ -533,7 +529,6 @@ BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
     dialog.profiles = profiles;
     dialog.takers = takers;
     dialog.chosen = (chosen & takers) ? chosen & takers : takers;
-    dialog.source = -1;
     dialog.archive = name ? name + 1 : path;
     if (!ChooseProfiles(owner, &dialog) || !LoadSessions(owner, profiles, &set)) return FALSE;
     ZeroMemory(&report, sizeof report);
@@ -546,7 +541,7 @@ BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
         return FALSE;
     }
     StringCchPrintfW(first, ARRAYSIZE(first), TR(L"Sessions in the archive: %d"), sessions);
-    ShowReport(owner, profiles, &report, first);
+    SyncUi_ShowReport(owner, profiles, &report, first);
     return TRUE;
 }
 
@@ -697,25 +692,25 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
         Ui_Message(owner, MB_ICONERROR, TR(L"Sessions could not be loaded."));
         return FALSE;
     }
-    ShowReport(owner, profiles, &report, NULL);
+    SyncUi_ShowReport(owner, profiles, &report, NULL);
     return TRUE;
 }
 
-/* The profiles' sessions made the same right away, and what that did said. */
-BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles)
+/* The sessions of group `group` made the same right away, and what that did said. */
+BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group)
 {
-    WCHAR names[NAMES_CCH], first[NAMES_CCH + 128];
+    WCHAR names[NAMES_CCH], first[NAMES_CCH + 128], listName[FOLDER_CCH];
     SyncReport report;
-    DWORD group = SessionVault_Group(profiles);
+    DWORD members = SessionVault_Group(profiles, group);
     HCURSOR old;
-    if (!group) return FALSE;
+    if (!members || !SessionVault_GroupListName(group, listName, ARRAYSIZE(listName))) return FALSE;
     ZeroMemory(&report, sizeof report);
     old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
-    SessionVault_Keep(profiles, group, VAULT_GROUP_LIST, TRUE, &report);
+    SessionVault_Keep(profiles, members, listName, TRUE, &report);
     SetCursor(old);
-    NamesOf(profiles, group, names, ARRAYSIZE(names));
+    NamesOf(profiles, members, names, ARRAYSIZE(names));
     StringCchPrintfW(first, ARRAYSIZE(first), TR(L"The sessions of %s are kept the same from now on."), names);
-    ShowReport(owner, profiles, &report, first);
+    SyncUi_ShowReport(owner, profiles, &report, first);
     return TRUE;
 }
 

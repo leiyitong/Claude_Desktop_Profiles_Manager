@@ -318,13 +318,14 @@ CopyResult SessionPurge_BackUp(HWND owner, const WCHAR *to, DWORD *error)
         *error = GetLastError();
         return COPY_FAILED;
     }
-    /* Windows shows the copy's progress, and asks about a file in use. */
+    /* With an owner, Windows shows the copy's progress, and asks about a
+     * file in use; without one, nothing is shown. */
     ZeroMemory(&operation, sizeof operation);
     operation.hwnd = owner;
     operation.wFunc = FO_COPY;
     operation.pFrom = source;
     operation.pTo = target;
-    operation.fFlags = FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR;
+    operation.fFlags = FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR | (owner ? 0 : FOF_SILENT | FOF_NOERRORUI);
     result = SHFileOperationW(&operation);
     if (result == 0 && !operation.fAnyOperationsAborted) {
         Util_Log(L"%s copied to %s", code, to);
