@@ -1,21 +1,16 @@
 """Check the embedded interface catalog against the code that uses it.
 
-Catalog rows: sorted unique keys, one column per language of src/localize.c,
-no empty text, no "..." (use U+2026).
+Catalog rows: sorted unique keys, one column per language of src/localize.c
+(English and Simplified Chinese), no empty text, no "..." (use U+2026).
 Each translation against its key: the same printf conversions in the same
 order (no stray "%", no %a, %A or %n), the same number of line breaks, the
 same leading and trailing spaces and line breaks (Chinese may drop the
-spaces), as many ellipses, the same text after a tab (a key's own name where
-Windows names it so), the same product names and access-key count.
-Each language: its own quotation marks, opened and closed in turn; French
-no-break spaces before : ; ? ! and inside guillemets; no straight
-apostrophe outside English; Hindi and Bengali sentences end with a danda;
-Arabic, Urdu and Chinese use their own question mark, comma and semicolon
-(and Chinese its colon); in Arabic and Urdu a path or %APPDATA% sits in a
-left-to-right embedding, "claude://" and every other inserted %s are followed
-by a left-to-right mark, as is the "*.lnk" pattern; one access-key
-convention per language ("(&X)" with the English key's letter, or the key
-in the words), Arabic keys on letters typed without Shift.
+spaces), as many ellipses, the same text after a tab, the same product names
+and access-key count.
+Each language: its own quotation marks, opened and closed in turn; no
+straight apostrophe outside English; Chinese uses its own question mark,
+exclamation mark, comma, semicolon and colon; one access-key convention per
+language ("(&X)" with the English key's letter, or the key in the words).
 Code: every TR() call and resource label has a key, a TR() of something else
 than a literal is listed below, every key is used; controls shown together
 never share an access key; the words of one command are the same wherever
@@ -41,23 +36,12 @@ FIXED_TERMS = ["claude://", "%APPDATA%", "%LOCALAPPDATA%", "*.lnk", "<a href=", 
                APP_NAME, "Claude Desktop", "Claude Code", "Claude", "Cowork", "Anthropic", "Windows"]
 MARKUP = re.compile(r'<a href="[^"]*">|</a>')
 ELLIPSIS = "\u2026"
-NBSP = "\u00a0"
-LRM, LRE, PDF = "\u200e", "\u202a", "\u202c"
 
 # Each language's opening and closing quotation marks.
-QUOTES = {"en": "\u201c\u201d", "fr": "\u00ab\u00bb", "de": "\u201e\u201c", "es": "\u00ab\u00bb", "ar": "\u00ab\u00bb",
-          "zh-CN": "\u201c\u201d", "ru": "\u00ab\u00bb", "hi": "\u201c\u201d", "pt-BR": "\u201c\u201d", "bn": "\u201c\u201d",
-          "id": "\u201c\u201d", "ur": "\u201c\u201d"}
+QUOTES = {"en": "\u201c\u201d", "zh-CN": "\u201c\u201d"}
 ALL_QUOTES = '"\u201c\u201d\u201e\u00ab\u00bb'
-DANDA_LANGUAGES = {"hi", "bn"}
 # ASCII punctuation these languages write with their own characters.
-OWN_PUNCTUATION = {"ar": "?;,", "ur": "?;,", "zh-CN": "?;,!:"}
-RIGHT_TO_LEFT = {"ar", "ur"}
-# Arabic (101) letters typed with Shift: an access key there would need Alt+Shift, Windows' layout switch.
-SHIFTED_ARABIC = "\u0625\u0623\u0622"
-# A key named after a tab: its name in Windows' own menus of a language (test_localize.c reads it in
-# Windows' keyboard layouts).
-KEY_NAMES = {"Del": {"fr": "Suppr", "de": "Entf", "es": "Supr"}}
+OWN_PUNCTUATION = {"zh-CN": "?;,!:"}
 
 # Commands that show in several places, in the same words.
 COMMAND_FAMILIES = [
@@ -219,34 +203,13 @@ def quotes_alternate(text, marks):
             return False
     return not inside
 
-def direction_problems(text):
-    """Arabic and Urdu: what must read left to right inside right-to-left text."""
-    problems = []
-    depth = 0
-    for i, c in enumerate(text):
-        if c == LRE:
-            depth += 1
-        elif c == PDF:
-            depth -= 1
-        elif text.startswith("%s", i) and depth == 0 and not text.startswith(LRM, i + 2):
-            problems.append("%s without a left-to-right mark after it")
-        elif text.startswith("claude://", i) and not text.startswith(LRM, i + len("claude://")):
-            problems.append("claude:// without a left-to-right mark after it")
-        elif text.startswith("*.lnk", i) and not (text.startswith(LRM, i + len("*.lnk")) and text[i - 1:i] == LRM):
-            problems.append("*.lnk without left-to-right marks around it")
-        elif text.startswith("APPDATA", i) and depth == 0:
-            problems.append("%APPDATA% outside a left-to-right embedding")
-    if depth != 0:
-        problems.append("unbalanced left-to-right embedding")
-    return problems
-
 def command_words(text):
     """A command's words: no access key, ellipsis, shortcut, colon or argument after the ellipsis."""
     text = text.split("\t")[0]
     text = re.sub(r"\(&.\)", "", text)
     text = re.sub(r"&(?!&)", "", text)
-    text = re.sub(ELLIPSIS + r"(%s" + LRM + "?)?$", "", text)
-    return text.rstrip(" :" + NBSP)
+    text = re.sub(ELLIPSIS + r"(%s)?$", "", text)
+    return text.rstrip(" :")
 
 def without_code_noise(source):
     """Comments blanked (line breaks kept), string and character literals kept."""
@@ -309,7 +272,7 @@ def check_translation(errors, number, langs, key, index, text):
     if "..." in text:
         error("three dots: use \u2026")
     key_tab, text_tab = key.partition("\t")[2], text.partition("\t")[2]
-    if text_tab != KEY_NAMES.get(key_tab, {}).get(language, key_tab) or ("\t" in key) != ("\t" in text):
+    if text_tab != key_tab or ("\t" in key) != ("\t" in text):
         error("text after the tab differs")
     prose = MARKUP.sub("", text)
     marks = QUOTES.get(language, "")
@@ -318,23 +281,12 @@ def check_translation(errors, number, langs, key, index, text):
         error(f"quotes {''.join(wrong)!r}: use {marks}")
     elif not quotes_alternate(prose, marks):
         error("quotation marks not opened and closed in turn")
-    if language == "fr":
-        french = prose.replace("claude://", "")
-        if re.search("\u00ab(?!" + NBSP + ")|(?<!" + NBSP + ")\u00bb|(?<!" + NBSP + ")[:;?!]", french):
-            error("missing no-break space before : ; ? ! or inside \u00ab \u00bb")
     if "'" in prose:
         error("straight apostrophe: use \u2019")
-    if language in DANDA_LANGUAGES and ("\u09f7" in text or re.search(r"\.(\s|$)", text)):
-        error("sentence not ended with a danda (U+0964)")
     if language in OWN_PUNCTUATION:
         plain = prose.replace("claude://", "")
         if any(c in OWN_PUNCTUATION[language] for c in plain):
             error(f"ASCII {OWN_PUNCTUATION[language]} punctuation")
-    if language in RIGHT_TO_LEFT:
-        for problem in sorted(set(direction_problems(text))):
-            error(problem)
-    if language == "ar" and access_key(text) and access_key(text) in SHIFTED_ARABIC:
-        error("access key needs Shift on the Arabic keyboard")
 
 def check_access_key_conventions(errors, catalog, rows, langs):
     """One convention per language: a "(&X)" suffix with the English key's

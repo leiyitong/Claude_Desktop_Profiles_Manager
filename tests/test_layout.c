@@ -1499,26 +1499,26 @@ static void CheckReopenedModal(HWND owner, LayoutFixture *fixture, const LayoutS
     Check(fixture, NULL, "closed modal uses the current script independently of its owner's resource font",
           script.dialogFont.available && wcscmp(script.dialogFont.logical.lfFaceName, Localize_FontFaceAt(chinese)) == 0 &&
           initial.dialogFont.logical.lfHeight == script.dialogFont.logical.lfHeight);
-    TransitionLanguage(owner, fixture, Language(L"fr"));
+    TransitionLanguage(owner, fixture, Language(L"en"));
     ReadPrivateModal(owner, fixture, &reopened);
-    Check(fixture, NULL, "reopened French modal keeps its own original font and metrics", SameFont(&initial.dialogFont, &reopened.dialogFont));
-    Check(fixture, NULL, "reopened French modal returns to its original client size", EqualRect(&initial.client, &reopened.client));
-    Check(fixture, NULL, "reopened French modal retains the same resource control count", initial.childCount == reopened.childCount);
+    Check(fixture, NULL, "reopened English modal keeps its own original font and metrics", SameFont(&initial.dialogFont, &reopened.dialogFont));
+    Check(fixture, NULL, "reopened English modal returns to its original client size", EqualRect(&initial.client, &reopened.client));
+    Check(fixture, NULL, "reopened English modal retains the same resource control count", initial.childCount == reopened.childCount);
     if (initial.childCount == reopened.childCount) for (i = 0; i < initial.childCount; i++)
-        Check(fixture, NULL, "reopened French modal retains its original resource geometry",
+        Check(fixture, NULL, "reopened English modal retains its original resource geometry",
               EqualRect(&initial.children[i].rect, &reopened.children[i].rect));
     CompareLayout(owner, fixture, french);
 }
 
-/* The same dialog goes from French to scripts of every shape and back: its
- * fonts, size and controls come back exactly. */
+/* The same dialog goes from English to Chinese and back: its fonts, size
+ * and controls come back exactly. */
 static void CheckLanguageRoundTrips(void)
 {
     static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
                                       IDD_RESTORE, IDD_PURGE };
-    static const WCHAR *const kVisited[] = { L"zh-CN", L"hi", L"bn", L"ar", L"de" };
+    static const WCHAR *const kVisited[] = { L"zh-CN" };
     size_t resource, scale, visited;
-    int view, round, french = Language(L"fr");
+    int view, round, french = Language(L"en");
     for (resource = 0; resource < ARRAYSIZE(kResources); resource++) for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++)
         for (view = 0; view < (kResources[resource] == IDD_MAIN ? 2 : 1); view++) {
             LayoutFixture fixture;
@@ -2019,7 +2019,7 @@ static void CheckMainFrameMessages(void)
 {
     static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_RESTORE, IDC_PURGE,
                                     IDC_BACKUP_CODE, IDC_DEFAULT };
-    LayoutFixture fixture = MainFixture(Language(L"fr"), 96, FALSE);
+    LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];
     SIZE minimum, size;
@@ -2082,7 +2082,7 @@ static void CheckMainFrameMessages(void)
     PumpMessages();
     TransitionLanguage(dialog, &fixture, Language(L"zh-CN"));
     PumpMessages();
-    TransitionLanguage(dialog, &fixture, Language(L"fr"));
+    TransitionLanguage(dialog, &fixture, Language(L"en"));
     PumpMessages();
     GetWindowRect(dialog, &actual);
     Check(&fixture, NULL, "language round trip preserves maximized state and frame", IsZoomed(dialog) && EqualRect(&actual, &requested));
@@ -2305,7 +2305,7 @@ static void CheckResponsiveMain(void)
         }
         {
             RECT resized, after;
-            int original = fixture.language, other = original == Language(L"zh-CN") ? Language(L"fr") : Language(L"zh-CN");
+            int original = fixture.language, other = original == Language(L"zh-CN") ? Language(L"en") : Language(L"zh-CN");
             GetWindowRect(dialog, &resized);
             TransitionLanguage(dialog, &fixture, other);
             TransitionLanguage(dialog, &fixture, original);
@@ -2337,7 +2337,7 @@ static void CheckResponsiveMain(void)
             gdiAfter = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
             Check(&fixture, NULL, "repeated minimum queries retain no new GDI resources", gdiBefore == gdiAfter);
         }
-        if (!view && language == Language(L"fr")) CheckColumnInteractions(dialog, &fixture);
+        if (!view && language == Language(L"en")) CheckColumnInteractions(dialog, &fixture);
         DestroyFixture(dialog, &fixture);
     }
 }
@@ -2714,7 +2714,7 @@ static void CheckSessionsRefillKeepsState(SessionsFixture *sessions)
     WCHAR title[64], starred[64], shown[256];
     FixtureRoots roots = ReadRoots(tree);
     HTREEITEM starredItem;
-    int original = fixture->language, other = original == Language(L"zh-CN") ? Language(L"fr") : Language(L"zh-CN"), pass;
+    int original = fixture->language, other = original == Language(L"zh-CN") ? Language(L"en") : Language(L"zh-CN"), pass;
     RowTitle(STARRED_ROW, starred, ARRAYSIZE(starred));
     if (!Folded(tree, roots.beta)) FoldFolder(tree, roots.beta);
     FoldFolder(tree, roots.unknown);
@@ -2994,7 +2994,7 @@ static void CheckSessionsFocus(SessionsFixture *sessions)
  * refills, watcher and double-clicks. */
 static void CheckPopulatedSessions(void)
 {
-    static const WCHAR *const kLanguages[] = { L"fr", L"es", L"zh-CN" };
+    static const WCHAR *const kLanguages[] = { L"en", L"zh-CN" };
     size_t language;
     if (!NativeScaleFits("the populated sessions view")) return;
     for (language = 0; language < ARRAYSIZE(kLanguages); language++) {
@@ -3065,7 +3065,8 @@ int wmain(void)
     CheckMainFrameMessages();
     if (NativeScaleFits("the real sessions view's transitions")) for (language = 0; language < Localize_LanguageCount(); language++) {
         const WCHAR *code = Localize_LanguageCode(language);
-        if (wcscmp(code, L"fr") == 0 || wcscmp(code, L"es") == 0 || wcscmp(code, L"zh-CN") == 0) CheckRealSessionsTransition(language);
+        (void)code;
+        CheckRealSessionsTransition(language);
     }
     CheckPopulatedSessions();
     UnregisterClassW(g_fixtureClass, g_hInst);

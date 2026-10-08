@@ -1,24 +1,15 @@
 /* What the program relies on even without tools/check-localization.py: keys
  * sorted for the binary search, printf contracts, no empty text; language
  * selection; resource labels, their reading direction and forgetting them;
- * names cut to fit; the Delete key's name in menus, as Windows' keyboard
- * layouts give it. Catalog wording is the Python checker's. */
+ * names cut to fit. Catalog wording is the Python checker's. */
 #include "../src/app.h"
 #include <stdio.h>
 #include <wchar.h>
 
 /* Columns of the catalog (localize.c's kLanguages). */
 #define ENGLISH_LANGUAGE    0
-#define FRENCH_LANGUAGE     1
-#define GERMAN_LANGUAGE     2
-#define SPANISH_LANGUAGE    3
-#define ARABIC_LANGUAGE     4
-#define CHINESE_LANGUAGE    5
-#define HINDI_LANGUAGE      7
-#define PORTUGUESE_LANGUAGE 8
-#define BENGALI_LANGUAGE    9
-#define URDU_LANGUAGE       11
-#define LANGUAGE_COUNT      12
+#define CHINESE_LANGUAGE    1
+#define LANGUAGE_COUNT      2
 #define LANGUAGE_VALUE      L"Language"   /* localize.c's value under REG_ROOT */
 
 static int g_checks, g_failures;
@@ -82,7 +73,7 @@ static void Catalog(void)
 {
     size_t i;
     int language;
-    Check("twelve interface languages", Localize_LanguageCount() == LANGUAGE_COUNT);
+    Check("English and Simplified Chinese", Localize_LanguageCount() == LANGUAGE_COUNT);
     for (i = 0; i < Localize_CatalogCount(); i++) {
         const WCHAR *key = Localize_CatalogKey(i);
         WCHAR copy[2048];
@@ -99,7 +90,7 @@ static void Catalog(void)
     }
     Check("out of bounds catalog key", Localize_CatalogKey(Localize_CatalogCount()) == NULL);
     Check("fallback preserves unknown user text",
-          wcscmp(Localize_TranslateAt(FRENCH_LANGUAGE, L"My own session title"), L"My own session title") == 0);
+          wcscmp(Localize_TranslateAt(CHINESE_LANGUAGE, L"My own session title"), L"My own session title") == 0);
     Check("null lookup", Localize_Text(NULL) == NULL);
     Check("invalid language falls back to English", wcscmp(Localize_TranslateAt(999, L"Close"), L"Close") == 0);
     Check("32 bit unsigned formats differ", !SameFormats(L"%lu", L"%s"));
@@ -118,27 +109,20 @@ static void Languages(void)
 {
     WCHAR savedBefore[32], savedAfter[32];
     int language;
-    Check("French OS language", Localize_LanguageForCode(L"fr-FR") == FRENCH_LANGUAGE);
-    Check("German OS language", Localize_LanguageForCode(L"de-DE") == GERMAN_LANGUAGE);
-    Check("Arabic OS language", Localize_LanguageForCode(L"ar-SA") == ARABIC_LANGUAGE);
+    Check("English OS language", Localize_LanguageForCode(L"en-US") == ENGLISH_LANGUAGE);
     Check("Chinese OS language", Localize_LanguageForCode(L"zh-Hans-CN") == CHINESE_LANGUAGE);
     Check("every Chinese locale uses the simplified catalog",
           Localize_LanguageForCode(L"zh-TW") == CHINESE_LANGUAGE && Localize_LanguageForCode(L"zh") == CHINESE_LANGUAGE);
-    Check("the Portuguese catalog is Brazil's", wcscmp(Localize_LanguageCode(PORTUGUESE_LANGUAGE), L"pt-BR") == 0);
-    Check("every Portuguese locale, and a code saved as pt, uses it",
-          Localize_LanguageForCode(L"pt-BR") == PORTUGUESE_LANGUAGE && Localize_LanguageForCode(L"pt-PT") == PORTUGUESE_LANGUAGE &&
-          Localize_LanguageForCode(L"pt") == PORTUGUESE_LANGUAGE);
+    Check("a language no longer offered matches none", Localize_LanguageForCode(L"fr-FR") == -1 && Localize_LanguageForCode(L"ar-SA") == -1);
     Check("unknown language", Localize_LanguageForCode(L"xx-XX") == -1);
     Check("language prefix is not enough", Localize_LanguageForCode(L"french") == -1);
     Check("empty locale", Localize_LanguageForCode(L"") == -1);
     SavedLanguage(savedBefore, ARRAYSIZE(savedBefore));
     for (language = 0; language < Localize_LanguageCount(); language++) {
-        BOOL rtl = language == ARABIC_LANGUAGE || language == URDU_LANGUAGE;
         Check("language can be selected for this run only", Localize_SetLanguage(language, FALSE));
         Check("selection and effective language agree", Localize_CurrentLanguage() == language && Localize_EffectiveLanguage() == language);
         Check("language code round trips", Localize_LanguageForCode(Localize_LanguageCode(language)) == language);
-        Check("RTL only for Arabic and Urdu", Localize_IsRTL() == rtl);
-        Check("RTL draw flag", Localize_ReadingFlags() == (UINT)(rtl ? DT_RTLREADING : 0));
+        Check("every language reads left to right", !Localize_IsRTL() && Localize_ReadingFlags() == 0);
         Check("lookup observes selected language", Localize_Text(L"Close") == Localize_TranslateAt(language, L"Close"));
     }
     SavedLanguage(savedAfter, ARRAYSIZE(savedAfter));
@@ -149,8 +133,6 @@ static void Languages(void)
           wcscmp(Localize_FontFaceAt(-1), Localize_FontFaceAt(ENGLISH_LANGUAGE)) == 0 &&
           wcscmp(Localize_FontFaceAt(LANGUAGE_COUNT), Localize_FontFaceAt(ENGLISH_LANGUAGE)) == 0);
     Check("invalid indexed directions fall back to English", !Localize_IsRTLAt(-1) && !Localize_IsRTLAt(LANGUAGE_COUNT));
-    Check("Hindi script font", Localize_SetLanguage(HINDI_LANGUAGE, FALSE) && wcscmp(Localize_FontFace(), L"Nirmala UI") == 0);
-    Check("Bengali script font", Localize_SetLanguage(BENGALI_LANGUAGE, FALSE) && wcscmp(Localize_FontFace(), L"Nirmala UI") == 0);
     Check("Chinese script font",
           Localize_SetLanguage(CHINESE_LANGUAGE, FALSE) && wcscmp(Localize_FontFace(), L"Microsoft YaHei UI") == 0);
     Check("automatic language", Localize_SetLanguage(-1, FALSE) && Localize_CurrentLanguage() == -1);
@@ -173,28 +155,21 @@ static void ResourceLabels(void)
         if (dialog) DestroyWindow(dialog);
         return;
     }
-    Localize_SetLanguage(FRENCH_LANGUAGE, FALSE);
+    Localize_SetLanguage(CHINESE_LANGUAGE, FALSE);
     Localize_Window(dialog);
     GetWindowTextW(button, text, ARRAYSIZE(text));
-    Check("resource button translated", wcscmp(text, Localize_Text(L"Cancel")) == 0);
+    Check("resource button translated", wcscmp(text, Localize_Text(L"Cancel")) == 0 && wcscmp(text, L"Cancel") != 0);
     GetWindowTextW(edit, text, ARRAYSIZE(text));
     Check("editable user title never translated", wcscmp(text, L"Cancel") == 0);
     SetWindowTextW(data, L"Cancel");
-    Localize_SetLanguage(GERMAN_LANGUAGE, FALSE);
+    Localize_SetLanguage(ENGLISH_LANGUAGE, FALSE);
     Localize_Window(dialog);
     GetWindowTextW(button, text, ARRAYSIZE(text));
-    Check("captured English key supports live switch", wcscmp(text, Localize_Text(L"Cancel")) == 0);
+    Check("captured English key supports live switch", wcscmp(text, L"Cancel") == 0);
     GetWindowTextW(data, text, ARRAYSIZE(text));
     Check("dynamic user text never captured on switch", wcscmp(text, L"Cancel") == 0);
-    Localize_SetLanguage(ARABIC_LANGUAGE, FALSE);
-    Localize_Window(dialog);
-    Check("the dialog reads right to left", ReadsRightToLeft(dialog));
-    Check("translated button reads right to left", ReadsRightToLeft(button));
-    Check("label the program fills reads right to left", ReadsRightToLeft(data));
+    Check("labels read left to right", !ReadsRightToLeft(button) && !ReadsRightToLeft(data) && !ReadsRightToLeft(dialog));
     Check("editable data direction preserved", (GetWindowLongPtrW(edit, GWL_EXSTYLE) & (WS_EX_RTLREADING | WS_EX_LAYOUTRTL)) == 0);
-    Localize_SetLanguage(FRENCH_LANGUAGE, FALSE);
-    Localize_Window(dialog);
-    Check("back from Arabic, labels read left to right", !ReadsRightToLeft(button) && !ReadsRightToLeft(data) && !ReadsRightToLeft(dialog));
     Localize_Window(NULL);
     Localize_ForgetWindow(NULL);
     /* Forgotten, a label's text is read again as it is: user text there stays. */
@@ -248,70 +223,12 @@ static void CutNames(void)
           Localize_ShorterCut(L"\xD83C\xDDEB\xD83C\xDDF7\xD83C\xDDE9\xD83C\xDDEA", 4) == 0);
 }
 
-/* The start of a keyboard layout's tables (KBDTABLES of the WDK's kbd.h):
- * its key names, the extended keys' (E0) apart. */
-typedef struct KeyName {
-    BYTE scanCode;
-    const WCHAR *name;
-} KeyName;
-
-typedef struct KeyboardTables {
-    const void *modifiers, *characters, *deadKeys;
-    const KeyName *names, *extendedNames;
-} KeyboardTables;
-
-typedef const KeyboardTables *(WINAPI *KeyboardDescriptor)(void);
-
-/* The Delete key's name (E0 53) in Windows' keyboard layout `file`, in
- * `name`; FALSE when the layout is not there. */
-static BOOL DeleteKeyName(const WCHAR *file, WCHAR *name, size_t cch)
-{
-    HMODULE layout = LoadLibraryExW(file, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    KeyboardDescriptor descriptor = layout ? (KeyboardDescriptor)(void *)GetProcAddress(layout, "KbdLayerDescriptor") : NULL;
-    const KeyboardTables *tables = descriptor ? descriptor() : NULL;
-    const KeyName *key;
-    BOOL found = FALSE;
-    name[0] = 0;
-    for (key = tables ? tables->extendedNames : NULL; key && key->scanCode && !found; key++)
-        if (key->scanCode == 0x53) found = SUCCEEDED(StringCchCopyW(name, cch, key->name));
-    if (layout) FreeLibrary(layout);
-    return found;
-}
-
-/* The menus' name of the Delete key (the text after a tab) is the one the
- * language's keyboard layout gives it, in capitals there; where it has none
- * of its own, it is English's "Del", as Windows' menus write "Delete". */
-static void KeyNames(void)
-{
-    static const struct { int language; const WCHAR *layout; } kLayouts[] = {
-        { FRENCH_LANGUAGE, L"kbdfr.dll" }, { GERMAN_LANGUAGE, L"kbdgr.dll" }, { SPANISH_LANGUAGE, L"kbdsp.dll" }
-    };
-    WCHAR name[64];
-    char label[160];
-    size_t i;
-    if (!DeleteKeyName(L"kbdus.dll", name, ARRAYSIZE(name))) {
-        printf("  skip  key names: the US keyboard layout cannot be read\n");
-        return;
-    }
-    Check("the US keyboard layout names the Delete key Delete (its tables are read right)", wcscmp(name, L"Delete") == 0);
-    for (i = 0; i < ARRAYSIZE(kLayouts); i++) {
-        const WCHAR *shown = Localize_TranslateAt(kLayouts[i].language, L"\tDel") + 1;
-        StringCchPrintfA(label, ARRAYSIZE(label), "the Delete key is named as %ls names it", kLayouts[i].layout);
-        if (!DeleteKeyName(kLayouts[i].layout, name, ARRAYSIZE(name))) {
-            printf("  skip  %s: the layout cannot be read\n", label);
-        } else if (!Check(label, CompareStringOrdinal(name, -1, shown, -1, TRUE) == CSTR_EQUAL)) {
-            wprintf(L"        layout %s, catalog %s\n", name, shown);
-        }
-    }
-}
-
 int wmain(void)
 {
     Catalog();
     Languages();
     ResourceLabels();
     CutNames();
-    KeyNames();
     printf("Localization tests: %d checks, %d failure(s).\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

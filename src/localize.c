@@ -12,17 +12,7 @@ typedef struct Language {
 /* In the order of the catalog's columns. */
 static const Language kLanguages[] = {
     { L"en", L"English", L"Segoe UI", FALSE },
-    { L"fr", L"Fran\x00E7" L"ais", L"Segoe UI", FALSE },
-    { L"de", L"Deutsch", L"Segoe UI", FALSE },
-    { L"es", L"Espa\x00F1ol", L"Segoe UI", FALSE },
-    { L"ar", L"\x0627\x0644\x0639\x0631\x0628\x064A\x0629", L"Segoe UI", TRUE },
-    { L"zh-CN", L"\x7B80\x4F53\x4E2D\x6587", L"Microsoft YaHei UI", FALSE },
-    { L"ru", L"\x0420\x0443\x0441\x0441\x043A\x0438\x0439", L"Segoe UI", FALSE },
-    { L"hi", L"\x0939\x093F\x0928\x094D\x0926\x0940", L"Nirmala UI", FALSE },
-    { L"pt-BR", L"Portugu\x00EAs (Brasil)", L"Segoe UI", FALSE },
-    { L"bn", L"\x09AC\x09BE\x0982\x09B2\x09BE", L"Nirmala UI", FALSE },
-    { L"id", L"Bahasa Indonesia", L"Segoe UI", FALSE },
-    { L"ur", L"\x0627\x0631\x062F\x0648", L"Segoe UI", TRUE }
+    { L"zh-CN", L"\x7B80\x4F53\x4E2D\x6587", L"Microsoft YaHei UI", FALSE }
 };
 
 typedef struct Translation {
@@ -57,9 +47,8 @@ const WCHAR *Localize_LanguageName(int language)
 }
 
 /* A locale matches a language by its language subtag, so every Chinese
- * locale uses the simplified catalog and every Portuguese one the Brazilian
- * catalog (named as such: European Windows calls some things otherwise). A
- * code saved as "pt" still matches. */
+ * locale uses the simplified catalog. A code another version saved for a
+ * language no longer offered matches none: Windows' language is followed. */
 int Localize_LanguageForCode(const WCHAR *code)
 {
     int i;

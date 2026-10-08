@@ -1652,6 +1652,27 @@ static WCHAR *TableCellText(HWND list, int row, int column, WCHAR *local, int lo
     }
 }
 
+/* Where the list itself puts row `row`'s state image, left of the icon at
+ * `iconLeft`: the span its hit test calls the state icon. The margin before
+ * it changes with the scale and the Windows build, so it is asked, not
+ * computed. FALSE when the list answers no such span. */
+static BOOL StateImageSpan(HWND list, int row, const RECT *bounds, int iconLeft, int *left, int *right)
+{
+    LVHITTESTINFO hit;
+    int x;
+    *left = *right = -1;
+    for (x = bounds->left; x < iconLeft; x++) {
+        ZeroMemory(&hit, sizeof hit);
+        hit.pt.x = x;
+        hit.pt.y = (bounds->top + bounds->bottom) / 2;
+        if (ListView_SubItemHitTest(list, &hit) >= 0 && hit.iItem == row && (hit.flags & LVHT_ONITEMSTATEICON)) {
+            if (*left < 0) *left = x;
+            *right = x + 1;
+        }
+    }
+    return *left >= 0;
+}
+
 /* A row's check box (the theme's glyph, where Windows draws its state
  * image) or other state image, and its icon, at the native item geometry. */
 static void PaintTableRowImages(HWND list, HDC dc, const RECT *bounds, const LVITEMW *item)
@@ -1669,11 +1690,14 @@ static void PaintTableRowImages(HWND list, HDC dc, const RECT *bounds, const LVI
         if (theme) {
             RECT check;
             TEXTMETRICW metrics;
-            int contentHeight, imageWidth, imageHeight;
+            int contentHeight, imageWidth, imageHeight, spanLeft, spanRight;
             GetTextMetricsW(dc, &metrics);
             contentHeight = metrics.tmHeight;
             if (images && ImageList_GetIconSize(images, &imageWidth, &imageHeight)) contentHeight = max(contentHeight, imageHeight);
-            check.left = icon.left - max(width, GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(list)));
+            if (StateImageSpan(list, item->iItem, bounds, icon.left, &spanLeft, &spanRight))
+                check.left = spanLeft + max(0, (spanRight - spanLeft - glyph.cx) / 2);
+            else
+                check.left = icon.left - max(width, GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(list)));
             check.top = bounds->top + max(0, (contentHeight - glyph.cy + 1) / 2);
             check.right = check.left + glyph.cx;
             check.bottom = check.top + glyph.cy;

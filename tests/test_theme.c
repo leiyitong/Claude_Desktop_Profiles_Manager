@@ -1404,9 +1404,6 @@ static void TestCheckBoxMetrics(void)
     static const struct { const WCHAR *caption, *language; const char *script; } kScripts[] = {
         { L"&Archived", L"en", "Latin" },
         { L"\x5DF2\x5F52\x6863", L"zh-CN", "Chinese" },
-        { L"\x0627\x0644\x0645\x0624\x0631\x0634\x0641\x0629", L"ar", "Arabic" },
-        { L"\x0938\x0902\x0917\x094D\x0930\x0939\x093F\x0924", L"hi", "Devanagari" },
-        { L"\x0986\x09B0\x09CD\x0995\x09BE\x0987\x09AD", L"bn", "Bengali" },
     };
     static const int kScales[] = { 96, 144, 192 };
     static const char *const kStates[] = { "unchecked", "checked", "disabled", "disabled and checked" };
@@ -1579,10 +1576,9 @@ static BOOL TipReads(HWND tips, const WCHAR *expected)
 static void TestCellTips(void)
 {
     static const struct { const WCHAR *title, *language; const char *script; } kTitles[] = {
-        { L"\x4F1A\x8BDD", L"zh-CN", "Chinese" }, { L"\x062C\x0644\x0633\x0629", L"ar", "Arabic" }, { L"Session", L"en", "Latin" },
-        { L"\x0938\x0924\x094D\x0930", L"hi", "Devanagari" }, { L"\x09B8\x09C7\x09B6\x09A8", L"bn", "Bengali" }
+        { L"\x4F1A\x8BDD", L"zh-CN", "Chinese" }, { L"Session", L"en", "Latin" }
     };
-    static const struct { const WCHAR *language; BOOL rightToLeft; } kDirections[] = { { L"fr", FALSE }, { L"ar", TRUE }, { L"fr", FALSE } };
+    static const struct { const WCHAR *language; BOOL rightToLeft; } kDirections[] = { { L"en", FALSE }, { L"zh-CN", FALSE }, { L"en", FALSE } };
     HWND host = ThemedHost(), list, tree, tips, treeTips;
     HFONT font = DialogFont();
     LVCOLUMNW column = { 0 };
