@@ -4678,7 +4678,7 @@ static void TestGlyphButtons(void)
         DeleteObject(font);
         return;
     }
-    Theme_SetGlyph(buttons[1], 0xE710);
+    Theme_SetGlyph(buttons[1], 0xE710, THEME_TINT_NONE);
     Theme_Apply(host);
     ShowWindow(host, SW_SHOWNOACTIVATE);
     for (kind = 0; kind < 2; kind++) {
@@ -4710,6 +4710,24 @@ static void TestGlyphButtons(void)
     }
     CanvasClose(&face);
     for (kind = 0; kind < 2; kind++) CanvasClose(&shown[kind]);
+    /* A filled star in gold: its tint, and the caption's color once disabled. */
+    Theme_SetGlyph(buttons[1], 0xE735, THEME_TINT_GOLD);
+    for (kind = 0; kind < 2; kind++) {
+        Canvas star = { 0 };
+        int tinted = 0;
+        EnableWindow(buttons[1], kind == 0);
+        BufferedPaintStopAllAnimations(buttons[1]);
+        RedrawWindow(buttons[1], NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        GetClientRect(buttons[1], &client);
+        if (CanvasOpen(&star, client.right, client.bottom, RGB(1, 2, 3)) && CopyClient(buttons[1], &star) && HasImage(&star, "icon buttons")) {
+            for (y = 0; y < client.bottom; y++) for (x = 0; x < client.right; x++)
+                if (PixelAt(&star, x, y) == Theme_TintColor(THEME_TINT_GOLD)) tinted++;
+            if (kind == 0) Check("icon buttons: the icon is drawn in its tint", tinted > 0 || HighContrastOn());
+            else Check("icon buttons: a disabled button's icon is not tinted", tinted == 0);
+        }
+        CanvasClose(&star);
+    }
+    EnableWindow(buttons[1], TRUE);
     ShowWindow(host, SW_HIDE);
     for (kind = 0; kind < 2; kind++) DestroyWindow(buttons[kind]);
     DeleteObject(font);

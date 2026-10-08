@@ -772,7 +772,7 @@ void Theme_DrawButton(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFO
 
 /* ------------------------------------------------------- buttons' icons */
 
-#define GLYPH_PROP     L"ClaudeDesktopProfilesManager.Glyph"   /* a push button's icon: a character of Windows' icon font */
+#define GLYPH_PROP     L"ClaudeDesktopProfilesManager.Glyph"   /* a push button's icon: a character of Windows' icon font, its tint above */
 #define GLYPH_GAP_DIPS 8                                       /* between a button's icon and its caption */
 
 /* Windows' icon font, Segoe Fluent Icons (Windows 11) or else Segoe MDL2
@@ -817,17 +817,42 @@ static HFONT GlyphFont(HFONT textFont)
     return cached;
 }
 
-void Theme_SetGlyph(HWND button, WCHAR glyph)
+/* Each tint, light and dark: Windows 11's own status and accent colors, the
+ * light shade dark enough on a light button, the dark one light enough on a
+ * dark button, its fill under the mouse included. */
+static const COLORREF kTints[THEME_TINTS][2] = {
+    { 0, 0 },
+    { RGB(0x0F, 0x7B, 0x0F), RGB(0x6C, 0xCB, 0x5F) },   /* green: success */
+    { RGB(0xC4, 0x2B, 0x1C), RGB(0xFF, 0x99, 0xA4) },   /* red: critical */
+    { RGB(0x00, 0x5F, 0xB8), RGB(0x60, 0xCD, 0xFF) },   /* blue: the accent */
+    { RGB(0x03, 0x83, 0x87), RGB(0x4C, 0xC2, 0xC4) },   /* teal */
+    { RGB(0x87, 0x64, 0xB8), RGB(0xC2, 0xA6, 0xFF) },   /* purple */
+    { RGB(0x9D, 0x5D, 0x00), RGB(0xFF, 0xB9, 0x00) },   /* amber: caution */
+    { RGB(0xC2, 0x7C, 0x0E), RGB(0xFF, 0xC8, 0x3D) }    /* gold: a star */
+};
+
+COLORREF Theme_TintColor(ThemeTint tint)
+{
+    if (tint <= THEME_TINT_NONE || tint >= THEME_TINTS || g_highContrast) return g_dark ? g_palette.color[THEME_TEXT] : GetSysColor(COLOR_BTNTEXT);
+    return kTints[tint][g_dark ? 1 : 0];
+}
+
+void Theme_SetGlyph(HWND button, WCHAR glyph, ThemeTint tint)
 {
     if (!button) return;
-    if (glyph) SetPropW(button, GLYPH_PROP, (HANDLE)(UINT_PTR)glyph);
+    if (glyph) SetPropW(button, GLYPH_PROP, (HANDLE)((UINT_PTR)glyph | ((UINT_PTR)tint << 16)));
     else RemovePropW(button, GLYPH_PROP);
     InvalidateRect(button, NULL, FALSE);
 }
 
 static WCHAR GlyphOf(HWND button)
 {
-    return (WCHAR)(UINT_PTR)GetPropW(button, GLYPH_PROP);
+    return (WCHAR)((UINT_PTR)GetPropW(button, GLYPH_PROP) & 0xFFFF);
+}
+
+static ThemeTint TintOf(HWND button)
+{
+    return (ThemeTint)(((UINT_PTR)GetPropW(button, GLYPH_PROP) >> 16) & 0xFF);
 }
 
 /* What a button's icon adds to its caption's width: the icon and the gap
@@ -847,9 +872,12 @@ static int GlyphWidth(HWND button, HFONT textFont, WCHAR glyph)
 }
 
 /* A push button with an icon before its caption, the two centered together,
- * the icon in the caption's color (see ButtonFace). */
-static void DrawGlyphButton(HWND button, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state, UINT format, WCHAR glyph)
+ * the icon in its tint; disabled, and on a dark button's bright blue while
+ * pressed, in the caption's color (see ButtonFace). */
+static void DrawGlyphButton(HWND button, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state, UINT format, WCHAR glyph,
+                            ThemeTint tint)
 {
+    COLORREF caption;
     HFONT glyphFont = GlyphFont(font);
     RECT measured = { 0, 0, 0, 0 }, label = *rc, icon;
     HGDIOBJ old;
@@ -867,7 +895,10 @@ static void DrawGlyphButton(HWND button, HDC dc, const RECT *rc, const WCHAR *te
     SelectObject(dc, old);
     left = rc->left + max(0, (int)(rc->right - rc->left) - (glyphSize.cx + gap + measured.right)) / 2;
     SetRect(&icon, left, rc->top, left + glyphSize.cx, rc->bottom);
+    caption = GetTextColor(dc);
+    if (!(state & THEME_BUTTON_DISABLED) && !(g_dark && (state & THEME_BUTTON_PRESSED))) SetTextColor(dc, Theme_TintColor(tint));
     DrawLabel(dc, &glyph, glyphFont, &icon, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    SetTextColor(dc, caption);
     label.left = icon.right + gap;
     DrawLabel(dc, text, font, &label, (format & ~(UINT)(DT_CENTER | DT_RIGHT)) | DT_LEFT | DT_END_ELLIPSIS);
 }
@@ -1078,7 +1109,7 @@ static LRESULT ButtonCustomDraw(const NMCUSTOMDRAW *customDraw)
     format = TextFormatForCues(button, DT_SINGLELINE | DT_CENTER | DT_VCENTER, &showFocus);
     if (GlyphOf(button))
         DrawGlyphButton(button, customDraw->hdc, &customDraw->rc, text, (HFONT)SendMessageW(button, WM_GETFONT, 0, 0), state, format,
-                        GlyphOf(button));
+                        GlyphOf(button), TintOf(button));
     else
         Theme_DrawButton(button, customDraw->hdc, &customDraw->rc, text, (HFONT)SendMessageW(button, WM_GETFONT, 0, 0), state, format);
     if ((customDraw->uItemState & CDIS_FOCUS) && showFocus) {
@@ -4682,36 +4713,44 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
 #define CLAUDE_VERSION_SAMPLE         L"2.99999.99"         /* the longest Claude Desktop version the status shows */
 
 /* A button, with every caption it shows (catalog keys) and its icon (a
- * character of Windows' icon font, 0 for none). */
+ * character of Windows' icon font, 0 for none) in its tint. */
 typedef struct MainButton {
     int id;
     const WCHAR *captions[2];
     WCHAR glyph;
+    ThemeTint tint;
 } MainButton;
 
-/* The toolbar, left to right, in groups: the profiles' Claude, the profiles, the default one. */
+/* The toolbar, left to right, in groups: the profiles' Claude, the profiles,
+ * the default one. Each icon in the color of what it does: green starts,
+ * red stops or deletes, a gold star for the default. */
 static const MainButton kMainToolbar[] = {
-    { IDC_OPEN, { L"&Open", NULL }, 0xE768 }, { IDC_STOP, { L"&Quit", NULL }, 0xE71A }, { IDC_RESTART, { L"&Restart", NULL }, 0xE72C },
-    { IDC_NEW, { L"&New\x2026", NULL }, 0xE710 }, { IDC_EDIT, { L"&Edit\x2026", NULL }, 0xE70F }, { IDC_DELETE, { L"&Delete\x2026", NULL }, 0xE74D },
-    { IDC_DEFAULT, { L"Set as de&fault", NULL }, 0xE734 }
+    { IDC_OPEN, { L"&Open", NULL }, 0xE768, THEME_TINT_GREEN }, { IDC_STOP, { L"&Quit", NULL }, 0xE71A, THEME_TINT_RED },
+    { IDC_RESTART, { L"&Restart", NULL }, 0xE72C, THEME_TINT_BLUE },
+    { IDC_NEW, { L"&New\x2026", NULL }, 0xE710, THEME_TINT_TEAL }, { IDC_EDIT, { L"&Edit\x2026", NULL }, 0xE70F, THEME_TINT_PURPLE },
+    { IDC_DELETE, { L"&Delete\x2026", NULL }, 0xE74D, THEME_TINT_RED },
+    { IDC_DEFAULT, { L"Set as de&fault", NULL }, 0xE735, THEME_TINT_GOLD }
 };
 static const int kMainToolbarGroups[] = { 3, 6 };   /* the actions that start a group of their own */
 /* The column's actions on the profiles, below the view's button. */
-static const MainButton kMainColumn[] = { { IDC_SYNC, { L"S&ync sessions", NULL }, 0xE895 }, { IDC_REPAIR, { L"Rep&air", NULL }, 0xE90F } };
+static const MainButton kMainColumn[] = {
+    { IDC_SYNC, { L"S&ync sessions", NULL }, 0xE895, THEME_TINT_BLUE }, { IDC_REPAIR, { L"Rep&air", NULL }, 0xE90F, THEME_TINT_AMBER }
+};
 /* The menu bar's menus. */
 static const MainButton kMainMenus[] = {
-    { IDC_MENU_APP, { L"&Program", NULL }, 0 }, { IDC_MENU_SESSIONS, { L"&Sessions", NULL }, 0 }, { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL }, 0 }
+    { IDC_MENU_APP, { L"&Program", NULL }, 0, THEME_TINT_NONE }, { IDC_MENU_SESSIONS, { L"&Sessions", NULL }, 0, THEME_TINT_NONE },
+    { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL }, 0, THEME_TINT_NONE }
 };
 /* The shortcuts menu's commands, each in the state its profile is in. */
 static const MainButton kMainShortcuts[] = {
-    { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" }, 0 },
-    { IDC_SC_SAVEAS, { L"Create s&hortcut\x2026", NULL }, 0 },
-    { IDC_SC_PIN, { L"Pin to &taskbar", L"Pinned" }, 0 },
-    { IDC_SC_START, { L"Add to Start &menu", L"Remove from Start &menu" }, 0 }
+    { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" }, 0, THEME_TINT_NONE },
+    { IDC_SC_SAVEAS, { L"Create s&hortcut\x2026", NULL }, 0, THEME_TINT_NONE },
+    { IDC_SC_PIN, { L"Pin to &taskbar", L"Pinned" }, 0, THEME_TINT_NONE },
+    { IDC_SC_START, { L"Add to Start &menu", L"Remove from Start &menu" }, 0, THEME_TINT_NONE }
 };
-static const MainButton kMainSessions = { IDC_SESSIONS, { L"Sessions &view  >", L"<  &Back" }, 0 };
-static const MainButton kMainStatusAction = { IDC_STATUS_ACTION, { L"&Get Claude", L"Set up l&inks" }, 0 };
-static const MainButton kMainUpdate = { IDC_UPDATE, { L"&Update", NULL }, 0 };
+static const MainButton kMainSessions = { IDC_SESSIONS, { L"Sessions &view  >", L"<  &Back" }, 0, THEME_TINT_NONE };
+static const MainButton kMainStatusAction = { IDC_STATUS_ACTION, { L"&Get Claude", L"Set up l&inks" }, 0, THEME_TINT_NONE };
+static const MainButton kMainUpdate = { IDC_UPDATE, { L"&Update", NULL }, 0, THEME_TINT_NONE };
 
 static const MainButton *MainButtonOf(int id)
 {
@@ -4741,8 +4780,9 @@ const WCHAR *Theme_MainCaption(int id, int state)
 static void ApplyMainGlyphs(HWND dialog)
 {
     size_t i;
-    for (i = 0; i < ARRAYSIZE(kMainToolbar); i++) Theme_SetGlyph(GetDlgItem(dialog, kMainToolbar[i].id), kMainToolbar[i].glyph);
-    for (i = 0; i < ARRAYSIZE(kMainColumn); i++) Theme_SetGlyph(GetDlgItem(dialog, kMainColumn[i].id), kMainColumn[i].glyph);
+    for (i = 0; i < ARRAYSIZE(kMainToolbar); i++)
+        Theme_SetGlyph(GetDlgItem(dialog, kMainToolbar[i].id), kMainToolbar[i].glyph, kMainToolbar[i].tint);
+    for (i = 0; i < ARRAYSIZE(kMainColumn); i++) Theme_SetGlyph(GetDlgItem(dialog, kMainColumn[i].id), kMainColumn[i].glyph, kMainColumn[i].tint);
 }
 
 /* The version label's texts in each state (MainVersion), each with one %s:

@@ -959,7 +959,14 @@ void     Theme_DropDownLabel(HWND owner, const RECT *box, RECT *label);   /* whe
 BOOL     Theme_TableCellText(HWND list, int row, int column, RECT *text);   /* where a table cell's text is drawn; a wider text shows a tip */
 UINT     Theme_TrackDropDown(HWND owner, HMENU menu, const RECT *screenBox);
 void     Theme_SetStrong(HWND control);   /* its text semibold, at the dialog's scale */
-void     Theme_SetGlyph(HWND button, WCHAR glyph);   /* an icon before a push button's caption: a character of Windows' icon font, 0 for none */
+/* The color of a button's icon, by what the button does, in a shade for each mode. */
+typedef enum ThemeTint {
+    THEME_TINT_NONE,     /* the caption's color */
+    THEME_TINT_GREEN, THEME_TINT_RED, THEME_TINT_BLUE, THEME_TINT_TEAL, THEME_TINT_PURPLE, THEME_TINT_AMBER, THEME_TINT_GOLD,
+    THEME_TINTS
+} ThemeTint;
+void     Theme_SetGlyph(HWND button, WCHAR glyph, ThemeTint tint);   /* an icon before a push button's caption: a character of Windows' icon font, 0 for none */
+COLORREF Theme_TintColor(ThemeTint tint);   /* in the current mode; the caption's color for none, and in a contrast theme */
 BOOL     Theme_CheckBoxSize(HWND control, SIZE *size);
 void     Theme_CreateFonts(HWND dialog, ThemeFonts *fonts);
 void     Theme_FreeFonts(ThemeFonts *fonts);
