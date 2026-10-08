@@ -15,6 +15,7 @@
 #define VALUE_COLOR           L"Color"
 #define VALUE_BADGE           L"Badge"            /* the badge's own text, absent for the initial */
 #define VALUE_PICTURE         L"Picture"          /* the stamp of its own picture (icons.c), absent for none */
+#define VALUE_SYNC_SESSIONS   L"SyncSessions"     /* 1: its sessions are kept the same as the others' that have it */
 #define VALUE_DEFAULT_PROFILE L"DefaultProfile"   /* under REG_ROOT */
 
 static void ProfileKey(const WCHAR *folder, WCHAR *out, size_t cch)
@@ -60,7 +61,7 @@ BOOL Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, const WCHAR 
 static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isStock, const ClaudePackage *pkg)
 {
     WCHAR key[MAX_PATH], localAppData[MAX_PATH], badge[BADGE_CCH];
-    DWORD color, picture;
+    DWORD color, picture, sync;
     ZeroMemory(p, sizeof *p);
     StringCchCopyW(p->folder, ARRAYSIZE(p->folder), folder);
     if (FAILED(StringCchPrintfW(p->dataDir, ARRAYSIZE(p->dataDir), L"%s\\%s", appData, folder))) p->dataDir[0] = 0;
@@ -75,6 +76,17 @@ static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isS
     p->color = (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_COLOR, &color) && color < PALETTE_SIZE) ? (int)color : -1;
     if (Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_BADGE, badge, ARRAYSIZE(badge))) Core_CleanBadge(badge, p->badge, ARRAYSIZE(p->badge));
     if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_PICTURE, &picture)) p->picture = picture;
+    p->syncSessions = Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, &sync) && sync == 1;
+}
+
+BOOL Profiles_SetSyncSessions(const WCHAR *folder, BOOL on)
+{
+    WCHAR key[MAX_PATH];
+    LSTATUS status;
+    ProfileKey(folder, key, ARRAYSIZE(key));
+    if (on) return Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, 1);
+    status = Util_RegDeleteValue(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS);
+    return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
 }
 
 /* The profile's name, color, badge text and picture stamp. */

@@ -363,6 +363,63 @@ static void BackupCaptions(HWND dialog, const WCHAR *name)
     SetDlgItemTextW(dialog, IDOK, TR(L"Restore"));
 }
 
+/* The recover dialog as syncui.c fills it: its text, the profile, versions in one column. */
+static void RestoreCaptions(HWND dialog, const WCHAR *name, BOOL fill)
+{
+    HWND list = GetDlgItem(dialog, IDC_R_LIST);
+    WCHAR text[256];
+    LVCOLUMNW column;
+    LVITEMW item;
+    int i;
+    SetDlgItemTextW(dialog, IDC_R_TEXT, TR(L"The sessions this version lists come back in the profile, as they were then. "
+                                           L"Sessions deleted in Claude stay deleted."));
+    if (!fill) return;
+    SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_ADDSTRING, 0, (LPARAM)name);
+    SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_SETCURSEL, 0, 0);
+    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    ZeroMemory(&column, sizeof column);
+    ListView_InsertColumn(list, 0, &column);
+    for (i = 0; i < 3; i++) {
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s \x00B7 sessions: %d"), L"2026-10-08  08:30:12", 56 + i);
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT;
+        item.iItem = i;
+        item.pszText = text;
+        ListView_InsertItem(list, &item);
+    }
+    ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    Theme_SmoothView(list);
+}
+
+/* The clean-up dialog as syncui.c fills it: its text, conversations checked or not. */
+static void PurgeCaptions(HWND dialog, BOOL fill)
+{
+    HWND list = GetDlgItem(dialog, IDC_C_LIST);
+    WCHAR text[256];
+    LVCOLUMNW column;
+    LVITEMW item;
+    int i;
+    SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"These conversations are on this PC, but no profile lists them, so a restore could bring them back. "
+                                           L"Deleting them makes sure nothing does.\nChecked: deleted in Claude. Unchecked: in no list, "
+                                           L"made in a terminal for example."));
+    if (!fill) return;
+    CheckDlgButton(dialog, IDC_C_BACKUP, BST_CHECKED);
+    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    ZeroMemory(&column, sizeof column);
+    ListView_InsertColumn(list, 0, &column);
+    for (i = 0; i < 3; i++) {
+        StringCchPrintfW(text, ARRAYSIZE(text), L"%s  \x00B7  Private conversation  \x00B7  2026-10-08  08:30  \x00B7  1.3 MB",
+                         i ? TR(L"In no list") : TR(L"Deleted in Claude"));
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT;
+        item.iItem = i;
+        item.pszText = text;
+        ListView_InsertItem(list, &item);
+        ListView_SetCheckState(list, i, i == 0);
+    }
+    Theme_SmoothView(list);
+}
+
 /* What the sessions dialog says when it overwrites, its longest form. */
 static void SyncCaptions(HWND dialog)
 {
@@ -463,6 +520,12 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         BackupCaptions(dialog, name);
         PopulateBackupParts(dialog);
         break;
+    case IDD_RESTORE:
+        RestoreCaptions(dialog, name, TRUE);
+        break;
+    case IDD_PURGE:
+        PurgeCaptions(dialog, TRUE);
+        break;
     }
 }
 
@@ -500,6 +563,10 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         LinkCaptions(dialog, L"Private profile");
     } else if (fixture->resource == IDD_BACKUP) {
         BackupCaptions(dialog, L"Private profile");
+    } else if (fixture->resource == IDD_RESTORE) {
+        RestoreCaptions(dialog, L"Private profile", FALSE);
+    } else if (fixture->resource == IDD_PURGE) {
+        PurgeCaptions(dialog, FALSE);
     }
 }
 
@@ -530,8 +597,8 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT,
-                                            IDC_NOTE, IDC_SC_GROUP, IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
+    static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_RESTORE,
+                                            IDC_PURGE, IDC_BACKUP_CODE, IDC_DEFAULT, IDC_NOTE, IDC_SC_GROUP, IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
     static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
     size_t i;
     for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
@@ -927,12 +994,12 @@ static void CheckNoteGeometry(HWND dialog, const LayoutFixture *fixture)
 {
     HWND note = GetDlgItem(dialog, IDC_NOTE);
     RECT client, table = RelativeRect(dialog, fixture->tableViewport), placed = RelativeRect(dialog, note);
-    RECT setDefault = RelativeRect(dialog, GetDlgItem(dialog, IDC_DEFAULT)), overwrite = RelativeRect(dialog, GetDlgItem(dialog, IDC_OVERWRITE));
+    RECT setDefault = RelativeRect(dialog, GetDlgItem(dialog, IDC_DEFAULT)), overwrite = RelativeRect(dialog, GetDlgItem(dialog, IDC_BACKUP_CODE));
     GetClientRect(dialog, &client);
     Check(fixture, note, "note stays beside the table and inside the dialog",
           placed.left >= table.right && placed.top >= 0 && placed.right <= client.right && placed.bottom <= client.bottom);
     Check(fixture, note, "note fits the table's vertical band", placed.bottom <= table.bottom);
-    Check(fixture, GetDlgItem(dialog, IDC_DEFAULT), "default button fits between Overwrite sessions and the complete note",
+    Check(fixture, GetDlgItem(dialog, IDC_DEFAULT), "default button fits between the sessions' last action and the complete note",
           setDefault.top >= overwrite.bottom && setDefault.bottom <= placed.top);
 }
 
@@ -1447,7 +1514,8 @@ static void CheckReopenedModal(HWND owner, LayoutFixture *fixture, const LayoutS
  * fonts, size and controls come back exactly. */
 static void CheckLanguageRoundTrips(void)
 {
-    static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP };
+    static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
+                                      IDD_RESTORE, IDD_PURGE };
     static const WCHAR *const kVisited[] = { L"zh-CN", L"hi", L"bn", L"ar", L"de" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"fr");
@@ -1524,7 +1592,7 @@ static BOOL NativeScaleFits(const char *what)
 
 /* A dialog's rows hidden before it is fitted. */
 typedef struct HiddenRowsCase {
-    int resource, rowAbove, lastHidden;   /* the hidden band: below rowAbove's bottom, down to lastHidden's */
+    int resource, rowAbove;   /* the hidden band: below rowAbove's bottom, down to the lowest hidden control's */
     int hidden[3], hiddenCount;
     const char *name;
 } HiddenRowsCase;
@@ -1537,12 +1605,13 @@ typedef struct HiddenRowsCase {
 static void CheckHiddenRows(void)
 {
     static const HiddenRowsCase kCases[] = {
-        { IDD_PROFILE, IDC_P_STARTUP, IDC_P_OPEN, { IDC_P_COPY, IDC_P_OPEN, 0 }, 2, "the profile dialog without its last check boxes" },
-        { IDD_PROFILE, IDC_P_STARTUP, IDC_P_COPY, { IDC_P_COPY, 0, 0 }, 1, "the profile dialog without Copy settings" },
-        { IDD_PROFILE, IDC_P_COPY, IDC_P_OPEN, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
-        { IDD_UNINSTALL, IDC_U_KEEP, IDC_U_HINT, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
-        { IDD_SYNC, IDC_Y_TEXT, IDC_Y_FROM, { IDC_Y_FROM_LABEL, IDC_Y_FROM, 0 }, 2, "the sessions dialog without its source" },
-        { IDD_SYNC, IDC_Y_LIST, IDC_Y_EXACT, { IDC_Y_EXACT, 0, 0 }, 1, "the sessions dialog without its removal choice" },
+        { IDD_PROFILE, IDC_P_STARTUP, { IDC_P_COPY, IDC_P_OPEN, 0 }, 2, "the profile dialog without its last check boxes" },
+        { IDD_PROFILE, IDC_P_STARTUP, { IDC_P_COPY, 0, 0 }, 1, "the profile dialog without Copy settings" },
+        { IDD_PROFILE, IDC_P_COPY, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
+        { IDD_UNINSTALL, IDC_U_KEEP, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
+        /* The label is centered on the drop-down list: at some scales it ends below it. */
+        { IDD_SYNC, IDC_Y_TEXT, { IDC_Y_FROM_LABEL, IDC_Y_FROM, 0 }, 2, "the sessions dialog without its source" },
+        { IDD_SYNC, IDC_Y_LIST, { IDC_Y_EXACT, 0, 0 }, 1, "the sessions dialog without its removal choice" },
     };
     size_t i, scale;
     for (i = 0; i < ARRAYSIZE(kCases); i++) for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) {
@@ -1562,12 +1631,14 @@ static void CheckHiddenRows(void)
         Check(&closed, NULL, "hidden rows fixtures created", wholeDialog && closedDialog);
         if (wholeDialog && closedDialog) {
             RECT aboveWhole = RelativeRect(wholeDialog, GetDlgItem(wholeDialog, kCases[i].rowAbove));
-            RECT lastWhole = RelativeRect(wholeDialog, GetDlgItem(wholeDialog, kCases[i].lastHidden));
             RECT clientWhole, clientClosed, clientAgain;
             LayoutState before, after;
             HWND child, twin;
-            int band = lastWhole.bottom - aboveWhole.bottom, moved = 0, kept = 0, childIndex;
+            int lowest = aboveWhole.bottom, band, moved = 0, kept = 0, childIndex;
             BOOL rowsFollow = TRUE, same = TRUE;
+            for (childIndex = 0; childIndex < kCases[i].hiddenCount; childIndex++)
+                lowest = max(lowest, RelativeRect(wholeDialog, GetDlgItem(wholeDialog, kCases[i].hidden[childIndex])).bottom);
+            band = lowest - aboveWhole.bottom;
             GetClientRect(wholeDialog, &clientWhole);
             GetClientRect(closedDialog, &clientClosed);
             /* The same template: the same controls, in the same order (labels share an id). */
@@ -1577,7 +1648,7 @@ static void CheckHiddenRows(void)
                 if (!(GetWindowLongW(child, GWL_STYLE) & WS_VISIBLE)) continue;
                 closedRect = RelativeRect(closedDialog, child);
                 wholeRect = RelativeRect(wholeDialog, twin);
-                if (wholeRect.top >= lastWhole.bottom) {
+                if (wholeRect.top >= lowest) {
                     moved++;
                     if (closedRect.top != wholeRect.top - band) rowsFollow = FALSE;
                 } else {
@@ -1607,7 +1678,7 @@ static void CheckHiddenRows(void)
 /* The dialogs other than the manager window, in every language and scale. */
 static void CheckDialogs(void)
 {
-    static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP };
+    static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)
@@ -1946,7 +2017,8 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
  * is on screen meanwhile: messages are handled between steps (PumpMessages). */
 static void CheckMainFrameMessages(void)
 {
-    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT };
+    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_RESTORE, IDC_PURGE,
+                                    IDC_BACKUP_CODE, IDC_DEFAULT };
     LayoutFixture fixture = MainFixture(Language(L"fr"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];

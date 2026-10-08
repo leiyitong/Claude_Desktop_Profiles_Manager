@@ -454,25 +454,59 @@ static BOOL DeleteTreeNow(const WCHAR *dir, int *error)
     return *error == 0 && !operation.fAnyOperationsAborted;
 }
 
+/* The state folder without its session vault (sessionvault.c): Main, which
+ * the uninstall never touches, and the profiles kept go on with it, and a
+ * new install finds it. FALSE when something else is left. */
+static BOOL DeleteStateNow(const WCHAR *stateDir, BOOL *vaultKept, int *error)
+{
+    WCHAR path[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    BOOL ok = TRUE;
+    *vaultKept = FALSE;
+    *error = 0;
+    if (!Util_DirExists(stateDir)) return TRUE;
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\vault", stateDir)) || !Util_DirExists(path)) return DeleteTreeNow(stateDir, error);
+    *vaultKept = TRUE;
+    if ((find = Util_FindFiles(stateDir, L"*", &found, FALSE)) == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        int itemError = 0;
+        if (wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0 || Core_EqualsI(found.cFileName, L"vault") ||
+            FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", stateDir, found.cFileName)))
+            continue;
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!DeleteTreeNow(path, &itemError)) {
+                ok = FALSE;
+                *error = itemError;
+            }
+        } else if (!DeleteFileW(path)) {
+            ok = FALSE;
+            *error = (int)GetLastError();
+        }
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    return ok;
+}
+
 /* Right before exiting, once no window of ours is left: what the uninstall
  * could not remove while they showed. The manager's shortcut gives them their
  * taskbar icon (Shortcut_RemoveManagerLink). The state folder goes after the
  * last line logged, which would make it again: only a failure logged after
  * that makes it again, to say what was left. What is still in use (this exe
  * and its folder, an icon Explorer holds, a download that ended meanwhile)
- * goes once this process has exited. */
+ * goes once this process has exited; the session vault stays. */
 void Install_FinishUninstall(void)
 {
     WCHAR installDir[MAX_PATH], stateDir[MAX_PATH], download[MAX_PATH], removals[REMOVALS_CCH] = L"";
-    BOOL hasState;
+    BOOL hasState, vaultKept = FALSE;
     int error;
     Shortcut_RemoveManagerLink();
     hasState = Util_StateDir(stateDir, ARRAYSIZE(stateDir));
-    if (hasState && !DeleteTreeNow(stateDir, &error)) Util_Log(L"could not remove %s (error %d)", stateDir, error);
+    if (hasState && !DeleteStateNow(stateDir, &vaultKept, &error)) Util_Log(L"could not remove %s (error %d)", stateDir, error);
     if (!Install_IsInstalledCopy() || !Util_InstallDir(installDir, ARRAYSIZE(installDir)) ||
         !AppendRemoval(removals, ARRAYSIZE(removals), L"rd /s /q", installDir))
         return;
-    if (hasState) AppendRemoval(removals, ARRAYSIZE(removals), L"rd /s /q", stateDir);
+    if (hasState && !vaultKept) AppendRemoval(removals, ARRAYSIZE(removals), L"rd /s /q", stateDir);
     if (Update_DownloadPath(download, ARRAYSIZE(download))) AppendRemoval(removals, ARRAYSIZE(removals), L"del /f /q", download);
     RemoveAfterExit(removals);
 }

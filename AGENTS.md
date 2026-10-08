@@ -72,7 +72,11 @@ Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project s
     and is made once it closes. One session opened in a profile reaches it
     through `claude://resume`, which makes the entry; only `sessionsync.c`
     writes new entries, as Claude writes them, after backing up what they
-    replace.
+    replace (`sessionvault.c` sends its changes through it).
+14. **No links for sharing sessions.** Claude refuses to write an entries
+    folder that is a junction or a symbolic link, so profiles keep the same
+    sessions through `sessionvault.c` (entries copied, deletions marked),
+    never through a shared folder.
 
 ## Conventions
 

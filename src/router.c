@@ -192,18 +192,46 @@ static void ReportMissingClaude(void)
         Util_OpenUrl(APP_DOWNLOAD_URL);
 }
 
+/* A profile about to open whose sessions are kept the same as others': one of
+ * those still open gets the latest of them only once it closes, so opening
+ * it alone (no link) offers to quit it first. Then the lists are made the
+ * same (sessionvault.c), or the profile's own list kept. */
+static void KeepBeforeOpen(const ClaudePackage *pkg, const Profile *p, const WCHAR *url)
+{
+    ProfileList list;
+    WCHAR text[1024];
+    DWORD error = 0;
+    int index, i;
+    Profiles_Load(&list, pkg);
+    if ((index = Profiles_Find(&list, p->folder)) < 0) return;
+    for (i = 0; !url && list.items[index].syncSessions && i < list.count; i++) {
+        if (i == index || !list.items[i].syncSessions || !Claude_IsRunning(&list.items[i])) continue;
+        StringCchPrintfW(text, ARRAYSIZE(text),
+                         TR(L"\x201C%s\x201D is open: the sessions of \x201C%s\x201D are made the same as its own only once it closes.\n\nQuit it first?"),
+                         list.items[i].name, list.items[index].name);
+        if (!Ui_Ask(NULL, IDI_QUESTION, text, TR(L"Quit it"), TR(L"Open anyway"), FALSE)) break;
+        if (!Claude_Quit(&list.items[i], &error))
+            Ui_Message(NULL, MB_ICONWARNING, TR(L"Claude for \x201C%s\x201D could not be closed (error %lu)."), list.items[i].name, error);
+    }
+    SessionVault_BeforeOpen(&list, index);
+}
+
 /* Opens a profile, with a claude:// link or without, and watches it. Whether
  * its Claude runs is looked at again: the caller's profile can be older, and
  * one quit a moment ago must start with a watcher of its own. A profile about
- * to start first gets the session changes waiting for it (sessionedit.c): its
- * Claude reads its sessions as it starts. */
+ * to start first gets the session changes waiting for it (sessionedit.c) and
+ * its list of sessions (KeepBeforeOpen): its Claude reads its sessions as it
+ * starts. */
 HRESULT Launcher_Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *url, DWORD *pid, BOOL *identity)
 {
     Profile watched = *p;
     DWORD launched = 0;
     HRESULT hr;
     Claude_RefreshRunning(&watched);
-    if (!watched.running) SessionEdit_ApplyPending(NULL, p);
+    if (!watched.running) {
+        SessionEdit_ApplyPending(NULL, p);
+        KeepBeforeOpen(pkg, p, url);
+    }
     hr = Claude_Launch(pkg, p, url, &launched, identity);
     if (pid) *pid = launched;
     if (SUCCEEDED(hr)) {

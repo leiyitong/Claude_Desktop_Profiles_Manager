@@ -1286,6 +1286,40 @@ BOOL SessionEdit_ListConversation(const SessionSet *set, int row, WCHAR (**paths
     return ok;
 }
 
+/* What Claude Code keeps for transcripts `ids` that no session lists any
+ * more, as SessionEdit_ListFiles lists it for a session's own: in its stores,
+ * its temporary folder and each project folder; never a working folder. */
+BOOL SessionEdit_ListTranscriptFiles(const WCHAR *const *ids, int idCount, WCHAR (**paths)[LONG_PATH_CCH], int *count, WCHAR *error,
+                                     size_t errorCch)
+{
+    WCHAR failed[LONG_PATH_CCH];
+    DWORD code = ERROR_INVALID_PARAMETER;
+    int capacity = 0, i;
+    BOOL ok = idCount > 0;
+    *paths = NULL;
+    *count = 0;
+    error[0] = 0;
+    failed[0] = 0;
+    for (i = 0; i < idCount && ok; i++) ok = Core_IsUuid(ids[i]);
+    ok = ok && AddStoreItems(paths, count, &capacity, ids, idCount, FALSE, failed, &code) &&
+         AddTemporaryFolders(paths, count, &capacity, ids, idCount, failed, &code) &&
+         AddProjectItems(paths, count, &capacity, ids, idCount, FALSE, failed, &code);
+    if (!ok) {
+        if (*paths) HeapFree(GetProcessHeap(), 0, *paths);
+        *paths = NULL;
+        *count = 0;
+        StringCchPrintfW(error, errorCch, TR(L"Its files could not all be listed (error %lu): %s"), code, failed);
+        Util_Log(L"conversation files could not all be listed (error %lu): %s", code, failed);
+    }
+    return ok;
+}
+
+/* Claude Code's temporary folder, where it keeps a folder per session. */
+BOOL SessionEdit_TemporaryDir(WCHAR *out, size_t cch)
+{
+    return ClaudeCodeTempDir(out, cch);
+}
+
 /* No Claude would write the session back once it is deleted: no profile
  * that lists it runs, and no Claude Code runs it (one a profile started
  * without listing it yet, or one in a terminal). FALSE with the reason in

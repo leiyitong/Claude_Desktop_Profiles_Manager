@@ -342,6 +342,8 @@ static int FixtureFileOperation(LPSHFILEOPSTRUCTW operation)
 #define SessionEdit_DeleteEverywhere     TestedSessionEdit_DeleteEverywhere
 #define SessionEdit_ListConversation     TestedSessionEdit_ListConversation
 #define SessionEdit_CopiedCwd            TestedSessionEdit_CopiedCwd
+#define SessionEdit_ListTranscriptFiles  TestedSessionEdit_ListTranscriptFiles
+#define SessionEdit_TemporaryDir         TestedSessionEdit_TemporaryDir
 #define SessionEdit_Lock                 TestedSessionEdit_Lock
 #define SessionEdit_Unlock               TestedSessionEdit_Unlock
 #define Util_Recycle                     FixtureRecycle
@@ -2457,6 +2459,201 @@ static void TestSessionSync(const WCHAR *projects)
     if (after) HeapFree(GetProcessHeap(), 0, after);
 }
 
+/* ------------------------------------------------- sessionvault.c, sessionpurge.c */
+
+static const WCHAR *const g_vaultIds[6] = {
+    L"abababab-0000-4000-8000-000000000001", L"abababab-0000-4000-8000-000000000002", L"abababab-0000-4000-8000-000000000003",
+    L"abababab-0000-4000-8000-000000000004", L"abababab-0000-4000-8000-000000000005", L"abababab-0000-4000-8000-000000000006"
+};
+
+/* An entry of session `id` named `title`, starred or not, last used at `activity`. */
+static BOOL WriteVaultEntry(const WCHAR *entries, const WCHAR *id, const char *title, int activity, BOOL starred)
+{
+    WCHAR file[MAX_PATH];
+    char json[512];
+    return SUCCEEDED(StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"cwd\":\"C:\\\\Fixture\","
+                                                         "\"title\":\"%s\",\"isStarred\":%s,\"lastActivityAt\":%d}",
+                                      id, id, title, starred ? "true" : "false", activity)) &&
+           EntryPath(entries, id, file, ARRAYSIZE(file)) && Save(file, json);
+}
+
+static BOOL KeepGroup(const ProfileList *profiles, DWORD members, SyncReport *report)
+{
+    ZeroMemory(report, sizeof *report);
+    return SessionVault_Keep(profiles, members, VAULT_GROUP_LIST, TRUE, report) && report->failed == 0;
+}
+
+static BOOL RemoveEntry(const WCHAR *entries, const WCHAR *id)
+{
+    WCHAR path[MAX_PATH];
+    return EntryPath(entries, id, path, ARRAYSIZE(path)) && DeleteFileW(path);
+}
+
+/* A folder made anew, as when Claude is reinstalled: another creation time. */
+static BOOL SetCreated(const WCHAR *dir, ULONGLONG ticks)
+{
+    FILETIME created;
+    HANDLE handle = CreateFileW(dir, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    BOOL ok;
+    if (handle == INVALID_HANDLE_VALUE) return FALSE;
+    created.dwLowDateTime = (DWORD)ticks;
+    created.dwHighDateTime = (DWORD)(ticks >> 32);
+    ok = SetFileTime(handle, &created, NULL, NULL);
+    CloseHandle(handle);
+    return ok;
+}
+
+static const PurgeItem *FindPurged(const PurgeItem *items, int count, const WCHAR *id)
+{
+    int i;
+    for (i = 0; i < count; i++)
+        if (Core_EqualsI(items[i].id, id)) return &items[i];
+    return NULL;
+}
+
+/* Two profiles keeping the same sessions, and a third one outside: changes
+ * made in either, a deletion with Claude's mark or without, a list lost and
+ * given back, a profile running meanwhile; a version restored; the
+ * conversations no list names; Claude Code's folder copied. */
+static void TestVault(const WCHAR *projects)
+{
+    static const WCHAR *const labels[3] = { L"Vault-A", L"Vault-B", L"Vault-C" };
+    static const WCHAR *const leaves[3] = { L"vault\\A", L"vault\\B", L"vault\\C" };
+    static const WCHAR *const accounts[3] = { L"vault-a", L"vault-b", L"vault-c" };
+    ProfileList profiles;
+    SyncReport report;
+    VaultVersion versions[16];
+    VaultIds listed, deleted;
+    PurgeItem *items = NULL;
+    const PurgeItem *gone, *unknown;
+    WCHAR entries[3][MAX_PATH], path[MAX_PATH], error[LONG_PATH_CCH], transcripts[4][MAX_PATH], code[MAX_PATH], copy[MAX_PATH];
+    WCHAR (*paths)[LONG_PATH_CCH] = NULL;
+    const WCHAR *ids[1];
+    DWORD copyError = 0;
+    HWND window;
+    int p, count, pathCount = 0;
+    BOOL ready = TRUE;
+
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 3;
+    for (p = 0; p < profiles.count && ready; p++)
+        ready = PrepareProfile(&profiles.items[p], labels[p], leaves[p], accounts[p], L"vault-organization", entries[p], ARRAYSIZE(entries[p]));
+    profiles.items[0].syncSessions = profiles.items[1].syncSessions = TRUE;
+    ready = ready && WriteVaultEntry(entries[0], g_vaultIds[0], "A one", 100, FALSE) && WriteVaultEntry(entries[1], g_vaultIds[1], "B two", 200, FALSE);
+    Check("vault fixtures created", ready);
+    if (!ready) return;
+
+    /* The first sync: each one gets the other's. */
+    Check("the group is the profiles that keep the same sessions", SessionVault_Group(&profiles) == 0x3);
+    Check("a first sync of the group succeeds", KeepGroup(&profiles, 0x3, &report));
+    Check("a first sync gives each one the other's sessions", report.added == 2 && EntryTitled(entries[1], g_vaultIds[0], L"A one") &&
+          EntryTitled(entries[0], g_vaultIds[1], L"B two"));
+    Check("a profile outside the group is left alone", !EntryThere(entries[2], g_vaultIds[0]) && !EntryThere(entries[2], g_vaultIds[1]));
+    Check("a version of the group's list is kept",
+          SessionVault_Versions(VAULT_GROUP_LIST, versions, ARRAYSIZE(versions)) == 1 && versions[0].sessions == 2 && versions[0].time > 0);
+    Check("syncing again changes nothing and keeps no other version",
+          KeepGroup(&profiles, 0x3, &report) && report.added + report.updated + report.removed == 0 &&
+          SessionVault_Versions(VAULT_GROUP_LIST, versions, ARRAYSIZE(versions)) == 1);
+
+    /* A rename in one, a star in the other, no message sent: both go across. */
+    Sleep(20);
+    ready = WriteVaultEntry(entries[0], g_vaultIds[0], "A one renamed", 100, FALSE) && WriteVaultEntry(entries[1], g_vaultIds[1], "B two", 200, TRUE);
+    Check("a rename and a star made in two profiles", ready);
+    Check("they are made the same", KeepGroup(&profiles, 0x3, &report) && report.updated == 2);
+    Check("the rename went across", EntryTitled(entries[1], g_vaultIds[0], L"A one renamed"));
+    Check("the star went across", EntryPath(entries[0], g_vaultIds[1], path, ARRAYSIZE(path)) && ReadTrue(path, "isStarred"));
+    Check("what a sync replaces is kept in the backup", BackedUp(&report, &profiles.items[1], g_vaultIds[0], path, ARRAYSIZE(path)) &&
+          TitledAs(path, L"A one"));
+
+    /* Deleted in one profile, Claude's mark beside: it goes from the other, and the vault knows it deleted. */
+    ready = RemoveEntry(entries[0], g_vaultIds[1]) && MarkPath(entries[0], g_vaultIds[1], path, ARRAYSIZE(path)) && Save(path, "777");
+    Check("a session deleted in one profile", ready);
+    Check("the deletion is made the same", KeepGroup(&profiles, 0x3, &report) && report.removed == 1 && !EntryThere(entries[1], g_vaultIds[1]));
+    SessionVault_Ids(&listed, &deleted);
+    Check("the vault names the deleted session deleted, the others listed",
+          SessionVault_HasId(&deleted, g_vaultIds[1]) && !SessionVault_HasId(&listed, g_vaultIds[1]) && SessionVault_HasId(&listed, g_vaultIds[0]));
+    SessionVault_FreeIds(&listed);
+    SessionVault_FreeIds(&deleted);
+
+    /* Taken away by Claude without a mark: it goes from the other too. */
+    ready = WriteVaultEntry(entries[1], g_vaultIds[2], "B three", 300, FALSE) && KeepGroup(&profiles, 0x3, &report) &&
+            EntryThere(entries[0], g_vaultIds[2]) && RemoveEntry(entries[1], g_vaultIds[2]);
+    Check("a new session went across, then Claude took it away in one profile", ready);
+    Check("a session taken away goes from the others", KeepGroup(&profiles, 0x3, &report) && report.removed == 1 && !EntryThere(entries[0], g_vaultIds[2]));
+
+    /* A profile whose whole list is lost (a new entries folder: Claude reinstalled) gets it back; nothing goes elsewhere. */
+    ready = WriteVaultEntry(entries[0], g_vaultIds[3], "A four", 400, FALSE) && KeepGroup(&profiles, 0x3, &report) &&
+            EntryThere(entries[1], g_vaultIds[3]) && RemoveEntry(entries[1], g_vaultIds[0]) && RemoveEntry(entries[1], g_vaultIds[3]) &&
+            SetCreated(entries[1], 133000000000000000ULL);
+    Check("a profile loses its list", ready);
+    Check("its list comes back", KeepGroup(&profiles, 0x3, &report) && report.added == 2 && report.removed == 0 &&
+          EntryTitled(entries[1], g_vaultIds[0], L"A one renamed") && EntryThere(entries[1], g_vaultIds[3]));
+    Check("the other one keeps its sessions", EntryThere(entries[0], g_vaultIds[0]) && EntryThere(entries[0], g_vaultIds[3]));
+
+    /* A running profile gets its part once it closes. */
+    Sleep(20);
+    ready = WriteVaultEntry(entries[0], g_vaultIds[0], "A one again", 500, FALSE);
+    window = ready ? StartFakeClaude(&profiles.items[1]) : NULL;
+    Check("a change made while the other profile runs", window != NULL);
+    if (window) {
+        Check("the change waits for the running profile", KeepGroup(&profiles, 0x3, &report) && (report.waiting & 0x2) &&
+              EntryTitled(entries[1], g_vaultIds[0], L"A one renamed"));
+        StopFakeClaude(window);
+        Check("it is made once that profile closed",
+              SessionEdit_ApplyPending(NULL, &profiles.items[1]) > 0 && EntryTitled(entries[1], g_vaultIds[0], L"A one again"));
+        Check("then nothing is left to change", KeepGroup(&profiles, 0x3, &report) && report.added + report.updated + report.removed == 0);
+    }
+
+    /* A profile outside the group gets the group's latest list: the deleted sessions only as Claude's marks. */
+    count = SessionVault_Versions(VAULT_GROUP_LIST, versions, ARRAYSIZE(versions));
+    Check("every change kept a version, the newest first", count >= 6 && versions[0].time >= versions[count - 1].time &&
+          wcscmp(versions[0].name, versions[count - 1].name) > 0);
+    ZeroMemory(&report, sizeof report);
+    Check("a version is restored to another profile",
+          count > 0 && SessionVault_Restore(&profiles, 2, VAULT_GROUP_LIST, versions[0].name, &report) && report.failed == 0);
+    Check("it lists the version's sessions", EntryTitled(entries[2], g_vaultIds[0], L"A one again") && EntryThere(entries[2], g_vaultIds[3]));
+    Check("a deleted session is not restored, Claude's mark is written for it",
+          !EntryThere(entries[2], g_vaultIds[1]) && MarkPath(entries[2], g_vaultIds[1], path, ARRAYSIZE(path)) && FileThere(path));
+    Check("a profile alone keeps a list of its own", SessionVault_Keep(&profiles, 0x4, profiles.items[2].folder, FALSE, &report) &&
+          SessionVault_Versions(profiles.items[2].folder, versions, ARRAYSIZE(versions)) == 1 && versions[0].sessions == 2);
+
+    /* The conversations no list names: a deleted one (any age), an old unknown one; a new unknown one is left. */
+    ready = TRUE;
+    for (p = 0; p < 4 && ready; p++)
+        ready = SUCCEEDED(StringCchPrintfW(transcripts[p], ARRAYSIZE(transcripts[p]), L"%s\\fixture\\%s.jsonl", projects,
+                                           g_vaultIds[p == 0 ? 1 : p == 1 ? 4 : p == 2 ? 5 : 0]));
+    ready = ready && Save(transcripts[0], "{\"type\":\"user\",\"cwd\":\"C:\\\\Gone\"}\n{\"type\":\"custom-title\",\"customTitle\":\"Gone one\"}\n") &&
+            Save(transcripts[1], "{\"type\":\"user\",\"cwd\":\"C:\\\\Old\"}\n{\"type\":\"last-prompt\",\"lastPrompt\":\"Old prompt\"}\n") &&
+            SetModified(transcripts[1], 132000000000000000ULL) && Save(transcripts[2], "{\"type\":\"user\"}\n") &&
+            Save(transcripts[3], "{\"type\":\"user\"}\n") && SetModified(transcripts[3], 132000000000000000ULL);
+    Check("conversation fixtures created", ready);
+    count = ready ? SessionPurge_List(&profiles, &items, error, ARRAYSIZE(error)) : -1;
+    gone = count > 0 ? FindPurged(items, count, g_vaultIds[1]) : NULL;
+    unknown = count > 0 ? FindPurged(items, count, g_vaultIds[4]) : NULL;
+    Check("the conversations no list names are found", count >= 2);
+    Check("a session deleted in Claude is offered as deleted, with its title",
+          gone && gone->kind == PURGE_DELETED && wcscmp(gone->title, L"Gone one") == 0 && Core_PathEquals(gone->project, L"C:\\Gone"));
+    Check("an old conversation no list ever had is offered as unknown, with its last prompt",
+          unknown && unknown->kind == PURGE_UNKNOWN && wcscmp(unknown->title, L"Old prompt") == 0);
+    Check("a new conversation no list knows is left alone", count > 0 && !FindPurged(items, count, g_vaultIds[5]));
+    Check("a listed session's conversation is never offered", count > 0 && !FindPurged(items, count, g_vaultIds[0]));
+    if (items) HeapFree(GetProcessHeap(), 0, items);
+    ids[0] = g_vaultIds[1];
+    Check("what goes of a conversation is listed, its transcript first",
+          TestedSessionEdit_ListTranscriptFiles(ids, 1, &paths, &pathCount, error, ARRAYSIZE(error)) && pathCount >= 1 &&
+          Listed(paths, pathCount, transcripts[0]));
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    Check("a conversation cleaned up joins the deleted ones", SessionVault_AddDeleted(&ids[0], 1));
+
+    /* Claude Code's folder copied beside it, as <name>_<date>. */
+    ready = SessionPurge_CodeFolder(code, ARRAYSIZE(code)) && SessionPurge_BackupName(copy, ARRAYSIZE(copy)) && InFixture(copy);
+    Check("the copy of Claude Code's folder is named after it and today", ready && wcsncmp(copy, code, wcslen(code)) == 0 && copy[wcslen(code)] == L'_');
+    Check("the folder is copied whole", ready && SessionPurge_BackUp(NULL, copy, &copyError) == COPY_MADE &&
+          SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\projects\\fixture\\%s.jsonl", copy, g_vaultIds[1])) && FileThere(path));
+    Check("the next copy that day gets another name", SessionPurge_BackupName(path, ARRAYSIZE(path)) && !Core_PathEquals(path, copy));
+}
+
 /* Environment variable `name` kept to be put back: `*kept` NULL when it is
  * not set. FALSE when it could not be kept. */
 static BOOL KeepVariable(const WCHAR *name, WCHAR **kept)
@@ -2523,6 +2720,7 @@ int wmain(int argc, WCHAR **argv)
             TestIndexedSessions();
             TestGroupAliases();
             TestSessionSync(projects);
+            TestVault(projects);
         }
         Check("nothing outside the fixture was given to the Recycle Bin", !g_recycle.escaped);
         StopStartedClaude();
