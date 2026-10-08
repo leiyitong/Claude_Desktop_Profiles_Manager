@@ -3403,6 +3403,8 @@ static void FixtureGuiRunning(ProfileList *profiles) { (void)profiles; }
 static void FixtureGuiSetProfiles(const ProfileList *profiles) { (void)profiles; }
 static void FixtureGuiReady(BOOL allowChanges) { (void)allowChanges; }
 static void FixtureGuiReload(void) { }
+/* The session lists the window keeps once it opens (sessionvault.c): not in these fixtures. */
+static void FixtureGuiKeepSessions(const ProfileList *list) { (void)list; }
 static UserChoiceState FixtureGuiChoice(void) { return USERCHOICE_OURS; }
 
 static void FixtureGuiProfiles(ProfileList *profiles, const ClaudePackage *package)
@@ -3469,6 +3471,7 @@ static INT_PTR FixtureUninstallDialog(HWND owner, int id, DLGPROC procedure, LPA
 #define SessionsView_SetProfiles FixtureGuiSetProfiles
 #define SessionsView_Ready FixtureGuiReady
 #define SessionsView_Reload FixtureGuiReload
+#define SessionVault_KeepAll FixtureGuiKeepSessions
 #define Handler_UserChoice FixtureGuiChoice
 #define Install_Uninstall FixtureGuiUninstall
 #define Gui_Run TestedGui_Run
@@ -3521,6 +3524,7 @@ static INT_PTR FixtureUninstallDialog(HWND owner, int id, DLGPROC procedure, LPA
 #undef SessionsView_SetProfiles
 #undef SessionsView_Ready
 #undef SessionsView_Reload
+#undef SessionVault_KeepAll
 #undef Handler_UserChoice
 #undef Install_Uninstall
 #undef Gui_Run
@@ -3710,6 +3714,27 @@ static BOOL FixtureRouteSignIn(const ClaudePackage *package, const Profile *prof
     return *ticks != 0;
 }
 
+/* The session lists made the same before a profile opens (sessionvault.c): not in these fixtures,
+ * whose profiles keep no sessions the same, so nothing asks to quit another first. */
+static void FixtureRouteKeepSessions(const ProfileList *list, int index)
+{
+    (void)list;
+    (void)index;
+}
+
+static BOOL FixtureRouteAsk(HWND owner, LPCWSTR icon, const WCHAR *text, const WCHAR *ok, const WCHAR *cancel, BOOL defaultCancel)
+{
+    (void)owner; (void)icon; (void)text; (void)ok; (void)cancel; (void)defaultCancel;
+    return FALSE;
+}
+
+static BOOL FixtureRouteQuit(const Profile *profile, DWORD *error)
+{
+    (void)profile;
+    *error = ERROR_ACCESS_DENIED;
+    return FALSE;
+}
+
 static int FixtureRoutePending(HWND owner, const Profile *profile)
 {
     (void)owner;
@@ -3803,6 +3828,9 @@ static INT_PTR FixtureRouteDialog(HWND owner, int id, DLGPROC proc, LPARAM param
 #define Claude_RefreshRunning FixtureRouteRunningNow
 #define Claude_Launch FixtureRouteLaunch
 #define SessionEdit_ApplyPending FixtureRoutePending
+#define SessionVault_BeforeOpen FixtureRouteKeepSessions
+#define Ui_Ask FixtureRouteAsk
+#define Claude_Quit FixtureRouteQuit
 #define Taskbar_Watch FixtureRouteWatch
 #define Taskbar_IsWatched FixtureRouteWatched
 #define Ui_Message FixtureRouteMessage
@@ -3822,6 +3850,9 @@ static INT_PTR FixtureRouteDialog(HWND owner, int id, DLGPROC proc, LPARAM param
 #undef Claude_RefreshRunning
 #undef Claude_Launch
 #undef SessionEdit_ApplyPending
+#undef SessionVault_BeforeOpen
+#undef Ui_Ask
+#undef Claude_Quit
 #undef Taskbar_Watch
 #undef Taskbar_IsWatched
 #undef Ui_Message
@@ -4489,6 +4520,7 @@ static RemoveResult FixtureRecycleLocation(HWND owner, const WCHAR *const *paths
 #define Profiles_LinkTarget TestedProfiles_LinkTarget
 #define Profiles_RecycleData TestedProfiles_RecycleData
 #define Profiles_Delete TestedProfiles_Delete
+#define Profiles_SetSyncSessions TestedProfiles_SetSyncSessions
 /* Profiles_Load calls it before its definition. */
 int TestedProfiles_Find(const ProfileList *list, const WCHAR *folder);
 #include "../src/profiles.c"

@@ -107,6 +107,7 @@ typedef struct Profile {
     WCHAR badge[BADGE_CCH];    /* the badge's own text; empty: the name's initial */
     DWORD picture;             /* the stamp of its own picture, which replaces the Claude icon; 0: none */
     BOOL  isStock;             /* the folder the regular Claude icon opens */
+    BOOL  syncSessions;        /* its sessions are kept the same as the other profiles' that have it (sessionvault.c) */
     BOOL  running;
     DWORD pid;                 /* main process when running */
 } Profile;
@@ -187,6 +188,22 @@ typedef enum RemoveResult { REMOVE_DONE, REMOVE_CANCELLED, REMOVE_FAILED } Remov
 
 typedef enum SessionEntryKind { ENTRY_NOT_SESSION, ENTRY_LOCAL, ENTRY_ELSEWHERE } SessionEntryKind;
 
+/* How one profile of a group keeping the same sessions has a session (sessionvault.c). */
+typedef enum MirrorState {
+    MIRROR_LISTED,    /* listed: `hash` its entry (without its own id), `time` when it was last written */
+    MIRROR_DELETED,   /* not listed: Claude marked it deleted there at `time` */
+    MIRROR_REMOVED,   /* not listed by a profile that had the group's list: Claude took it away */
+    MIRROR_MISSING    /* not listed by a profile that never had it, or that lost its whole list */
+} MirrorState;
+
+typedef struct MirrorSide {
+    MirrorState state;
+    ULONGLONG   hash, time;   /* time in ms since 1970 */
+} MirrorSide;
+
+#define CORE_MIRROR_DELETED (-1)
+#define CORE_MIRROR_NOWHERE (-2)
+
 #define CORE_PROJECT_NAME_MAX 200
 #define CORE_SCROLL_EASE_MS   35   /* a wheel notch is 95 % done after three of these */
 #define CORE_HASH_START       14695981039346656037ULL
@@ -254,6 +271,8 @@ BOOL         Core_JsonRemoveMember(const char *json, size_t len, const char *key
 BOOL         Core_SyncOpFormat(const SyncOp *op, WCHAR *out, size_t cch);
 BOOL         Core_SyncOpParse(const WCHAR *line, SyncOp *op);
 BOOL         Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added);
+int          Core_MirrorResolve(const MirrorSide *sides, int count, const MirrorSide *base);
+BOOL         Core_DatedCopyName(const WCHAR *name, const SYSTEMTIME *day, int copy, WCHAR *out, size_t cch);
 DWORD        Core_Crc32(DWORD crc, const void *data, size_t size);
 /* Deflate (RFC 1951), as ZIP's method 8: the whole input at once. Compressing
  * needs Core_DeflateBound(size) bytes at most; FALSE when `capacity` is short
@@ -348,6 +367,7 @@ BOOL         Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t
 /* The name, color, badge text (empty: the initial) and picture stamp (0: none). */
 BOOL         Profiles_Update(const WCHAR *folder, const WCHAR *label, int color, const WCHAR *badge, DWORD picture);
 BOOL         Profiles_SetDefault(const WCHAR *folder);
+BOOL         Profiles_SetSyncSessions(const WCHAR *folder, BOOL on);
 void         Profiles_CopySettings(const Profile *from, const Profile *to);
 RemoveResult Profiles_Delete(HWND owner, const Profile *profile);
 RemoveResult Profiles_RecycleData(HWND owner, const Profile *profile);
@@ -356,7 +376,8 @@ BOOL         Profiles_LinkTarget(const Profile *profile, WCHAR *out, size_t cch)
 
 /* --------------------------------------------------------- sessionlink.c */
 /* A profile's entries folder shared with another profile or kept in a
- * folder of the user's, through a directory junction. */
+ * folder of the user's, through a directory junction earlier versions made:
+ * read, and taken away. */
 typedef enum LinkKind { LINK_NOT_SIGNED_IN, LINK_NO_SESSIONS, LINK_OWN, LINK_PROFILE, LINK_FOLDER, LINK_BROKEN } LinkKind;
 typedef struct LinkState {
     LinkKind kind;
@@ -368,7 +389,6 @@ void SessionLink_Read(const ProfileList *list, int index, LinkState *state);
 /* Its Claude runs, or the Claude of a profile sharing its entries folder:
  * the entries are not written then (Claude writes its own back). */
 BOOL SessionLink_Busy(const Profile *p);
-BOOL SessionLink_Create(HWND owner, const ProfileList *list, int index, const WCHAR *target, WCHAR *error, size_t errorCch);
 BOOL SessionLink_Remove(const ProfileList *list, int index, WCHAR *error, size_t errorCch);
 
 /* ----------------------------------------------------------------- zip.c */
@@ -662,13 +682,27 @@ BOOL         SessionEdit_ListFiles(const SessionSet *set, int row, WCHAR (**path
                                    WCHAR *error, size_t errorCch);
 BOOL         SessionEdit_ListConversation(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count,
                                           WCHAR *error, size_t errorCch);
+BOOL         SessionEdit_ListTranscriptFiles(const WCHAR *const *ids, int idCount, WCHAR (**paths)[LONG_PATH_CCH], int *count,
+                                             WCHAR *error, size_t errorCch);
+BOOL         SessionEdit_TemporaryDir(WCHAR *out, size_t cch);
 BOOL         SessionEdit_CopiedCwd(const WCHAR *copyId, WCHAR *cwd, size_t cch);
 HANDLE       SessionEdit_Lock(const Profile *p);   /* the lock of a profile's entry changes; NULL when not taken */
 void         SessionEdit_Unlock(HANDLE lock);
 
 /* ---------------------------------------------------------- sessionsync.c */
 
+/* A change chosen elsewhere (sessionvault.c), for SessionSync_Send. */
+typedef struct SyncSend {
+    int         profile;   /* in the set */
+    SyncOp      op;        /* its kind, flags, key, time and seen; content is filled in */
+    const char *content;   /* put, index: what is written (the caller keeps it until the send returns) */
+    size_t      length;
+} SyncSend;
+
 DWORD        SessionSync_Takers(const SessionSet *set);   /* the profiles whose entries can take sessions */
+/* `changes` made as the other sends are: at once in a closed profile, else
+ * waiting for it to close; backed up first, each checked again then. */
+BOOL         SessionSync_Send(const SessionSet *set, const SyncSend *changes, int count, SyncReport *report);
 BOOL         SessionSync_Merge(const SessionSet *set, DWORD profiles, SyncReport *report);
 BOOL         SessionSync_Overwrite(const SessionSet *set, int source, DWORD targets, BOOL exact, SyncReport *report);
 BOOL         SessionSync_Share(const SessionSet *set, int from, const int *rows, int rowCount, DWORD targets, SyncReport *report);
@@ -682,6 +716,67 @@ BOOL         SessionSync_Export(const SessionSet *set, int profile, const int *r
 BOOL         SessionSync_IsArchive(const WCHAR *archive);   /* a session archive this version reads */
 BOOL         SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targets, int *sessions, SyncReport *report);
 
+/* --------------------------------------------------------- sessionvault.c */
+/* Every list of sessions kept out of Claude's reach, and the profiles whose
+ * sessions are kept the same (Profile.syncSessions): they share the list
+ * VAULT_GROUP_LIST, a profile alone keeps one named after its folder. */
+
+#define VAULT_GROUP_LIST L"group"
+#define VAULT_VERSIONS_SHOWN 200
+
+typedef struct VaultVersion {
+    WCHAR     name[40];          /* its file's name */
+    ULONGLONG time;              /* when it was kept, ms since 1970 */
+    int       sessions;          /* how many it lists */
+} VaultVersion;
+
+typedef struct VaultIds {        /* session ids, each once */
+    WCHAR (*ids)[SESSION_ID_CCH];
+    int    count, capacity;
+} VaultIds;
+
+DWORD SessionVault_Group(const ProfileList *list);   /* the profiles whose sessions are kept the same, one bit each */
+BOOL  SessionVault_ListName(const ProfileList *list, int index, WCHAR *out, size_t cch);
+/* `profiles`' list kept as `listName`; with `same`, each of them made to list
+ * the same sessions (changes made since the last version win, the latest
+ * first; a deletion goes everywhere; a profile that lost the list gets it). */
+BOOL  SessionVault_Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same, SyncReport *report);
+void  SessionVault_KeepAll(const ProfileList *list);   /* the group's, and every closed profile's alone */
+void  SessionVault_BeforeOpen(const ProfileList *list, int index);
+void  SessionVault_AfterClose(const WCHAR *folder);   /* the watcher's call each time its profile's Claude closed */
+int   SessionVault_Versions(const WCHAR *listName, VaultVersion *out, int capacity);   /* newest first */
+BOOL  SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version, SyncReport *report);
+/* The ids of the sessions some kept list names (their transcripts too), and
+ * of those deleted, which nothing brings back. */
+BOOL  SessionVault_Ids(VaultIds *listed, VaultIds *deleted);
+BOOL  SessionVault_HasId(const VaultIds *ids, const WCHAR *id);
+void  SessionVault_FreeIds(VaultIds *ids);
+BOOL  SessionVault_AddDeleted(const WCHAR *const *ids, int count);
+
+/* --------------------------------------------------------- sessionpurge.c */
+/* The conversations of sessions no profile lists any more, deleted for good
+ * from Claude Code's folder; and that folder copied whole. */
+
+typedef enum PurgeKind { PURGE_DELETED, PURGE_UNKNOWN } PurgeKind;
+
+typedef struct PurgeItem {
+    WCHAR     id[SESSION_ID_CCH];
+    WCHAR     path[LONG_PATH_CCH];     /* its transcript */
+    WCHAR     title[SESSION_TITLE_CCH];
+    WCHAR     project[MAX_PATH];       /* its working folder, as the transcript names it */
+    PurgeKind kind;                    /* deleted in Claude, or no list ever named it */
+    ULONGLONG bytes, written;          /* written: ms since 1970 */
+} PurgeItem;
+
+#define PURGE_RECENT_HOURS 24   /* an unknown conversation written since is left alone: it may be in use */
+
+int          SessionPurge_List(const ProfileList *profiles, PurgeItem **items, WCHAR *error, size_t errorCch);   /* HeapFree the array */
+RemoveResult SessionPurge_Delete(HWND owner, const ProfileList *profiles, const PurgeItem *items, const int *chosen, int count,
+                                 int *deleted, WCHAR *error, size_t errorCch);
+BOOL         SessionPurge_CodeFolder(WCHAR *out, size_t cch);
+BOOL         SessionPurge_BackupName(WCHAR *out, size_t cch);   /* the folder a copy of it made today goes to */
+CopyResult   SessionPurge_BackUp(HWND owner, const WCHAR *to, DWORD *error);
+
 /* ---------------------------------------------------------------- syncui.c */
 
 BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles);
@@ -690,6 +785,10 @@ BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *
 BOOL SyncUi_Export(HWND owner, const SessionSet *set, int profile, const int *rows, int rowCount);
 BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen);
 BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen);
+BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *selected);
+BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles);
+BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles);
+BOOL SyncUi_BackUpCode(HWND owner);
 
 /* ------------------------------------------------------------- sessions.c */
 

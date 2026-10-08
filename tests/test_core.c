@@ -998,6 +998,67 @@ static void TestSessionSync(void)
     Check("json remove: too small", !Core_JsonRemoveMember("{\"a\":1}", 7, "b", inPlace, 3, &length));
 }
 
+static MirrorSide Side(MirrorState state, ULONGLONG hash, ULONGLONG time)
+{
+    MirrorSide side;
+    side.state = state;
+    side.hash = hash;
+    side.time = time;
+    return side;
+}
+
+static void TestMirror(void)
+{
+    MirrorSide sides[3], base = Side(MIRROR_LISTED, 7, 0), gone = Side(MIRROR_DELETED, 0, 0);
+    WCHAR name[64];
+    SYSTEMTIME day;
+
+    sides[0] = Side(MIRROR_LISTED, 7, 10);
+    sides[1] = Side(MIRROR_LISTED, 7, 20);
+    Check("mirror: nothing changed, the profiles keep theirs", Core_MirrorResolve(sides, 2, &base) == 0);
+    sides[1] = Side(MIRROR_LISTED, 9, 20);
+    Check("mirror: the side changed since the last sync wins", Core_MirrorResolve(sides, 2, &base) == 1);
+    sides[0] = Side(MIRROR_LISTED, 8, 30);
+    Check("mirror: of two changed sides, the latest written wins", Core_MirrorResolve(sides, 2, &base) == 0);
+    sides[0] = Side(MIRROR_MISSING, 0, 0);
+    sides[1] = Side(MIRROR_MISSING, 0, 0);
+    Check("mirror: profiles that lost it get the base's back", Core_MirrorResolve(sides, 2, &base) == 2);
+    sides[1] = Side(MIRROR_LISTED, 7, 5);
+    Check("mirror: ... or a profile's copy of it, the same", Core_MirrorResolve(sides, 2, &base) == 1);
+    sides[0] = Side(MIRROR_DELETED, 0, 40);
+    Check("mirror: deleted in one profile, it goes everywhere", Core_MirrorResolve(sides, 2, &base) == CORE_MIRROR_DELETED);
+    sides[1] = Side(MIRROR_LISTED, 9, 50);
+    Check("mirror: a change made after the deletion keeps it", Core_MirrorResolve(sides, 2, &base) == 1);
+    sides[1] = Side(MIRROR_LISTED, 9, 30);
+    Check("mirror: a deletion after the change takes it away", Core_MirrorResolve(sides, 2, &base) == CORE_MIRROR_DELETED);
+    sides[0] = Side(MIRROR_REMOVED, 0, 0);
+    sides[1] = Side(MIRROR_LISTED, 7, 5);
+    Check("mirror: taken away by Claude in one profile, it goes everywhere", Core_MirrorResolve(sides, 2, &base) == CORE_MIRROR_DELETED);
+    sides[1] = Side(MIRROR_LISTED, 9, 1);
+    Check("mirror: ... unless another profile changed it", Core_MirrorResolve(sides, 2, &base) == 1);
+    sides[0] = Side(MIRROR_LISTED, 3, 10);
+    sides[1] = Side(MIRROR_MISSING, 0, 0);
+    Check("mirror: a new session goes to the others", Core_MirrorResolve(sides, 2, NULL) == 0);
+    sides[1] = Side(MIRROR_DELETED, 0, 20);
+    Check("mirror: a new session deleted later elsewhere goes", Core_MirrorResolve(sides, 2, NULL) == CORE_MIRROR_DELETED);
+    sides[0] = Side(MIRROR_MISSING, 0, 0);
+    sides[1] = Side(MIRROR_MISSING, 0, 0);
+    Check("mirror: nowhere at all", Core_MirrorResolve(sides, 2, NULL) == CORE_MIRROR_NOWHERE);
+    Check("mirror: deleted before, it stays deleted", Core_MirrorResolve(sides, 2, &gone) == CORE_MIRROR_DELETED);
+    sides[2] = Side(MIRROR_LISTED, 4, 1);
+    Check("mirror: deleted before, listed again since, it comes back", Core_MirrorResolve(sides, 3, &gone) == 2);
+
+    day.wYear = 2026;
+    day.wMonth = 10;
+    day.wDay = 7;
+    Check("dated copy: the first of the day", Core_DatedCopyName(L".claude", &day, 1, name, ARRAYSIZE(name)) &&
+          wcscmp(name, L".claude_20261007") == 0);
+    Check("dated copy: the next ones", Core_DatedCopyName(L".claude", &day, 3, name, ARRAYSIZE(name)) &&
+          wcscmp(name, L".claude_20261007_3") == 0);
+    Check("dated copy: no name, no copy", !Core_DatedCopyName(L"", &day, 1, name, ARRAYSIZE(name)) &&
+          !Core_DatedCopyName(L".claude", &day, 0, name, ARRAYSIZE(name)));
+}
+
 static void TestDeflate(void)
 {
     /* zlib's own output for 1129 bytes of words: a block of dynamic codes, which Core_Deflate never writes. */
@@ -1121,6 +1182,7 @@ int wmain(void)
     TestSessionEntries();
     TestSessionEdits();
     TestSessionSync();
+    TestMirror();
     TestDrawingMath();
     TestDeflate();
     TestProcessTree();

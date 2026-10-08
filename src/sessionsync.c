@@ -933,6 +933,29 @@ BOOL SessionSync_Merge(const SessionSet *set, DWORD profiles, SyncReport *report
     return TRUE;
 }
 
+BOOL SessionSync_Send(const SessionSet *set, const SyncSend *changes, int count, SyncReport *report)
+{
+    Outbox box;
+    DWORD takers = SessionSync_Takers(set);
+    int i;
+    ZeroMemory(&box, sizeof box);
+    for (i = 0; i < count; i++) {
+        const SyncSend *change = &changes[i];
+        if (change->profile < 0 || change->profile >= set->profiles.count) continue;
+        if (!(takers & (1u << change->profile))) {
+            report->unavailable |= 1u << change->profile;
+            continue;
+        }
+        if (!AddSent(&box.sent[change->profile], &change->op, change->content, change->length)) {
+            FreeOutbox(&box);
+            return OutOfMemory(report);
+        }
+    }
+    Send(&box, set, report);
+    FreeOutbox(&box);
+    return TRUE;
+}
+
 /* A profile lists the session of id `id` (its id, or an entry's own id without local_). */
 static BOOL Lists(const SessionSet *set, int p, const WCHAR *id)
 {

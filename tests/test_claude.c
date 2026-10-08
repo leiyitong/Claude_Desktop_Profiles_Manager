@@ -331,6 +331,10 @@ int wmain(void)
         { "... tagged [Auth]", "logPrefix??\"[Auth]\"" },
         { "other windows ignore a sign-in they did not start", "does not answer a sign-in this app started" },
         { "session entries live in claude-code-sessions, in files that start with local_", "=\"claude-code-sessions\",\x01=\"local_\"" },
+        /* Profiles keep the same sessions by copying entries (sessionvault.c): a shared, linked folder is read but never written. */
+        { "Claude refuses to write an entries folder that is a link", "Refusing non-directory at private dir path (symlink/file plant)" },
+        { "... or one whose path leads elsewhere", "Private dir leaf redirects (junction/substitute-name plant)" },
+        { "Claude lists the archived sessions in archived-sessions.idx beside the entries", "archived-sessions.idx" },
         { "config.json names the account signed in (lastKnownAccountUuid)", "lastKnownAccountUuid" },
         { "a star is isStarred in the entry", "isStarred" },
         { "an archived session is isArchived in the entry", "isArchived" },

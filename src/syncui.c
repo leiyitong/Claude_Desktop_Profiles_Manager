@@ -3,12 +3,18 @@
  * merge every profile's, overwrite others with one profile's, share or copy the
  * sessions chosen in the sessions view, export sessions to an archive and
  * import one. The profiles taking part are chosen in one dialog (IDD_SYNC),
- * which says what will happen; what was done is said once it is.
+ * which says what will happen; what was done is said once it is. Also a list
+ * of sessions recovered from the vault (sessionvault.c, IDD_RESTORE), the
+ * conversations no profile lists cleaned up and Claude Code's folder copied
+ * (sessionpurge.c, IDD_PURGE).
  */
 #include "app.h"
 #include "resource.h"
 #include <commctrl.h>
 #include <shlobj.h>
+
+#define UNIX_EPOCH_TICKS      116444736000000000ULL
+#define TICKS_PER_MILLISECOND (TICKS_PER_SECOND / 1000)
 
 #define ARCHIVE_EXTENSION L"zip"
 #define NAMES_CCH         (MAX_PROFILES * (LABEL_CCH + 16))
@@ -542,4 +548,332 @@ BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
     StringCchPrintfW(first, ARRAYSIZE(first), TR(L"Sessions in the archive: %d"), sessions);
     ShowReport(owner, profiles, &report, first);
     return TRUE;
+}
+
+/* ------------------------------------------------------------- the vault */
+
+/* A time (ms since 1970) as the user's short date and time. */
+static void FormatWhen(ULONGLONG ms, WCHAR *out, size_t cch)
+{
+    ULONGLONG ticks = ms * TICKS_PER_MILLISECOND + UNIX_EPOCH_TICKS;
+    FILETIME utc;
+    SYSTEMTIME universal, local;
+    WCHAR date[64], time[64];
+    utc.dwLowDateTime = (DWORD)ticks;
+    utc.dwHighDateTime = (DWORD)(ticks >> 32);
+    out[0] = 0;
+    if (!FileTimeToSystemTime(&utc, &universal) || !SystemTimeToTzSpecificLocalTime(NULL, &universal, &local) ||
+        !GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local, NULL, date, ARRAYSIZE(date), NULL) ||
+        !GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &local, NULL, time, ARRAYSIZE(time)))
+        return;
+    StringCchPrintfW(out, cch, L"%s  %s", date, time);
+}
+
+typedef struct RestoreDialog {
+    const ProfileList *profiles;
+    int                profile;          /* the one chosen */
+    WCHAR              list[FOLDER_CCH];   /* its list in the vault */
+    VaultVersion      *versions;
+    int                count, chosen;
+    HWND               rows;             /* the versions (in the view it scrolls in, which has its id) */
+} RestoreDialog;
+
+/* The versions of the list of the profile chosen, newest first and selected. */
+static void FillVersions(HWND dialog, RestoreDialog *state)
+{
+    WCHAR when[128], text[256];
+    LVITEMW item;
+    int i;
+    ListView_DeleteAllItems(state->rows);
+    state->count = SessionVault_ListName(state->profiles, state->profile, state->list, ARRAYSIZE(state->list))
+                       ? SessionVault_Versions(state->list, state->versions, VAULT_VERSIONS_SHOWN) : 0;
+    state->chosen = state->count ? 0 : -1;
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_TEXT;
+    if (!state->count) {
+        item.pszText = (LPWSTR)TR(L"No session list kept yet");
+        ListView_InsertItem(state->rows, &item);
+    }
+    for (i = 0; i < state->count; i++) {
+        FormatWhen(state->versions[i].time, when, ARRAYSIZE(when));
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s \x00B7 sessions: %d"), when[0] ? when : state->versions[i].name, state->versions[i].sessions);
+        item.iItem = i;
+        item.pszText = text;
+        ListView_InsertItem(state->rows, &item);
+    }
+    if (state->count) ListView_SetItemState(state->rows, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    EnableWindow(GetDlgItem(dialog, IDOK), state->count > 0);
+}
+
+static INT_PTR CALLBACK RestoreProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    RestoreDialog *state = (RestoreDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    LVCOLUMNW column;
+    int p;
+    switch (message) {
+    case WM_INITDIALOG:
+        state = (RestoreDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetDlgItemTextW(dialog, IDC_R_TEXT, TR(L"The sessions this version lists come back in the profile, as they were then. "
+                                               L"Sessions deleted in Claude stay deleted."));
+        for (p = 0; p < state->profiles->count; p++) {
+            SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_ADDSTRING, 0, (LPARAM)state->profiles->items[p].name);
+            if (p == state->profile) SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_SETCURSEL, (WPARAM)p, 0);
+        }
+        state->rows = GetDlgItem(dialog, IDC_R_LIST);
+        ListView_SetExtendedListViewStyle(state->rows, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        ZeroMemory(&column, sizeof column);
+        ListView_InsertColumn(state->rows, 0, &column);   /* the view it scrolls in gives it the list's width */
+        FillVersions(dialog, state);
+        Theme_SmoothView(state->rows);
+        return TRUE;
+
+    case WM_NOTIFY:
+        if (state && ((const NMHDR *)lp)->hwndFrom == state->rows) {
+            const NMHDR *header = (const NMHDR *)lp;
+            int row = ListView_GetNextItem(state->rows, -1, LVNI_SELECTED);
+            if (header->code == LVN_ITEMCHANGED && row >= 0 && row < state->count) state->chosen = row;
+            if (header->code == NM_DBLCLK && ((const NMITEMACTIVATE *)lp)->iItem >= 0 && state->count) PostMessageW(dialog, WM_COMMAND, IDOK, 0);
+            return TRUE;
+        }
+        break;
+
+    case WM_COMMAND:
+        if (!state) break;
+        switch (LOWORD(wp)) {
+        case IDC_R_PROFILE:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                LRESULT chosen = SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_GETCURSEL, 0, 0);
+                if (chosen >= 0 && chosen < state->profiles->count) {
+                    state->profile = (int)chosen;
+                    FillVersions(dialog, state);
+                }
+            }
+            return TRUE;
+        case IDOK:
+            if (state->chosen < 0 || state->chosen >= state->count) return TRUE;
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        case IDCANCEL:
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *selected)
+{
+    RestoreDialog dialog;
+    SyncReport report;
+    const Profile *p;
+    BOOL ok;
+    if (!profiles->count) return FALSE;
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.profiles = profiles;
+    dialog.profile = selected ? Profiles_Find(profiles, selected) : -1;
+    if (dialog.profile < 0) dialog.profile = max(Profiles_Find(profiles, STOCK_FOLDER), 0);
+    if ((dialog.versions = (VaultVersion *)HeapAlloc(GetProcessHeap(), 0, VAULT_VERSIONS_SHOWN * sizeof *dialog.versions)) == NULL) return FALSE;
+    if (Ui_Dialog(owner, IDD_RESTORE, RestoreProc, (LPARAM)&dialog) != IDOK || dialog.chosen < 0) {
+        HeapFree(GetProcessHeap(), 0, dialog.versions);
+        return FALSE;
+    }
+    p = &profiles->items[dialog.profile];
+    if (Claude_IsRunning(p)) {
+        Ui_Message(owner, MB_ICONINFORMATION, TR(L"Close \x201C%s\x201D first: while it runs, Claude keeps its list of sessions and would write it back."),
+                   p->name);
+        HeapFree(GetProcessHeap(), 0, dialog.versions);
+        return FALSE;
+    }
+    ZeroMemory(&report, sizeof report);
+    ok = SessionVault_Restore(profiles, dialog.profile, dialog.list, dialog.versions[dialog.chosen].name, &report);
+    HeapFree(GetProcessHeap(), 0, dialog.versions);
+    if (!ok && report.unavailable) {
+        Ui_Message(owner, MB_ICONINFORMATION, TR(L"\x201C%s\x201D is not signed in to Claude yet: sign in there first."), p->name);
+        return FALSE;
+    }
+    if (!ok && !report.failed) {
+        Ui_Message(owner, MB_ICONERROR, TR(L"Sessions could not be loaded."));
+        return FALSE;
+    }
+    ShowReport(owner, profiles, &report, NULL);
+    return TRUE;
+}
+
+/* The profiles' sessions made the same right away, and what that did said. */
+BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles)
+{
+    WCHAR names[NAMES_CCH], first[NAMES_CCH + 128];
+    SyncReport report;
+    DWORD group = SessionVault_Group(profiles);
+    HCURSOR old;
+    if (!group) return FALSE;
+    ZeroMemory(&report, sizeof report);
+    old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    SessionVault_Keep(profiles, group, VAULT_GROUP_LIST, TRUE, &report);
+    SetCursor(old);
+    NamesOf(profiles, group, names, ARRAYSIZE(names));
+    StringCchPrintfW(first, ARRAYSIZE(first), TR(L"The sessions of %s are kept the same from now on."), names);
+    ShowReport(owner, profiles, &report, first);
+    return TRUE;
+}
+
+/* ---------------------------------------------------------- cleaning up */
+
+/* Claude Code's folder copied beside it, as <name>_<date>; `ask` first, and
+ * say where it went. FALSE when no copy was made whole. */
+static BOOL CopyCodeFolder(HWND owner, BOOL ask)
+{
+    WCHAR code[MAX_PATH], target[MAX_PATH], text[2 * MAX_PATH + 128];
+    DWORD error = 0;
+    CopyResult result;
+    if (!SessionPurge_CodeFolder(code, ARRAYSIZE(code)) || !Util_DirExists(code)) {
+        Ui_Message(owner, MB_ICONWARNING, TR(L"%s could not be opened (error %lu)."), code, (DWORD)ERROR_PATH_NOT_FOUND);
+        return FALSE;
+    }
+    if (!SessionPurge_BackupName(target, ARRAYSIZE(target))) {
+        Ui_Message(owner, MB_ICONERROR, TR(L"The path is too long."));
+        return FALSE;
+    }
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Copy %s\nto %s?"), code, target);
+    if (ask && !Ui_Ask(owner, IDI_QUESTION, text, TR(L"Copy"), TR(L"Cancel"), FALSE)) return FALSE;
+    result = SessionPurge_BackUp(owner, target, &error);
+    if (result == COPY_MADE) {
+        if (ask) Ui_Message(owner, MB_ICONINFORMATION, TR(L"Copied to:\n%s"), target);
+        return TRUE;
+    }
+    if (result == COPY_FAILED) Ui_Message(owner, MB_ICONWARNING, TR(L"%s could not be copied whole (error %lu)."), code, error);
+    return FALSE;
+}
+
+BOOL SyncUi_BackUpCode(HWND owner)
+{
+    return CopyCodeFolder(owner, TRUE);
+}
+
+typedef struct PurgeDialog {
+    const PurgeItem *items;
+    int              count;
+    BOOL            *checked;
+    BOOL             backUp;
+    HWND             rows;           /* in the view it scrolls in, which has its id */
+    BOOL             filling;
+} PurgeDialog;
+
+static void ReadChecked(HWND dialog, PurgeDialog *state)
+{
+    int i, chosen = 0;
+    for (i = 0; i < state->count; i++)
+        if ((state->checked[i] = ListView_GetCheckState(state->rows, i)) != FALSE) chosen++;
+    EnableWindow(GetDlgItem(dialog, IDOK), chosen > 0);
+}
+
+/* A conversation's row: what it is, its title (its id without one), when it
+ * was last written, its size. */
+static void PurgeRow(const PurgeItem *item, WCHAR *out, size_t cch)
+{
+    WCHAR when[128];
+    FormatWhen(item->written, when, ARRAYSIZE(when));
+    StringCchPrintfW(out, cch, L"%s  \x00B7  %s  \x00B7  %s  \x00B7  %.1f MB", item->kind == PURGE_DELETED ? TR(L"Deleted in Claude") : TR(L"In no list"),
+                     item->title[0] ? item->title : item->id, when, (double)item->bytes / (1024.0 * 1024.0));
+}
+
+static INT_PTR CALLBACK PurgeProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    PurgeDialog *state = (PurgeDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    WCHAR text[SESSION_TITLE_CCH + MAX_PATH];
+    LVCOLUMNW column;
+    LVITEMW item;
+    int i;
+    switch (message) {
+    case WM_INITDIALOG:
+        state = (PurgeDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"These conversations are on this PC, but no profile lists them, so a restore could bring them back. "
+                                               L"Deleting them makes sure nothing does.\nChecked: deleted in Claude. Unchecked: in no list, "
+                                               L"made in a terminal for example."));
+        CheckDlgButton(dialog, IDC_C_BACKUP, BST_CHECKED);
+        state->rows = GetDlgItem(dialog, IDC_C_LIST);
+        ListView_SetExtendedListViewStyle(state->rows, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        ZeroMemory(&column, sizeof column);
+        ListView_InsertColumn(state->rows, 0, &column);
+        state->filling = TRUE;
+        for (i = 0; i < state->count; i++) {
+            PurgeRow(&state->items[i], text, ARRAYSIZE(text));
+            ZeroMemory(&item, sizeof item);
+            item.mask = LVIF_TEXT;
+            item.iItem = i;
+            item.pszText = text;
+            ListView_InsertItem(state->rows, &item);
+            ListView_SetCheckState(state->rows, i, state->items[i].kind == PURGE_DELETED);
+        }
+        state->filling = FALSE;
+        Theme_SmoothView(state->rows);
+        ReadChecked(dialog, state);
+        return TRUE;
+
+    case WM_NOTIFY:
+        if (state && ((const NMHDR *)lp)->hwndFrom == state->rows && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
+            const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
+            if (!state->filling && (change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK))
+                ReadChecked(dialog, state);
+            return TRUE;
+        }
+        break;
+
+    case WM_COMMAND:
+        if (!state) break;
+        switch (LOWORD(wp)) {
+        case IDOK:
+            ReadChecked(dialog, state);
+            state->backUp = IsDlgButtonChecked(dialog, IDC_C_BACKUP) == BST_CHECKED;
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        case IDCANCEL:
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
+{
+    WCHAR error[LONG_PATH_CCH];
+    PurgeDialog dialog;
+    PurgeItem *items = NULL;
+    RemoveResult result;
+    HCURSOR old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    int count = SessionPurge_List(profiles, &items, error, ARRAYSIZE(error)), *chosen = NULL, n = 0, deleted = 0, i;
+    SetCursor(old);
+    if (count < 0) {
+        Ui_Message(owner, MB_ICONERROR, L"%s", error);
+        return FALSE;
+    }
+    if (count == 0) {
+        Ui_Message(owner, MB_ICONINFORMATION,
+                   TR(L"No conversation to clean up: each one on this PC is listed by a profile, kept to be recovered, in use, or new."));
+        HeapFree(GetProcessHeap(), 0, items);
+        return FALSE;
+    }
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.items = items;
+    dialog.count = count;
+    dialog.checked = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *dialog.checked);
+    chosen = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof *chosen);
+    if (dialog.checked && chosen && Ui_Dialog(owner, IDD_PURGE, PurgeProc, (LPARAM)&dialog) == IDOK) {
+        for (i = 0; i < count; i++)
+            if (dialog.checked[i]) chosen[n++] = i;
+        if (n && (!dialog.backUp || CopyCodeFolder(owner, FALSE))) {
+            result = SessionPurge_Delete(owner, profiles, items, chosen, n, &deleted, error, ARRAYSIZE(error));
+            if (result == REMOVE_DONE) Ui_Message(owner, MB_ICONINFORMATION, TR(L"Conversations moved to the Recycle Bin: %d"), deleted);
+            else if (result == REMOVE_FAILED) Ui_Message(owner, MB_ICONWARNING, TR(L"The conversations could not be deleted. %s"), error);
+        }
+    }
+    if (dialog.checked) HeapFree(GetProcessHeap(), 0, dialog.checked);
+    if (chosen) HeapFree(GetProcessHeap(), 0, chosen);
+    HeapFree(GetProcessHeap(), 0, items);
+    return deleted > 0;
 }

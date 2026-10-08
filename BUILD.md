@@ -98,7 +98,12 @@ src/sessionstore.c            every profile's Claude Code sessions: entries, tra
 src/sessionedit.c             session actions: open, copy, entry changes (made when an open profile closes), delete
 src/sessionsync.c             sessions sent between profiles: merge, overwrite, several shared or copied, archives
                               exported and imported (made when an open profile closes), backups
-src/syncui.c                  the dialog choosing the profiles that take part, and the summary of what was done
+src/sessionvault.c            the session vault (every list of sessions kept, its versions, the sessions deleted) and the
+                              profiles whose sessions are kept the same; a version recovered into a profile
+src/sessionpurge.c            conversations no profile lists, cleaned up; Claude Code's folder copied beside it
+src/sessionlink.c             session folders linked by earlier versions: read, and taken away
+src/syncui.c                  the dialog choosing the profiles that take part, and the summary of what was done; the
+                              recover and clean-up dialogs
 src/sessions.c                the sessions view of the manager window: profiles, tree, details, menus, several sessions
 src/main.c                    command-line dispatch
 src/app.rc, src/resource.h    dialogs, version info, control ids

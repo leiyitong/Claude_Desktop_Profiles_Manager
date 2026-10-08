@@ -15,6 +15,8 @@
 #define IDD_SYNC          105
 #define IDD_LINK          106
 #define IDD_BACKUP        107
+#define IDD_RESTORE       108
+#define IDD_PURGE         109
 
 /* main window */
 #define IDC_STATUS        1000
@@ -39,6 +41,9 @@
 #define IDC_MERGE         1019
 #define IDC_OVERWRITE        1020
 #define IDC_STOP          1021
+#define IDC_RESTORE       1022
+#define IDC_PURGE         1023
+#define IDC_BACKUP_CODE   1024
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -89,6 +94,20 @@
 #define IDC_B_TEXT        1800
 #define IDC_B_LIST        1801
 #define IDC_B_NOTE        1802
+
+/* sessions recovered from the vault */
+#define IDC_R_TEXT          1900
+#define IDC_R_PROFILE_LABEL 1901
+#define IDC_R_PROFILE       1902
+#define IDC_R_VERSION_LABEL 1903
+#define IDC_R_LIST          1904
+#define IDC_R_NOTE          1905
+
+/* conversations no profile lists, cleaned up */
+#define IDC_C_TEXT        2000
+#define IDC_C_LIST        2001
+#define IDC_C_BACKUP      2002
+#define IDC_C_NOTE        2003
 
 /* message box */
 #define IDC_M_ICON        1300

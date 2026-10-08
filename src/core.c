@@ -1192,6 +1192,50 @@ BOOL Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added)
     return a == b && EqualsI(queued->key, -1, added->key, -1);
 }
 
+/* What every profile of a group keeping the same sessions gets of one
+ * session, from how each one has it (`sides`) and how the group's list had it
+ * at the last sync (`base`, NULL when it never had it): the index of the side
+ * whose entry they all take (`count` for the base's own), CORE_MIRROR_DELETED
+ * when it goes everywhere, CORE_MIRROR_NOWHERE when no profile has it. A side
+ * changed since the base wins, the latest written first, unless a deletion
+ * came later; a profile that only lacks it (never had it, or lost its whole
+ * list) gets it back. */
+int Core_MirrorResolve(const MirrorSide *sides, int count, const MirrorSide *base)
+{
+    BOOL baseListed = base && base->state == MIRROR_LISTED, deleted = FALSE;
+    ULONGLONG deletedAt = 0;
+    int i, winner = -1;
+    for (i = 0; i < count; i++) {
+        const MirrorSide *side = &sides[i];
+        if (side->state == MIRROR_LISTED) {
+            if (baseListed && side->hash == base->hash) continue;
+            if (winner < 0 || side->time > sides[winner].time) winner = i;
+        } else if (side->state == MIRROR_DELETED && (!base || baseListed)) {
+            deleted = TRUE;
+            deletedAt = max(deletedAt, side->time);
+        } else if (side->state == MIRROR_REMOVED && baseListed) {
+            deleted = TRUE;   /* taken away by Claude, its time unknown: any change made elsewhere wins */
+        }
+    }
+    if (winner >= 0) return deleted && deletedAt > sides[winner].time ? CORE_MIRROR_DELETED : winner;
+    if (deleted) return CORE_MIRROR_DELETED;
+    if (baseListed) {
+        for (i = 0; i < count; i++)
+            if (sides[i].state == MIRROR_LISTED) return i;
+        return count;
+    }
+    return base ? CORE_MIRROR_DELETED : CORE_MIRROR_NOWHERE;
+}
+
+/* The name of a copy of folder `name` made on `day`: "<name>_yyyymmdd", then
+ * "_2", "_3"... for the `copy`th of that day. */
+BOOL Core_DatedCopyName(const WCHAR *name, const SYSTEMTIME *day, int copy, WCHAR *out, size_t cch)
+{
+    if (!name[0] || copy < 1) return FALSE;
+    if (copy == 1) return SUCCEEDED(StringCchPrintfW(out, cch, L"%s_%04u%02u%02u", name, day->wYear, day->wMonth, day->wDay));
+    return SUCCEEDED(StringCchPrintfW(out, cch, L"%s_%04u%02u%02u_%d", name, day->wYear, day->wMonth, day->wDay, copy));
+}
+
 /* ---------------------------------------------------------------- archives */
 
 /* CRC-32 (ISO 3309, as ZIP files check their content), going on from `crc`

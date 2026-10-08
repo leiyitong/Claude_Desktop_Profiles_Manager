@@ -55,6 +55,9 @@ BEGIN
     PUSHBUTTON      L"&Delete\x2026", IDC_DELETE, 334, 104, 76, 15
     PUSHBUTTON      L"Merge &all sessions\x2026", IDC_MERGE, 334, 129, 76, 15
     PUSHBUTTON      L"Ove&rwrite sessions\x2026", IDC_OVERWRITE, 334, 148, 76, 15
+    PUSHBUTTON      L"Reco&ver sessions\x2026", IDC_RESTORE, 334, 167, 76, 15
+    PUSHBUTTON      L"&Clean up deleted sessions\x2026", IDC_PURGE, 334, 186, 76, 15
+    PUSHBUTTON      L"&Back up .claude\x2026", IDC_BACKUP_CODE, 334, 205, 76, 15
     PUSHBUTTON      "Set as de&fault", IDC_DEFAULT, 334, 173, 76, 15
     LTEXT           "", IDC_NOTE, 334, 194, 76, 42, SS_NOPREFIX
     CONTROL         "Shortcuts", IDC_SC_GROUP, "Static", SS_OWNERDRAW | SS_NOPREFIX, 10, 244, 400, 10
@@ -156,6 +159,34 @@ BEGIN
     LTEXT           "Sign-in restores only on this PC, for this Windows user. Anyone who has the file can use the account: keep it safe.", IDC_B_NOTE, 10, 104, 248, 30
     DEFPUSHBUTTON   "OK", IDOK, 154, 144, 50, 15
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 144, 50, 15
+END
+
+IDD_RESTORE DIALOGEX 0, 0, 268, 214
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Recover sessions"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_R_TEXT, 10, 10, 248, 30, SS_NOPREFIX
+    LTEXT           "&Profile:", IDC_R_PROFILE_LABEL, 10, 49, 40, 10
+    COMBOBOX        IDC_R_PROFILE, 52, 46, 140, 120, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "&Version:", IDC_R_VERSION_LABEL, 10, 66, 248, 10
+    CONTROL         "", IDC_R_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 78, 248, 80
+    LTEXT           "The profile must be closed. What is replaced is kept in a backup first.", IDC_R_NOTE, 10, 164, 248, 18
+    DEFPUSHBUTTON   "Recover", IDOK, 154, 192, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 208, 192, 50, 15
+END
+
+IDD_PURGE DIALOGEX 0, 0, 300, 236
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Clean up deleted sessions"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_C_TEXT, 10, 10, 280, 40, SS_NOPREFIX
+    CONTROL         "", IDC_C_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 54, 280, 110
+    AUTOCHECKBOX    "&Back up .claude first", IDC_C_BACKUP, 10, 170, 280, 10
+    LTEXT           "They go to the Recycle Bin. A conversation in use, or new and in no list, is not shown.", IDC_C_NOTE, 10, 184, 280, 18
+    DEFPUSHBUTTON   "Delete", IDOK, 186, 214, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 240, 214, 50, 15
 END
 
 IDD_UNINSTALL DIALOGEX 0, 0, 292, 206

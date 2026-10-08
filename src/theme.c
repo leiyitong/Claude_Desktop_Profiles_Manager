@@ -4432,9 +4432,9 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
 #define MAIN_RESOURCE_WIDTH_DIPS      821    /* IDD_MAIN's 420 x 312 dialog units in its 9 pt font */
 #define MAIN_RESOURCE_HEIGHT_DIPS     577
 #define MAIN_STATUS_MINIMUM_DIPS      60     /* the status text between the header buttons */
-#define SIDEBAR_GROUP_GAP_DIPS        15     /* the sessions' actions stay apart from the profile's */
-#define SIDEBAR_DEFAULT_GAP_DIPS      15     /* "Set as default" stays apart from the other actions */
-#define SIDEBAR_NOTE_GAP_DIPS         10     /* between "Set as default" and the note below it */
+#define SIDEBAR_GROUP_GAP_DIPS        12     /* the sessions' actions stay apart from the profile's */
+#define SIDEBAR_DEFAULT_GAP_DIPS      9      /* "Set as default" below the other actions: with these gaps the window fits 150 % on 1080p */
+#define SIDEBAR_NOTE_GAP_DIPS         9      /* between "Set as default" and the note below it */
 #define DETAILS_PADDING_DIPS          12     /* around the caption of the details' button */
 #define ARCHIVED_INSET_DIPS           5      /* "Show archived" ends before the tree: room before the details */
 #define SHORTCUT_GROWTH_ONE_ROW_DIPS  280    /* the most a shortcut button grows, on one row */
@@ -4449,9 +4449,11 @@ typedef struct MainButton {
 static const MainButton kMainActions[] = {
     { IDC_OPEN, { L"&Open", NULL } }, { IDC_STOP, { L"&Quit", NULL } }, { IDC_NEW, { L"&New profile\x2026", NULL } }, { IDC_EDIT, { L"&Edit\x2026", NULL } },
     { IDC_DELETE, { L"&Delete\x2026", NULL } }, { IDC_MERGE, { L"Merge &all sessions\x2026", NULL } },
-    { IDC_OVERWRITE, { L"Ove&rwrite sessions\x2026", NULL } }, { IDC_DEFAULT, { L"Set as de&fault", NULL } }
+    { IDC_OVERWRITE, { L"Ove&rwrite sessions\x2026", NULL } }, { IDC_RESTORE, { L"Reco&ver sessions\x2026", NULL } },
+    { IDC_PURGE, { L"&Clean up deleted sessions\x2026", NULL } }, { IDC_BACKUP_CODE, { L"&Back up .claude\x2026", NULL } },
+    { IDC_DEFAULT, { L"Set as de&fault", NULL } }
 };
-#define MAIN_PROFILE_ACTIONS 5                               /* Open to Delete; the sessions' two below them, apart */
+#define MAIN_PROFILE_ACTIONS 5                               /* Open to Delete; the sessions' below them, apart */
 #define MAIN_STACKED_ACTIONS (ARRAYSIZE(kMainActions) - 1)   /* all but "Set as default", which sits above the note */
 static const MainButton kMainShortcuts[] = {
     { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" } },
@@ -4604,7 +4606,8 @@ static ULONGLONG HashControlFont(ULONGLONG key, HWND control)
 
 static ULONGLONG MainFontKey(HWND dialog)
 {
-    static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_DEFAULT, IDC_SC_DESKTOP,
+    static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_MERGE, IDC_OVERWRITE, IDC_RESTORE, IDC_PURGE,
+        IDC_BACKUP_CODE, IDC_DEFAULT, IDC_SC_DESKTOP,
         IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START, IDC_SESSIONS, IDC_LANGUAGE, IDC_STATUS_ACTION, IDC_UNINSTALL,
         IDC_UPDATE, IDCANCEL, IDC_S_ARCHIVED, IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE, IDC_ABOUT };
     HWND list = MainViewContent(dialog, IDC_LIST);

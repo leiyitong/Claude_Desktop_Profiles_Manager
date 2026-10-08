@@ -73,6 +73,8 @@ COMMAND_FAMILIES = [
     ["Overwrite sessions", "Ove&rwrite sessions\u2026"],
     ["Export sessions", "E&xport sessions\u2026"],
     ["Import sessions", "&Import sessions\u2026"],
+    ["Recover sessions", "Reco&ver sessions\u2026"],
+    ["Clean up deleted sessions", "&Clean up deleted sessions\u2026"],
 ]
 
 # TR() calls whose argument is no literal, by file: the variable or the
@@ -97,7 +99,7 @@ TRANSLATED_THROUGH_VARIABLES = {
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
     "gui.c": ["A profile folder with this name already exists."],
     "theme.c": ["&Open", "&Quit", "&New profile\u2026", "&Edit\u2026", "&Delete\u2026", "Merge &all sessions\u2026", "Ove&rwrite sessions\u2026",
-                "Set as de&fault", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar", "Pinned",
+                "Reco&ver sessions\u2026", "&Clean up deleted sessions\u2026", "&Back up .claude\u2026", "Set as de&fault", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar", "Pinned",
                 "Add to Start &menu", "Remove from Start &menu", "&Sessions  >", "<  &Back", "&Language\u2026",
                 "&Get Claude", "Set up l&inks", "&Uninstall\u2026", "U&pdate", "Close",
                 "Profile", "Role", "Data folder", "Sessions folder", "This profile", "Not signed in", "No sessions yet", "Link broken",
@@ -113,7 +115,8 @@ TRANSLATED_THROUGH_VARIABLES = {
 STATUS_ACTIONS = ["&Get Claude", "Set up l&inks"]
 ACCESS_KEY_GROUPS = {
     "profiles view": ["&Sessions  >", "&Language\u2026", "&Open", "&Quit", "&New profile\u2026", "&Edit\u2026", "&Delete\u2026",
-                      "Merge &all sessions\u2026", "Ove&rwrite sessions\u2026", "Set as de&fault", "Create shortcut on des&ktop",
+                      "Merge &all sessions\u2026", "Ove&rwrite sessions\u2026", "Reco&ver sessions\u2026", "&Clean up deleted sessions\u2026",
+                      "&Back up .claude\u2026", "Set as de&fault", "Create shortcut on des&ktop",
                       "Create s&hortcut\u2026", "Pin to &taskbar", "Add to Start &menu", "Remove from Start &menu", "&Uninstall\u2026", "U&pdate"] + STATUS_ACTIONS,
     "sessions view": ["<  &Back", "&Language\u2026", "Show &archived", "&Uninstall\u2026", "U&pdate"] + STATUS_ACTIONS,
     "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "Open at &Windows sign-in",
@@ -125,14 +128,16 @@ ACCESS_KEY_GROUPS = {
                      "Uns&tar", "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s", "&Show folder",
                      "&Delete session everywhere\u2026"],
     "profile list menu": ["&Open", "&Quit", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "Shortcuts", "Merge &all sessions\u2026",
-                          "Ove&rwrite sessions\u2026", "E&xport sessions\u2026", "&Import sessions\u2026", "&Link sessions folder to",
-                          "U&nlink sessions folder\u2026", "&Back up\u2026", "Restore from bac&kup\u2026"],
+                          "Ove&rwrite sessions\u2026", "E&xport sessions\u2026", "&Import sessions\u2026", "Keep sessions the sa&me as",
+                          "&Stop keeping sessions the same", "U&nlink sessions folder\u2026", "&Back up\u2026", "Restore from bac&kup\u2026"],
     "shortcuts menu of a profile": ["Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar",
                                     "Pinned", "Add to Start &menu", "Remove from Start &menu"],
     "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "S&tar", "Uns&tar", "Re&move\u2026%s",
                                  "&Delete sessions everywhere\u2026"],
     "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026"],
     "sessions dialog": ["&From:", "&To these profiles:", "Also &remove the sessions the source does not list"],
+    "recover dialog": ["&Profile:", "&Version:"],
+    "clean-up dialog": ["&Back up .claude first"],
 }
 # Choices made in the same place: a key of one choice never shows with a key of another.
 ALTERNATIVES = [

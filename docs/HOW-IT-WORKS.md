@@ -136,6 +136,20 @@ A running Claude keeps its sessions in memory and writes them back: an entry cha
 
 Claude Code records each session it runs in `<Claude Code folder>\sessions\<pid>.json` (`sessionId`, `procStart`). A session whose process still runs, with that start time, under a profile's Claude is "in use" there; one in use in two profiles at once gets a warning, since each goes on from what it read.
 
+### Sessions kept the same, and the session vault
+
+Claude no longer writes a profile's entries through a link: before it saves one, it refuses an entries folder that is a reparse point, or whose path leads elsewhere (`main.log` then says `Failed to save session ...: Refusing non-directory at private dir path (symlink/file plant)`). A profile whose entries folder is a junction to another profile's, as earlier versions of the manager made them, reads the shared sessions but loses every change it makes (titles, stars, the last activity that orders them, new sessions) once it closes. Such links are only read and taken away now: when the manager opens it offers, for each, to give the profile a folder of its own again (with the entries the shared one holds) and to keep its sessions the same as the other profile's instead; **Unlink sessions folder…** stays in the profile list's menu.
+
+**Keep sessions the same as** (the profile list's menu) puts the profiles selected and the one chosen in one group (`SyncSessions` = 1 under each one's key); **Stop keeping sessions the same** takes them out. The group's sessions are made the same each time one of its profiles closes (its watcher, after the waiting changes), before one opens through the manager, and when the manager opens. A profile of the group opened alone (no link) while another one runs asks to quit that one first: an open profile gets the others' changes only once it closes.
+
+Each session, by its transcript id, is resolved against the last version the vault kept of the group's list (`Core_MirrorResolve`): in each profile its entry, without its own id, hashed, with the time its file was written; or Claude's `deleted_<id>` mark and its time; or nothing. A profile that had that version's list and no longer lists a session took it away; one that never had the list, or whose entries folder is not the one the version knew (another path, or made since: Claude reinstalled, another account), or one of whose entries could not be read, only lacks it. An entry changed since the version wins, the one written last first, unless a deletion came later; a deletion, or a session taken away, goes from every profile; a profile that only lacks a session gets it. `archived-sessions.idx` follows the same way. The entries go through the sends above (backed up first, at once where a profile is closed, else once it closes), and the version is written only once every change was made or waits.
+
+The vault is `vault` in the manager's folder, out of Claude's package, so a reinstalled Claude finds it: `lists\<list>\<UTC time>.txt` names each session a version lists, its entry (kept once, `objects\<hash>.json`) and the profiles that had it; `deleted.txt` names the sessions deleted (their entries' own ids and transcripts), which nothing here brings back. A version is written only when the list changed, and every version stays. The group's list is `group`; a profile alone keeps one named after its folder, kept when it closes, opens or the manager opens, which only follows it: what it lost stays listed, to be recovered.
+
+**Recover sessions…** puts a version of a profile's list back into it, closed: each session the version lists (as it was then, but not a deleted one), its `archived-sessions.idx`, and Claude's marks of the deleted sessions it does not list, so that Claude's own import of Claude Code's sessions leaves them out too. A profile of the group recovered to an older version passes it on to the others.
+
+**Clean up deleted sessions…** lists the transcripts in Claude Code's folder that no profile lists and no kept list names, nor any transcript a listed session goes on from: the deleted ones (a profile's `deleted_<id>` mark, or the vault's), checked; the ones no list ever had (made in a terminal, say), unchecked, and only when written more than 24 hours ago; none that a Claude Code runs now. The ones checked go, as Claude's own delete removes what a transcript has in Claude Code's folders (never a working folder), to the Recycle Bin, and their ids join the vault's deleted ones; a copy of Claude Code's folder can be made first. **Back up .claude…** copies Claude Code's folder beside it as `<name>_<yyyymmdd>` (then `_2`, `_3`… that day); Windows shows the copy's progress and asks about a file in use.
+
 ## Opening at sign-in
 
 **Open at Windows sign-in** puts a profile shortcut (`Claude (<name>).lnk`) in the user's Startup folder, which Windows opens at sign-in: the profile starts with its own button and icon. Claude's own start-up setting cannot do this for a profile other than Main, since it starts Claude without arguments. The shortcut is recorded like the others.
@@ -175,15 +189,15 @@ A link reaches a running window through a second activation with the same `--use
 |---|---|
 | Program | `%LOCALAPPDATA%\Programs\Claude Desktop Profiles Manager\ClaudeDesktopProfilesManager.exe` |
 | Start menu folder | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Claude Desktop Profiles Manager` (the manager, and the profiles added to the Start menu) |
-| Settings | `HKCU\Software\Claude Desktop Profiles Manager`: `Profiles\<folder>` (name, color, badge text, picture stamp), `DefaultProfile`, `Language`, `InstallPath`, `Shortcuts` (the profile shortcuts made, which follow renames), `Update` (the last release check), `Capabilities` (the `claude://` link handler as Windows lists it) |
-| Profile icons and pictures, log, session changes and sessions waiting for a profile to close, backups of what sending sessions replaced | `%LOCALAPPDATA%\Claude Desktop Profiles Manager` |
+| Settings | `HKCU\Software\Claude Desktop Profiles Manager`: `Profiles\<folder>` (name, color, badge text, picture stamp, `SyncSessions`), `DefaultProfile`, `Language`, `InstallPath`, `Shortcuts` (the profile shortcuts made, which follow renames), `Update` (the last release check), `Capabilities` (the `claude://` link handler as Windows lists it) |
+| Profile icons and pictures, log, session changes and sessions waiting for a profile to close, backups of what sending sessions replaced, the session vault (`vault`) | `%LOCALAPPDATA%\Claude Desktop Profiles Manager` |
 | A downloaded update, until it has installed itself | `%TEMP%\update-ClaudeDesktopProfilesManager.exe` |
 | Taskbar pins | Windows' own pin list |
 | Apps & features entry | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ClaudeDesktopProfilesManager` |
 | Link handler | `HKCU\Software\Classes\ClaudeDesktopProfilesManager.Url`, value `Claude Desktop Profiles Manager` in `HKCU\Software\RegisteredApplications`, value `ClaudeDesktopProfilesManager.Url_claude` in `HKCU\Software\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts` |
 | Default app for `claude://` | picked by the user in Windows: `...\UrlAssociations\claude\UserChoiceLatest` |
 
-Uninstalling removes all of it, asks first when a kept profile is open with session changes still waiting for it, stops (and says so) when the watchers cannot be stopped, forgets the default-app choice when it is the manager (links then go back to Claude), gives open windows their Claude button back, and never touches `%APPDATA%\Claude`.
+Uninstalling removes all of it but the session vault (Main, which it never touches, and the profiles kept go on with it), asks first when a kept profile is open with session changes still waiting for it, stops (and says so) when the watchers cannot be stopped, forgets the default-app choice when it is the manager (links then go back to Claude), gives open windows their Claude button back, and never touches `%APPDATA%\Claude`.
 
 ## Command line
 
@@ -192,7 +206,7 @@ Uninstalling removes all of it, asks first when a kept profile is open with sess
 | none | opens the manager; a copy outside the install folder installs itself first |
 | `--launch "<folder>"` | opens a profile (what shortcuts run) |
 | `--url "<link>"` | routes a link |
-| `--watch "<folder>" [<pid>]` | runs a profile's watcher, which also makes the session changes waiting for the profile when its Claude closes and opens the profile again after a Claude update (`<pid>`: the Claude process just started for it) |
+| `--watch "<folder>" [<pid>]` | runs a profile's watcher, which also makes the session changes waiting for the profile when its Claude closes, keeps its list of sessions (made the same in its group) and opens the profile again after a Claude update (`<pid>`: the Claude process just started for it) |
 | `--set-up-links` | opens the manager and offers to set up links |
 | `--install [--quiet]` | installs this copy, then opens the manager (not with `--quiet`) |
 | `--uninstall` | opens the uninstall dialog |
@@ -203,6 +217,7 @@ Any other option, or `--launch` and `--watch` without their folder, does nothing
 
 - **The regular Claude icon opens Main**, with Claude's own button until the manager opens it or sends it a link: the Start menu and taskbar start Claude without arguments. The default profile only decides where `claude://` links go while Claude is closed.
 - **After a Claude update** Windows opens Main again, even when only another profile was open. That Main keeps Claude's button unless it was open with its own before the update.
+- **Sessions kept the same** reach a profile that is open only once it closes, and a session run over SSH, in WSL or in the cloud is not kept the same. A session without a folder shows in the other profiles in a folder named `scratch-...`, not under "no folder".
 - **Shared Claude Code data**: `%USERPROFILE%\.claude` (or `CLAUDE_CONFIG_DIR`: Claude Code settings and memory) is the same for every profile. A `CLAUDE_CONFIG_DIR` set in a profile's own Claude settings is not followed.
 - **Cowork** runs in one profile at a time: its VM is shared by the whole PC.
 - **One sign-in at a time**: the newest `[Auth]` line is the one selected. A second sign-in started in another window before the first one finishes gets the first one's link selected for it: pick the first window in the dialog, or start that sign-in again.
