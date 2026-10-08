@@ -1592,7 +1592,7 @@ static BOOL NativeScaleFits(const char *what)
 
 /* A dialog's rows hidden before it is fitted. */
 typedef struct HiddenRowsCase {
-    int resource, rowAbove, lastHidden;   /* the hidden band: below rowAbove's bottom, down to lastHidden's */
+    int resource, rowAbove;   /* the hidden band: below rowAbove's bottom, down to the lowest hidden control's */
     int hidden[3], hiddenCount;
     const char *name;
 } HiddenRowsCase;
@@ -1605,12 +1605,13 @@ typedef struct HiddenRowsCase {
 static void CheckHiddenRows(void)
 {
     static const HiddenRowsCase kCases[] = {
-        { IDD_PROFILE, IDC_P_STARTUP, IDC_P_OPEN, { IDC_P_COPY, IDC_P_OPEN, 0 }, 2, "the profile dialog without its last check boxes" },
-        { IDD_PROFILE, IDC_P_STARTUP, IDC_P_COPY, { IDC_P_COPY, 0, 0 }, 1, "the profile dialog without Copy settings" },
-        { IDD_PROFILE, IDC_P_COPY, IDC_P_OPEN, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
-        { IDD_UNINSTALL, IDC_U_KEEP, IDC_U_HINT, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
-        { IDD_SYNC, IDC_Y_TEXT, IDC_Y_FROM, { IDC_Y_FROM_LABEL, IDC_Y_FROM, 0 }, 2, "the sessions dialog without its source" },
-        { IDD_SYNC, IDC_Y_LIST, IDC_Y_EXACT, { IDC_Y_EXACT, 0, 0 }, 1, "the sessions dialog without its removal choice" },
+        { IDD_PROFILE, IDC_P_STARTUP, { IDC_P_COPY, IDC_P_OPEN, 0 }, 2, "the profile dialog without its last check boxes" },
+        { IDD_PROFILE, IDC_P_STARTUP, { IDC_P_COPY, 0, 0 }, 1, "the profile dialog without Copy settings" },
+        { IDD_PROFILE, IDC_P_COPY, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
+        { IDD_UNINSTALL, IDC_U_KEEP, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
+        /* The label is centered on the drop-down list: at some scales it ends below it. */
+        { IDD_SYNC, IDC_Y_TEXT, { IDC_Y_FROM_LABEL, IDC_Y_FROM, 0 }, 2, "the sessions dialog without its source" },
+        { IDD_SYNC, IDC_Y_LIST, { IDC_Y_EXACT, 0, 0 }, 1, "the sessions dialog without its removal choice" },
     };
     size_t i, scale;
     for (i = 0; i < ARRAYSIZE(kCases); i++) for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) {
@@ -1630,12 +1631,14 @@ static void CheckHiddenRows(void)
         Check(&closed, NULL, "hidden rows fixtures created", wholeDialog && closedDialog);
         if (wholeDialog && closedDialog) {
             RECT aboveWhole = RelativeRect(wholeDialog, GetDlgItem(wholeDialog, kCases[i].rowAbove));
-            RECT lastWhole = RelativeRect(wholeDialog, GetDlgItem(wholeDialog, kCases[i].lastHidden));
             RECT clientWhole, clientClosed, clientAgain;
             LayoutState before, after;
             HWND child, twin;
-            int band = lastWhole.bottom - aboveWhole.bottom, moved = 0, kept = 0, childIndex;
+            int lowest = aboveWhole.bottom, band, moved = 0, kept = 0, childIndex;
             BOOL rowsFollow = TRUE, same = TRUE;
+            for (childIndex = 0; childIndex < kCases[i].hiddenCount; childIndex++)
+                lowest = max(lowest, RelativeRect(wholeDialog, GetDlgItem(wholeDialog, kCases[i].hidden[childIndex])).bottom);
+            band = lowest - aboveWhole.bottom;
             GetClientRect(wholeDialog, &clientWhole);
             GetClientRect(closedDialog, &clientClosed);
             /* The same template: the same controls, in the same order (labels share an id). */
@@ -1645,7 +1648,7 @@ static void CheckHiddenRows(void)
                 if (!(GetWindowLongW(child, GWL_STYLE) & WS_VISIBLE)) continue;
                 closedRect = RelativeRect(closedDialog, child);
                 wholeRect = RelativeRect(wholeDialog, twin);
-                if (wholeRect.top >= lastWhole.bottom) {
+                if (wholeRect.top >= lowest) {
                     moved++;
                     if (closedRect.top != wholeRect.top - band) rowsFollow = FALSE;
                 } else {

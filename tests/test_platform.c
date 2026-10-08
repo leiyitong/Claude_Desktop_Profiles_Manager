@@ -25,6 +25,7 @@
 
 #define FIXTURE_WAIT_MS    5000    /* the longest wait for a fixture thread or event that should answer at once */
 #define CHILD_EXIT_WAIT_MS 60000   /* a child process: a scanner may hold the first run of a new exe for seconds */
+#define SCANNER_OPEN_MS    2000    /* a scanner's own brief open of a program just let go */
 
 static int g_checks, g_failures;
 static WCHAR g_root[MAX_PATH], g_stateDir[MAX_PATH], g_downloadFile[MAX_PATH];
@@ -99,13 +100,21 @@ static BOOL OpenRefused(const WCHAR *path, DWORD access)
     return FALSE;
 }
 
-/* Whether nothing else holds `path` open. */
+/* Whether nothing else holds `path` open. A scanner opens a program the
+ * moment it is let go, from the kernel (no process holds it): that open ends
+ * within SCANNER_OPEN_MS, a handle the program kept does not. */
 static BOOL OpensAlone(const WCHAR *path)
 {
-    HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) return FALSE;
-    CloseHandle(file);
-    return TRUE;
+    DWORD waited;
+    for (waited = 0;; waited += 50) {
+        HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+            return TRUE;
+        }
+        if (GetLastError() != ERROR_SHARING_VIOLATION || waited >= SCANNER_OPEN_MS) return FALSE;
+        Sleep(50);
+    }
 }
 
 /* A file, or a folder with what it holds, under the private root only; a link
