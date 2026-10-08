@@ -959,6 +959,7 @@ void     Theme_DropDownLabel(HWND owner, const RECT *box, RECT *label);   /* whe
 BOOL     Theme_TableCellText(HWND list, int row, int column, RECT *text);   /* where a table cell's text is drawn; a wider text shows a tip */
 UINT     Theme_TrackDropDown(HWND owner, HMENU menu, const RECT *screenBox);
 void     Theme_SetStrong(HWND control);   /* its text semibold, at the dialog's scale */
+void     Theme_SetGlyph(HWND button, WCHAR glyph);   /* an icon before a push button's caption: a character of Windows' icon font, 0 for none */
 BOOL     Theme_CheckBoxSize(HWND control, SIZE *size);
 void     Theme_CreateFonts(HWND dialog, ThemeFonts *fonts);
 void     Theme_FreeFonts(ThemeFonts *fonts);
@@ -983,13 +984,16 @@ const WCHAR *Theme_MainCaption(int id, int state);
 const WCHAR *Theme_ProfileColumnTitle(int column);
 const WCHAR *Theme_ProfileRole(BOOL stock, BOOL isDefault);
 /* The version label's text in each state (its one %s: this build, the
- * release available, the one downloading), the note under Set as default
- * (its %s: the profile the regular Claude icon opens) and the sessions
- * details' captions, also measured with the window: catalog keys. */
+ * release available, the one downloading), the status in each state (its
+ * %s: Claude Desktop's version), the note under the column's actions (its
+ * %s: the profile the regular Claude icon opens) and the sessions details'
+ * captions, also measured with the window: catalog keys. */
 typedef enum MainVersion { MAIN_VERSION_BUILD, MAIN_VERSION_AVAILABLE, MAIN_VERSION_DOWNLOADING, MAIN_VERSION_INSTALLING, MAIN_VERSIONS } MainVersion;
+typedef enum MainStatus { MAIN_STATUS_NO_CLAUDE, MAIN_STATUS_NO_LINKS, MAIN_STATUS_ROUTED, MAIN_STATUSES } MainStatus;
 typedef enum SessionsCaption { SESSIONS_ACTIONS, SESSIONS_DELETE_EVERYWHERE, SESSIONS_CAPTIONS } SessionsCaption;
 const WCHAR *Theme_MainVersion(MainVersion state);
-void         Theme_DrawProgress(HWND owner, HDC dc, const RECT *rc, int done, int total, const WCHAR *text);   /* a sync's, in the header */
+const WCHAR *Theme_MainStatus(MainStatus state);
+void         Theme_DrawProgress(HWND owner, HDC dc, const RECT *rc, int done, int total, const WCHAR *text);   /* a sync's, in the column's foot */
 const WCHAR *Theme_MainNote(void);
 const WCHAR *Theme_SessionsCaption(SessionsCaption caption);
 BOOL     Theme_ColumnResizeIsManual(HWND list, int column);   /* the user sized it (a header divider dragged or double-clicked) */

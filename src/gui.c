@@ -60,7 +60,7 @@ typedef struct MainState {
     BOOL         inStartMenu;
     ULONG        shortcutsNotify;  /* SHChangeNotifyRegister on the folders the shortcuts menu reads */
     HANDLE       job;              /* the thread of the Open, Quit, Restart or Sync under way */
-    BOOL         progressShown;    /* the header shows a sync's progress in place of the status */
+    BOOL         progressShown;    /* the column's foot shows a sync's progress in place of the status */
     int          progressDone, progressTotal;
     WCHAR        progressText[128];
     WCHAR        build[32];        /* this copy's version: when it was built */
@@ -81,6 +81,9 @@ typedef struct MainState {
     BOOL         shortcutsCheckPending; /* WM_APP_SHORTCUTS_CHECK posted */
     BOOL         layoutReady, layingOut;
     HANDLE       shellWork;        /* the thread writing shortcuts and pins in a new language */
+    HMENU        programMenu;      /* the menu bar's menus, filled as each opens (WM_INITMENUPOPUP) */
+    HMENU        sessionsMenu;
+    HMENU        shortcutsMenu;
 } MainState;
 
 static MainState g_manager;
@@ -147,11 +150,17 @@ static void EnableControl(int id, BOOL enabled)
     EnableWindow(control, enabled);
 }
 
+static void LayoutMainControls(void);
+
+/* The status and the version take the height their text needs: the window
+ * is laid out again when one of them changes. */
 static void SetTextIfChanged(int id, const WCHAR *text)
 {
     WCHAR current[512];
     GetDlgItemTextW(g_manager.dlg, id, current, ARRAYSIZE(current));
-    if (wcscmp(current, text) != 0) SetDlgItemTextW(g_manager.dlg, id, text);
+    if (wcscmp(current, text) == 0) return;
+    SetDlgItemTextW(g_manager.dlg, id, text);
+    if (id == IDC_STATUS || id == IDC_VERSION) LayoutMainControls();
 }
 
 /* Posts `message` unless it already waits in the queue: a burst of events
@@ -163,7 +172,6 @@ static void PostOnce(BOOL *pending, UINT message)
     PostMessageW(g_manager.dlg, message, 0, 0);
 }
 
-static void LayoutMainControls(void);
 static void JoinNames(DWORD bits, WCHAR *out, size_t cch);
 
 /* The status action and Update buttons take room only while they show: the
@@ -404,13 +412,13 @@ static void UpdateStatus(void)
     ShortVersion(version, ARRAYSIZE(version));
 
     if (!g_manager.pkg.found) {
-        StringCchCopyW(text, ARRAYSIZE(text), TR(L"Claude Desktop is not installed."));
+        StringCchCopyW(text, ARRAYSIZE(text), TR(Theme_MainStatus(MAIN_STATUS_NO_CLAUDE)));
         action = STATUS_ACTION_GET_CLAUDE;
     } else if (Handler_UserChoice() != USERCHOICE_OURS) {
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Claude Desktop %s \x00B7 claude:// links are not set up yet"), version);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainStatus(MAIN_STATUS_NO_LINKS)), version);
         action = STATUS_ACTION_SET_UP_LINKS;
     } else {
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Claude Desktop %s \x00B7 claude:// links are routed correctly"), version);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainStatus(MAIN_STATUS_ROUTED)), version);
     }
     SetTextIfChanged(IDC_STATUS, text);
     SetTextIfChanged(IDC_STATUS_ACTION, TR(Theme_MainCaption(IDC_STATUS_ACTION, action != STATUS_ACTION_GET_CLAUDE)));
@@ -1201,7 +1209,7 @@ static DWORD WINAPI JobThread(void *parameter)
     return 0;
 }
 
-/* The header shows a sync's progress in place of the status, until it ends. */
+/* The column's foot shows a sync's progress in place of the status, until it ends. */
 static void ShowProgress(int done, int total)
 {
     HWND bar = GetDlgItem(g_manager.dlg, IDC_PROGRESS);
@@ -1748,6 +1756,7 @@ static void DoSessions(SessionsAction action)
 #define IDM_LIST_UNLINK     0x6008
 #define IDM_LIST_BACKUP     0x6009
 #define IDM_LIST_RESTORE    0x600A
+#define IDM_EXIT            0x600B   /* the program menu: closes the window, as Esc does outside a search box */
 #define IDM_LANGUAGE        0x6020   /* + 1 + a language; itself: Windows' */
 #define IDM_LIST_SAME_FIRST 0x6100   /* + the index of the profile whose sessions the ones selected keep */
 
@@ -1936,23 +1945,18 @@ static void MenuName(const WCHAR *name, WCHAR *label, size_t cch)
 
 /* -------------------------------------------------------------- the menus */
 
-/* The sessions menu: in the header, and in the list's menu. */
-static HMENU SessionsMenu(DWORD selected)
+static void ClearMenu(HMENU menu)
 {
-    HMENU menu = CreatePopupMenu(), same = CreatePopupMenu();
+    while (GetMenuItemCount(menu) > 0) DeleteMenu(menu, 0, MF_BYPOSITION);   /* with its submenus */
+}
+
+/* Keep sessions the same as (the other profiles, checked when the ones
+ * selected keep theirs already), and Stop keeping them the same. */
+static void AppendKeepSame(HMENU menu, DWORD selected)
+{
+    HMENU same = CreatePopupMenu();
     WCHAR label[2 * LABEL_CCH];
     int i, j;
-    if (!menu) {
-        if (same) DestroyMenu(same);
-        return NULL;
-    }
-    AppendMenuW(menu, MF_STRING | (selected && !g_manager.job ? 0 : MF_GRAYED), IDC_SYNC, TR(Theme_MainCaption(IDC_SYNC, 0)));
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDC_MERGE, TR(L"Merge &all sessions\x2026"));
-    AppendMenuW(menu, MF_STRING | (selected && g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDC_COPY_ALL, TR(L"&Copy all sessions to\x2026"));
-    AppendMenuW(menu, MF_STRING | (selected && g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDC_MOVE_ALL, TR(L"&Move all sessions to\x2026"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    /* The profiles selected join another one's sessions, checked when they keep them the same already. */
     for (i = 0; same && selected && i < g_manager.profiles.count; i++) {
         BOOL joined = g_manager.profiles.items[i].syncGroup != 0;
         if (selected & (1u << i)) continue;
@@ -1964,6 +1968,18 @@ static HMENU SessionsMenu(DWORD selected)
     if (same)
         AppendMenuW(menu, MF_POPUP | (selected && GetMenuItemCount(same) > 0 ? 0 : MF_GRAYED), (UINT_PTR)same, TR(L"&Keep sessions the same as"));
     AppendMenuW(menu, MF_STRING | (SameSelected(selected) ? 0 : MF_GRAYED), IDC_SAME_STOP, TR(L"&Stop keeping sessions the same"));
+}
+
+/* The menu bar's Sessions menu. */
+static void FillSessionsMenu(HMENU menu, DWORD selected)
+{
+    AppendMenuW(menu, MF_STRING | (selected && !g_manager.job ? 0 : MF_GRAYED), IDC_SYNC, TR(Theme_MainCaption(IDC_SYNC, 0)));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDC_MERGE, TR(L"Merge &all sessions\x2026"));
+    AppendMenuW(menu, MF_STRING | (selected && g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDC_COPY_ALL, TR(L"&Copy all sessions to\x2026"));
+    AppendMenuW(menu, MF_STRING | (selected && g_manager.profiles.count >= 2 ? 0 : MF_GRAYED), IDC_MOVE_ALL, TR(L"&Move all sessions to\x2026"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendKeepSame(menu, selected);
     if (LinkedProfiles(selected)) AppendMenuW(menu, MF_STRING, IDM_LIST_UNLINK, TR(L"U&nlink sessions folder\x2026"));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDM_LIST_EXPORT, TR(L"E&xport sessions\x2026"));
@@ -1972,34 +1988,26 @@ static HMENU SessionsMenu(DWORD selected)
     AppendMenuW(menu, MF_STRING | (g_manager.profiles.count ? 0 : MF_GRAYED), IDC_RESTORE, TR(L"Reco&ver sessions\x2026"));
     AppendMenuW(menu, MF_STRING, IDC_PURGE, TR(L"C&lean up deleted sessions\x2026"));
     AppendMenuW(menu, MF_STRING, IDC_BACKUP_CODE, TR(L"&Back up .claude\x2026"));
-    return menu;
 }
 
-/* The shortcuts menu: the state shown is of a profile selected alone; with
- * several, each command does what is left to do for each. */
-static HMENU ShortcutsMenu(DWORD selected)
+/* The menu bar's Shortcuts menu: the state shown is of a profile selected
+ * alone; with several, each command does what is left to do for each. */
+static void FillShortcutsMenu(HMENU menu, DWORD selected)
 {
-    HMENU menu = CreatePopupMenu();
     const Profile *one = SelectedProfile();
-    if (!menu) return NULL;
     AppendMenuW(menu, MF_STRING | (selected && !(one && g_manager.onDesktop) ? 0 : MF_GRAYED), IDC_SC_DESKTOP,
                 TR(Theme_MainCaption(IDC_SC_DESKTOP, one && g_manager.onDesktop)));
     AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDC_SC_SAVEAS, TR(Theme_MainCaption(IDC_SC_SAVEAS, 0)));
     AppendMenuW(menu, MF_STRING | (selected && !(one && g_manager.pinned) ? 0 : MF_GRAYED), IDC_SC_PIN,
                 TR(Theme_MainCaption(IDC_SC_PIN, one && g_manager.pinned)));
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDC_SC_START, TR(Theme_MainCaption(IDC_SC_START, one && g_manager.inStartMenu)));
-    return menu;
 }
 
-/* The program's menu: its language, links, repair, uninstall and exit. */
-static HMENU ProgramMenu(void)
+/* The menu bar's Program menu: its language, links, repair, uninstall and exit. */
+static void FillProgramMenu(HMENU menu)
 {
-    HMENU menu = CreatePopupMenu(), languages = CreatePopupMenu();
+    HMENU languages = CreatePopupMenu();
     int i;
-    if (!menu) {
-        if (languages) DestroyMenu(languages);
-        return NULL;
-    }
     if (languages) {
         AppendMenuW(languages, MF_STRING | (Localize_CurrentLanguage() < 0 ? MF_CHECKED : 0), IDM_LANGUAGE, Localize_LanguageName(-1));
         AppendMenuW(languages, MF_SEPARATOR, 0, NULL);
@@ -2012,31 +2020,86 @@ static HMENU ProgramMenu(void)
     AppendMenuW(menu, MF_STRING | (g_manager.job ? MF_GRAYED : 0), IDC_REPAIR, TR(Theme_MainCaption(IDC_REPAIR, 0)));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDC_UNINSTALL, TR(L"&Uninstall\x2026"));
-    AppendMenuW(menu, MF_STRING, IDCANCEL, TR(L"E&xit"));
-    return menu;
+    AppendMenuW(menu, MF_STRING, IDM_EXIT, TR(L"E&xit"));
+}
+
+/* The window's menu bar: Program, Sessions and Shortcuts, named in the
+ * current language; what each holds is made as it opens. */
+static void MakeMenuBar(HWND dialog)
+{
+    HMENU bar = CreateMenu();
+    g_manager.programMenu = CreatePopupMenu();
+    g_manager.sessionsMenu = CreatePopupMenu();
+    g_manager.shortcutsMenu = CreatePopupMenu();
+    if (!bar || !g_manager.programMenu || !g_manager.sessionsMenu || !g_manager.shortcutsMenu) {
+        if (bar) DestroyMenu(bar);
+        if (g_manager.programMenu) DestroyMenu(g_manager.programMenu);
+        if (g_manager.sessionsMenu) DestroyMenu(g_manager.sessionsMenu);
+        if (g_manager.shortcutsMenu) DestroyMenu(g_manager.shortcutsMenu);
+        g_manager.programMenu = g_manager.sessionsMenu = g_manager.shortcutsMenu = NULL;
+        return;
+    }
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)g_manager.programMenu, TR(Theme_MainCaption(IDC_MENU_APP, 0)));
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)g_manager.sessionsMenu, TR(Theme_MainCaption(IDC_MENU_SESSIONS, 0)));
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)g_manager.shortcutsMenu, TR(Theme_MainCaption(IDC_MENU_SHORTCUTS, 0)));
+    if (!SetMenu(dialog, bar)) {
+        DestroyMenu(bar);   /* with its menus */
+        g_manager.programMenu = g_manager.sessionsMenu = g_manager.shortcutsMenu = NULL;
+    }
+}
+
+/* The menu bar's names in a new language. */
+static void NameMenuBar(void)
+{
+    static const int kMenus[] = { IDC_MENU_APP, IDC_MENU_SESSIONS, IDC_MENU_SHORTCUTS };
+    HMENU bar = GetMenu(g_manager.dlg);
+    UINT i;
+    if (!bar) return;
+    for (i = 0; i < ARRAYSIZE(kMenus); i++)
+        ModifyMenuW(bar, i, MF_BYPOSITION | MF_POPUP | MF_STRING, (UINT_PTR)GetSubMenu(bar, (int)i), TR(Theme_MainCaption(kMenus[i], 0)));
+    DrawMenuBar(g_manager.dlg);
+}
+
+/* WM_INITMENUPOPUP: one of the menu bar's menus fills as it opens, for the
+ * profiles selected now; while the window closes or uninstalls, all of it
+ * but Exit is grayed. FALSE for another menu. */
+static BOOL FillMenuBarMenu(HMENU menu)
+{
+    int i, count;
+    if (!menu || (menu != g_manager.programMenu && menu != g_manager.sessionsMenu && menu != g_manager.shortcutsMenu)) return FALSE;
+    UpdateButtons();   /* the shortcuts' state of the profile selected */
+    ClearMenu(menu);
+    if (menu == g_manager.programMenu) FillProgramMenu(menu);
+    else if (menu == g_manager.sessionsMenu) FillSessionsMenu(menu, SelectedProfiles());
+    else FillShortcutsMenu(menu, SelectedProfiles());
+    count = GetMenuItemCount(menu);
+    for (i = 0; StateChangesBlocked() && i < count; i++)
+        if (GetMenuItemID(menu, i) != IDM_EXIT) EnableMenuItem(menu, (UINT)i, MF_BYPOSITION | MF_GRAYED);
+    return TRUE;
 }
 
 static void DoLanguage(int choice);
+static void Close(HWND dialog);
 
-/* What a menu chose: its own commands here, the others as the buttons they stand for. */
-static void MenuCommand(UINT cmd)
+/* A menu's own commands: TRUE when `cmd` is one; the others are the buttons they stand for. */
+static BOOL MenuOwnCommand(UINT cmd)
 {
-    if (!cmd) return;
     if (cmd >= IDM_LIST_SAME_FIRST && cmd < IDM_LIST_SAME_FIRST + MAX_PROFILES) {
         DoKeepSame((int)(cmd - IDM_LIST_SAME_FIRST));
-        return;
+        return TRUE;
     }
     if (cmd >= IDM_LANGUAGE && cmd <= IDM_LANGUAGE + (UINT)Localize_LanguageCount()) {
         DoLanguage(cmd == IDM_LANGUAGE ? -1 : (int)(cmd - IDM_LANGUAGE - 1));
-        return;
+        return TRUE;
     }
     switch (cmd) {
-    case IDM_LIST_EXPORT: DoSessions(SESSIONS_EXPORT); break;
-    case IDM_LIST_IMPORT: DoSessions(SESSIONS_IMPORT); break;
-    case IDM_LIST_UNLINK: DoUnlink(); break;
+    case IDM_EXIT: Close(g_manager.dlg); return TRUE;
+    case IDM_LIST_EXPORT: DoSessions(SESSIONS_EXPORT); return TRUE;
+    case IDM_LIST_IMPORT: DoSessions(SESSIONS_IMPORT); return TRUE;
+    case IDM_LIST_UNLINK: DoUnlink(); return TRUE;
     case IDM_LIST_BACKUP:
         if (SelectedProfiles()) Backup_Create(g_manager.dlg, &g_manager.pkg, &g_manager.profiles, SelectedProfiles());
-        break;
+        return TRUE;
     case IDM_LIST_RESTORE:
         if (SelectedProfile() && !StateChangesBlocked()) {
             FinishShellWork();
@@ -2045,36 +2108,25 @@ static void MenuCommand(UINT cmd)
             SessionsView_ResumeWatching();
             Refresh(FALSE);
         }
-        break;
-    default:
-        SendMessageW(g_manager.dlg, WM_COMMAND, MAKEWPARAM(cmd, BN_CLICKED), 0);
-        break;
+        return TRUE;
     }
+    return FALSE;
 }
 
-/* A header menu under its button. */
-static void HeaderMenu(int id)
+/* What a popup menu chose: its own commands here, the others as the buttons they stand for. */
+static void MenuCommand(UINT cmd)
 {
-    HMENU menu;
-    RECT button;
-    UINT cmd;
-    if (StateChangesBlocked()) return;
-    UpdateButtons();   /* the shortcuts' state of the profile selected */
-    menu = id == IDC_MENU_APP ? ProgramMenu() : id == IDC_MENU_SESSIONS ? SessionsMenu(SelectedProfiles()) : ShortcutsMenu(SelectedProfiles());
-    if (!menu) return;
-    GetWindowRect(GetDlgItem(g_manager.dlg, id), &button);
-    cmd = Theme_TrackDropDown(g_manager.dlg, menu, &button);
-    DestroyMenu(menu);   /* with its submenus */
-    if (!StateChangesBlocked()) MenuCommand(cmd);
+    if (cmd && !MenuOwnCommand(cmd)) SendMessageW(g_manager.dlg, WM_COMMAND, MAKEWPARAM(cmd, BN_CLICKED), 0);
 }
 
 /* The list's menu, at the mouse or (from the keyboard) under the row with
- * the focus: every action on the profiles selected (the side bar's go through
- * its buttons, by their id), their shortcuts and sessions, and the profile
- * backed up. */
+ * the focus: what the toolbar and the column do to the profiles selected
+ * (through their buttons, by their id), keeping their sessions the same,
+ * and the profiles backed up; their shortcuts and other session commands
+ * are in the menu bar. */
 static void ListMenu(LPARAM pos)
 {
-    HMENU menu, sessions, shortcuts;
+    HMENU menu;
     const Profile *one;
     DWORD selected = SelectedProfiles();
     BOOL isDefault, idle = g_manager.job == NULL;
@@ -2090,7 +2142,7 @@ static void ListMenu(LPARAM pos)
         pt.x = (short)LOWORD(pos);
         pt.y = (short)HIWORD(pos);
     }
-    /* The row just clicked is selected, its WM_APP_SELECTION maybe not handled yet: the shortcuts' state follows it now. */
+    /* The row just clicked is selected, its WM_APP_SELECTION maybe not handled yet: the buttons follow it now. */
     UpdateButtons();
     one = SelectedProfile();
     isDefault = one && Core_EqualsI(one->folder, g_manager.profiles.defaultFolder);
@@ -2103,13 +2155,11 @@ static void ListMenu(LPARAM pos)
     AppendMenuW(menu, MF_STRING | (Deletable(selected) ? 0 : MF_GRAYED), IDC_DELETE, TR(Theme_MainCaption(IDC_DELETE, 0)));
     AppendMenuW(menu, MF_STRING | (one && !isDefault ? 0 : MF_GRAYED), IDC_DEFAULT, TR(Theme_MainCaption(IDC_DEFAULT, 0)));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    if ((shortcuts = ShortcutsMenu(selected)) != NULL)
-        AppendMenuW(menu, MF_POPUP | (selected ? 0 : MF_GRAYED), (UINT_PTR)shortcuts, TR(Theme_MainCaption(IDC_MENU_SHORTCUTS, 0)));
-    if ((sessions = SessionsMenu(selected)) != NULL)
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)sessions, TR(Theme_MainCaption(IDC_MENU_SESSIONS, 0)));
+    AppendMenuW(menu, MF_STRING | (selected && idle ? 0 : MF_GRAYED), IDC_SYNC, TR(Theme_MainCaption(IDC_SYNC, 0)));
+    AppendKeepSame(menu, selected);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDM_LIST_BACKUP, TR(L"&Back up\x2026"));
-    AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDM_LIST_RESTORE, TR(L"Restore from bac&kup\x2026"));
+    AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDM_LIST_RESTORE, TR(L"Restore from back&up\x2026"));
     if (selected && g_manager.pkg.found && idle) SetMenuDefaultItem(menu, IDC_OPEN, FALSE);
     MenuCommand((UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | (Localize_IsRTL() ? TPM_LAYOUTRTL : 0), pt.x, pt.y,
                                        g_manager.dlg, NULL));
@@ -2117,9 +2167,9 @@ static void ListMenu(LPARAM pos)
 }
 
 /* The profiles and the sessions share the window: Sessions view swaps them,
- * and becomes "< Back" in the same place. */
-static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR,
-                                        IDC_DEFAULT, IDC_NOTE };
+ * and becomes "< Back" in the same place. The toolbar stays: in the
+ * sessions view it acts on the profile shown. */
+static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_NOTE };
 
 static const WCHAR *SessionsButtonCaption(BOOL sessionsShown)
 {
@@ -2149,6 +2199,7 @@ static void ToggleSessions(void)
     if (!SessionsView_Shown()) {
         const Profile *p = FocusedProfile();
         Gui_ShowSessions(g_manager.dlg, &g_manager.pkg, TRUE, p ? p->folder : NULL);
+        SelectProfileRow(SessionsView_Profile());   /* the toolbar acts on the profile shown */
     } else {
         WCHAR folder[FOLDER_CCH];
         StringCchCopyW(folder, ARRAYSIZE(folder), SessionsView_Profile());
@@ -2682,6 +2733,7 @@ static void DoLanguage(int choice)
         return;
     }
     Localize_Window(g_manager.dlg);
+    NameMenuBar();
     Theme_Apply(g_manager.dlg);
     SetColumnTitles();
     SetTextIfChanged(IDC_SESSIONS, SessionsButtonCaption(SessionsView_Shown()));
@@ -2860,6 +2912,7 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         AddColumns();
         Theme_SmoothView(g_manager.list);
         SessionsView_Init(dialog);
+        MakeMenuBar(dialog);
         Theme_SetStrong(GetDlgItem(dialog, IDC_SESSIONS));   /* it leads to the other view */
         Theme_Apply(dialog);
         Theme_RememberLayout(dialog);
@@ -2992,16 +3045,28 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         break;
     }
 
+    case WM_INITMENUPOPUP:
+        if (!HIWORD(lp) && FillMenuBarMenu((HMENU)wp)) return TRUE;
+        break;
+
     case WM_COMMAND:
+        /* A menu's command (no control sends it): a closing window takes none but Exit and Esc. */
+        if (!lp && HIWORD(wp) == 0 && LOWORD(wp) != IDCANCEL) {
+            if (StateChangesBlocked() && LOWORD(wp) != IDM_EXIT) return TRUE;
+            if (MenuOwnCommand(LOWORD(wp))) return TRUE;
+        }
+        /* The sessions view shows another profile: the toolbar acts on it. */
+        if (LOWORD(wp) == IDC_S_PROFILES && HIWORD(wp) == LBN_SELCHANGE) {
+            SessionsView_Command(wp);
+            if (SessionsView_Shown()) SelectProfileRow(SessionsView_Profile());
+            return TRUE;
+        }
         switch (LOWORD(wp)) {
         case IDC_OPEN:          DoOpen(); return TRUE;
         case IDC_STOP:          DoQuit(FALSE); return TRUE;
         case IDC_RESTART:       DoQuit(TRUE); return TRUE;
         case IDC_SYNC:          RunJob(JOB_SYNC, SelectedProfiles()); return TRUE;
         case IDC_REPAIR:        DoRepair(); return TRUE;
-        case IDC_MENU_APP:
-        case IDC_MENU_SESSIONS:
-        case IDC_MENU_SHORTCUTS: HeaderMenu(LOWORD(wp)); return TRUE;
         case IDC_COPY_ALL:      DoSessions(SESSIONS_COPY_ALL); return TRUE;
         case IDC_MOVE_ALL:      DoSessions(SESSIONS_MOVE_ALL); return TRUE;
         case IDC_SAME_STOP:     DoStopSame(); return TRUE;
