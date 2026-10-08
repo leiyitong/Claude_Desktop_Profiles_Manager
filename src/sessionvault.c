@@ -8,8 +8,11 @@
  * of Claude's reach, in our state folder: vault\lists\<list>\<time>.txt names
  * each session a version lists and its entry, kept once in
  * vault\objects\<hash>.json; vault\deleted.txt names the sessions deleted,
- * which nothing here brings back. A version is written only when the list
- * changed, and every version stays.
+ * which nothing here brings back unless the user undeletes them
+ * (SessionVault_Undelete). A version is written only when the list changed;
+ * the versions of the last VAULT_KEEP_DAYS days stay, and at least the
+ * VAULT_KEEP_LEAST latest, and an entry no version names any more goes
+ * (Prune), so the vault does not grow without end.
  *
  * The profiles of one group (Profile.syncGroup) keep the same sessions and
  * share one list, "group" for group 1, "group-<n>" for the others. Whenever
@@ -56,6 +59,9 @@
 #define LAYOUT_KEY            L"layout"
 #define TRANSCRIPT_MAX_BYTES  (512u * 1024u * 1024u)   /* larger, a conversation is not forked: it stays one session */
 #define GUID_TEXT_CCH         39
+#define VAULT_KEEP_DAYS       30   /* a list's versions younger than that stay */
+#define VAULT_KEEP_LEAST      20   /* ... and at least its latest ones, however old */
+#define OBJECT_GRACE_MS       (24ULL * 3600ULL * 1000ULL)   /* an entry no version names yet may be one a keep is writing */
 
 typedef struct VaultItem {          /* a session a version lists */
     WCHAR     key[SESSION_ID_CCH];
@@ -440,7 +446,7 @@ static void ReadMarks(const WCHAR *dir, DatedSet *marks)
     FindClose(find);
 }
 
-/* The ledger of sessions deleted, which nothing here brings back. */
+/* The ledger of sessions deleted, which only SessionVault_Undelete brings back. */
 static void LoadLedger(DatedSet *ledger)
 {
     WCHAR path[MAX_PATH], *text, *rest, *line, *fields[2];
@@ -640,6 +646,106 @@ static WCHAR *VersionText(VaultList *list)
     return text;
 }
 
+/* ---------------------------------------------------------------- pruning */
+
+typedef struct Hashes {
+    ULONGLONG *items;
+    int        count, capacity;
+} Hashes;
+
+static void AddHash(Hashes *hashes, ULONGLONG hash)
+{
+    ULONGLONG *grown;
+    if (!hash || (grown = (ULONGLONG *)Grow(hashes->items, &hashes->capacity, hashes->count + 1, sizeof *grown)) == NULL) return;
+    hashes->items = grown;
+    hashes->items[hashes->count++] = hash;
+}
+
+static int __cdecl CompareHashes(const void *a, const void *b)
+{
+    ULONGLONG x = *(const ULONGLONG *)a, y = *(const ULONGLONG *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Every entry, archived list and sidebar layout some version of some list
+ * names, sorted; FALSE when one could not be read (nothing may go then). */
+static BOOL NamedObjects(Hashes *named)
+{
+    WCHAR dir[MAX_PATH], (*names)[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    BOOL ok = TRUE;
+    int count, i, j;
+    ZeroMemory(named, sizeof *named);
+    if (!VaultPath(LISTS_DIR, dir, ARRAYSIZE(dir)) || (find = Util_FindFiles(dir, L"*", &found, TRUE)) == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == L'.') continue;
+        names = VersionNames(found.cFileName, &count);
+        for (i = 0; i < count && ok; i++) {
+            VaultList version;
+            if (!LoadVersion(found.cFileName, names[i], &version)) {
+                ok = FALSE;
+                break;
+            }
+            for (j = 0; j < version.count; j++) AddHash(named, version.items[j].hash);
+            AddHash(named, version.index);
+            AddHash(named, version.layout);
+            FreeList(&version);
+        }
+        Free(names);
+    } while (ok && FindNextFileW(find, &found));
+    FindClose(find);
+    if (named->count > 1) qsort(named->items, (size_t)named->count, sizeof *named->items, CompareHashes);
+    return ok;
+}
+
+/* The list's versions older than VAULT_KEEP_DAYS days beyond its
+ * VAULT_KEEP_LEAST latest removed, then the entries no version names any
+ * more, unless written in the last day. */
+static void Prune(const WCHAR *listName)
+{
+    WCHAR (*names)[MAX_PATH], path[MAX_PATH], cutoff[32], dir[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    FILETIME now;
+    SYSTEMTIME limit;
+    ULONGLONG ticks;
+    Hashes named;
+    HANDLE find;
+    int count, i, removed = 0, objects = 0;
+    GetSystemTimeAsFileTime(&now);
+    ticks = (((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - (ULONGLONG)VAULT_KEEP_DAYS * 24 * 3600 * TICKS_PER_SECOND;
+    now.dwLowDateTime = (DWORD)ticks;
+    now.dwHighDateTime = (DWORD)(ticks >> 32);
+    if (!FileTimeToSystemTime(&now, &limit)) return;
+    /* Version names are their UTC time: older ones sort before this one. */
+    StringCchPrintfW(cutoff, ARRAYSIZE(cutoff), L"%04u%02u%02u-%02u%02u%02u-%03u", limit.wYear, limit.wMonth, limit.wDay, limit.wHour,
+                     limit.wMinute, limit.wSecond, limit.wMilliseconds);
+    names = VersionNames(listName, &count);   /* newest first */
+    for (i = VAULT_KEEP_LEAST; i < count; i++)
+        if (wcscmp(names[i], cutoff) < 0 && VersionPath(listName, names[i], path, ARRAYSIZE(path)) && DeleteFileW(path)) removed++;
+    Free(names);
+    if (!NamedObjects(&named)) {
+        Free(named.items);
+        return;
+    }
+    if (VaultPath(OBJECTS_DIR, dir, ARRAYSIZE(dir)) && (find = Util_FindFiles(dir, L"*.json", &found, FALSE)) != INVALID_HANDLE_VALUE) {
+        ULONGLONG recent = NowMs() - OBJECT_GRACE_MS;
+        do {
+            ULONGLONG hash;
+            WCHAR *end;
+            if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            hash = _wcstoui64(found.cFileName, &end, 16);
+            if (_wcsicmp(end, L".json") != 0 || FileTimeMs(&found.ftLastWriteTime) > recent ||
+                bsearch(&hash, named.items, (size_t)named.count, sizeof *named.items, CompareHashes))
+                continue;
+            if (SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", dir, found.cFileName)) && DeleteFileW(path)) objects++;
+        } while (FindNextFileW(find, &found));
+        FindClose(find);
+    }
+    Free(named.items);
+    if (removed || objects) Util_Log(L"session vault: %s pruned, %d old version(s) and %d entr(ies) no version names removed", listName, removed, objects);
+}
+
 /* A new version of the list, unless it reads as the latest one. */
 static BOOL SaveVersion(const WCHAR *listName, VaultList *list, const WCHAR *latest)
 {
@@ -667,8 +773,12 @@ static BOOL SaveVersion(const WCHAR *listName, VaultList *list, const WCHAR *lat
         ok = WriteText(path, text, FALSE);
         if (!ok) break;
     }
-    if (ok) Util_Log(L"session vault: %s kept, %d session(s)", listName, list->count);
-    else Util_Log(L"session vault: %s could not be kept (error %lu)", listName, GetLastError());
+    if (ok) {
+        Util_Log(L"session vault: %s kept, %d session(s)", listName, list->count);
+        Prune(listName);
+    } else {
+        Util_Log(L"session vault: %s could not be kept (error %lu)", listName, GetLastError());
+    }
 done:
     Free(previous);
     Free(text);
@@ -1616,6 +1726,7 @@ void SessionVault_AfterClose(const WCHAR *folder)
     progress.report = TellManager;
     KeepFor(&list, i, &report, &progress);
     TellManager(NULL, 0, 0);
+    SessionPurge_WeeklyBackUp(&list);
 }
 
 /* ---------------------------------------------------------------- restoring */
@@ -1804,4 +1915,142 @@ BOOL SessionVault_AddDeleted(const WCHAR *const *ids, int count)
     ok = SaveLedger(&ledger);
     Free(ledger.items);
     return ok;
+}
+
+/* ------------------------------------------------------------ undeleting */
+
+BOOL SessionVault_EverListed(VaultIds *keys)
+{
+    WCHAR dir[MAX_PATH], (*names)[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    int count, i, j;
+    ZeroMemory(keys, sizeof *keys);
+    if (!VaultPath(LISTS_DIR, dir, ARRAYSIZE(dir)) || (find = Util_FindFiles(dir, L"*", &found, TRUE)) == INVALID_HANDLE_VALUE) return TRUE;
+    do {
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == L'.') continue;
+        names = VersionNames(found.cFileName, &count);
+        for (i = 0; i < count; i++) {
+            VaultList version;
+            if (!LoadVersion(found.cFileName, names[i], &version)) continue;
+            for (j = 0; j < version.count; j++) AddId(keys, version.items[j].key);
+            FreeList(&version);
+        }
+        Free(names);
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    return TRUE;
+}
+
+/* The entry the newest version of `listName` that lists `key` kept for it; 0 for none. */
+static ULONGLONG KeptHash(const WCHAR *listName, const WCHAR *key)
+{
+    WCHAR (*names)[MAX_PATH];
+    ULONGLONG hash = 0;
+    int count, i, at;
+    names = VersionNames(listName, &count);
+    for (i = 0; i < count && !hash; i++) {
+        VaultList version;
+        if (!LoadVersion(listName, names[i], &version)) continue;
+        if ((at = FindItem(&version, key)) >= 0) hash = version.items[at].hash;
+        FreeList(&version);
+    }
+    Free(names);
+    return hash;
+}
+
+static void TakeFromLedger(void *context, const WCHAR *id)
+{
+    RemoveDated((DatedSet *)context, id);
+}
+
+typedef struct Unmarking {
+    const SessionSet *set;
+    int               profile;
+} Unmarking;
+
+/* Claude's mark of `id` taken from a closed profile that does not get the
+ * session back: kept alone, its marks would name the session deleted again. */
+static void Unmark(void *context, const WCHAR *id)
+{
+    const Unmarking *unmarking = (const Unmarking *)context;
+    const WCHAR *dir = unmarking->set->source[unmarking->profile].entriesDir;
+    WCHAR path[LONG_PATH_CCH], extended[LONG_PATH_CCH];
+    if (!dir[0] || Claude_IsRunning(&unmarking->set->profiles.items[unmarking->profile])) return;
+    if (SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" TOMBSTONE_PREFIX L"%s", dir, id)) &&
+        Util_ExtendedPath(path, extended, ARRAYSIZE(extended)) && !DeleteFileW(extended) && GetLastError() != ERROR_FILE_NOT_FOUND &&
+        GetLastError() != ERROR_PATH_NOT_FOUND)
+        Util_Log(L"session vault: %s could not be removed (error %lu)", path, GetLastError());
+}
+
+int SessionVault_Undelete(const ProfileList *list, const WCHAR *const *keys, int count, SyncReport *report)
+{
+    SessionSet set;
+    DatedSet ledger;
+    Changes changes;
+    int restored = 0, k, m;
+    BOOL ok = TRUE;
+    if (!SessionStore_LoadProfiles(&set, list)) return -1;
+    LoadLedger(&ledger);
+    ZeroMemory(&changes, sizeof changes);
+    for (k = 0; k < count && ok; k++) {
+        const char *found = NULL;
+        DWORD foundLength = 0, given = 0;
+        BOOL back = FALSE;
+        for (m = 0; m < set.profiles.count && ok; m++) {
+            const Profile *p = &set.profiles.items[m];
+            WCHAR listName[FOLDER_CCH];
+            ULONGLONG hash = 0;
+            DWORD length = 0;
+            size_t mappedLength = 0;
+            const char *mapped;
+            char *content;
+            /* Its own list, then the one it kept alone before it joined a group. */
+            if (SessionVault_ListName(&set.profiles, m, listName, ARRAYSIZE(listName))) hash = KeptHash(listName, keys[k]);
+            if (!hash && p->syncGroup) hash = KeptHash(p->folder, keys[k]);
+            if (!hash) continue;
+            if (!set.source[m].entriesDir[0]) {   /* not signed in now: nowhere to put it */
+                report->unavailable |= 1u << m;
+                continue;
+            }
+            if (SessionStore_FindEntry(&set, m, keys[k], NULL) >= 0) {   /* listed there again already */
+                given |= 1u << m;
+                back = TRUE;
+                continue;
+            }
+            if ((content = Own(&changes, LoadObject(hash, &length))) == NULL) {
+                Util_Log(L"session vault: the entry of %s is missing", keys[k]);
+                continue;
+            }
+            mapped = ContentFor(&set, m, content, length, &changes, &mappedLength);
+            ok = mapped && AddChange(&changes, m, SYNC_PUT, SYNC_UNDELETE, keys[k], EntryActivity(content, length), 0, mapped, mappedLength);
+            if (ok) {
+                EntryIds(content, length, TakeFromLedger, &ledger);
+                given |= 1u << m;
+                found = content;
+                foundLength = length;
+                back = TRUE;
+            }
+        }
+        if (!back) continue;
+        RemoveDated(&ledger, keys[k]);
+        restored++;
+        for (m = 0; m < set.profiles.count; m++) {
+            Unmarking unmarking;
+            if (given & (1u << m)) continue;   /* its put takes Claude's marks away */
+            unmarking.set = &set;
+            unmarking.profile = m;
+            Unmark(&unmarking, keys[k]);
+            if (found) EntryIds(found, foundLength, Unmark, &unmarking);
+        }
+    }
+    if (ok && changes.count) ok = SessionSync_Send(&set, changes.items, changes.count, report);
+    /* Out of the ledger once their entries are back or wait: the next keep lists them again. */
+    if (ok) ok = SaveLedger(&ledger);
+    Util_Log(L"session vault: %d of %d session(s) restored%s", restored, count, ok ? L"" : L" FAILED");
+    Free(ledger.items);
+    FreeChanges(&changes);
+    SessionStore_Free(&set);
+    if (ok && restored) SessionVault_KeepAll(list);
+    return ok ? restored : -1;
 }

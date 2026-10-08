@@ -276,6 +276,14 @@ BOOL         Core_SyncOpParse(const WCHAR *line, SyncOp *op);
 BOOL         Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added);
 int          Core_MirrorResolve(const MirrorSide *sides, int count, const MirrorSide *base);
 BOOL         Core_DatedCopyName(const WCHAR *name, const SYSTEMTIME *day, int copy, WCHAR *out, size_t cch);
+/* The weekly copy of folder `name` (sessionpurge.c): "<name>_auto_yyyymmdd". */
+#define CORE_WEEKLY_COPY_DAYS 7
+BOOL         Core_WeeklyCopyName(const WCHAR *name, const SYSTEMTIME *day, WCHAR *out, size_t cch);
+/* The day folder `copy` is a copy of folder `name` from: a dated copy
+ * (Core_DatedCopyName) or a weekly one (`weekly`). FALSE for any other name. */
+BOOL         Core_CopyDay(const WCHAR *name, const WCHAR *copy, SYSTEMTIME *day, BOOL *weekly);
+/* A copy is due when the latest one (wYear 0: none) is CORE_WEEKLY_COPY_DAYS days old or more. */
+BOOL         Core_WeeklyCopyDue(const SYSTEMTIME *latest, const SYSTEMTIME *today);
 BOOL         Core_BuildStamp(const char *date, const char *time, WCHAR *out, size_t cch);   /* __DATE__, __TIME__ as "2026.10.08 17:20" */
 BOOL         Core_ScratchFolderName(const WCHAR *cwd, WCHAR *out, size_t cch);
 char        *Core_JsonSetNested(const char *json, size_t len, const char *const *keys, int depth, const char *raw, size_t *outLen);
@@ -786,15 +794,21 @@ char *SessionVault_ForProfile(const SessionSet *set, int target, const char *con
 int   SessionVault_Versions(const WCHAR *listName, VaultVersion *out, int capacity);   /* newest first */
 BOOL  SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version, SyncReport *report);
 /* The ids of the sessions some kept list names (their transcripts too), and
- * of those deleted, which nothing brings back. */
+ * of those deleted, which only undeleting them brings back. */
 BOOL  SessionVault_Ids(VaultIds *listed, VaultIds *deleted);
 BOOL  SessionVault_HasId(const VaultIds *ids, const WCHAR *id);
 void  SessionVault_FreeIds(VaultIds *ids);
 BOOL  SessionVault_AddDeleted(const WCHAR *const *ids, int count);
+/* The keys of the sessions any version of any kept list names. */
+BOOL  SessionVault_EverListed(VaultIds *keys);
+/* Deleted sessions (by key) put back in each profile whose kept list had them,
+ * as that list last had them, at once where it is closed, else once it closes;
+ * they leave the deleted ones. Returns how many came back, -1 on a failure. */
+int   SessionVault_Undelete(const ProfileList *list, const WCHAR *const *keys, int count, SyncReport *report);
 
 /* --------------------------------------------------------- sessionpurge.c */
 /* The conversations of sessions no profile lists any more, deleted for good
- * from Claude Code's folder; and that folder copied whole. */
+ * from Claude Code's folder or put back in the lists; and that folder copied whole. */
 
 typedef enum PurgeKind { PURGE_DELETED, PURGE_UNKNOWN } PurgeKind;
 
@@ -804,6 +818,7 @@ typedef struct PurgeItem {
     WCHAR     title[SESSION_TITLE_CCH];
     WCHAR     project[MAX_PATH];       /* its working folder, as the transcript names it */
     PurgeKind kind;                    /* deleted in Claude, or no list ever named it */
+    BOOL      restorable;              /* a kept list had it (SessionVault_Undelete) */
     ULONGLONG bytes, written;          /* written: ms since 1970 */
 } PurgeItem;
 
@@ -815,6 +830,10 @@ RemoveResult SessionPurge_Delete(HWND owner, const ProfileList *profiles, const 
 BOOL         SessionPurge_CodeFolder(WCHAR *out, size_t cch);
 BOOL         SessionPurge_BackupName(WCHAR *out, size_t cch);   /* the folder a copy of it made today goes to */
 CopyResult   SessionPurge_BackUp(HWND owner, const WCHAR *to, DWORD *error);   /* Windows' progress shown only with an owner */
+/* With no Claude of `profiles` running and no copy of Claude Code's folder made
+ * in the last CORE_WEEKLY_COPY_DAYS days, one made beside it, silently; the
+ * weekly copies beyond the two latest removed. */
+void         SessionPurge_WeeklyBackUp(const ProfileList *profiles);
 
 /* ---------------------------------------------------------------- syncui.c */
 
@@ -832,6 +851,11 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
 BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles);
 BOOL SyncUi_BackUpCode(HWND owner);
+
+/* ---------------------------------------------------------------- help.c */
+
+/* The questions someone new asks, under `button`; the answer picked shown. */
+void Help_Show(HWND owner, HWND button);
 
 /* ------------------------------------------------------------- sessions.c */
 

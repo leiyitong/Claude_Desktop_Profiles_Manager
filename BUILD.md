@@ -100,11 +100,14 @@ src/sessionsync.c             sessions sent between profiles: merge, several sha
                               pins and groups, archives exported and imported (made when an open profile closes), backups
 src/sessionvault.c            the session vault (every list of sessions kept, its versions, the sessions deleted) and the
                               groups of profiles whose sessions are kept the same (sessions without a folder moved to
-                              each one's own area, sessions continued apart kept as two); a version recovered into a profile
-src/sessionpurge.c            conversations no profile lists, cleaned up; Claude Code's folder copied beside it
+                              each one's own area, sessions continued apart kept as two); a version recovered into a profile;
+                              deleted sessions put back; old versions pruned
+src/sessionpurge.c            conversations no profile lists, restored or cleaned up; Claude Code's folder copied beside
+                              it, on demand and every week
 src/sessionlink.c             session folders linked by earlier versions: read, and taken away
 src/syncui.c                  the dialog choosing the profiles that take part, and the summary of what was done; the
-                              recover and clean-up dialogs
+                              recover and Recently deleted dialogs
+src/help.c                    the Help menu's questions and answers
 src/sessions.c                the sessions view of the manager window: profiles, tree, details, menus, several sessions
 src/main.c                    command-line dispatch
 src/app.rc, src/resource.h    dialogs, version info, control ids

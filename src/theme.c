@@ -4482,7 +4482,8 @@ static const MainButton kMainActions[] = {
 #define MAIN_STACKED_ACTIONS (ARRAYSIZE(kMainActions) - 1)   /* all but "Set as default", which sits above the note */
 static const int kMainActionGroups[] = { 3, 6 };            /* the actions that start a group of their own */
 static const MainButton kMainMenus[] = {
-    { IDC_MENU_APP, { L"&Program", NULL } }, { IDC_MENU_SESSIONS, { L"&Sessions", NULL } }, { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL } }
+    { IDC_MENU_APP, { L"&Program", NULL } }, { IDC_MENU_SESSIONS, { L"&Sessions", NULL } }, { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL } },
+    { IDC_MENU_HELP, { L"Help", NULL } }   /* no access key: it would be one more shortcut */
 };
 /* The shortcuts menu's commands, each in the state its profile is in. */
 static const MainButton kMainShortcuts[] = {
@@ -4636,7 +4637,7 @@ static ULONGLONG HashControlFont(ULONGLONG key, HWND control)
 static ULONGLONG MainFontKey(HWND dialog)
 {
     static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR, IDC_DEFAULT,
-        IDC_MENU_APP, IDC_MENU_SESSIONS, IDC_MENU_SHORTCUTS, IDC_SESSIONS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_ARCHIVED,
+        IDC_MENU_APP, IDC_MENU_SESSIONS, IDC_MENU_SHORTCUTS, IDC_MENU_HELP, IDC_SESSIONS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_ARCHIVED,
         IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE };
     HWND list = MainViewContent(dialog, IDC_LIST);
     ULONGLONG key = Core_HashBytes(CORE_HASH_START, &g_dark, sizeof g_dark);

@@ -1245,6 +1245,58 @@ BOOL Core_DatedCopyName(const WCHAR *name, const SYSTEMTIME *day, int copy, WCHA
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s_%04u%02u%02u_%d", name, day->wYear, day->wMonth, day->wDay, copy));
 }
 
+#define WEEKLY_COPY_TAG L"_auto_"
+
+BOOL Core_WeeklyCopyName(const WCHAR *name, const SYSTEMTIME *day, WCHAR *out, size_t cch)
+{
+    return name[0] && SUCCEEDED(StringCchPrintfW(out, cch, L"%s" WEEKLY_COPY_TAG L"%04u%02u%02u", name, day->wYear, day->wMonth, day->wDay));
+}
+
+/* Eight digits that make a real day. */
+static BOOL ReadDay(const WCHAR *digits, SYSTEMTIME *day)
+{
+    FILETIME unused;
+    int i, value[8];
+    for (i = 0; i < 8; i++) {
+        if (digits[i] < L'0' || digits[i] > L'9') return FALSE;
+        value[i] = digits[i] - L'0';
+    }
+    ZeroMemory(day, sizeof *day);
+    day->wYear = (WORD)(value[0] * 1000 + value[1] * 100 + value[2] * 10 + value[3]);
+    day->wMonth = (WORD)(value[4] * 10 + value[5]);
+    day->wDay = (WORD)(value[6] * 10 + value[7]);
+    return SystemTimeToFileTime(day, &unused);
+}
+
+BOOL Core_CopyDay(const WCHAR *name, const WCHAR *copy, SYSTEMTIME *day, BOOL *weekly)
+{
+    size_t length = wcslen(name), tag = ARRAYSIZE(WEEKLY_COPY_TAG) - 1;
+    const WCHAR *rest, *end;
+    if (!length || _wcsnicmp(copy, name, length) != 0 || copy[length] != L'_') return FALSE;
+    rest = copy + length;
+    *weekly = _wcsnicmp(rest, WEEKLY_COPY_TAG, tag) == 0;
+    rest += *weekly ? tag : 1;
+    if (wcslen(rest) < 8 || !ReadDay(rest, day)) return FALSE;
+    end = rest + 8;
+    if (!*end) return TRUE;
+    if (*weekly || end[0] != L'_' || !end[1]) return FALSE;   /* "_2", "_3"... of a day */
+    for (end++; *end; end++)
+        if (*end < L'0' || *end > L'9') return FALSE;
+    return TRUE;
+}
+
+BOOL Core_WeeklyCopyDue(const SYSTEMTIME *latest, const SYSTEMTIME *today)
+{
+    SYSTEMTIME from = *latest, to = *today;
+    FILETIME a, b;
+    if (!latest->wYear) return TRUE;
+    from.wHour = from.wMinute = from.wSecond = from.wMilliseconds = 0;
+    to.wHour = to.wMinute = to.wSecond = to.wMilliseconds = 0;
+    if (!SystemTimeToFileTime(&from, &a) || !SystemTimeToFileTime(&to, &b)) return TRUE;
+    return (((ULONGLONG)b.dwHighDateTime << 32) | b.dwLowDateTime) >=
+           (((ULONGLONG)a.dwHighDateTime << 32) | a.dwLowDateTime) + (ULONGLONG)CORE_WEEKLY_COPY_DAYS * 24 * 3600 * TICKS_PER_SECOND;
+}
+
 /* The version the manager shows, the time this copy was built: the
  * compiler's __DATE__ ("Oct  8 2026") and __TIME__ ("17:20:33") as
  * "2026.10.08 17:20". */

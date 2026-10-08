@@ -1072,6 +1072,35 @@ static void TestMirror(void)
           wcscmp(name, L".claude_20261007_3") == 0);
     Check("dated copy: no name, no copy", !Core_DatedCopyName(L"", &day, 1, name, ARRAYSIZE(name)) &&
           !Core_DatedCopyName(L".claude", &day, 0, name, ARRAYSIZE(name)));
+
+    {
+        SYSTEMTIME found, none, today;
+        BOOL weekly = TRUE;
+        Check("weekly copy: its name", Core_WeeklyCopyName(L".claude", &day, name, ARRAYSIZE(name)) &&
+              wcscmp(name, L".claude_auto_20261007") == 0);
+        Check("copy day: a weekly copy", Core_CopyDay(L".claude", L".claude_auto_20261007", &found, &weekly) && weekly &&
+              found.wYear == 2026 && found.wMonth == 10 && found.wDay == 7);
+        Check("copy day: a dated copy", Core_CopyDay(L".claude", L".claude_20261007", &found, &weekly) && !weekly && found.wDay == 7);
+        Check("copy day: the third dated copy of a day", Core_CopyDay(L".claude", L".claude_20261007_3", &found, &weekly) && !weekly);
+        Check("copy day: not a copy", !Core_CopyDay(L".claude", L".claude", &found, &weekly) &&
+              !Core_CopyDay(L".claude", L".claude_bak_20261006", &found, &weekly) &&
+              !Core_CopyDay(L".claude", L".claude_20261307", &found, &weekly) &&
+              !Core_CopyDay(L".claude", L".claude_auto_20261007_2", &found, &weekly) &&
+              !Core_CopyDay(L".claude", L".claude_2026100", &found, &weekly) &&
+              !Core_CopyDay(L".claude", L".claude_20261007_", &found, &weekly) &&
+              !Core_CopyDay(L".claude", L".clauded_20261007", &found, &weekly));
+        ZeroMemory(&none, sizeof none);
+        today = day;
+        today.wDay = 13;
+        today.wHour = 23;
+        Check("weekly copy: due with none", Core_WeeklyCopyDue(&none, &today));
+        Check("weekly copy: not due after six days", !Core_WeeklyCopyDue(&day, &today));
+        today.wDay = 14;
+        today.wHour = 0;
+        Check("weekly copy: due on the seventh day", Core_WeeklyCopyDue(&day, &today));
+        today.wDay = 6;
+        Check("weekly copy: a copy dated later than today is no reason", !Core_WeeklyCopyDue(&day, &today));
+    }
 }
 
 /* A transcript line: `uuid` after `parent` ("" for none), written at second `second` of a day. */

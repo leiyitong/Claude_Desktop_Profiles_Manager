@@ -52,6 +52,7 @@
 #define IDC_MOVE_ALL       1034
 #define IDC_SET_UP_LINKS   1035   /* the program menu */
 #define IDC_SAME_STOP      1036   /* the sessions menu */
+#define IDC_MENU_HELP      1037   /* Help: its questions (IDC_HELP is a cursor's id) */
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -118,6 +119,7 @@
 #define IDC_C_LIST        2001
 #define IDC_C_BACKUP      2002
 #define IDC_C_NOTE        2003
+#define IDC_C_RESTORE     2004
 
 /* message box */
 #define IDC_M_ICON        1300

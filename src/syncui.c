@@ -756,12 +756,17 @@ typedef struct PurgeDialog {
     BOOL             filling;
 } PurgeDialog;
 
+/* Delete takes any conversation checked; Restore, one a kept list had. */
 static void ReadChecked(HWND dialog, PurgeDialog *state)
 {
-    int i, chosen = 0;
+    int i, chosen = 0, restorable = 0;
     for (i = 0; i < state->count; i++)
-        if ((state->checked[i] = ListView_GetCheckState(state->rows, i)) != FALSE) chosen++;
+        if ((state->checked[i] = ListView_GetCheckState(state->rows, i)) != FALSE) {
+            chosen++;
+            if (state->items[i].restorable) restorable++;
+        }
     EnableWindow(GetDlgItem(dialog, IDOK), chosen > 0);
+    EnableWindow(GetDlgItem(dialog, IDC_C_RESTORE), restorable > 0);
 }
 
 /* A conversation's row: what it is, its title (its id without one), when it
@@ -785,9 +790,9 @@ static INT_PTR CALLBACK PurgeProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
     case WM_INITDIALOG:
         state = (PurgeDialog *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
-        SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"These conversations are on this PC, but no profile lists them, so a restore could bring them back. "
-                                               L"Deleting them makes sure nothing does.\nChecked: deleted in Claude. Unchecked: in no list, "
-                                               L"made in a terminal for example."));
+        SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"These conversations are on this PC, but no profile lists them any more: deleted in Claude, or made in a "
+                                               L"terminal for example.\nRestore puts the ones checked back in the profiles that listed them. "
+                                               L"Delete removes them, so that nothing brings them back."));
         CheckDlgButton(dialog, IDC_C_BACKUP, BST_CHECKED);
         state->rows = GetDlgItem(dialog, IDC_C_LIST);
         ListView_SetExtendedListViewStyle(state->rows, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
@@ -800,8 +805,7 @@ static INT_PTR CALLBACK PurgeProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
             item.mask = LVIF_TEXT;
             item.iItem = i;
             item.pszText = text;
-            ListView_InsertItem(state->rows, &item);
-            ListView_SetCheckState(state->rows, i, state->items[i].kind == PURGE_DELETED);
+            ListView_InsertItem(state->rows, &item);   /* none checked: restoring and deleting are both choices */
         }
         state->filling = FALSE;
         Theme_SmoothView(state->rows);
@@ -821,9 +825,10 @@ static INT_PTR CALLBACK PurgeProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
         if (!state) break;
         switch (LOWORD(wp)) {
         case IDOK:
+        case IDC_C_RESTORE:
             ReadChecked(dialog, state);
             state->backUp = IsDlgButtonChecked(dialog, IDC_C_BACKUP) == BST_CHECKED;
-            EndDialog(dialog, IDOK);
+            EndDialog(dialog, LOWORD(wp));
             return TRUE;
         case IDCANCEL:
             EndDialog(dialog, IDCANCEL);
@@ -834,6 +839,37 @@ static INT_PTR CALLBACK PurgeProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
     return FALSE;
 }
 
+/* The conversations checked that a kept list had, put back in its profiles; what that did said. */
+static BOOL RestoreChosen(HWND owner, const ProfileList *profiles, const PurgeItem *items, const int *chosen, int count)
+{
+    WCHAR first[512], line[256];
+    const WCHAR **keys = (const WCHAR **)HeapAlloc(GetProcessHeap(), 0, (size_t)max(count, 1) * sizeof *keys);
+    SyncReport report;
+    HCURSOR old;
+    int i, n = 0, missing = 0, restored;
+    if (!keys) return FALSE;
+    for (i = 0; i < count; i++)
+        if (items[chosen[i]].restorable) keys[n++] = items[chosen[i]].id;
+        else missing++;
+    ZeroMemory(&report, sizeof report);
+    old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    restored = n ? SessionVault_Undelete(profiles, keys, n, &report) : 0;
+    SetCursor(old);
+    HeapFree(GetProcessHeap(), 0, (void *)keys);
+    if (restored < 0) {
+        Ui_Message(owner, MB_ICONWARNING, TR(L"The conversations could not be restored. %s"), report.error);
+        return FALSE;
+    }
+    StringCchPrintfW(first, ARRAYSIZE(first), TR(L"Conversations restored: %d"), restored);
+    if (missing) {
+        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Not restored, as no kept list had them: %d"), missing);
+        StringCchCatW(first, ARRAYSIZE(first), L"\n");
+        StringCchCatW(first, ARRAYSIZE(first), line);
+    }
+    SyncUi_ShowReport(owner, profiles, &report, first);
+    return restored > 0;
+}
+
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
 {
     WCHAR error[LONG_PATH_CCH];
@@ -841,6 +877,8 @@ BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
     PurgeItem *items = NULL;
     RemoveResult result;
     HCURSOR old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    INT_PTR action = IDCANCEL;
+    BOOL changed = FALSE;
     int count = SessionPurge_List(profiles, &items, error, ARRAYSIZE(error)), *chosen = NULL, n = 0, deleted = 0, i;
     SetCursor(old);
     if (count < 0) {
@@ -858,17 +896,20 @@ BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
     dialog.count = count;
     dialog.checked = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *dialog.checked);
     chosen = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof *chosen);
-    if (dialog.checked && chosen && Ui_Dialog(owner, IDD_PURGE, PurgeProc, (LPARAM)&dialog) == IDOK) {
+    if (dialog.checked && chosen) action = Ui_Dialog(owner, IDD_PURGE, PurgeProc, (LPARAM)&dialog);
+    if (action == IDOK || action == IDC_C_RESTORE)
         for (i = 0; i < count; i++)
             if (dialog.checked[i]) chosen[n++] = i;
-        if (n && (!dialog.backUp || CopyCodeFolder(owner, FALSE))) {
-            result = SessionPurge_Delete(owner, profiles, items, chosen, n, &deleted, error, ARRAYSIZE(error));
-            if (result == REMOVE_DONE) Ui_Message(owner, MB_ICONINFORMATION, TR(L"Conversations moved to the Recycle Bin: %d"), deleted);
-            else if (result == REMOVE_FAILED) Ui_Message(owner, MB_ICONWARNING, TR(L"The conversations could not be deleted. %s"), error);
-        }
+    if (action == IDC_C_RESTORE && n) {
+        changed = RestoreChosen(owner, profiles, items, chosen, n);
+    } else if (action == IDOK && n && (!dialog.backUp || CopyCodeFolder(owner, FALSE))) {
+        result = SessionPurge_Delete(owner, profiles, items, chosen, n, &deleted, error, ARRAYSIZE(error));
+        if (result == REMOVE_DONE) Ui_Message(owner, MB_ICONINFORMATION, TR(L"Conversations moved to the Recycle Bin: %d"), deleted);
+        else if (result == REMOVE_FAILED) Ui_Message(owner, MB_ICONWARNING, TR(L"The conversations could not be deleted. %s"), error);
+        changed = deleted > 0;
     }
     if (dialog.checked) HeapFree(GetProcessHeap(), 0, dialog.checked);
     if (chosen) HeapFree(GetProcessHeap(), 0, chosen);
     HeapFree(GetProcessHeap(), 0, items);
-    return deleted > 0;
+    return changed;
 }

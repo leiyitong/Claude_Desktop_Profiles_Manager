@@ -79,6 +79,7 @@ typedef struct MainState {
     BOOL         installing;
     BOOL         selectionPending; /* WM_APP_SELECTION posted */
     BOOL         shortcutsCheckPending; /* WM_APP_SHORTCUTS_CHECK posted */
+    BOOL         keepAsked;        /* a linked session folder's offer waits for its profiles to close (AskKeepAgain) */
     BOOL         layoutReady, layingOut;
     HANDLE       shellWork;        /* the thread writing shortcuts and pins in a new language */
 } MainState;
@@ -1882,6 +1883,56 @@ static void DoStopSame(void)
     SetSessionsChoice(SelectedProfiles(), 0);
 }
 
+/* `target` and the profiles whose session folder is linked to its, one bit each. */
+static DWORD SharingProfiles(int target)
+{
+    LinkState state;
+    DWORD sharing = 1u << target;
+    int i;
+    for (i = 0; i < g_manager.profiles.count; i++) {
+        SessionLink_Read(&g_manager.profiles, i, &state);
+        if (state.kind == LINK_PROFILE && state.profile == target) sharing |= 1u << i;
+    }
+    return sharing;
+}
+
+/* A linked session folder the user wants made its own, while a profile that
+ * shares it runs (its Claude would write the old list back): its Claude quit
+ * now, or not; either way the question comes back once they are all closed
+ * (AskKeepAgain). */
+static void OfferQuitForLink(int target)
+{
+    WCHAR text[1024];
+    DWORD running = RunningOf(SharingProfiles(target));
+    int i, first = -1;
+    for (i = 0; i < g_manager.profiles.count && first < 0; i++)
+        if (running & (1u << i)) first = i;
+    g_manager.keepAsked = TRUE;
+    if (first < 0) return;   /* closed meanwhile */
+    StringCchPrintfW(text, ARRAYSIZE(text),
+                     TR(L"\x201C%s\x201D is open. Quit Claude there now? Otherwise this question comes back once it is closed."),
+                     g_manager.profiles.items[first].name);
+    if (Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Quit it"), TR(L"Not now"), FALSE)) RunJob(JOB_QUIT, running);
+}
+
+/* The offer KeepSessions could not carry out made again, once no profile
+ * sharing a linked session folder runs: after a job, or back from another
+ * window. */
+static void AskKeepAgain(void)
+{
+    LinkState state;
+    int i;
+    if (!g_manager.keepAsked || g_manager.job || StateChangesBlocked()) return;
+    for (i = 0; i < g_manager.profiles.count; i++) {
+        SessionLink_Read(&g_manager.profiles, i, &state);
+        if (state.kind == LINK_PROFILE && (SessionLink_Busy(&g_manager.profiles.items[i]) ||
+                                           SessionLink_Busy(&g_manager.profiles.items[state.profile])))
+            return;
+    }
+    g_manager.keepAsked = FALSE;
+    PostMessageW(g_manager.dlg, WM_APP_KEEP_SESSIONS, 0, 0);
+}
+
 /* Once the window opened: a session folder linked to another profile's (which
  * Claude no longer writes through) offered a folder of its own, its sessions
  * kept the same as that profile's; then the session lists kept, the ones kept
@@ -1902,7 +1953,10 @@ static void KeepSessions(void)
                             L"Give it a folder of its own again, and keep its sessions the same as those of \x201C%s\x201D instead?"),
                          g_manager.profiles.items[i].name, g_manager.profiles.items[state.profile].name, g_manager.profiles.items[state.profile].name);
         if (!Ui_Ask(g_manager.dlg, IDI_WARNING, text, TR(L"Keep the same"), TR(L"Not now"), FALSE)) continue;
-        if (LinkBusy(&g_manager.profiles.items[i]) || LinkBusy(&g_manager.profiles.items[state.profile])) continue;
+        if (SessionLink_Busy(&g_manager.profiles.items[i]) || SessionLink_Busy(&g_manager.profiles.items[state.profile])) {
+            OfferQuitForLink(state.profile);
+            continue;
+        }
         FinishShellWork();
         SessionsView_PauseWatching();
         if (!SessionLink_Remove(&g_manager.profiles, i, error, ARRAYSIZE(error))) {
@@ -1970,7 +2024,7 @@ static HMENU SessionsMenu(DWORD selected)
     AppendMenuW(menu, MF_STRING, IDM_LIST_IMPORT, TR(L"&Import sessions\x2026"));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (g_manager.profiles.count ? 0 : MF_GRAYED), IDC_RESTORE, TR(L"Reco&ver sessions\x2026"));
-    AppendMenuW(menu, MF_STRING, IDC_PURGE, TR(L"C&lean up deleted sessions\x2026"));
+    AppendMenuW(menu, MF_STRING, IDC_PURGE, TR(L"Recently de&leted\x2026"));
     AppendMenuW(menu, MF_STRING, IDC_BACKUP_CODE, TR(L"&Back up .claude\x2026"));
     return menu;
 }
@@ -2918,6 +2972,7 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
 
     case WM_APP_JOB_DONE:
         JobDone((Job *)lp);
+        AskKeepAgain();
         return TRUE;
 
     case WM_APP_SYNC_PROGRESS:
@@ -2942,6 +2997,7 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
             g_manager.shortcutStateFolder[0] = 0;
             Refresh(FALSE);
             SessionsView_Reload();
+            AskKeepAgain();
             /* The dialog manager then gives the focus back to the control
              * that had it, which the refresh may just have hidden. */
             PostMessageW(dialog, WM_APP_RESTORE_FOCUS, 0, 0);
@@ -3002,6 +3058,7 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         case IDC_MENU_APP:
         case IDC_MENU_SESSIONS:
         case IDC_MENU_SHORTCUTS: HeaderMenu(LOWORD(wp)); return TRUE;
+        case IDC_MENU_HELP:      Help_Show(dialog, GetDlgItem(dialog, IDC_MENU_HELP)); return TRUE;
         case IDC_COPY_ALL:      DoSessions(SESSIONS_COPY_ALL); return TRUE;
         case IDC_MOVE_ALL:      DoSessions(SESSIONS_MOVE_ALL); return TRUE;
         case IDC_SAME_STOP:     DoStopSame(); return TRUE;

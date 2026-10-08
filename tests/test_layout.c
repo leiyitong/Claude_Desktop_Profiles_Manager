@@ -399,9 +399,9 @@ static void PurgeCaptions(HWND dialog, BOOL fill)
     LVCOLUMNW column;
     LVITEMW item;
     int i;
-    SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"These conversations are on this PC, but no profile lists them, so a restore could bring them back. "
-                                           L"Deleting them makes sure nothing does.\nChecked: deleted in Claude. Unchecked: in no list, "
-                                           L"made in a terminal for example."));
+    SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"These conversations are on this PC, but no profile lists them any more: deleted in Claude, or made in a "
+                                           L"terminal for example.\nRestore puts the ones checked back in the profiles that listed them. "
+                                           L"Delete removes them, so that nothing brings them back."));
     if (!fill) return;
     CheckDlgButton(dialog, IDC_C_BACKUP, BST_CHECKED);
     ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);

@@ -1,6 +1,7 @@
 /*
- * Conversations of sessions no profile lists any more, deleted from Claude
- * Code's folder; and that whole folder copied beside itself.
+ * Conversations of sessions no profile lists any more ("Recently deleted"),
+ * deleted from Claude Code's folder, or put back in the lists that had them
+ * (SessionVault_Undelete); and that whole folder copied beside itself.
  *
  * Deleting a session in Claude removes its entry only (sessionedit.c): its
  * conversation stays in Claude Code's folder, which every profile shares, and
@@ -13,6 +14,10 @@
  * session listed goes on from. What goes is what Claude's own delete removes
  * for a transcript (SessionEdit_ListTranscriptFiles), to the Recycle Bin,
  * never a working folder; its ids then join the vault's deleted ones.
+ *
+ * Claude Code's folder holds the conversations of every profile, and only
+ * there: once a week, when a Claude closes and none runs, it is copied beside
+ * itself as <name>_auto_<date>, and only the two latest such copies stay.
  */
 #include "app.h"
 #include <objbase.h>
@@ -209,6 +214,10 @@ int SessionPurge_List(const ProfileList *profiles, PurgeItem **items, WCHAR *err
     if (count > 1) qsort(*items, (size_t)count, sizeof **items, CompareWritten);
     SessionVault_FreeIds(&listed);
     SessionVault_FreeIds(&deleted);
+    if (count > 0 && SessionVault_EverListed(&listed)) {
+        for (i = 0; i < count; i++) (*items)[i].restorable = SessionVault_HasId(&listed, (*items)[i].id);
+        SessionVault_FreeIds(&listed);
+    }
     SessionStore_Free(&set);
     Util_Log(L"conversations no list names: %d", count);
     return count;
@@ -334,4 +343,104 @@ CopyResult SessionPurge_BackUp(HWND owner, const WCHAR *to, DWORD *error)
     *error = (DWORD)result;
     Util_Log(L"%s not copied whole to %s (code %d%s)", code, to, result, operation.fAnyOperationsAborted ? L", cancelled" : L"");
     return operation.fAnyOperationsAborted || result == ERROR_CANCELLED ? COPY_CANCELLED : COPY_FAILED;
+}
+
+/* ------------------------------------------------------- the weekly copy */
+
+#define WEEKLY_COPIES_KEPT 2
+#define WEEKLY_COPY_MUTEX  L"Local\\ClaudeDesktopProfilesManager.WeeklyCopy"   /* one watcher copies at a time */
+#define PARTIAL_SUFFIX     L".partial"
+
+typedef struct WeeklyCopy {
+    WCHAR      name[MAX_PATH];
+    SYSTEMTIME day;
+} WeeklyCopy;
+
+static int __cdecl CompareCopiesNewestFirst(const void *a, const void *b)
+{
+    return -wcscmp(((const WeeklyCopy *)a)->name, ((const WeeklyCopy *)b)->name);   /* the same prefix, then the date */
+}
+
+/* The copies beside Claude Code's folder `leaf` in `parent`: the latest day
+ * of any (`latest`, wYear 0 for none), and the weekly ones, newest first. */
+static int ReadCopies(const WCHAR *parent, const WCHAR *leaf, SYSTEMTIME *latest, WeeklyCopy *weekly, int capacity)
+{
+    WCHAR pattern[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    int count = 0;
+    ZeroMemory(latest, sizeof *latest);
+    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s_*", leaf)) ||
+        (find = Util_FindFiles(parent, pattern, &found, TRUE)) == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        SYSTEMTIME day;
+        BOOL isWeekly;
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !Core_CopyDay(leaf, found.cFileName, &day, &isWeekly)) continue;
+        if (day.wYear > latest->wYear || (day.wYear == latest->wYear && (day.wMonth > latest->wMonth ||
+            (day.wMonth == latest->wMonth && day.wDay > latest->wDay))))
+            *latest = day;
+        if (isWeekly && count < capacity) {
+            StringCchCopyW(weekly[count].name, ARRAYSIZE(weekly[count].name), found.cFileName);
+            weekly[count++].day = day;
+        }
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    if (count > 1) qsort(weekly, (size_t)count, sizeof *weekly, CompareCopiesNewestFirst);
+    return count;
+}
+
+void SessionPurge_WeeklyBackUp(const ProfileList *profiles)
+{
+    WCHAR code[MAX_PATH], parent[MAX_PATH], name[MAX_PATH], target[MAX_PATH], partial[MAX_PATH + 16], old[MAX_PATH], *slash;
+    const WCHAR *leaf;
+    WeeklyCopy weekly[16];
+    SYSTEMTIME latest, today;
+    HANDLE mutex;
+    DWORD error = 0;
+    BOOL whole;
+    int count, i;
+    for (i = 0; i < profiles->count; i++)
+        if (Claude_IsRunning(&profiles->items[i])) return;   /* its Claude Code writes there: the next close copies */
+    if (!SessionPurge_CodeFolder(code, ARRAYSIZE(code)) || !Util_DirExists(code) || FAILED(StringCchCopyW(parent, ARRAYSIZE(parent), code)) ||
+        (slash = wcsrchr(parent, L'\\')) == NULL)
+        return;
+    *slash = 0;
+    leaf = code + (slash + 1 - parent);
+    if ((mutex = CreateMutexW(NULL, FALSE, WEEKLY_COPY_MUTEX)) == NULL) return;
+    if (WaitForSingleObject(mutex, 0) != WAIT_OBJECT_0) {
+        CloseHandle(mutex);
+        return;
+    }
+    GetLocalTime(&today);
+    ReadCopies(parent, leaf, &latest, weekly, ARRAYSIZE(weekly));
+    if (!Core_WeeklyCopyDue(&latest, &today) || !Core_WeeklyCopyName(leaf, &today, name, ARRAYSIZE(name)) ||
+        FAILED(StringCchPrintfW(target, ARRAYSIZE(target), L"%s\\%s", parent, name)) ||
+        FAILED(StringCchPrintfW(partial, ARRAYSIZE(partial), L"%s" PARTIAL_SUFFIX, target)) || Util_QueryPath(target, NULL) != PATH_MISSING)
+        goto done;
+    /* Copied under another name first: a copy cut short is never taken for one. */
+    if (!Util_DeleteTree(partial, &error)) {
+        Util_Log(L"weekly copy: %s cannot be replaced (error %lu)", partial, error);
+        goto done;
+    }
+    whole = Util_CopyTree(code, partial, FALSE, &error);
+    if (!MoveFileW(partial, target)) {
+        Util_Log(L"weekly copy: %s cannot be named %s (error %lu)", partial, target, GetLastError());
+        goto done;
+    }
+    if (!whole) {
+        /* Kept, as a copy of what could be read; the older copies stay too. */
+        Util_Log(L"weekly copy: %s copied to %s, not whole (error %lu)", code, target, error);
+        goto done;
+    }
+    Util_Log(L"weekly copy: %s copied to %s", code, target);
+    count = ReadCopies(parent, leaf, &latest, weekly, ARRAYSIZE(weekly));
+    for (i = WEEKLY_COPIES_KEPT; i < count; i++) {
+        if (FAILED(StringCchPrintfW(old, ARRAYSIZE(old), L"%s\\%s", parent, weekly[i].name))) continue;
+        if (Util_DeleteTree(old, &error)) Util_Log(L"weekly copy: %s removed, the latest %d stay", old, WEEKLY_COPIES_KEPT);
+        else Util_Log(L"weekly copy: %s could not be removed (error %lu)", old, error);
+    }
+done:
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
 }

@@ -31,8 +31,8 @@ APP_NAME = "Claude Desktop Profiles Manager"
 FORMAT = re.compile(r'%%|%(?:[-+ #0]*)(?:\*|\d+)?(?:\.(?:\*|\d+))?(?:I64|ll|l|h|z|w)?[diuoxXfFeEgGaAcCsSpn]')
 FORBIDDEN_CONVERSIONS = ("a", "A", "n")
 # Names that are no format: their single percent signs are literal.
-PLAIN_NAMES = ["%LOCALAPPDATA%", "%APPDATA%"]
-FIXED_TERMS = ["claude://", "%APPDATA%", "%LOCALAPPDATA%", "*.lnk", "<a href=", "</a>",
+PLAIN_NAMES = ["%LOCALAPPDATA%", "%APPDATA%", "%USERPROFILE%"]
+FIXED_TERMS = ["claude://", "%APPDATA%", "%LOCALAPPDATA%", "%USERPROFILE%", "*.lnk", "<a href=", "</a>",
                APP_NAME, "Claude Desktop", "Claude Code", "Claude", "Cowork", "Anthropic", "Windows"]
 MARKUP = re.compile(r'<a href="[^"]*">|</a>')
 ELLIPSIS = "\u2026"
@@ -58,7 +58,7 @@ COMMAND_FAMILIES = [
     ["Export sessions", "E&xport sessions\u2026"],
     ["Import sessions", "&Import sessions\u2026"],
     ["Recover sessions", "Reco&ver sessions\u2026"],
-    ["Clean up deleted sessions", "C&lean up deleted sessions\u2026"],
+    ["Recently deleted", "Recently de&leted\u2026"],
 ]
 
 # TR() calls whose argument is no literal, by file: the variable or the
@@ -83,7 +83,7 @@ TRANSLATED_THROUGH_VARIABLES = {
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
     "gui.c": ["A profile folder with this name already exists."],
     "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "S&ync sessions", "Rep&air", "Set as de&fault",
-                "&Program", "&Sessions", "S&hortcuts", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
+                "&Program", "&Sessions", "S&hortcuts", "Help", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
                 "Pin to &taskbar", "Pinned", "Add to Start &menu", "Remove from Start &menu", "Sessions &view  >", "<  &Back",
                 "&Get Claude", "Set up l&inks", "&Update",
                 "Profile", "Role", "Data folder", "Sessions", "This profile", "Not signed in", "No sessions yet", "Link broken",
@@ -112,7 +112,7 @@ ACCESS_KEY_GROUPS = {
                           "&Back up\u2026", "Restore from bac&kup\u2026"],
     "sessions menu": ["S&ync sessions", "Merge &all sessions\u2026", "&Copy all sessions to\u2026", "&Move all sessions to\u2026",
                       "&Keep sessions the same as", "&Stop keeping sessions the same", "U&nlink sessions folder\u2026", "E&xport sessions\u2026",
-                      "&Import sessions\u2026", "Reco&ver sessions\u2026", "C&lean up deleted sessions\u2026", "&Back up .claude\u2026"],
+                      "&Import sessions\u2026", "Reco&ver sessions\u2026", "Recently de&leted\u2026", "&Back up .claude\u2026"],
     "program menu": ["&Language", "Set up l&inks\u2026", "Rep&air", "&Uninstall\u2026", "E&xit"],
     "shortcuts menu of a profile": ["Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar",
                                     "Pinned", "Add to Start &menu", "Remove from Start &menu"],
@@ -121,7 +121,7 @@ ACCESS_KEY_GROUPS = {
     "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026"],
     "sessions dialog": ["&To these profiles:"],
     "recover dialog": ["&Profile:", "&Version:"],
-    "clean-up dialog": ["&Back up .claude first"],
+    "clean-up dialog": ["&Back up .claude first", "&Restore"],
 }
 # Choices made in the same place: a key of one choice never shows with a key of another.
 ALTERNATIVES = [

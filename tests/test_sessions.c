@@ -2634,13 +2634,102 @@ static void TestVault(const WCHAR *projects)
           unknown && unknown->kind == PURGE_UNKNOWN && wcscmp(unknown->title, L"Old prompt") == 0);
     Check("a new conversation no list knows is left alone", count > 0 && !FindPurged(items, count, g_vaultIds[5]));
     Check("a listed session's conversation is never offered", count > 0 && !FindPurged(items, count, g_vaultIds[0]));
+    Check("a deleted session a kept list had can be restored, one no list had cannot",
+          gone && gone->restorable && unknown && !unknown->restorable);
     if (items) HeapFree(GetProcessHeap(), 0, items);
+
+    /* Restored: back in each profile of the group, as the list last had it, Claude's mark gone, no longer deleted. */
+    ids[0] = g_vaultIds[1];
+    ZeroMemory(&report, sizeof report);
+    Check("a deleted session is restored", SessionVault_Undelete(&profiles, ids, 1, &report) == 1 && report.failed == 0);
+    Check("it is back in both profiles of the group, as it was",
+          EntryTitled(entries[0], g_vaultIds[1], L"B two") && EntryTitled(entries[1], g_vaultIds[1], L"B two"));
+    Check("Claude's mark of its deletion is gone", MarkPath(entries[0], g_vaultIds[1], path, ARRAYSIZE(path)) && !FileThere(path));
+    Check("a profile whose list never had it does not get it, but loses Claude's mark of it",
+          !EntryThere(entries[2], g_vaultIds[1]) && MarkPath(entries[2], g_vaultIds[1], path, ARRAYSIZE(path)) && !FileThere(path));
+    SessionVault_Ids(&listed, &deleted);
+    Check("the vault no longer names it deleted, and lists it again",
+          !SessionVault_HasId(&deleted, g_vaultIds[1]) && SessionVault_HasId(&listed, g_vaultIds[1]));
+    SessionVault_FreeIds(&listed);
+    SessionVault_FreeIds(&deleted);
+    Check("the next sync keeps it", KeepGroup(&profiles, 0x3, &report) && report.removed == 0 && EntryThere(entries[0], g_vaultIds[1]));
+    ids[0] = g_vaultIds[4];
+    ZeroMemory(&report, sizeof report);
+    Check("a conversation no list had is not restored", SessionVault_Undelete(&profiles, ids, 1, &report) == 0 &&
+          !EntryThere(entries[0], g_vaultIds[4]));
+    Check("the restored session is deleted again for the clean-up below",
+          RemoveEntry(entries[0], g_vaultIds[1]) && MarkPath(entries[0], g_vaultIds[1], path, ARRAYSIZE(path)) && Save(path, "888") &&
+          KeepGroup(&profiles, 0x3, &report) && report.removed == 1 && !EntryThere(entries[1], g_vaultIds[1]));
     ids[0] = g_vaultIds[1];
     Check("what goes of a conversation is listed, its transcript first",
           TestedSessionEdit_ListTranscriptFiles(ids, 1, &paths, &pathCount, error, ARRAYSIZE(error)) && pathCount >= 1 &&
           Listed(paths, pathCount, transcripts[0]));
     if (paths) HeapFree(GetProcessHeap(), 0, paths);
     Check("a conversation cleaned up joins the deleted ones", SessionVault_AddDeleted(&ids[0], 1));
+
+    /* The weekly copy: none for a week, so one is made; the oldest weekly copies go, two stay. */
+    {
+        WCHAR oldest[MAX_PATH], older[MAX_PATH], weekly[MAX_PATH], partial[MAX_PATH + 16], name[MAX_PATH];
+        SYSTEMTIME today;
+        GetLocalTime(&today);
+        ready = SessionPurge_CodeFolder(code, ARRAYSIZE(code)) && InFixture(code) &&
+                SUCCEEDED(StringCchPrintfW(oldest, ARRAYSIZE(oldest), L"%s_auto_20200101", code)) &&
+                SUCCEEDED(StringCchPrintfW(older, ARRAYSIZE(older), L"%s_auto_20200108", code)) &&
+                Core_WeeklyCopyName(wcsrchr(code, L'\\') + 1, &today, name, ARRAYSIZE(name)) &&
+                SUCCEEDED(StringCchCopyW(weekly, ARRAYSIZE(weekly), code)) && wcsrchr(weekly, L'\\') &&
+                SUCCEEDED(StringCchCopyW(wcsrchr(weekly, L'\\') + 1, ARRAYSIZE(weekly) - (size_t)(wcsrchr(weekly, L'\\') + 1 - weekly), name)) &&
+                SUCCEEDED(StringCchPrintfW(partial, ARRAYSIZE(partial), L"%s.partial", weekly)) &&
+                CreateDirectoryW(oldest, NULL) && CreateDirectoryW(older, NULL);
+        Check("two old weekly copies", ready);
+        if (ready) SessionPurge_WeeklyBackUp(&profiles);
+        Check("a weekly copy is made when none is a week old",
+              ready && SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\projects\\fixture\\%s.jsonl", weekly, g_vaultIds[1])) && FileThere(path));
+        Check("it is named after the folder and today, and no partial copy is left", ready && Util_DirExists(weekly) && !Util_DirExists(partial));
+        Check("only the two latest weekly copies stay", ready && !Util_DirExists(oldest) && Util_DirExists(older));
+        if (ready) {
+            DeleteFileW(path);
+            SessionPurge_WeeklyBackUp(&profiles);
+        }
+        Check("none is made again within the week", ready && !FileThere(path) && Util_DirExists(older));
+    }
+
+    /* The vault does not grow without end: old versions beyond the latest 20 go, and the entries no version names. */
+    {
+        static VaultVersion many[64];
+        WCHAR state[MAX_PATH], dir[MAX_PATH], latest[MAX_PATH], old[MAX_PATH], stray[MAX_PATH];
+        DWORD length = 0;
+        char *text = NULL;
+        int made = 0, before, after, oldLeft = 0;
+        before = SessionVault_Versions(VAULT_GROUP_LIST, many, ARRAYSIZE(many));
+        ready = before > 0 && before < 20 && Util_StateDir(state, ARRAYSIZE(state)) &&
+                SUCCEEDED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\vault\\lists\\" VAULT_GROUP_LIST, state)) &&
+                SUCCEEDED(StringCchPrintfW(latest, ARRAYSIZE(latest), L"%s\\%s.txt", dir, many[0].name)) &&
+                (text = Util_ReadFile(latest, 1024 * 1024, FALSE, &length)) != NULL &&
+                SUCCEEDED(StringCchPrintfW(stray, ARRAYSIZE(stray), L"%s\\vault\\objects\\00000000000abcde.json", state)) &&
+                Save(stray, "{}") && SetModified(stray, 132000000000000000ULL);
+        for (p = 1; ready && p <= 25; p++) {
+            HANDLE file = INVALID_HANDLE_VALUE;
+            DWORD written = 0;
+            ready = SUCCEEDED(StringCchPrintfW(old, ARRAYSIZE(old), L"%s\\202001%02d-000000-000.txt", dir, p)) &&
+                    (file = CreateFileW(old, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL)) != INVALID_HANDLE_VALUE;
+            if (!ready) break;
+            ready = WriteFile(file, text, length, &written, NULL) && written == length;
+            CloseHandle(file);
+            made++;
+        }
+        if (text) HeapFree(GetProcessHeap(), 0, text);
+        Check("old versions and a stray entry in the vault", ready && made == 25);
+        Sleep(20);
+        ready = ready && WriteVaultEntry(entries[0], g_vaultIds[0], "A one pruned", 600, FALSE) && KeepGroup(&profiles, 0x3, &report);
+        after = SessionVault_Versions(VAULT_GROUP_LIST, many, ARRAYSIZE(many));
+        for (p = 0; p < after; p++)
+            if (wcsncmp(many[p].name, L"2020", 4) == 0) oldLeft++;
+        Check("a new version keeps the latest 20, the older ones go", ready && after == 20 && oldLeft == 20 - (before + 1) &&
+              wcsncmp(many[0].name, L"2020", 4) != 0);
+        Check("an entry no version names, written long ago, goes", ready && !FileThere(stray));
+        Check("the entries the versions name stay", ready && EntryTitled(entries[1], g_vaultIds[0], L"A one pruned") &&
+              SessionVault_Restore(&profiles, 2, VAULT_GROUP_LIST, many[0].name, &report) && report.failed == 0);
+    }
 
     /* Claude Code's folder copied beside it, as <name>_<date>. */
     ready = SessionPurge_CodeFolder(code, ARRAYSIZE(code)) && SessionPurge_BackupName(copy, ARRAYSIZE(copy)) && InFixture(copy);
