@@ -2775,9 +2775,10 @@ static void Downloaded(UpdateResult result, DWORD error)
     }
     g_manager.updating = FALSE;
     g_manager.installing = FALSE;
-    if (result == UPDATE_NOT_SIGNED)
-        Ui_Message(g_manager.dlg, MB_ICONWARNING,
-                   TR(L"The new version was not installed: the downloaded file is not signed by the author of " APP_NAME L"."));
+    if (result == UPDATE_NOT_SIGNED)   /* this fork's releases are not signed: the user installs them from the page */
+        openPage = Ui_Message(g_manager.dlg, MB_ICONWARNING | MB_YESNO,
+                              TR(L"The new version is not signed by the author of " APP_NAME L", so it was not installed.\n\n"
+                                 L"Open its download page to install it yourself?")) == IDYES;
     else if (result == UPDATE_NOT_VERIFIED)
         Ui_Message(g_manager.dlg, MB_ICONWARNING,
                    TR(L"The new version was not installed: Windows could not check its signature (error 0x%08lX). Try again later."),

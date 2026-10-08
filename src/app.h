@@ -40,7 +40,7 @@
 #define APP_EXE            L"ClaudeDesktopProfilesManager.exe"
 #define APP_AUMID_PREFIX   L"ClaudeDesktopProfilesManager."
 #define APP_DOWNLOAD_URL   L"https://claude.ai/download"
-#define APP_REPO           L"Freenitial/Claude_Desktop_Profiles_Manager"
+#define APP_REPO           L"leiyitong/Claude_Desktop_Profiles_Manager"   /* this fork's releases: the original's would replace it */
 #define APP_RELEASES_URL   L"https://github.com/" APP_REPO L"/releases"
 #define APP_AUTHOR_URL     L"https://github.com/Freenitial"
 /* Whom the release certificate is issued to (sign.cmd signs with it): an

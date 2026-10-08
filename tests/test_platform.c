@@ -3596,7 +3596,7 @@ static void CheckDownloadOutcomes(void)
 {
     static const DownloadOutcome outcomes[] = {
         { UPDATE_NOT_DOWNLOADED, "not downloaded", TRUE },
-        { UPDATE_NOT_SIGNED, "not signed", FALSE },
+        { UPDATE_NOT_SIGNED, "not signed", TRUE },   /* this fork's releases are not signed: installed by hand from the page */
         { UPDATE_NOT_VERIFIED, "signature not verified", FALSE },
         { UPDATE_WRONG_VERSION, "wrong version", FALSE },
         { UPDATE_NOT_STARTED, "not started", TRUE },
