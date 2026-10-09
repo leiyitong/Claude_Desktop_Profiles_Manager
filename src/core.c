@@ -550,6 +550,19 @@ BOOL Core_PathUnder(const WCHAR *path, const WCHAR *dir)
            path[dirLength] == L'/';
 }
 
+/* `path` with its start written as `%variable%` when that start is the
+ * variable's `value` (a whole folder, case-insensitive): FALSE, and `path`
+ * as it is, when it is not. */
+BOOL Core_PathWithVariable(const WCHAR *path, const WCHAR *variable, const WCHAR *value, WCHAR *out, size_t cch)
+{
+    size_t valueLength = value ? Core_TrimmedPathLength(value) : 0;
+    if (path && variable && *variable && valueLength && Core_PathUnder(path, value) &&
+        SUCCEEDED(StringCchPrintfW(out, cch, L"%%%s%%%s", variable, path + valueLength)))
+        return TRUE;
+    if (FAILED(StringCchCopyW(out, cch, path ? path : L""))) out[0] = 0;
+    return FALSE;
+}
+
 /* Where Claude's package keeps what it writes to AppData for itself:
  * %LOCALAPPDATA%\Packages\<family>\LocalCache\<area>\<name> (area: Local or Roaming). */
 BOOL Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *family, const WCHAR *area, const WCHAR *name,

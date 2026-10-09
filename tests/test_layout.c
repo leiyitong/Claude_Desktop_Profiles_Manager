@@ -614,7 +614,7 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_SET_UP_LINKS, IDC_NOTE };
+    static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_BACKUP_CODE, IDC_NOTE };
     static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
     size_t i;
     for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
@@ -992,13 +992,13 @@ static void CheckNoteGeometry(HWND dialog, const LayoutFixture *fixture)
 {
     HWND note = GetDlgItem(dialog, IDC_NOTE);
     RECT client, table = RelativeRect(dialog, fixture->tableViewport), placed = RelativeRect(dialog, note);
-    RECT links = RelativeRect(dialog, GetDlgItem(dialog, IDC_SET_UP_LINKS)), status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS));
+    RECT last = RelativeRect(dialog, GetDlgItem(dialog, IDC_BACKUP_CODE)), status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS));
     GetClientRect(dialog, &client);
     Check(fixture, note, "note stays beside the table and inside the dialog",
           placed.left >= table.right && placed.top >= 0 && placed.right <= client.right && placed.bottom <= client.bottom);
     Check(fixture, note, "note fits the table's vertical band", placed.bottom <= table.bottom);
     Check(fixture, note, "the complete note fits between the column's last action and its foot",
-          placed.top >= links.bottom && placed.bottom <= status.top);
+          placed.top >= last.bottom && placed.bottom <= status.top);
 }
 
 static BOOL IntentionalEllipsis(HWND control)
@@ -1961,7 +1961,7 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
 static void CheckMainFrameMessages(void)
 {
     static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_REPAIR,
-                                    IDC_SET_UP_LINKS };
+                                    IDC_BACKUP_CODE };
     LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];

@@ -39,7 +39,7 @@
 #define IDC_STOP           1021
 #define IDC_RESTORE        1022
 #define IDC_PURGE          1023
-#define IDC_BACKUP_CODE    1024
+#define IDC_BACKUP_CODE    1024   /* Back up .claude, in the column */
 #define IDC_MENU_APP       1025
 #define IDC_MENU_SESSIONS  1026
 #define IDC_MENU_SHORTCUTS 1027
@@ -50,7 +50,6 @@
 #define IDC_PROGRESS       1032
 #define IDC_COPY_ALL       1033   /* the sessions menu */
 #define IDC_MOVE_ALL       1034
-#define IDC_SET_UP_LINKS   1035   /* Fix claude:// links, in the column */
 #define IDC_SAME_STOP      1036   /* the sessions menu */
 
 /* sessions view of the main window */

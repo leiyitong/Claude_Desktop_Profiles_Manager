@@ -516,6 +516,18 @@ static void TestPathsAndTimes(void)
     Check("a drive root is inside itself", Core_PathUnder(L"C:\\", L"C:\\"));
     Check("a forward slash separates folders too", Core_PathUnder(L"C:\\a/b", L"C:\\a") && !Core_PathUnder(L"C:\\ab/c", L"C:\\a"));
     Check("a different drive is outside a root", !Core_PathUnder(L"D:\\a.lnk", L"C:\\"));
+    {
+        WCHAR shown[MAX_PATH];
+        Check("a path under a variable's folder is written with the variable",
+              Core_PathWithVariable(L"C:\\Users\\X\\AppData\\Roaming\\Claude-A\\x", L"APPDATA", L"c:\\users\\x\\appdata\\roaming\\", shown,
+                                    ARRAYSIZE(shown)) &&
+              wcscmp(shown, L"%APPDATA%\\Claude-A\\x") == 0);
+        Check("the variable's folder itself is the variable",
+              Core_PathWithVariable(L"C:\\Users\\X", L"USERPROFILE", L"C:\\Users\\X", shown, ARRAYSIZE(shown)) && wcscmp(shown, L"%USERPROFILE%") == 0);
+        Check("a sibling folder with the same start stays as it is",
+              !Core_PathWithVariable(L"C:\\Users\\X2\\a", L"USERPROFILE", L"C:\\Users\\X", shown, ARRAYSIZE(shown)) && wcscmp(shown, L"C:\\Users\\X2\\a") == 0);
+        Check("no value: the path as it is", !Core_PathWithVariable(L"C:\\a", L"APPDATA", L"", shown, ARRAYSIZE(shown)) && wcscmp(shown, L"C:\\a") == 0);
+    }
 
     ZeroMemory(&st, sizeof st);
     st.wYear = 2026; st.wMonth = 9; st.wDay = 27; st.wHour = 8; st.wMinute = 15; st.wSecond = 40; st.wMilliseconds = 500;

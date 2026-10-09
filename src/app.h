@@ -75,6 +75,8 @@
 #define STOCK_DEFAULT_NAME L"Main"
 #define CLAUDE_DESKTOP_SETTINGS L"claude_desktop_config.json"   /* in a profile's data folder */
 #define CLAUDE_APP_SETTINGS L"config.json"                      /* ...its app state: the account signed in */
+#define CLAUDE_ENTRIES_DIR  L"claude-code-sessions"             /* ...its Claude Code sessions' entries */
+#define CLAUDE_SCRATCH_DIR  L"scratch-workspaces"               /* ...the working folders of its sessions without a folder */
 
 #define MAX_PROFILES       32
 C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
@@ -249,6 +251,7 @@ void         Core_ProfileAumid(const WCHAR *folder, WCHAR *out, size_t cch);
 void         Core_ShortcutFileName(const WCHAR *label, int copyNumber, WCHAR *out, size_t cch);
 ULONGLONG    Core_SystemTimeTicks(const SYSTEMTIME *st);
 BOOL         Core_PathUnder(const WCHAR *path, const WCHAR *dir);
+BOOL         Core_PathWithVariable(const WCHAR *path, const WCHAR *variable, const WCHAR *value, WCHAR *out, size_t cch);   /* "%APPDATA%\..." */
 BOOL         Core_ProfileFilePath(const Profile *p, const WCHAR *path, WCHAR *out, size_t cch);
 BOOL         Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *family, const WCHAR *area, const WCHAR *name,
                                    WCHAR *out, size_t cch);
@@ -832,6 +835,25 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
 BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles);
 BOOL SyncUi_BackUpCode(HWND owner);
+/* A change to data, said before it is made and asked: `question`, the
+ * folders it changes (`folders`: lines made with SyncUi_AddLine and
+ * SyncUi_AddSessionFolders), and, when `backedUp`, where what it replaces
+ * goes first. TRUE to go on. */
+#define CONFIRM_CCH 8192
+BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, const WCHAR *folders, BOOL backedUp, const WCHAR *button);
+void SyncUi_AddLine(WCHAR *text, size_t cch, const WCHAR *line, BOOL indent);
+void SyncUi_ShortPath(const WCHAR *path, WCHAR *out, size_t cch);   /* with %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% for its start */
+void SyncUi_AddPath(WCHAR *text, size_t cch, const WCHAR *path);   /* a path, short, on an indented line */
+/* The folders a change to the sessions of the profiles of `bits` writes in
+ * each: the entries, the working folders of sessions without a folder, and
+ * (`layout`) the sidebar's settings; with a heading. */
+void SyncUi_AddSessionFolders(WCHAR *text, size_t cch, const ProfileList *profiles, DWORD bits, BOOL layout);
+void SyncUi_AddTranscriptFolder(WCHAR *text, size_t cch, const WCHAR *heading);   /* Claude Code's conversations, under `heading` */
+/* Sessions of the profiles of `bits` written, asked first (SyncUi_Confirm):
+ * their folders, the sidebar's settings when `layout`, Claude Code's
+ * conversations when `transcripts`. */
+BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const ProfileList *profiles, DWORD bits, BOOL layout, BOOL transcripts,
+                            const WCHAR *button);
 
 /* ------------------------------------------------------------- sessions.c */
 
