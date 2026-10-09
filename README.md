@@ -4,6 +4,32 @@ Run several Claude Desktop accounts side by side on Windows, each with **its own
 
 Unofficial tool, not affiliated with Anthropic.
 
+## 关于这个版本 / About this version
+
+这是 [leiyitong](https://github.com/leiyitong) 公开分享的版本。程序最初由 [Freenitial](https://github.com/Freenitial)（Léo Gillet）编写，之后由 Cheese（[JustLikeCheese](https://github.com/JustLikeCheese)）在一个不公开的仓库里继续开发。这个仓库跟随 Cheese 的最新版本，并在它的基础上做了下面这些改进：
+
+- **帮助**：顶部菜单栏多了"帮助"，用大白话回答新手常问的问题：对话存在哪里、几个账号怎么保持同样的对话、什么在保护对话、重装 Claude 前要做什么。没有快捷键，不会和其他软件冲突
+- **最近删除**：在 Claude 里删掉的对话，文件其实还在电脑上。"会话"菜单 → **最近删除…** 列出它们，可以**恢复**到原来的账号，也可以**删除**（放进回收站）
+- **每周自动备份 `.claude`**：一周内没有备份过时，在 Claude 关闭后自动复制一份 `%USERPROFILE%\.claude`，名叫 `.claude_auto_<日期>`，只保留最新 2 份，更旧的自动删除
+- **保险库自动清理**：保险库（`%LOCALAPPDATA%\Claude Desktop Profiles Manager\vault`）只保留最近 30 天的版本（至少最新 20 个），不再无限增长
+- **再次询问"保持一致"**：如果因为某个 Claude 正开着而没能把账号设成"保持一致"，管理器会提议帮你退出它；等它关闭后会再问一次
+- **更新来源**：管理器从这个仓库检查新版本，所以原版的发布不会覆盖这个版本
+
+更早的改进已经被 Cheese 合并进他的版本：几个账号不再共用一个链接的会话文件夹（Claude 会拒绝写入链接文件夹，导致新对话丢失），而是各自保存，再由保险库把变化同步过去。
+
+This is the version [leiyitong](https://github.com/leiyitong) shares publicly. It was written by [Freenitial](https://github.com/Freenitial) (Léo Gillet) and developed further by Cheese ([JustLikeCheese](https://github.com/JustLikeCheese)) in a private repository. This repository follows Cheese's latest version and adds: a **Help** menu, **Recently deleted** with **Restore**, a weekly copy of `.claude` (two kept), a vault limited to 30 days (at least 20 versions), the "Keep the same" question asked again once the Claude in the way closes, and updates from this repository.
+
+### 怎么安装 / How to install
+
+1. 先安装 [Claude Desktop](https://claude.ai/download)（Windows 10 1809 或更新的 64 位系统）
+2. 打开本仓库的 **[Releases](../../releases/latest)**，下载 **`ClaudeDesktopProfilesManager.exe`**（不要下载 "Source code"，那是源代码）
+3. 双击运行。它不需要安装包，也不需要管理员权限：会自己装到 `%LOCALAPPDATA%\Programs\Claude Desktop Profiles Manager`，在开始菜单加上快捷方式，然后打开。下载的那个文件之后可以删掉
+4. Windows 问"用哪个应用打开 claude:// 链接"时，选 **Claude Desktop Profiles Manager**，再选**始终**
+
+这个版本没有数字签名，所以第一次运行时 Windows 可能显示"Windows 已保护你的电脑"：点**更多信息** → **仍要运行**。有新版本时，管理器会提示你，并打开下载页面，按上面的步骤再装一次即可。
+
+Download `ClaudeDesktopProfilesManager.exe` from [Releases](../../releases/latest) and double-click it: it installs itself for the current user. It is not signed, so Windows SmartScreen may ask first: **More info** → **Run anyway**.
+
 ![Claude Desktop Profiles Manager window in dark theme, listing the Personal and Work profiles](docs/screenshot.png)
 
 ## Features
@@ -26,7 +52,7 @@ Unofficial tool, not affiliated with Anthropic.
 - **Backups** - Right-click a profile, **Back up…** saves the parts you check (Code sessions, Cowork sessions, settings, sign-in) to one .zip, one per profile when several are selected; **Restore from backup…** puts them into the same or another profile
 - **English and Simplified Chinese** - The manager follows your Windows language, or the one you pick in **Program** → **Language**
 - **Settings copy** - A new profile can start with the MCP servers, notification-area icon, hardware acceleration setting, language and theme of another one
-- **Updates** - Tells you when a new version is out and installs it in one click, once Windows has checked its signature
+- **Updates** - Tells you when a new version is out and opens its download page (this version's releases are not signed, so it does not install them by itself)
 - **Claude unchanged** - Starts the installed app like the Start menu does, so Claude keeps updating itself
 - **Lightweight** - One native exe, no runtime, no admin rights
 
@@ -78,6 +104,8 @@ See [BUILD.md](BUILD.md).
 
 ## Credits
 
+- [Freenitial](https://github.com/Freenitial) (Léo Gillet) - the original Claude Desktop Profiles Manager
+- Cheese ([JustLikeCheese](https://github.com/JustLikeCheese)) - its further development: session groups, the sidebar kept the same, the menus
 - [ai-multi-instance](https://github.com/Zoltak-Dev/ai-multi-instance) - the `--user-data-dir` technique for Claude Desktop
 - [claude-desktop-clone](https://github.com/vodongha/claude-desktop-clone) and [claude-windows-multiprofile](https://github.com/fredless/claude-windows-multiprofile) - earlier PowerShell tools for the same job
 
