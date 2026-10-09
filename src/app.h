@@ -69,6 +69,8 @@
 #define MANAGER_MUTEX      L"Local\\ClaudeDesktopProfilesManager.Manager"
 #define LOG_MUTEX          L"Local\\ClaudeDesktopProfilesManager.Log"
 #define SESSION_MUTEX_PREFIX L"Local\\ClaudeDesktopProfilesManager.Session."
+#define SYNC_MUTEX_PREFIX  L"Local\\ClaudeDesktopProfilesManager.Sync."    /* and the state folder's hash */
+#define SYNC_LOCK_WAIT_MS  (5u * 60u * 1000u)
 
 #define STOCK_FOLDER       L"Claude"
 #define PROFILE_PREFIX     L"Claude-"
@@ -200,6 +202,7 @@ typedef struct SyncReport {             /* what sending sessions to profiles did
     int   forked;                       /* sessions two profiles went on with apart, kept as two */
     DWORD waiting;                      /* the profiles whose part waits for them to close */
     DWORD unavailable;                  /* the profiles that have no session entries yet: nothing sent there */
+    int   conflicts;                    /* parts of a sidebar changed in two profiles each their own way: left to the person */
     WCHAR backup[MAX_PATH];             /* where what was replaced or removed went; "" for nowhere */
     WCHAR error[LONG_PATH_CCH];         /* the first failure, "" for none */
 } SyncReport;
@@ -388,6 +391,11 @@ BOOL      Util_InstallDir(WCHAR *out, size_t cch);     /* %LOCALAPPDATA%\Program
 BOOL      Util_InstallExe(WCHAR *out, size_t cch);
 BOOL      Util_StateDir(WCHAR *out, size_t cch);       /* %LOCALAPPDATA%\Claude Desktop Profiles Manager */
 void      Util_SetStateDir(const WCHAR *dir);          /* tests: a private state folder */
+/* One sync at a time, across processes (the state folder's lock: a test has
+ * its own). The thread that holds it takes it again; NULL after
+ * SYNC_LOCK_WAIT_MS, the sync then not made. */
+HANDLE    Util_SyncLock(void);
+void      Util_SyncUnlock(HANDLE lock);
 BOOL      Util_FileExists(const WCHAR *path);
 BOOL      Util_DirExists(const WCHAR *path);
 typedef enum PathState { PATH_MISSING, PATH_PRESENT, PATH_UNREACHABLE } PathState;
@@ -661,6 +669,7 @@ typedef struct SessionEntry {          /* one profile's entry for a session */
     BOOL      userTitle;               /* named by someone, not by Claude */
     BOOL      starred;
     BOOL      archived;
+    BOOL      damaged;                 /* Claude's startup took it for a session whose transcript is gone (transcriptUnavailable) */
     ULONGLONG lastActivity;            /* ms since 1970 */
     /* Changes made here while the profile runs, waiting for it to close. */
     BOOL      pending;
@@ -857,6 +866,17 @@ typedef void (*SyncProgress)(void *context, int done, int total);
 DWORD SessionVault_Group(const ProfileList *list, int group);   /* its profiles, one bit each; none for group 0 */
 int   SessionVault_NewGroup(const ProfileList *list);           /* the lowest group no profile is in; 0 when there is none */
 DWORD SessionVault_GroupItems(const ProfileList *list, DWORD members);   /* what all of `members` keep the same (SYNC_ITEM_*) */
+/* A part of the sidebar two profiles of a group changed each their own way
+ * since the last sync: it stays as each has it until the person chooses. */
+typedef struct VaultConflict {
+    char  part[64];      /* the layout's part (SessionSync_LayoutPart) */
+    DWORD item;          /* what it belongs to (SYNC_ITEM_*) */
+    DWORD members;       /* the profiles of the list that changed it, one bit each */
+} VaultConflict;
+int   SessionVault_Conflicts(const ProfileList *list, int group, VaultConflict *out, int capacity);
+/* Every conflict of `item` in `group` settled for the version of profile
+ * `profile` (an index of `list`); the next sync makes it. */
+BOOL  SessionVault_Decide(const ProfileList *list, int group, DWORD item, int profile);
 BOOL  SessionVault_GroupListName(int group, WCHAR *out, size_t cch);
 BOOL  SessionVault_ListName(const ProfileList *list, int index, WCHAR *out, size_t cch);
 /* `profiles`' list kept as `listName`; with `same`, each of them made to list
@@ -936,6 +956,9 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
 BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
 /* What `members` keep the same, chosen in a dialog (IDD_SYNC_ITEMS) from `*items`: FALSE when cancelled. */
 BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items);
+/* The conflicts syncs left to the person (SessionVault_Conflicts), one
+ * dialog per group (IDD_CONFLICTS): the profiles of the groups settled. */
+DWORD SyncUi_SettleConflicts(HWND owner, const ProfileList *profiles);
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles);
 BOOL SyncUi_BackUpCode(HWND owner);
 /* A change to data, said before it is made and asked: `question`, the
@@ -969,6 +992,7 @@ BOOL Help_Command(HWND owner, UINT command);
 #define WM_APP_SESSIONS (WM_APP + 12)   /* to the manager: session entries or transcripts changed on disk */
 #define WM_APP_SESSIONS_READY (WM_APP + 13) /* background session snapshot ready for the window */
 #define WM_APP_SYNC_PROGRESS (WM_APP + 20)  /* to the manager, from any process: wParam steps done of lParam; 0 of 0 once done */
+#define WM_APP_SYNC_CONFLICTS (WM_APP + 21) /* to the manager, from any process: a sync left conflicts to the person */
 
 void         SessionsView_Init(HWND dlg);
 void         SessionsView_Warm(const ProfileList *profiles);

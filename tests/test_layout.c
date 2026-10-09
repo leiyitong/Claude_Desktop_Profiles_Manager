@@ -391,6 +391,38 @@ static void SyncItemsCaptions(HWND dialog, const WCHAR *name)
     SetDlgItemTextW(dialog, IDC_I_TEXT, text);
 }
 
+/* The conflicts of a sync as syncui.c lists them: two rows, each with whose version is kept. */
+static void ConflictsCaptions(HWND dialog, const WCHAR *name, BOOL fill)
+{
+    static const WCHAR *const kItems[] = { L"Sidebar: pins, groups, project order, filters",
+                                           L"Settings: auto-archive, Cowork, Remote Control, recent folders" };
+    HWND list = GetDlgItem(dialog, IDC_X_LIST);
+    WCHAR text[512], names[LABEL_CCH * 2 + 32];
+    LVCOLUMNW column;
+    LVITEMW item;
+    int i;
+    StringCchPrintfW(names, ARRAYSIZE(names), L"%s%s%s", name, TR(L" and "), L"Personal");
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Since the last sync, %s changed these each their own way. Choose whose version to keep:"), names);
+    SetDlgItemTextW(dialog, IDC_X_TEXT, text);
+    if (!fill) return;
+    SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)name);
+    SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)L"Personal");
+    SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_SETCURSEL, 0, 0);
+    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    ZeroMemory(&column, sizeof column);
+    ListView_InsertColumn(list, 0, &column);
+    for (i = 0; i < (int)ARRAYSIZE(kItems); i++) {
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s \x00B7 kept: %s"), TR(kItems[i]), i ? L"Personal" : name);
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT;
+        item.iItem = i;
+        item.pszText = text;
+        ListView_InsertItem(list, &item);
+    }
+    ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    Theme_SmoothView(list);
+}
+
 /* What the backup dialog says when it restores, its longest form. */
 static void BackupCaptions(HWND dialog, const WCHAR *name)
 {
@@ -574,6 +606,9 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         SyncItemsCaptions(dialog, name);
         PopulateSyncItems(dialog);
         break;
+    case IDD_CONFLICTS:
+        ConflictsCaptions(dialog, name, TRUE);
+        break;
     }
 }
 
@@ -618,6 +653,8 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         PurgeCaptions(dialog, FALSE);
     } else if (fixture->resource == IDD_SYNC_ITEMS) {
         SyncItemsCaptions(dialog, L"Private profile");
+    } else if (fixture->resource == IDD_CONFLICTS) {
+        ConflictsCaptions(dialog, L"Private profile", FALSE);
     }
 }
 
@@ -1530,7 +1567,7 @@ static void CheckReopenedModal(HWND owner, LayoutFixture *fixture, const LayoutS
 static void CheckLanguageRoundTrips(void)
 {
     static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
-                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS };
+                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS };
     static const WCHAR *const kVisited[] = { L"zh-CN" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"en");
@@ -1693,7 +1730,7 @@ static void CheckHiddenRows(void)
 static void CheckDialogs(void)
 {
     static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE,
-                                      IDD_SYNC_ITEMS };
+                                      IDD_SYNC_ITEMS, IDD_CONFLICTS };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)

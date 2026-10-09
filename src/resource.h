@@ -18,6 +18,7 @@
 #define IDD_RESTORE       108
 #define IDD_PURGE         109
 #define IDD_SYNC_ITEMS    110
+#define IDD_CONFLICTS     111
 
 /* main window; the ids of the commands its menus give are the buttons' they stand for */
 #define IDC_STATUS         1000
@@ -127,6 +128,13 @@
 #define IDC_I_TEXT        2100
 #define IDC_I_LIST        2101
 #define IDC_I_NOTE        2102
+
+/* conflicts of a sync, settled */
+#define IDC_X_TEXT        2200
+#define IDC_X_LIST        2201
+#define IDC_X_LABEL       2202
+#define IDC_X_PROFILE     2203
+#define IDC_X_NOTE        2204
 
 /* message box */
 #define IDC_M_ICON        1300

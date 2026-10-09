@@ -932,6 +932,170 @@ BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, 
     return TRUE;
 }
 
+/* ------------------------------------------------------ conflicts settled */
+
+typedef struct ConflictRow {
+    DWORD item;         /* SYNC_ITEM_* */
+    DWORD candidates;   /* the profiles that changed it each their own way */
+    int   chosen;       /* whose version is kept */
+} ConflictRow;
+
+typedef struct ConflictsDialog {
+    const ProfileList *profiles;
+    const WCHAR       *text;
+    ConflictRow        rows[SYNC_ITEM_COUNT];
+    int                count;
+    int                row;   /* the one the drop-down is for */
+    HWND               list;
+    int                comboProfile[MAX_PROFILES];
+} ConflictsDialog;
+
+static const WCHAR *ItemLabel(DWORD item)
+{
+    int row;
+    for (row = 0; row < SYNC_ITEM_COUNT; row++)
+        if (kSyncItems[row].item == item) return TR(kSyncItems[row].label);
+    return L"";
+}
+
+static void ConflictRowText(const ConflictsDialog *state, int row, WCHAR *out, size_t cch)
+{
+    StringCchPrintfW(out, cch, TR(L"%s \x00B7 kept: %s"), ItemLabel(state->rows[row].item), state->profiles->items[state->rows[row].chosen].name);
+}
+
+/* The drop-down lists the profiles that changed the row's item, its choice selected. */
+static void FillConflictChoices(HWND dialog, ConflictsDialog *state)
+{
+    HWND combo = GetDlgItem(dialog, IDC_X_PROFILE);
+    const ConflictRow *row = &state->rows[state->row];
+    int p, n = 0;
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (p = 0; p < state->profiles->count; p++) {
+        if (!(row->candidates & (1u << p))) continue;
+        SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)state->profiles->items[p].name);
+        if (p == row->chosen) SendMessageW(combo, CB_SETCURSEL, (WPARAM)n, 0);
+        state->comboProfile[n++] = p;
+    }
+}
+
+static INT_PTR CALLBACK ConflictsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    ConflictsDialog *state = (ConflictsDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    WCHAR text[LABEL_CCH + 256];
+    switch (message) {
+    case WM_INITDIALOG: {
+        LVCOLUMNW column;
+        LVITEMW item;
+        int row;
+        state = (ConflictsDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetDlgItemTextW(dialog, IDC_X_TEXT, state->text);
+        state->list = GetDlgItem(dialog, IDC_X_LIST);
+        ListView_SetExtendedListViewStyle(state->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        ZeroMemory(&column, sizeof column);
+        ListView_InsertColumn(state->list, 0, &column);   /* the view it scrolls in gives it the list's width */
+        for (row = 0; row < state->count; row++) {
+            ConflictRowText(state, row, text, ARRAYSIZE(text));
+            ZeroMemory(&item, sizeof item);
+            item.mask = LVIF_TEXT;
+            item.iItem = row;
+            item.pszText = text;
+            ListView_InsertItem(state->list, &item);
+        }
+        ListView_SetItemState(state->list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        FillConflictChoices(dialog, state);
+        Theme_SmoothView(state->list);
+        return TRUE;
+    }
+
+    case WM_CTLCOLORSTATIC:
+        return Theme_CtlColor(message, wp, lp, IDC_X_NOTE);
+
+    case WM_NOTIFY:
+        if (state && ((const NMHDR *)lp)->hwndFrom == state->list && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
+            const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
+            if ((change->uChanged & LVIF_STATE) && (change->uNewState & LVIS_SELECTED) && change->iItem >= 0 && change->iItem < state->count &&
+                change->iItem != state->row) {
+                state->row = change->iItem;
+                FillConflictChoices(dialog, state);
+            }
+            return TRUE;
+        }
+        break;
+
+    case WM_COMMAND:
+        if (!state) break;
+        switch (LOWORD(wp)) {
+        case IDC_X_PROFILE:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                LRESULT chosen = SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_GETCURSEL, 0, 0);
+                if (chosen >= 0 && chosen < BitCount(state->rows[state->row].candidates)) {
+                    state->rows[state->row].chosen = state->comboProfile[chosen];
+                    ConflictRowText(state, state->row, text, ARRAYSIZE(text));
+                    ListView_SetItemText(state->list, state->row, 0, text);
+                }
+            }
+            return TRUE;
+        case IDOK:
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        case IDCANCEL:
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+/* Group `group`'s conflicts settled: FALSE when there were none, or the person left them for later. */
+static BOOL SettleGroup(HWND owner, const ProfileList *profiles, int group)
+{
+    WCHAR names[NAMES_CCH], text[NAMES_CCH + 256];
+    VaultConflict conflicts[64];
+    ConflictsDialog dialog;
+    DWORD changed = 0;
+    int count = SessionVault_Conflicts(profiles, group, conflicts, ARRAYSIZE(conflicts)), c, k, row, first = -1, stock;
+    BOOL ok = TRUE;
+    if (count <= 0) return FALSE;
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.profiles = profiles;
+    stock = Profiles_Find(profiles, profiles->defaultFolder);
+    for (k = 0; k < SYNC_ITEM_COUNT; k++) {
+        ConflictRow *r = &dialog.rows[dialog.count];
+        ZeroMemory(r, sizeof *r);
+        for (c = 0; c < count; c++)
+            if (conflicts[c].item == kSyncItems[k].item) r->candidates |= conflicts[c].members;
+        if (!r->candidates) continue;
+        r->item = kSyncItems[k].item;
+        /* At first, the default profile's where it changed it, else the first one's. */
+        for (first = 0; first < profiles->count && !(r->candidates & (1u << first)); first++) {}
+        r->chosen = stock >= 0 && (r->candidates & (1u << stock)) ? stock : first;
+        changed |= r->candidates;
+        dialog.count++;
+    }
+    if (!dialog.count) return FALSE;
+    NamesOf(profiles, changed, names, ARRAYSIZE(names));
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Since the last sync, %s changed these each their own way. Choose whose version to keep:"), names);
+    dialog.text = text;
+    if (Ui_Dialog(owner, IDD_CONFLICTS, ConflictsProc, (LPARAM)&dialog) != IDOK) return FALSE;
+    for (row = 0; row < dialog.count; row++)
+        if (!SessionVault_Decide(profiles, group, dialog.rows[row].item, dialog.rows[row].chosen)) ok = FALSE;
+    if (!ok) Ui_Message(owner, MB_ICONERROR, TR(L"The choice could not be saved: the profiles keep their own until the next sync asks again."));
+    return ok;
+}
+
+DWORD SyncUi_SettleConflicts(HWND owner, const ProfileList *profiles)
+{
+    DWORD settled = 0;
+    int group;
+    for (group = 1; group <= MAX_PROFILES; group++) {
+        DWORD members = SessionVault_Group(profiles, group);
+        if (BitCount(members) >= 2 && SettleGroup(owner, profiles, group)) settled |= members;
+    }
+    return settled;
+}
+
 /* The sessions of group `group` made the same right away, and what that did said. */
 BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group)
 {

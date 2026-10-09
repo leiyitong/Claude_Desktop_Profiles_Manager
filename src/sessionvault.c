@@ -62,6 +62,10 @@
 #define VAULT_KEEP_DAYS       30   /* a list's versions younger than that stay */
 #define VAULT_KEEP_LEAST      20   /* ... and at least its latest ones, however old */
 #define OBJECT_GRACE_MS       (24ULL * 3600ULL * 1000ULL)   /* an entry no version names yet may be one a keep is writing */
+#define CONFLICTS_DIR         L"conflicts"   /* per list: the layout's parts changed in two members each their own way */
+#define DECISIONS_DIR         L"decisions"   /* per list: whose each of those parts the person chose */
+#define LAYOUT_PARTS_MAX      96
+#define SEEN_MARK             L"-"           /* a member's seen line saying it has a record, whatever it holds */
 
 typedef struct VaultItem {          /* a session a version lists */
     WCHAR     key[SESSION_ID_CCH];
@@ -73,6 +77,8 @@ typedef struct VaultMember {        /* a profile that had the version's list */
     WCHAR     folder[FOLDER_CCH];
     ULONGLONG entries;              /* its entries folder (its path hashed) */
     ULONGLONG created;              /* ... and when that folder was made */
+    ULONGLONG *seen;                /* each part of its layout as the sync last read it there (LAYOUT_PARTS_MAX
+                                     * hashes, 0 for none); NULL: no record, as a version before them wrote */
 } VaultMember;
 
 typedef struct VaultList {
@@ -484,6 +490,8 @@ static BOOL SaveLedger(const DatedSet *ledger)
 
 static void FreeList(VaultList *list)
 {
+    int i;
+    for (i = 0; i < list->memberCount; i++) Free(list->members[i].seen);
     Free(list->items);
     ZeroMemory(list, sizeof *list);
 }
@@ -552,6 +560,18 @@ static BOOL VersionPath(const WCHAR *listName, const WCHAR *version, WCHAR *out,
            SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\%s" VERSION_EXTENSION, dir, version));
 }
 
+/* The index of the layout's part named `name` (SessionSync_LayoutPart); -1 for none. */
+static int PartIndex(const WCHAR *name)
+{
+    LayoutPart part;
+    char narrow[64];
+    int p;
+    if (WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow, sizeof narrow, NULL, NULL) <= 0) return -1;
+    for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++)
+        if (strcmp(part.name, narrow) == 0) return p;
+    return -1;
+}
+
 static BOOL ParseVersion(WCHAR *text, VaultList *list)
 {
     WCHAR *rest = text, *line, *fields[4];
@@ -574,6 +594,14 @@ static BOOL ParseVersion(WCHAR *text, VaultList *list)
             list->index = a;
         } else if (n == 2 && wcscmp(fields[0], LAYOUT_KEY) == 0 && HexNumber(fields[1], &a)) {
             list->layout = a;
+        } else if (n == 4 && wcscmp(fields[0], L"seen") == 0 && HexNumber(fields[3], &a)) {
+            int i, part = wcscmp(fields[2], SEEN_MARK) == 0 ? -1 : PartIndex(fields[2]);
+            for (i = 0; i < list->memberCount && !Core_EqualsI(list->members[i].folder, fields[1]); i++) {}
+            if (i == list->memberCount) continue;
+            if (!list->members[i].seen &&
+                (list->members[i].seen = (ULONGLONG *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, LAYOUT_PARTS_MAX * sizeof(ULONGLONG))) == NULL)
+                return FALSE;
+            if (part >= 0) list->members[i].seen[part] = a;
         }
     }
     list->found = TRUE;
@@ -619,7 +647,7 @@ static int __cdecl CompareItems(const void *a, const void *b)
 /* The version's text, its sessions in order: two versions alike read alike. */
 static WCHAR *VersionText(VaultList *list)
 {
-    size_t cch = (size_t)(list->count + list->memberCount + 4) * LINE_CCH;
+    size_t cch = (size_t)(list->count + list->memberCount * (LAYOUT_PARTS_MAX + 2) + 4) * LINE_CCH;
     WCHAR *text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, cch * sizeof(WCHAR)), line[LINE_CCH];
     int i;
     if (!text) return NULL;
@@ -637,6 +665,18 @@ static WCHAR *VersionText(VaultList *list)
         StringCchPrintfW(line, ARRAYSIZE(line), L"member\t%s\t%016I64x\t%I64u\n", list->members[i].folder, list->members[i].entries,
                          list->members[i].created);
         StringCchCatW(text, cch, line);
+    }
+    for (i = 0; i < list->memberCount; i++) {
+        LayoutPart part;
+        int p;
+        if (!list->members[i].seen) continue;
+        StringCchPrintfW(line, ARRAYSIZE(line), L"seen\t%s\t" SEEN_MARK L"\t0\n", list->members[i].folder);
+        StringCchCatW(text, cch, line);
+        for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++) {
+            if (!list->members[i].seen[p]) continue;
+            StringCchPrintfW(line, ARRAYSIZE(line), L"seen\t%s\t%S\t%016I64x\n", list->members[i].folder, part.name, list->members[i].seen[p]);
+            StringCchCatW(text, cch, line);
+        }
     }
     for (i = 0; i < list->count; i++) {
         StringCchPrintfW(line, ARRAYSIZE(line), L"listed\t%s\t%016I64x\t%I64u\n", list->items[i].key, list->items[i].hash,
@@ -790,6 +830,7 @@ done:
 /* What the sync reads of one profile. */
 typedef struct Member {
     MemberState state;
+    const VaultMember *had;          /* its record in the base; NULL for none */
     BOOL        taker;               /* it has an entries folder, read whole */
     ULONGLONG   entries, created;
     DatedSet    marks;
@@ -843,10 +884,23 @@ static void ReadMember(const SessionSet *set, int m, const VaultList *base, Memb
     for (i = 0; i < base->memberCount; i++) {
         const VaultMember *had = &base->members[i];
         if (!Core_EqualsI(had->folder, set->profiles.items[m].folder)) continue;
+        member->had = had;
         member->state = had->entries == member->entries && had->created == member->created ? MEMBER_KEPT : MEMBER_LOST;
     }
     /* Sessions it could not read are not taken for gone. */
     if (source->unreadable && member->state == MEMBER_KEPT) member->state = MEMBER_LOST;
+    /* A member that had the group's list and now lists nothing: its storage
+     * wiped (Claude reinstalled, signed out), not every session deleted by
+     * hand. Taken for a list it lost: nothing is deleted elsewhere, and it
+     * gets the group's sessions back. */
+    if (member->state == MEMBER_KEPT && base->count > 0 && member->taker) {
+        int r, listed = 0;
+        for (r = 0; r < set->rowCount && !listed; r++) listed = set->rows[r].entry[m] >= 0;
+        if (!listed) {
+            member->state = MEMBER_LOST;
+            Util_Log(L"session vault: %s lists no session any more: taken for a list it lost, nothing deleted", set->profiles.items[m].folder);
+        }
+    }
     member->queuedCount = max(SessionSync_Queued(&set->profiles.items[m], &member->queued), 0);
 }
 
@@ -1130,7 +1184,7 @@ done:
 /* One session made the same in every member: `row` of `set` (-1: listed by
  * none, only by the base, as `key`). */
 static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, const Member *members, const VaultList *base,
-                           DatedSet *ledger, BOOL same, Changes *changes, VaultList *next)
+                           DatedSet *ledger, BOOL same, const int *heal, Changes *changes, VaultList *next)
 {
     MirrorSide sides[MAX_PROFILES], baseSide;
     char *contents[MAX_PROFILES], *content = NULL;
@@ -1169,6 +1223,23 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
             Free(contents[m]);
             contents[m] = NULL;
             lengths[m] = 0;
+        }
+    }
+    /* An entry Claude's startup took for one whose transcript is gone, or
+     * kept apart from its session (heal: its id lost), never wins over a sound
+     * one: it gets the sound one back. */
+    {
+        BOOL sound = FALSE;
+        for (m = 0; m < n; m++) {
+            int entry = row >= 0 ? set->rows[row].entry[m] : -1;
+            if (sides[m].state == MIRROR_LISTED && entry >= 0 && !set->entries[entry].damaged) sound = TRUE;
+        }
+        for (m = 0; m < n; m++) {
+            int entry = row >= 0 ? set->rows[row].entry[m] : -1;
+            if ((sound && sides[m].state == MIRROR_LISTED && entry >= 0 && set->entries[entry].damaged) || (heal && heal[m] >= 0)) {
+                sides[m].state = MIRROR_MISSING;
+                sides[m].hash = 0;
+            }
         }
     }
     /* Two profiles went on with it apart since the last sync: the branch of
@@ -1233,6 +1304,18 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
             const char *mapped, *own = m == winner ? content : contents[m];
             size_t mappedLength = 0;
             DWORD ownLength = m == winner ? length : lengths[m];
+            if (heal && heal[m] >= 0 && members[m].taker) {
+                /* Its entry lost its session's id: the sound one replaces it under its own id. */
+                const SessionEntry *damaged = &set->entries[heal[m]];
+                char *healed = CopyOf(content, length);
+                size_t healedLength = length;
+                ok = (healed = SetString(healed, &healedLength, "sessionId", damaged->localId)) != NULL && Own(changes, healed) != NULL &&
+                     (mapped = ContentFor(set, m, healed, healedLength, changes, &mappedLength)) != NULL &&
+                     AddChange(changes, m, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, key, EntryActivity(content, length), damaged->lastActivity, mapped,
+                               mappedLength);
+                if (ok) Util_Log(L"session vault: %s in %s: its entry lost the session's id; the sound one goes back", key, set->profiles.items[m].folder);
+                continue;
+            }
             /* The same entry, but working in another profile's "no folder" area: it moves to its own. */
             if (!members[m].taker || (waits[m] ? holds[m] == hash
                                                : sides[m].state == MIRROR_LISTED && sides[m].hash == hash && !InOthersArea(set, m, own, ownLength)))
@@ -1405,7 +1488,6 @@ static char *LayoutOf(const SessionSet *set, int m, size_t *length, ULONGLONG *w
 /* The parts of a layout (SessionSync_LayoutPart) are each made the same on
  * their own: a running Claude rewrites its settings all the time, and a part
  * it rewrote changes none of the others. */
-#define LAYOUT_PARTS_MAX 96
 
 /* Part `part` of `layout`: its hash, 0 when it has none; where its value is. */
 static ULONGLONG PartOf(const char *layout, size_t length, const char *part, const char **value, size_t *valueLength)
@@ -1489,18 +1571,18 @@ static ULONGLONG MemberHash(const char *object, size_t length, const char *key, 
 }
 
 /* Part `part` of the members' layouts made the same session by session: each
- * session's member the latest changed since the base, as a part is (the
- * first time, the preferred member's, else the fullest); one no member has
- * any more is gone. A heap block (an object), NULL without memory or when no
- * member has the part. */
-static char *MergeByKey(const char *part, char *const *contents, const size_t *lengths, const ULONGLONG *written, const Member *members,
-                        const BOOL *waits, int preferred, int n, const char *baseContent, size_t baseLength, size_t *outLength)
+ * session's member taken from the members that changed the part since they
+ * last showed it (`say`), the latest changed since the base winning; the
+ * first time, the `preferred` member's, else the latest written. One no
+ * member has any more is gone. A heap block (an object), NULL without memory
+ * or when no member has the part. */
+static char *MergeByKey(const char *part, char *const *contents, const size_t *lengths, const ULONGLONG *written, const BOOL *say,
+                        int preferred, int n, const char *baseContent, size_t baseLength, size_t *outLength)
 {
     const char *objects[MAX_PROFILES], *baseObject = NULL, *value;
     size_t objectLengths[MAX_PROFILES], baseObjectLength = 0, valueLength, used = 2;
-    MirrorSide sides[MAX_PROFILES], baseSide;
     KeySet keys;
-    char *merged, *next, *name;
+    char *merged, *name;
     int m, k, any = 0;
     ZeroMemory(&keys, sizeof keys);
     *outLength = 0;
@@ -1521,36 +1603,20 @@ static char *MergeByKey(const char *part, char *const *contents, const size_t *l
         return NULL;
     }
     for (k = 0; k < keys.count && merged; k++) {
-        ULONGLONG baseHash = MemberHash(baseObject, baseObjectLength, keys.keys[k], &value, &valueLength);
+        ULONGLONG baseHash = MemberHash(baseObject, baseObjectLength, keys.keys[k], &value, &valueLength), hash;
         const char *chosen = NULL;
-        size_t chosenLength = 0, longest = 0;
-        int winner = -1, listed = 0;
+        size_t chosenLength = 0;
+        int winner = -1, holders = 0;
         for (m = 0; m < n; m++) {
-            ZeroMemory(&sides[m], sizeof sides[m]);
-            sides[m].state = MIRROR_MISSING;
-            if ((sides[m].hash = MemberHash(objects[m], objectLengths[m], keys.keys[k], &value, &valueLength)) == 0) continue;
-            if (baseContent && members[m].state != MEMBER_KEPT) continue;
-            if (waits[m] && baseHash) continue;
-            sides[m].state = MIRROR_LISTED;
-            sides[m].time = written[m];
-            listed++;
-            if (!baseHash && (winner < 0 || (winner != preferred && (m == preferred || valueLength > longest)))) {
-                winner = m;
-                longest = valueLength;
-            }
+            if ((hash = MemberHash(objects[m], objectLengths[m], keys.keys[k], &value, &valueLength)) == 0) continue;
+            holders++;
+            if (!say[m] || hash == baseHash) continue;
+            if (winner < 0 || (!baseHash && m == preferred)) winner = m;
+            else if ((baseHash || winner != preferred) && written[m] > written[winner]) winner = m;
         }
-        if (!listed) continue;   /* gone from every member that has a say */
-        if (baseHash) {
-            ZeroMemory(&baseSide, sizeof baseSide);
-            baseSide.state = MIRROR_LISTED;
-            baseSide.hash = baseHash;
-            winner = Core_MirrorResolve(sides, n, &baseSide);
-        }
-        if (winner >= 0 && winner < n) {
-            MemberHash(objects[winner], objectLengths[winner], keys.keys[k], &chosen, &chosenLength);
-        } else if (winner == n && baseHash) {
-            MemberHash(baseObject, baseObjectLength, keys.keys[k], &chosen, &chosenLength);
-        }
+        if (!holders) continue;   /* gone from every member */
+        if (winner >= 0) MemberHash(objects[winner], objectLengths[winner], keys.keys[k], &chosen, &chosenLength);
+        else if (baseHash) MemberHash(baseObject, baseObjectLength, keys.keys[k], &chosen, &chosenLength);
         if (!chosen || (name = CopyOf(keys.keys[k], keys.lengths[k])) == NULL) continue;
         merged = WithPart(merged, &used, name, chosen, chosenLength);
         Free(name);
@@ -1558,9 +1624,8 @@ static char *MergeByKey(const char *part, char *const *contents, const size_t *l
     for (k = 0; k < keys.count; k++) Free(keys.keys[k]);
     Free(keys.keys);
     Free(keys.lengths);
-    next = merged;
-    if (next) *outLength = used;
-    return next;
+    if (merged) *outLength = used;
+    return merged;
 }
 
 static BOOL AddMemberHash(void *context, const char *key, size_t keyLength, const char *value, size_t valueLength)
@@ -1589,113 +1654,261 @@ DWORD SessionVault_GroupItems(const ProfileList *list, DWORD members)
     return items;
 }
 
-/* The pins and groups of the sidebar, the same in every member: each part
- * the latest changed since the base, as the archived sessions are. Only the
- * parts of `items`. A part kept for the first time takes the value of the
- * `preferred` member (the default profile, -1 for none) where it has one. */
+/* ------------------------------------------------------------- conflicts */
+
+/* The layout's parts two members changed each their own way, and whose
+ * the person chose for each: one line per part, the part's name first. */
+typedef struct PartChoice {
+    char  part[64];
+    WCHAR folders[MAX_PROFILES][FOLDER_CCH];   /* conflicts: the members that changed it; decisions: the one chosen */
+    int   count;
+} PartChoice;
+
+typedef struct PartChoices {
+    PartChoice *items;
+    int         count, capacity;
+} PartChoices;
+
+static BOOL ChoicesPath(const WCHAR *dir, const WCHAR *listName, WCHAR *out, size_t cch)
+{
+    WCHAR sub[MAX_PATH];
+    return listName[0] && !wcschr(listName, L'\\') && !wcschr(listName, L'/') &&
+           SUCCEEDED(StringCchPrintfW(sub, ARRAYSIZE(sub), L"%s\\%s.txt", dir, listName)) && VaultPath(sub, out, cch);
+}
+
+static void LoadChoices(const WCHAR *dir, const WCHAR *listName, PartChoices *choices)
+{
+    WCHAR path[MAX_PATH], *text, *rest, *line, *fields[MAX_PROFILES + 1];
+    int n, i;
+    ZeroMemory(choices, sizeof *choices);
+    if (!ChoicesPath(dir, listName, path, ARRAYSIZE(path)) || (text = ReadText(path)) == NULL) return;
+    rest = text;
+    while ((line = NextLine(&rest)) != NULL) {
+        PartChoice *grown, *choice;
+        if ((n = Fields(line, fields, ARRAYSIZE(fields))) < 2 ||
+            (grown = (PartChoice *)Grow(choices->items, &choices->capacity, choices->count + 1, sizeof *grown)) == NULL)
+            continue;
+        choices->items = grown;
+        choice = &choices->items[choices->count];
+        ZeroMemory(choice, sizeof *choice);
+        if (WideCharToMultiByte(CP_UTF8, 0, fields[0], -1, choice->part, sizeof choice->part, NULL, NULL) <= 0) continue;
+        for (i = 1; i < n && choice->count < MAX_PROFILES; i++)
+            if (fields[i][0]) StringCchCopyW(choice->folders[choice->count++], FOLDER_CCH, fields[i]);
+        choices->count++;
+    }
+    Free(text);
+}
+
+/* `choices` written for `listName`, or its file deleted when it holds none. */
+static BOOL SaveChoices(const WCHAR *dir, const WCHAR *listName, const PartChoices *choices)
+{
+    WCHAR path[MAX_PATH], folder[MAX_PATH], line[LINE_CCH], *text, *slash;
+    size_t cch = (size_t)(choices->count + 1) * (MAX_PROFILES + 1) * (FOLDER_CCH + 2);
+    int c, i;
+    BOOL ok;
+    if (!ChoicesPath(dir, listName, path, ARRAYSIZE(path))) return FALSE;
+    if (!choices->count) return DeleteFileW(path) || GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+    StringCchCopyW(folder, ARRAYSIZE(folder), path);
+    if ((slash = wcsrchr(folder, L'\\')) != NULL) *slash = 0;
+    if (!Util_EnsureDir(folder) || (text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cch * sizeof(WCHAR))) == NULL) return FALSE;
+    for (c = 0; c < choices->count; c++) {
+        StringCchPrintfW(line, ARRAYSIZE(line), L"%S", choices->items[c].part);
+        StringCchCatW(text, cch, line);
+        for (i = 0; i < choices->items[c].count; i++) {
+            StringCchCatW(text, cch, L"\t");
+            StringCchCatW(text, cch, choices->items[c].folders[i]);
+        }
+        StringCchCatW(text, cch, L"\n");
+    }
+    ok = WriteText(path, text, TRUE);
+    Free(text);
+    return ok;
+}
+
+static const PartChoice *FindChoice(const PartChoices *choices, const char *part)
+{
+    int c;
+    for (c = 0; c < choices->count; c++)
+        if (strcmp(choices->items[c].part, part) == 0) return &choices->items[c];
+    return NULL;
+}
+
+/* The manager's window told that the person has conflicts to settle. */
+static void TellConflicts(void)
+{
+    HWND manager = FindWindowW(APP_WINDOW_CLASS, NULL);
+    if (manager) PostMessageW(manager, WM_APP_SYNC_CONFLICTS, 0, 0);
+}
+
+/* Each part of member `m`'s layout that `settled` names, read now into `seen`. */
+static void ReadSeen(const SessionSet *set, int m, const BOOL *settled, ULONGLONG *seen)
+{
+    LayoutPart part;
+    const char *value;
+    size_t length = 0, valueLength;
+    ULONGLONG written = 0, hash;
+    char *content = LayoutOf(set, m, &length, &written);
+    int p;
+    for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++) {
+        if (!settled[p]) continue;
+        hash = PartOf(content, length, part.name, &value, &valueLength);
+        seen[p] = hash && part.byKey ? KeyedHash(value, valueLength) : hash;
+    }
+    Free(content);
+}
+
+/* The pins and groups of the sidebar, the same in every member. Each part is
+ * taken from the members that changed it since the sync last read it there
+ * (`had->seen`), and only from those: a member that never got a change (it
+ * was open, or the change waits for it) shows what it had, which is no
+ * change. One member changed it: theirs goes to the others. Several changed
+ * it each their own way: a conflict, which the person settles (`decisions`);
+ * until then the part stays as each member has it. The first time a part is
+ * kept, every member that has it counts, and they too conflict when they
+ * differ. A part that is each session's own is made the same session by
+ * session, the latest winning, never a conflict. Only the parts of `items`.
+ * What each member showed of each part goes to `seen` (for a conflict, what
+ * it had before); the conflicts left to the person to `conflicts`. */
 static BOOL ResolveLayout(const SessionSet *set, const Member *members, const VaultList *base, BOOL same, DWORD items, int preferred,
+                          const PartChoices *decisions, PartChoices *conflicts, ULONGLONG (*seen)[LAYOUT_PARTS_MAX], BOOL *settled,
                           Changes *changes, VaultList *next)
 {
-    MirrorSide sides[MAX_PROFILES], baseSide;
-    char *contents[MAX_PROFILES], *baseContent = NULL, *content, *layout;
-    size_t lengths[MAX_PROFILES], used = 2;
+    char *contents[MAX_PROFILES], *baseContent = NULL, *content, *kept = NULL, *layout;
+    size_t lengths[MAX_PROFILES], used = 2, keptUsed = 2;
     ULONGLONG written[MAX_PROFILES], hashes[LAYOUT_PARTS_MAX], hash;
     LayoutPart part;
     DWORD baseLength = 0;
-    BOOL waits[MAX_PROFILES], ok = TRUE;
+    BOOL waits[MAX_PROFILES], say[MAX_PROFILES], ok = TRUE, conflicted = FALSE;
     int n = set->profiles.count, m, p;
     ZeroMemory(contents, sizeof contents);
     ZeroMemory(lengths, sizeof lengths);
     ZeroMemory(written, sizeof written);
     ZeroMemory(hashes, sizeof hashes);
     for (m = 0; m < n; m++) {
-        /* Sent to it while it was open: what it shows of the parts sent is
-         * no change, it gets the base's once it closes. */
+        /* A layout sent to it while it was open: until it closes, what it
+         * shows is what it had. */
         waits[m] = members[m].taker && Queued(&members[m], SYNC_LAYOUT, LAYOUT_KEY) != NULL;
         if (members[m].taker) contents[m] = LayoutOf(set, m, &lengths[m], &written[m]);
+        for (p = 0; p < LAYOUT_PARTS_MAX; p++) seen[m][p] = members[m].had && members[m].had->seen ? members[m].had->seen[p] : 0;
     }
     if (base->layout) baseContent = LoadObject(base->layout, &baseLength);
-    if ((content = CopyOf("{}", 2)) == NULL) {
+    if ((content = CopyOf("{}", 2)) == NULL || (kept = CopyOf("{}", 2)) == NULL) {
         ok = FALSE;
         goto done;
     }
-    for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part) && content; p++) {
-        const char *value = NULL, *baseValue = NULL;
-        size_t valueLength = 0, baseValueLength = 0, longest = 0;
-        ULONGLONG baseHash;
-        int winner = -1;
+    for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part) && content && kept; p++) {
+        const char *value = NULL, *baseValue = NULL, *shown[MAX_PROFILES];
+        size_t valueLength = 0, baseValueLength = 0, shownLength[MAX_PROFILES];
+        ULONGLONG baseHash, current[MAX_PROFILES], first = 0;
+        int winner = -1, distinct = 0;
+        DWORD changed = 0;
         if (!(part.item & items)) continue;
+        settled[p] = TRUE;
+        baseHash = PartOf(baseContent, baseLength, part.name, &baseValue, &baseValueLength);
+        for (m = 0; m < n; m++) {
+            shown[m] = NULL;
+            shownLength[m] = 0;
+            current[m] = PartOf(contents[m], lengths[m], part.name, &shown[m], &shownLength[m]);
+            if (current[m] && part.byKey) current[m] = KeyedHash(shown[m], shownLength[m]);
+            say[m] = FALSE;
+            if (!members[m].taker || !current[m]) continue;
+            if (members[m].had && members[m].had->seen) {
+                say[m] = current[m] != members[m].had->seen[p];   /* changed since the sync last read it there */
+            } else if (baseContent && baseHash) {
+                /* No record yet (a version before them): changed against the base, unless something waits for it. */
+                say[m] = members[m].state == MEMBER_KEPT && !waits[m] && current[m] != baseHash;
+            } else {
+                say[m] = !baseContent || members[m].state == MEMBER_KEPT;   /* the part kept for the first time */
+            }
+        }
         if (part.byKey) {
-            char *merged = MergeByKey(part.name, contents, lengths, written, members, waits, preferred, n, baseContent, baseLength, &valueLength);
+            char *merged = MergeByKey(part.name, contents, lengths, written, say, preferred, n, baseContent, baseLength, &valueLength);
             if (merged) {
                 hashes[p] = KeyedHash(merged, valueLength);
                 content = WithPart(content, &used, part.name, merged, valueLength);
+                kept = WithPart(kept, &keptUsed, part.name, merged, valueLength);
                 Free(merged);
             }
+            for (m = 0; m < n; m++) seen[m][p] = current[m];
             continue;
         }
-        baseHash = PartOf(baseContent, baseLength, part.name, &baseValue, &baseValueLength);
+        /* The members that changed it to something other than the base, and how many ways. */
         for (m = 0; m < n; m++) {
-            ZeroMemory(&sides[m], sizeof sides[m]);
-            sides[m].state = MIRROR_MISSING;
-            if ((sides[m].hash = PartOf(contents[m], lengths[m], part.name, &value, &valueLength)) == 0) continue;
-            /* New to the group's list, or with a list of its own it lost: it
-             * takes the group's layout, and what it showed changes none. */
-            if (baseContent && members[m].state != MEMBER_KEPT) continue;
-            if (waits[m] && baseHash) continue;
-            sides[m].state = MIRROR_LISTED;
-            sides[m].time = written[m];
-            /* Kept for the first time (the list, or this part of it): no
-             * change to go by, and a running Claude writes its settings all
-             * the time. The default profile's goes to the others; without
-             * it, the fullest, the one the user built. */
-            if (!baseHash && (winner < 0 || (winner != preferred && (m == preferred || valueLength > longest)))) {
+            if (!say[m] || current[m] == baseHash) continue;
+            changed |= 1u << m;
+            if (winner < 0) {
                 winner = m;
-                longest = valueLength;
+                first = current[m];
+                distinct = 1;
+            } else if (current[m] != first && distinct == 1) {
+                distinct = 2;
             }
         }
-        if (baseHash) {
-            ZeroMemory(&baseSide, sizeof baseSide);
-            baseSide.state = MIRROR_LISTED;
-            baseSide.hash = baseHash;
-            winner = Core_MirrorResolve(sides, n, &baseSide);
+        if (distinct > 1) {
+            const PartChoice *decision = FindChoice(decisions, part.name);
+            int chosen = -1;
+            for (m = 0; decision && decision->count && m < n; m++)
+                if (current[m] && Core_EqualsI(set->profiles.items[m].folder, decision->folders[0])) chosen = m;
+            if (chosen < 0) {
+                /* Left to the person: each member keeps its own, the base its value, the record its old reading. */
+                PartChoice *grown = (PartChoice *)Grow(conflicts->items, &conflicts->capacity, conflicts->count + 1, sizeof *grown);
+                if (grown) {
+                    PartChoice *conflict = &grown[conflicts->count++];
+                    conflicts->items = grown;
+                    ZeroMemory(conflict, sizeof *conflict);
+                    StringCchCopyA(conflict->part, sizeof conflict->part, part.name);
+                    for (m = 0; m < n; m++)
+                        if (changed & (1u << m)) StringCchCopyW(conflict->folders[conflict->count++], FOLDER_CCH, set->profiles.items[m].folder);
+                }
+                if (baseValue) kept = WithPart(kept, &keptUsed, part.name, baseValue, baseValueLength);
+                conflicted = TRUE;
+                settled[p] = FALSE;
+                continue;
+            }
+            winner = chosen;
+            Util_Log(L"session vault: %S settled by the person: the one of %s", part.name, set->profiles.items[chosen].folder);
         }
+        for (m = 0; m < n; m++) seen[m][p] = current[m];
         value = NULL;
-        if (winner >= 0 && winner < n) {
-            hashes[p] = PartOf(contents[winner], lengths[winner], part.name, &value, &valueLength);
-        } else if (winner == n && baseHash) {
-            hashes[p] = baseHash;
+        if (winner >= 0) {
+            value = shown[winner];
+            valueLength = shownLength[winner];
+            hashes[p] = current[winner];
+        } else if (baseHash) {
             value = baseValue;
             valueLength = baseValueLength;
+            hashes[p] = baseHash;
         }
-        if (value) content = WithPart(content, &used, part.name, value, valueLength);
+        if (value) {
+            content = WithPart(content, &used, part.name, value, valueLength);
+            kept = WithPart(kept, &keptUsed, part.name, value, valueLength);
+        }
     }
-    if (!content) {
+    if (!content || !kept) {
         ok = FALSE;
         goto done;
     }
-    if (used <= 2) goto done;   /* no member has one */
-    hash = Core_HashBytes(CORE_HASH_START, content, used);
-    if (!hash) hash = 1;
+    if (keptUsed > 2) {
+        hash = Core_HashBytes(CORE_HASH_START, kept, keptUsed);
+        if (!hash) hash = 1;
+        ok = SaveObject(hash, kept, keptUsed);
+        if (ok) next->layout = hash;
+    }
+    if (!ok || used <= 2) goto done;   /* nothing to send */
     layout = Own(changes, content);   /* sent: kept until then */
     content = NULL;
-    ok = layout && SaveObject(hash, layout, used);
-    if (ok) next->layout = hash;
-    for (m = 0; ok && same && m < n; m++) {
+    for (m = 0; ok && same && layout && m < n; m++) {
         LayoutIds ids;
         size_t mappedLength = 0;
         char *mapped;
-        BOOL holds = TRUE;
+        BOOL holds = !waits[m];   /* a layout waiting for it is replaced by this one: the parts left to the person leave it */
         if (!members[m].taker) continue;
-        for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++) {
+        for (p = 0; holds && p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++) {
             const char *shown;
             size_t shownLength;
             ULONGLONG has;
             if (!hashes[p]) continue;
-            if (waits[m] && PartOf(baseContent, baseLength, part.name, NULL, NULL))
-                has = PartOf(baseContent, baseLength, part.name, &shown, &shownLength);
-            else
-                has = PartOf(contents[m], lengths[m], part.name, &shown, &shownLength);
+            has = PartOf(contents[m], lengths[m], part.name, &shown, &shownLength);
             if (has && part.byKey) has = KeyedHash(shown, shownLength);
             if (has != hashes[p]) holds = FALSE;
         }
@@ -1706,7 +1919,9 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
              AddChange(changes, m, SYNC_LAYOUT, 0, LAYOUT_KEY, 0, 0, mapped, mappedLength);
     }
 done:
+    if (conflicted) Util_Log(L"session vault: %d part(s) of the sidebar changed in two profiles each their own way: left to the person", conflicts->count);
     Free(content);
+    Free(kept);
     Free(baseContent);
     for (m = 0; m < n; m++) Free(contents[m]);
     return ok;
@@ -1714,7 +1929,53 @@ done:
 
 /* ------------------------------------------------------------ the list */
 
-static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same, SyncReport *report, Progress *progress)
+/* Entries Claude's startup stripped of their session's id (and marked
+ * transcriptUnavailable): each forms a row of its own, keyed by its own id.
+ * The row of the session another profile's sound entry of the same own id
+ * names heals it. A heap block: rowCount rows of MAX_PROFILES entry indexes
+ * (-1: none to heal), then rowCount rows whose first value says the row is
+ * only such entries; NULL for none or without memory. */
+static int *FindHealed(const SessionSet *set)
+{
+    int *heal = NULL, r, other, m, o, found = 0;
+    size_t cells = (size_t)set->rowCount * MAX_PROFILES * 2;
+    for (r = 0; r < set->rowCount; r++) {
+        BOOL all = TRUE, any = FALSE;
+        for (m = 0; m < set->profiles.count; m++) {
+            int entry = set->rows[r].entry[m], target = -1;
+            if (entry < 0) continue;
+            if (!set->entries[entry].damaged || wcscmp(set->rows[r].key, set->entries[entry].localId) != 0) {
+                all = FALSE;
+                continue;
+            }
+            for (other = 0; other < set->rowCount && target < 0; other++) {
+                if (other == r || wcscmp(set->rows[other].key, set->entries[entry].localId) == 0 || set->rows[other].entry[m] >= 0) continue;
+                for (o = 0; o < set->profiles.count && target < 0; o++) {
+                    int candidate = set->rows[other].entry[o];
+                    if (candidate >= 0 && !set->entries[candidate].damaged && wcscmp(set->entries[candidate].localId, set->entries[entry].localId) == 0)
+                        target = other;
+                }
+            }
+            if (target < 0) {
+                all = FALSE;
+                continue;
+            }
+            if (!heal) {
+                if ((heal = (int *)HeapAlloc(GetProcessHeap(), 0, cells * sizeof *heal)) == NULL) return NULL;
+                FillMemory(heal, cells * sizeof *heal, 0xFF);
+                for (o = 0; o < set->rowCount; o++) heal[((size_t)set->rowCount + o) * MAX_PROFILES] = 0;
+            }
+            heal[(size_t)target * MAX_PROFILES + m] = entry;
+            any = TRUE;
+            found++;
+        }
+        if (heal && any && all) heal[((size_t)set->rowCount + r) * MAX_PROFILES] = 1;
+    }
+    if (found) Util_Log(L"session vault: %d entr(y/ies) lost their session's id: healed from a sound one", found);
+    return heal;
+}
+
+static BOOL KeepLocked(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same, SyncReport *report, Progress *progress)
 {
     ProfileList members;
     SessionSet set;
@@ -1723,6 +1984,9 @@ static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName,
     Member member[MAX_PROFILES];
     Changes changes;
     WCHAR latest[MAX_PATH];
+    PartChoices decisions, conflicts, none;
+    ULONGLONG (*seen)[LAYOUT_PARTS_MAX] = NULL;
+    BOOL settled[LAYOUT_PARTS_MAX];
     int n, m, r, i, baseOnly = 0;
     BOOL ok = TRUE, sessions;
     DWORD items = same ? SessionVault_GroupItems(list, profiles) : SYNC_ITEMS_ALL;
@@ -1735,8 +1999,13 @@ static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName,
     if (!SessionStore_LoadProfiles(&set, &members)) return FALSE;
     LoadLatest(listName, &base, latest, ARRAYSIZE(latest));
     LoadLedger(&ledger);
+    LoadChoices(DECISIONS_DIR, listName, &decisions);
+    ZeroMemory(&conflicts, sizeof conflicts);
+    ZeroMemory(&none, sizeof none);
+    ZeroMemory(settled, sizeof settled);
     ZeroMemory(&next, sizeof next);
     ZeroMemory(&changes, sizeof changes);
+    if ((seen = (ULONGLONG (*)[LAYOUT_PARTS_MAX])HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)n * sizeof *seen)) == NULL) ok = FALSE;
     for (m = 0; m < n; m++) ReadMember(&set, m, &base, &member[m]);
     for (i = 0; i < base.count; i++)
         if (SessionStore_FindRow(&set, base.items[i].key) < 0) baseOnly++;
@@ -1746,13 +2015,18 @@ static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName,
     }
 
     if (sessions) {
+        int *heal = FindHealed(&set);
         for (r = 0; r < set.rowCount && ok; r++) {
-            ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, &changes, &next);
+            const int *rowHeal = heal ? heal + (size_t)r * MAX_PROFILES : NULL;
+            /* A row of entries that lost their session's id is no session of its own: the session's row heals them. */
+            if (!(heal && heal[((size_t)set.rowCount + r) * MAX_PROFILES]))
+                ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, rowHeal, &changes, &next);
             Step(progress, 1);
         }
+        Free(heal);
         for (i = 0; i < base.count && ok; i++)
             if (SessionStore_FindRow(&set, base.items[i].key) < 0) {
-                ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, &changes, &next);
+                ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, NULL, &changes, &next);
                 Step(progress, 1);
             }
         if (ok) ok = ResolveIndex(&set, member, &base, same, &changes, &next);
@@ -1762,7 +2036,9 @@ static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName,
         for (i = 0; i < base.count && ok; i++) ok = AddItem(&next, base.items[i].key, base.items[i].hash, base.items[i].activity);
         next.index = base.index;
     }
-    if (ok) ok = ResolveLayout(&set, member, &base, same, items, Profiles_Find(&members, members.defaultFolder), &changes, &next);
+    if (ok)
+        ok = ResolveLayout(&set, member, &base, same, items, Profiles_Find(&members, members.defaultFolder), &decisions, &conflicts, seen, settled,
+                           &changes, &next);
     Step(progress, 1);
     /* Sessions Claude marked deleted that no list names: deleted before the vault knew them. */
     for (m = 0; m < n && ok; m++)
@@ -1778,14 +2054,30 @@ static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName,
         ok = SessionSync_Send(&set, changes.items, changes.count, report);
         SessionSync_OnEachChange(NULL, NULL);
     }
+    /* What a closed member holds once the changes are made there is its
+     * record; one still open keeps what it showed, the changes waiting. */
+    for (m = 0; ok && m < n; m++) {
+        if (!member[m].taker || (report->waiting & (1u << m)) || Claude_IsRunning(&members.items[m])) continue;
+        ReadSeen(&set, m, settled, seen[m]);
+    }
     if (ok && !report->failed) {
         for (m = 0; m < n; m++) {
+            VaultMember *kept = &next.members[next.memberCount];
             if (!member[m].taker) continue;   /* not signed in yet: it gets the list once it is */
-            StringCchCopyW(next.members[next.memberCount].folder, FOLDER_CCH, members.items[m].folder);
-            next.members[next.memberCount].entries = member[m].entries;
-            next.members[next.memberCount++].created = member[m].created;
+            StringCchCopyW(kept->folder, FOLDER_CCH, members.items[m].folder);
+            kept->entries = member[m].entries;
+            kept->created = member[m].created;
+            if ((kept->seen = (ULONGLONG *)HeapAlloc(GetProcessHeap(), 0, sizeof seen[m])) != NULL) memcpy(kept->seen, seen[m], sizeof seen[m]);
+            next.memberCount++;
         }
         ok = SaveVersion(listName, &next, latest) && SaveLedger(&ledger);
+        /* What the person has to settle, and their choices made. */
+        if (ok && same) {
+            SaveChoices(CONFLICTS_DIR, listName, &conflicts);
+            SaveChoices(DECISIONS_DIR, listName, &none);
+            report->conflicts += conflicts.count;
+            if (conflicts.count) TellConflicts();
+        }
     } else if (report->failed) {
         Util_Log(L"session vault: %s not kept, %d change(s) could not be made", listName, report->failed);
         ok = FALSE;
@@ -1796,10 +2088,88 @@ static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName,
         Free(member[m].queued);
     }
     Free(ledger.items);
+    Free(decisions.items);
+    Free(conflicts.items);
+    Free(seen);
     FreeChanges(&changes);
     FreeList(&base);
     FreeList(&next);
     SessionStore_Free(&set);
+    return ok;
+}
+
+/* One sync at a time: another one reading a profile half written makes what
+ * it had there look like a change. */
+static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same, SyncReport *report, Progress *progress)
+{
+    HANDLE lock = Util_SyncLock();
+    BOOL ok;
+    if (!lock) {
+        report->failed++;
+        return FALSE;
+    }
+    ok = KeepLocked(list, profiles, listName, same, report, progress);
+    Util_SyncUnlock(lock);
+    return ok;
+}
+
+int SessionVault_Conflicts(const ProfileList *list, int group, VaultConflict *out, int capacity)
+{
+    WCHAR listName[FOLDER_CCH];
+    PartChoices conflicts;
+    LayoutPart part;
+    int c, i, p, at, count = 0;
+    if (!SessionVault_GroupListName(group, listName, ARRAYSIZE(listName))) return 0;
+    LoadChoices(CONFLICTS_DIR, listName, &conflicts);
+    for (c = 0; c < conflicts.count && count < capacity; c++) {
+        VaultConflict *conflict = &out[count];
+        ZeroMemory(conflict, sizeof *conflict);
+        StringCchCopyA(conflict->part, sizeof conflict->part, conflicts.items[c].part);
+        for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++)
+            if (strcmp(part.name, conflict->part) == 0) conflict->item = part.item;
+        for (i = 0; i < conflicts.items[c].count; i++)
+            if ((at = Profiles_Find(list, conflicts.items[c].folders[i])) >= 0) conflict->members |= 1u << at;
+        if (conflict->item && conflict->members) count++;
+    }
+    Free(conflicts.items);
+    return count;
+}
+
+BOOL SessionVault_Decide(const ProfileList *list, int group, DWORD item, int profile)
+{
+    WCHAR listName[FOLDER_CCH];
+    PartChoices conflicts, decisions;
+    LayoutPart part;
+    HANDLE lock;
+    int c, p, kept = 0;
+    BOOL ok;
+    if (profile < 0 || profile >= list->count || !SessionVault_GroupListName(group, listName, ARRAYSIZE(listName))) return FALSE;
+    /* Under the sync's lock: a sync reading the choices never misses one made meanwhile. */
+    if ((lock = Util_SyncLock()) == NULL) return FALSE;
+    LoadChoices(CONFLICTS_DIR, listName, &conflicts);
+    LoadChoices(DECISIONS_DIR, listName, &decisions);
+    for (c = 0; c < conflicts.count; c++) {
+        DWORD partItem = 0;
+        PartChoice *grown;
+        for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++)
+            if (strcmp(part.name, conflicts.items[c].part) == 0) partItem = part.item;
+        if (!(partItem & item) ||
+            (grown = (PartChoice *)Grow(decisions.items, &decisions.capacity, decisions.count + 1, sizeof *grown)) == NULL) {
+            conflicts.items[kept++] = conflicts.items[c];
+            continue;
+        }
+        decisions.items = grown;
+        ZeroMemory(&decisions.items[decisions.count], sizeof decisions.items[0]);
+        StringCchCopyA(decisions.items[decisions.count].part, sizeof decisions.items[0].part, conflicts.items[c].part);
+        StringCchCopyW(decisions.items[decisions.count].folders[0], FOLDER_CCH, list->items[profile].folder);
+        decisions.items[decisions.count++].count = 1;
+    }
+    conflicts.count = kept;
+    ok = SaveChoices(DECISIONS_DIR, listName, &decisions) && SaveChoices(CONFLICTS_DIR, listName, &conflicts);
+    if (ok) Util_Log(L"session vault: %s: the person chose the version of %s", listName, list->items[profile].folder);
+    Free(conflicts.items);
+    Free(decisions.items);
+    Util_SyncUnlock(lock);
     return ok;
 }
 
