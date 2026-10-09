@@ -77,6 +77,7 @@
 #define CLAUDE_APP_SETTINGS L"config.json"                      /* ...its app state: the account signed in */
 #define CLAUDE_ENTRIES_DIR  L"claude-code-sessions"             /* ...its Claude Code sessions' entries */
 #define CLAUDE_SCRATCH_DIR  L"scratch-workspaces"               /* ...the working folders of its sessions without a folder */
+#define CLAUDE_WEB_STORAGE  L"Local Storage\\leveldb"           /* ...its web UI's storage (webstore.c) */
 
 #define MAX_PROFILES       32
 C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
@@ -295,6 +296,39 @@ DWORD        Core_Crc32(DWORD crc, const void *data, size_t size);
 size_t       Core_DeflateBound(size_t size);
 BOOL         Core_Deflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
 BOOL         Core_Inflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
+
+/* LevelDB, as Chromium keeps a window's web storage in it: a log of write
+ * batches, tables of sorted entries, a manifest naming the live ones. */
+typedef struct CoreLevelOp {
+    BOOL        put;          /* a value; FALSE: the key deleted */
+    const BYTE *key;
+    size_t      keyLength;
+    const BYTE *value;
+    size_t      valueLength;
+} CoreLevelOp;
+typedef BOOL (*CoreLevelEntry)(void *context, ULONGLONG sequence, const CoreLevelOp *op);
+typedef BOOL (*CoreLevelRecord)(void *context, const BYTE *record, size_t length);
+typedef struct CoreLevelManifest {
+    ULONGLONG logNumber, prevLogNumber, nextFile, lastSequence;
+    BOOL      hasLog;
+    void    (*onTable)(void *context, ULONGLONG number, BOOL added);   /* a table made live, or gone */
+    void     *context;
+} CoreLevelManifest;
+DWORD        Core_Crc32c(DWORD crc, const void *data, size_t size);
+DWORD        Core_LevelMask(DWORD crc);
+BOOL         Core_SnappyLength(const BYTE *in, size_t length, size_t *outLength);
+BOOL         Core_SnappyDecode(const BYTE *in, size_t length, BYTE *out, size_t outLength);
+/* Each whole record of a log, in order; `cleanEnd`: where the last whole one ends. */
+BOOL         Core_LevelLogRecords(const BYTE *log, size_t length, CoreLevelRecord each, void *context, size_t *cleanEnd);
+/* What to add to a log `fileLength` bytes long for one record: 0 when `capacity` is short. */
+size_t       Core_LevelLogAppend(size_t fileLength, const BYTE *record, size_t length, BYTE *out, size_t capacity);
+BOOL         Core_LevelBatchRead(const BYTE *batch, size_t length, CoreLevelEntry each, void *context);
+size_t       Core_LevelBatchWrite(ULONGLONG sequence, const CoreLevelOp *ops, int count, BYTE *out, size_t capacity);
+BOOL         Core_LevelTableRead(const BYTE *table, size_t length, CoreLevelEntry each, void *context);
+BOOL         Core_LevelManifestEdit(const BYTE *edit, size_t length, CoreLevelManifest *state);
+size_t       Core_WebStorageKey(const char *origin, const WCHAR *name, BYTE *out, size_t capacity);   /* Local Storage's key */
+size_t       Core_WebStorageValue(const WCHAR *text, size_t length, BYTE *out, size_t capacity);
+BOOL         Core_WebStorageText(const BYTE *value, size_t length, WCHAR *out, size_t cch, size_t *outLength);
 /* A process of a snapshot: its id, its parent's, and when it started (0: unknown). */
 typedef struct CoreProcess {
     DWORD     pid, parent;
@@ -704,6 +738,19 @@ BOOL         SessionEdit_CopiedCwd(const WCHAR *copyId, WCHAR *cwd, size_t cch);
 HANDLE       SessionEdit_Lock(const Profile *p);   /* the lock of a profile's entry changes; NULL when not taken */
 void         SessionEdit_Unlock(HANDLE lock);
 
+/* ------------------------------------------------------------ webstore.c */
+/* Claude's web storage: the Local Storage its window keeps for claude.ai in
+ * the profile's folder. Read at any time; written, as one batch, only while
+ * that Claude is closed, its folder copied to `backup` first. Values are
+ * UTF-8 text, keys the names the window gives them. */
+typedef struct WebStore WebStore;
+WebStore *WebStore_Open(const Profile *p);   /* NULL when it has none, or it cannot be read */
+char     *WebStore_Get(const WebStore *store, const WCHAR *name, size_t *length);   /* a heap block; NULL when absent */
+BOOL      WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, size_t length);   /* waits for the commit */
+BOOL      WebStore_Commit(WebStore *store, const WCHAR *backup);
+ULONGLONG WebStore_Written(const WebStore *store);   /* when its newest file was written, ms since 1970 */
+void      WebStore_Free(WebStore *store);
+
 /* ---------------------------------------------------------- sessionsync.c */
 
 /* A change chosen elsewhere (sessionvault.c), for SessionSync_Send. */
@@ -715,11 +762,13 @@ typedef struct SyncSend {
 } SyncSend;
 
 DWORD        SessionSync_Takers(const SessionSet *set);   /* the profiles whose entries can take sessions */
-/* The pins and groups of the sidebar of `p` (its claude_desktop_config.json),
- * for the account and organization of `entriesDir`, as a layout of ours: a
- * heap block (HeapFree it), NULL when it has none. `written`: when the file
- * was written, in ms since 1970. */
+/* The pins, groups and settings of the sidebar of `p` (its
+ * claude_desktop_config.json and its web storage), for the account and
+ * organization of `entriesDir`, as a layout of ours: a heap block (HeapFree
+ * it), NULL when it has none. `written`: when they were last written, in ms
+ * since 1970. */
 char        *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *length, ULONGLONG *written);
+const char  *SessionSync_LayoutPart(int index);   /* the name of a layout's part `index`; NULL past the last */
 /* From now on, each change this thread makes in a profile calls `step` (a
  * progress bar's); NULL for none. */
 void         SessionSync_OnEachChange(void (*step)(void *context), void *context);

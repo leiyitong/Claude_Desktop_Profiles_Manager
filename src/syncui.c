@@ -311,6 +311,8 @@ void SyncUi_AddSessionFolders(WCHAR *text, size_t cch, const ProfileList *profil
     if (layout) {
         StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
         StringCchCatW(items, ARRAYSIZE(items), CLAUDE_DESKTOP_SETTINGS);
+        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
+        StringCchCatW(items, ARRAYSIZE(items), CLAUDE_WEB_STORAGE);
     }
     for (p = 0; p < profiles->count; p++) {
         if (!(bits & (1u << p))) continue;

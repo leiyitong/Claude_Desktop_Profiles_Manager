@@ -1292,11 +1292,10 @@ static char *LayoutOf(const SessionSet *set, int m, size_t *length, ULONGLONG *w
     return mapped;
 }
 
-/* The parts of a layout (SessionSync_ReadLayout), each made the same on its
- * own: a running Claude rewrites its settings all the time, and a part it
- * rewrote changes none of the others. */
-static const char *const kLayoutParts[] = { "starred", "slice", "starredGroups", "order", "statusFilter", "environments", "showEmpty",
-                                            "showPrStatus", "projectsFilter" };
+/* The parts of a layout (SessionSync_LayoutPart) are each made the same on
+ * their own: a running Claude rewrites its settings all the time, and a part
+ * it rewrote changes none of the others. */
+#define LAYOUT_PARTS_MAX 64
 
 /* Part `part` of `layout`: its hash, 0 when it has none; where its value is. */
 static ULONGLONG PartOf(const char *layout, size_t length, const char *part, const char **value, size_t *valueLength)
@@ -1338,7 +1337,8 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
     MirrorSide sides[MAX_PROFILES], baseSide;
     char *contents[MAX_PROFILES], *baseContent = NULL, *content, *layout;
     size_t lengths[MAX_PROFILES], used = 2;
-    ULONGLONG written[MAX_PROFILES], hashes[ARRAYSIZE(kLayoutParts)], hash;
+    ULONGLONG written[MAX_PROFILES], hashes[LAYOUT_PARTS_MAX], hash;
+    const char *part;
     DWORD baseLength = 0;
     BOOL waits[MAX_PROFILES], ok = TRUE;
     int n = set->profiles.count, m, p;
@@ -1357,43 +1357,44 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
         ok = FALSE;
         goto done;
     }
-    for (p = 0; p < (int)ARRAYSIZE(kLayoutParts) && content; p++) {
+    for (p = 0; p < LAYOUT_PARTS_MAX && (part = SessionSync_LayoutPart(p)) != NULL && content; p++) {
         const char *value = NULL, *baseValue = NULL;
         size_t valueLength = 0, baseValueLength = 0, longest = 0;
-        ULONGLONG baseHash = PartOf(baseContent, baseLength, kLayoutParts[p], &baseValue, &baseValueLength);
+        ULONGLONG baseHash = PartOf(baseContent, baseLength, part, &baseValue, &baseValueLength);
         int winner = -1;
         for (m = 0; m < n; m++) {
             ZeroMemory(&sides[m], sizeof sides[m]);
             sides[m].state = MIRROR_MISSING;
-            if ((sides[m].hash = PartOf(contents[m], lengths[m], kLayoutParts[p], &value, &valueLength)) == 0) continue;
+            if ((sides[m].hash = PartOf(contents[m], lengths[m], part, &value, &valueLength)) == 0) continue;
             /* New to the group's list, or with a list of its own it lost: it
              * takes the group's layout, and what it showed changes none. */
             if (baseContent && members[m].state != MEMBER_KEPT) continue;
             sides[m].state = MIRROR_LISTED;
             sides[m].time = written[m];
-            /* Kept for the first time: no change to go by, and a running
-             * Claude writes its settings all the time. The fullest part is
-             * the one the user built: it goes to the others. */
-            if (!baseContent && (winner < 0 || valueLength > longest)) {
+            /* Kept for the first time (the list, or this part of it): no
+             * change to go by, and a running Claude writes its settings all
+             * the time. The fullest part is the one the user built: it goes
+             * to the others. */
+            if (!baseHash && (winner < 0 || valueLength > longest)) {
                 winner = m;
                 longest = valueLength;
             }
         }
-        if (baseContent) {
+        if (baseHash) {
             ZeroMemory(&baseSide, sizeof baseSide);
             baseSide.state = MIRROR_LISTED;
             baseSide.hash = baseHash;
-            winner = Core_MirrorResolve(sides, n, baseHash ? &baseSide : NULL);
+            winner = Core_MirrorResolve(sides, n, &baseSide);
         }
         value = NULL;
         if (winner >= 0 && winner < n) {
-            hashes[p] = PartOf(contents[winner], lengths[winner], kLayoutParts[p], &value, &valueLength);
+            hashes[p] = PartOf(contents[winner], lengths[winner], part, &value, &valueLength);
         } else if (winner == n && baseHash) {
             hashes[p] = baseHash;
             value = baseValue;
             valueLength = baseValueLength;
         }
-        if (value) content = WithPart(content, &used, kLayoutParts[p], value, valueLength);
+        if (value) content = WithPart(content, &used, part, value, valueLength);
     }
     if (!content) {
         ok = FALSE;
@@ -1412,8 +1413,8 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
         char *mapped;
         BOOL holds = TRUE;
         if (!members[m].taker) continue;
-        for (p = 0; p < (int)ARRAYSIZE(kLayoutParts); p++)
-            if (hashes[p] && PartOf(waits[m] ? baseContent : contents[m], waits[m] ? baseLength : lengths[m], kLayoutParts[p], NULL, NULL) != hashes[p])
+        for (p = 0; p < LAYOUT_PARTS_MAX && (part = SessionSync_LayoutPart(p)) != NULL; p++)
+            if (hashes[p] && PartOf(waits[m] ? baseContent : contents[m], waits[m] ? baseLength : lengths[m], part, NULL, NULL) != hashes[p])
                 holds = FALSE;
         if (holds) continue;
         ids.set = set;

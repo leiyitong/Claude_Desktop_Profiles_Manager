@@ -1315,8 +1315,260 @@ static void TestProcessTree(void)
     Check("process tree: a root out of range marks none", Core_ProcessDescendants(kProcesses, ARRAYSIZE(kProcesses), 9, chosen) == 0 && !chosen[1]);
 }
 
+/* ---------------------------------------------------------------- LevelDB */
+
+typedef struct LevelSeen {
+    int       count;
+    ULONGLONG sequence[8];
+    BOOL      put[8];
+    char      key[8][16];
+    char      value[8][16];
+    size_t    recordLengths[8];
+    int       records;
+    BYTE     *last;     /* the last record, copied */
+    size_t    lastLength;
+} LevelSeen;
+
+static BOOL SeeEntry(void *context, ULONGLONG sequence, const CoreLevelOp *op)
+{
+    LevelSeen *seen = (LevelSeen *)context;
+    if (seen->count >= 8) return FALSE;
+    seen->sequence[seen->count] = sequence;
+    seen->put[seen->count] = op->put;
+    memcpy(seen->key[seen->count], op->key, min(op->keyLength, 15));
+    seen->key[seen->count][min(op->keyLength, 15)] = 0;
+    if (op->put) memcpy(seen->value[seen->count], op->value, min(op->valueLength, 15));
+    seen->value[seen->count][op->put ? min(op->valueLength, 15) : 0] = 0;
+    seen->count++;
+    return TRUE;
+}
+
+static BOOL SeeRecord(void *context, const BYTE *record, size_t length)
+{
+    LevelSeen *seen = (LevelSeen *)context;
+    if (seen->records < 8) seen->recordLengths[seen->records] = length;
+    seen->records++;
+    if (seen->last) HeapFree(GetProcessHeap(), 0, seen->last);
+    seen->last = (BYTE *)HeapAlloc(GetProcessHeap(), 0, max(length, 1));
+    if (seen->last) memcpy(seen->last, record, length);
+    seen->lastLength = length;
+    return TRUE;
+}
+
+static void PutFixed(BYTE *out, ULONGLONG value, int bytes)
+{
+    int i;
+    for (i = 0; i < bytes; i++) out[i] = (BYTE)(value >> (8 * i));
+}
+
+/* A block of a table: entries of whole keys (none shared), one restart. */
+static size_t TableBlock(BYTE *out, const BYTE *const *keys, const size_t *keyLengths, const char *const *values, int count)
+{
+    size_t at = 0;
+    int i;
+    for (i = 0; i < count; i++) {
+        size_t valueLength = strlen(values[i]);
+        out[at++] = 0;
+        out[at++] = (BYTE)keyLengths[i];
+        out[at++] = (BYTE)valueLength;
+        memcpy(out + at, keys[i], keyLengths[i]);
+        at += keyLengths[i];
+        memcpy(out + at, values[i], valueLength);
+        at += valueLength;
+    }
+    PutFixed(out + at, 0, 4);
+    PutFixed(out + at + 4, 1, 4);
+    return at + 8;
+}
+
+/* A table: one data block (Snappy-compressed when `compressed`, as one literal), its index block pointing to it, the footer. */
+static size_t MakeTable(BYTE *out, BOOL compressed)
+{
+    BYTE keyA[9], keyB[9], data[128];
+    const BYTE *keys[2] = { keyA, keyB };
+    const char *values[2] = { "x", "" };
+    size_t keyLengths[2] = { 9, 9 }, dataLength, at = 0, dataSize, indexOffset, indexStart, footer;
+    keyA[0] = 'a';
+    PutFixed(keyA + 1, (5ULL << 8) | 1, 8);   /* sequence 5, a value */
+    keyB[0] = 'b';
+    PutFixed(keyB + 1, (6ULL << 8) | 0, 8);   /* sequence 6, deleted */
+    dataLength = TableBlock(data, keys, keyLengths, values, 2);
+    if (compressed) {
+        out[at++] = (BYTE)dataLength;          /* the inflated length, under 128 */
+        out[at++] = (BYTE)(60 << 2);           /* a literal, its length - 1 in the next byte */
+        out[at++] = (BYTE)(dataLength - 1);
+    }
+    memcpy(out + at, data, dataLength);
+    at += dataLength;
+    dataSize = at;
+    out[at++] = (BYTE)(compressed ? 1 : 0);
+    PutFixed(out + at, 0, 4);                  /* its checksum: not read */
+    at += 4;
+    /* The index: one entry, the last key of the block and where the block is. */
+    indexOffset = indexStart = at;
+    out[at++] = 0;
+    out[at++] = 9;
+    out[at++] = 2;
+    memcpy(out + at, keyB, 9);
+    at += 9;
+    out[at++] = 0;                             /* offset 0 */
+    out[at++] = (BYTE)dataSize;
+    PutFixed(out + at, 0, 4);
+    PutFixed(out + at + 4, 1, 4);
+    at += 8;
+    footer = at + 5;
+    out[at] = 0;
+    PutFixed(out + at + 1, 0, 4);
+    memset(out + footer, 0, 48);
+    out[footer + 2] = (BYTE)indexOffset;       /* the metaindex first: offset 0, size 0 */
+    out[footer + 3] = (BYTE)(at - indexStart);
+    PutFixed(out + footer + 40, 0xdb4775248b80fb57ULL, 8);
+    return footer + 48;
+}
+
+typedef struct TableSeen {
+    ULONGLONG added[4], gone[4];
+    int addedCount, goneCount;
+} TableSeen;
+
+static void SeeTable(void *context, ULONGLONG number, BOOL added)
+{
+    TableSeen *seen = (TableSeen *)context;
+    if (added && seen->addedCount < 4) seen->added[seen->addedCount++] = number;
+    if (!added && seen->goneCount < 4) seen->gone[seen->goneCount++] = number;
+}
+
+static void TestLevelDb(void)
+{
+    static const BYTE kSnappy[] = { 0x0C, 0x08, 'a', 'b', 'c', 0x15, 0x03 };
+    static const BYTE kBadSnappy[] = { 0x0C, 0x08, 'a', 'b', 'c', 0x15, 0x09 };
+    BYTE zeros[32], ones[32], decoded[16], batch[256], *log, *big, table[512], key[64], value[64];
+    CoreLevelOp ops[2];
+    LevelSeen seen;
+    CoreLevelManifest manifest;
+    TableSeen tables;
+    WCHAR text[16];
+    size_t length, batchLength, logLength, appended, cleanEnd, i, n;
+
+    Check("CRC32C of \"123456789\"", Core_Crc32c(0, "123456789", 9) == 0xE3069283u);
+    memset(zeros, 0, sizeof zeros);
+    memset(ones, 0xFF, sizeof ones);
+    Check("CRC32C of 32 zeros and of 32 0xFF bytes, as LevelDB's tests say",
+          Core_Crc32c(0, zeros, sizeof zeros) == 0x8a9136aau && Core_Crc32c(0, ones, sizeof ones) == 0x62a8ab43u);
+    Check("CRC32C goes on from a part", Core_Crc32c(Core_Crc32c(0, "1234", 4), "56789", 5) == 0xE3069283u);
+    Check("a masked CRC differs from the CRC", Core_LevelMask(0xE3069283u) != 0xE3069283u);
+
+    Check("Snappy: the length comes first", Core_SnappyLength(kSnappy, sizeof kSnappy, &length) && length == 12);
+    Check("Snappy: a literal and a copy of it", Core_SnappyDecode(kSnappy, sizeof kSnappy, decoded, 12) && memcmp(decoded, "abcabcabcabc", 12) == 0);
+    Check("Snappy: a copy from before the start is refused", !Core_SnappyDecode(kBadSnappy, sizeof kBadSnappy, decoded, 12));
+    Check("Snappy: a length that does not match is refused", !Core_SnappyDecode(kSnappy, sizeof kSnappy, decoded, 11));
+
+    /* A write batch: a value put, a key deleted, from sequence 100. */
+    ZeroMemory(ops, sizeof ops);
+    ops[0].put = TRUE;
+    ops[0].key = (const BYTE *)"k1";
+    ops[0].keyLength = 2;
+    ops[0].value = (const BYTE *)"v1";
+    ops[0].valueLength = 2;
+    ops[1].key = (const BYTE *)"k2";
+    ops[1].keyLength = 2;
+    batchLength = Core_LevelBatchWrite(100, ops, 2, batch, sizeof batch);
+    ZeroMemory(&seen, sizeof seen);
+    Check("a batch is written", batchLength == 12 + 1 + 1 + 2 + 1 + 2 + 1 + 1 + 2);
+    Check("a batch reads back: the put, then the deletion, each with its sequence",
+          Core_LevelBatchRead(batch, batchLength, SeeEntry, &seen) && seen.count == 2 && seen.sequence[0] == 100 && seen.put[0] &&
+          strcmp(seen.key[0], "k1") == 0 && strcmp(seen.value[0], "v1") == 0 && seen.sequence[1] == 101 && !seen.put[1] &&
+          strcmp(seen.key[1], "k2") == 0);
+    Check("a batch cut short is refused", !Core_LevelBatchRead(batch, batchLength - 1, SeeEntry, &seen));
+
+    /* The log: the batch added to an empty log, then a record spanning three blocks, then one where a block has no room left. */
+    log = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 4 * 32768);
+    big = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 70000);
+    if (!log || !big) {
+        Check("log buffers", FALSE);
+        return;
+    }
+    for (i = 0; i < 70000; i++) big[i] = (BYTE)(i * 7);
+    logLength = Core_LevelLogAppend(0, batch, batchLength, log, 4 * 32768);
+    Check("one record in an empty log: a header and the batch", logLength == 7 + batchLength);
+    appended = Core_LevelLogAppend(logLength, big, 70000, log + logLength, 4 * 32768 - logLength);
+    Check("a record longer than a block takes three", appended == 70000 + 3 * 7);
+    logLength += appended;
+    ZeroMemory(&seen, sizeof seen);
+    Check("the log reads back: both records whole, the long one put together",
+          Core_LevelLogRecords(log, logLength, SeeRecord, &seen, &cleanEnd) && seen.records == 2 && seen.recordLengths[0] == batchLength &&
+          seen.lastLength == 70000 && seen.last && memcmp(seen.last, big, 70000) == 0 && cleanEnd == logLength);
+    if (seen.last) HeapFree(GetProcessHeap(), 0, seen.last);
+
+    /* A record that ends three bytes before a block's end: the next one starts in the next block, the gap zeros. */
+    memset(log, 0, 4 * 32768);
+    n = Core_LevelLogAppend(0, big, 32768 - 3 - 7, log, 4 * 32768);
+    appended = Core_LevelLogAppend(n, batch, batchLength, log + n, 4 * 32768 - n);
+    Check("a block's last bytes too few for a header stay zeros", n == 32765 && appended == 3 + 7 + batchLength &&
+          log[n] == 0 && log[n + 1] == 0 && log[n + 2] == 0);
+    ZeroMemory(&seen, sizeof seen);
+    Check("both read back across the gap", Core_LevelLogRecords(log, n + appended, SeeRecord, &seen, &cleanEnd) && seen.records == 2 &&
+          seen.lastLength == batchLength && memcmp(seen.last, batch, batchLength) == 0 && cleanEnd == n + appended);
+    if (seen.last) HeapFree(GetProcessHeap(), 0, seen.last);
+    /* Garbage after the records: reading stops before it, at the clean end. */
+    log[n + appended] = 0x55;
+    log[n + appended + 4] = 9;
+    log[n + appended + 6] = 1;
+    ZeroMemory(&seen, sizeof seen);
+    Check("garbage after the last record is not read", Core_LevelLogRecords(log, n + appended + 20, SeeRecord, &seen, &cleanEnd) &&
+          seen.records == 2 && cleanEnd == n + appended);
+    if (seen.last) HeapFree(GetProcessHeap(), 0, seen.last);
+    /* A record whose checksum is wrong is not read. */
+    log[7 + 3] ^= 1;
+    ZeroMemory(&seen, sizeof seen);
+    Core_LevelLogRecords(log, n + appended, SeeRecord, &seen, &cleanEnd);
+    Check("a record that does not match its checksum is not read", seen.records == 0 && cleanEnd == 0);
+    HeapFree(GetProcessHeap(), 0, log);
+    HeapFree(GetProcessHeap(), 0, big);
+
+    /* Tables: their entries with sequence and type, stored or Snappy-compressed. */
+    for (i = 0; i < 2; i++) {
+        size_t tableLength = MakeTable(table, i == 1);
+        ZeroMemory(&seen, sizeof seen);
+        Check(i ? "a table with a Snappy block reads its entries" : "a table reads its entries",
+              Core_LevelTableRead(table, tableLength, SeeEntry, &seen) && seen.count == 2 && seen.sequence[0] == 5 && seen.put[0] &&
+              strcmp(seen.key[0], "a") == 0 && strcmp(seen.value[0], "x") == 0 && seen.sequence[1] == 6 && !seen.put[1] &&
+              strcmp(seen.key[1], "b") == 0);
+        table[tableLength - 1] ^= 1;
+        Check("a table without LevelDB's magic is refused", !Core_LevelTableRead(table, tableLength, SeeEntry, &seen));
+    }
+
+    /* A manifest's edit: the log, the next file, the last sequence, a table added and one gone. */
+    {
+        static const BYTE kEdit[] = { 1, 3, 'c', 'm', 'p', 2, 7, 3, 9, 4, 0xD2, 0x09, 7, 0, 5, 100, 1, 'a', 1, 'b', 6, 0, 3, 9, 0 };
+        ZeroMemory(&manifest, sizeof manifest);
+        ZeroMemory(&tables, sizeof tables);
+        manifest.onTable = SeeTable;
+        manifest.context = &tables;
+        Check("a manifest's edit is read whole", Core_LevelManifestEdit(kEdit, sizeof kEdit, &manifest));
+        Check("it names the log, the next file and the last sequence",
+              manifest.hasLog && manifest.logNumber == 7 && manifest.nextFile == 9 && manifest.lastSequence == 1234);
+        Check("it tells the table made live and the one gone",
+              tables.addedCount == 1 && tables.added[0] == 5 && tables.goneCount == 1 && tables.gone[0] == 3);
+        Check("an edit with a tag LevelDB does not write is refused", !Core_LevelManifestEdit((const BYTE *)"\x08\x01", 2, &manifest));
+    }
+
+    /* Chromium's Local Storage: keys and values. */
+    length = Core_WebStorageKey("https://claude.ai", L"dframe-store", key, sizeof key);
+    Check("a Local Storage key: the origin, a zero, a Latin-1 mark, the name",
+          length == 1 + 17 + 1 + 1 + 12 && memcmp(key, "_https://claude.ai\0\1dframe-store", length) == 0);
+    length = Core_WebStorageValue(L"caf\x00E9", 4, value, sizeof value);
+    Check("a value every character of which fits Latin-1 is stored so", length == 5 && value[0] == 1 && value[4] == 0xE9);
+    Check("and reads back", Core_WebStorageText(value, length, text, ARRAYSIZE(text), &n) && n == 4 && wcscmp(text, L"caf\x00E9") == 0);
+    length = Core_WebStorageValue(L"\x672A\x5206\x7C7B", 3, value, sizeof value);
+    Check("a value with other characters is UTF-16", length == 7 && value[0] == 0 && value[1] == 0x2A && value[2] == 0x67);
+    Check("and reads back too", Core_WebStorageText(value, length, text, ARRAYSIZE(text), &n) && n == 3 && text[2] == 0x7C7B);
+    Check("a value without its mark is refused", !Core_WebStorageText((const BYTE *)"\x02x", 2, text, ARRAYSIZE(text), &n));
+}
+
 int wmain(void)
 {
+    TestLevelDb();
     TestSessionEntries();
     TestSessionEdits();
     TestSessionSync();

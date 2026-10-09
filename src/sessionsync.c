@@ -779,13 +779,7 @@ static OpResult ApplyIndex(const Profile *p, const WCHAR *dir, const char *conte
 /* The pins, project order and filters of Claude's sidebar, in
  * claude_desktop_config.json under preferences.epitaxyPrefs: each part by its
  * name in a layout of ours, the name Claude gives it, and whether Claude keeps
- * it for every account, per account and organization (its member
- * "<account>/<organization>"), or per account (the account's id after the
- * name). Its groups and their sections (dframe-group-scopes,
- * dframe-code-sections) are there too, but only as a copy: Claude's web UI
- * keeps them in its web storage, a database of its own, and writes that copy
- * over this file each time it starts; so do the "Edit sidebar" choices and
- * the groups folded. Written here they would show nowhere: not kept. */
+ * it for every account or per account (the account's id after the name). */
 typedef enum LayoutScope { LAYOUT_ANY, LAYOUT_ORGANIZATION, LAYOUT_ACCOUNT } LayoutScope;
 static const struct { const char *part, *name; LayoutScope scope; } kLayoutParts[] = {
     { "starred", "starred-local-code-sessions", LAYOUT_ANY },
@@ -799,18 +793,65 @@ static const struct { const char *part, *name; LayoutScope scope; } kLayoutParts
     { "projectsFilter", "ccd-sessions-filter", LAYOUT_ANY },                        /* the projects chosen */
 };
 
+/* The sidebar's groups and their sections, the "Edit sidebar" choices, the
+ * groups folded, how sessions are grouped and sorted, and the editor's
+ * settings: Claude's web UI keeps them in its web storage (webstore.c), most
+ * under "state" of its value dframe-store. It keeps copies of the groups and
+ * sections (dframe-group-scopes, dframe-code-sections) in the settings above
+ * and in its web storage (LSS-persisted.<the same name>), and writes them from
+ * dframe-store each time it starts: written in a copy alone, a change would
+ * show nowhere. So these are read from the web storage and written to it and
+ * to both copies alike. Each part: its name in a layout of ours, the value,
+ * its member of "state" (NULL: the value whole), whether Claude keeps it per
+ * account and organization (its member "<account>/<organization>"), and the
+ * name of the copies. */
+#define SIDEBAR_STORE   L"dframe-store"
+#define COPY_PREFIX     L"LSS-persisted."
+typedef struct WebPart {
+    const char  *part;
+    const WCHAR *value;
+    const char  *member;
+    LayoutScope  scope;
+    const char  *copy;
+} WebPart;
+static const WebPart kWebParts[] = {
+    { "groups", SIDEBAR_STORE, "customGroupsByScope", LAYOUT_ORGANIZATION, "dframe-group-scopes" },
+    { "sections", SIDEBAR_STORE, "codeSidebarByScope", LAYOUT_ORGANIZATION, "dframe-code-sections" },
+    { "navPins", SIDEBAR_STORE, "navPinnedIds", LAYOUT_ANY, NULL },               /* Edit sidebar */
+    { "folded", SIDEBAR_STORE, "collapsedGroups", LAYOUT_ANY, NULL },
+    { "groupBy", SIDEBAR_STORE, "groupByByMode", LAYOUT_ANY, NULL },
+    { "sortBy", SIDEBAR_STORE, "sortByByMode", LAYOUT_ANY, NULL },
+    { "recentsType", SIDEBAR_STORE, "recentsTypeFilter", LAYOUT_ANY, NULL },      /* the filter of Recents */
+    { "recentsStatus", SIDEBAR_STORE, "recentsStatusFilter", LAYOUT_ANY, NULL },
+    { "routines", SIDEBAR_STORE, "routinesSidebarPlacement", LAYOUT_ANY, NULL },
+    { "sidebarWidth", SIDEBAR_STORE, "sidebarWidth", LAYOUT_ANY, NULL },
+    { "interfaceFont", SIDEBAR_STORE, "interfaceFont", LAYOUT_ANY, NULL },
+    { "systemFont", SIDEBAR_STORE, "systemFont", LAYOUT_ANY, NULL },
+    { "editor", L"epitaxy-editor-prefs", NULL, LAYOUT_ANY, NULL },                 /* the editor's font, theme, text size */
+};
+
+const char *SessionSync_LayoutPart(int index)
+{
+    if (index < 0) return NULL;
+    if (index < (int)ARRAYSIZE(kLayoutParts)) return kLayoutParts[index].part;
+    index -= (int)ARRAYSIZE(kLayoutParts);
+    return index < (int)ARRAYSIZE(kWebParts) ? kWebParts[index].part : NULL;
+}
+
 /* The account and organization an entries folder is for (its last two
- * folders), as UTF-8. */
-static BOOL LayoutScopeOf(const WCHAR *entriesDir, char *account, size_t accountCap, char *organization, size_t organizationCap)
+ * folders), as UTF-8, and Claude's name for both: "<account>/<organization>". */
+static BOOL LayoutScopeOf(const WCHAR *entriesDir, char *account, size_t accountCap, char *scope, size_t scopeCap)
 {
     const WCHAR *last = wcsrchr(entriesDir, L'\\'), *before;
     WCHAR accountName[SESSION_ID_CCH];
+    char organization[SESSION_ID_CCH * 3];
     if (!last || last == entriesDir || !last[1]) return FALSE;
     for (before = last - 1; before > entriesDir && *before != L'\\'; before--) {}
     if (*before != L'\\' || before + 1 == last || FAILED(StringCchCopyNW(accountName, ARRAYSIZE(accountName), before + 1, (size_t)(last - before - 1))))
         return FALSE;
     return WideCharToMultiByte(CP_UTF8, 0, accountName, -1, account, (int)accountCap, NULL, NULL) > 0 &&
-           WideCharToMultiByte(CP_UTF8, 0, last + 1, -1, organization, (int)organizationCap, NULL, NULL) > 0;
+           WideCharToMultiByte(CP_UTF8, 0, last + 1, -1, organization, (int)sizeof organization, NULL, NULL) > 0 &&
+           SUCCEEDED(StringCchPrintfA(scope, scopeCap, "%s/%s", account, organization));
 }
 
 /* `json` (a heap block, freed) with its member `key` set to `raw` (`length`
@@ -836,6 +877,35 @@ static char *SetRaw(char *json, size_t *used, const char *key, const char *raw, 
     return out;
 }
 
+/* `*json` (a heap block) with the member reached through `keys` set to
+ * `length` bytes of `raw`; FALSE, `*json` as it was, when it cannot be. */
+static BOOL SetNested(char **json, size_t *used, const char *const *keys, int depth, const char *raw, size_t length)
+{
+    char *text, *out = NULL;
+    size_t outLength = 0;
+    if (*json && (text = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1)) != NULL) {
+        memcpy(text, raw, length);
+        text[length] = 0;
+        out = Core_JsonSetNested(*json, *used, keys, depth, text, &outLength);
+        Free(text);
+    }
+    if (!out) return FALSE;
+    Free(*json);
+    *json = out;
+    *used = outLength;
+    return TRUE;
+}
+
+static char *Duplicate(const char *text, size_t length)
+{
+    char *copy = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1);
+    if (copy) {
+        memcpy(copy, text, length);
+        copy[length] = 0;
+    }
+    return copy;
+}
+
 static char *EmptyObject(size_t *used)
 {
     char *json = (char *)HeapAlloc(GetProcessHeap(), 0, 3);
@@ -844,74 +914,107 @@ static char *EmptyObject(size_t *used)
     return json;
 }
 
+/* Part `part` of the web storage value `text`: where it is. A value whole is
+ * one of Claude's stores ({"state": ..., "version": ...}) or none. */
+static BOOL WebPartOf(const WebPart *part, const char *text, size_t length, const char *scope, const char **value, size_t *valueLength)
+{
+    const char *state, *inner;
+    size_t stateLength, innerLength;
+    if (!text || !Core_JsonMember(text, length, "state", &state, &stateLength)) return FALSE;
+    if (!part->member) {
+        *value = text;
+        *valueLength = length;
+        return TRUE;
+    }
+    if (!Core_JsonMember(state, stateLength, part->member, &inner, &innerLength) ||
+        (part->scope == LAYOUT_ORGANIZATION && !Core_JsonMember(inner, innerLength, scope, &inner, &innerLength)))
+        return FALSE;
+    *value = inner;
+    *valueLength = innerLength;
+    return TRUE;
+}
+
+/* The parts of `layout` (a heap block, freed) read from the web storage of
+ * `p`; `written` made the time its newest file was written, when later. */
+static char *ReadWebParts(const Profile *p, const char *scope, char *layout, size_t *used, ULONGLONG *written)
+{
+    WebStore *store = WebStore_Open(p);
+    const WCHAR *read = NULL;
+    char *text = NULL;
+    const char *value;
+    size_t length = 0, valueLength, i;
+    if (!store) return layout;
+    if (written) *written = max(*written, WebStore_Written(store));
+    for (i = 0; i < ARRAYSIZE(kWebParts) && layout; i++) {
+        if (!read || wcscmp(read, kWebParts[i].value) != 0) {
+            Free(text);
+            text = WebStore_Get(store, kWebParts[i].value, &length);
+            read = kWebParts[i].value;
+        }
+        if (WebPartOf(&kWebParts[i], text, length, scope, &value, &valueLength))
+            layout = SetRaw(layout, used, kWebParts[i].part, value, valueLength);
+    }
+    Free(text);
+    WebStore_Free(store);
+    return layout;
+}
+
 char *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *length, ULONGLONG *written)
 {
     WCHAR path[LONG_PATH_CCH];
     WIN32_FILE_ATTRIBUTE_DATA attributes;
-    char account[SESSION_ID_CCH * 3], organization[SESSION_ID_CCH * 3], name[128], *config, *layout = NULL;
-    const char *prefs, *epitaxy, *value, *inner;
-    size_t prefsLength, epitaxyLength, valueLength, innerLength, used = 0, i;
+    char account[SESSION_ID_CCH * 3], scope[SESSION_ID_CCH * 6 + 2], name[128], *config, *layout;
+    const char *prefs, *epitaxy, *value;
+    size_t prefsLength, epitaxyLength, valueLength, used = 0, i;
     DWORD size = 0;
     *length = 0;
     if (written) *written = 0;
-    if (!p->storageDir[0] || !LayoutScopeOf(entriesDir, account, sizeof account, organization, sizeof organization) ||
-        FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir)) ||
-        (config = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &size)) == NULL)
+    if (!p->storageDir[0] || !LayoutScopeOf(entriesDir, account, sizeof account, scope, sizeof scope) ||
+        FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir)) || (layout = EmptyObject(&used)) == NULL)
         return NULL;
-    if (written && GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) {
-        ULONGLONG ticks = ((ULONGLONG)attributes.ftLastWriteTime.dwHighDateTime << 32) | attributes.ftLastWriteTime.dwLowDateTime;
-        *written = ticks > UNIX_EPOCH_TICKS ? (ticks - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND : 0;
-    }
-    if (Core_JsonMember(config, size, "preferences", &prefs, &prefsLength) &&
-        Core_JsonMember(prefs, prefsLength, "epitaxyPrefs", &epitaxy, &epitaxyLength) && (layout = EmptyObject(&used)) != NULL) {
-        for (i = 0; i < ARRAYSIZE(kLayoutParts) && layout; i++) {
-            if (FAILED(StringCchPrintfA(name, sizeof name, "%s%s", kLayoutParts[i].name, kLayoutParts[i].scope == LAYOUT_ACCOUNT ? account : "")) ||
-                !Core_JsonMember(epitaxy, epitaxyLength, name, &value, &valueLength))
-                continue;
-            if (kLayoutParts[i].scope == LAYOUT_ORGANIZATION) {
-                char scope[sizeof account + sizeof organization + 2];
-                if (FAILED(StringCchPrintfA(scope, sizeof scope, "%s/%s", account, organization)) ||
-                    !Core_JsonMember(value, valueLength, scope, &inner, &innerLength))
-                    continue;
-                value = inner;
-                valueLength = innerLength;
-            }
-            layout = SetRaw(layout, &used, kLayoutParts[i].part, value, valueLength);
+    if ((config = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &size)) != NULL) {
+        if (written && GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) {
+            ULONGLONG ticks = ((ULONGLONG)attributes.ftLastWriteTime.dwHighDateTime << 32) | attributes.ftLastWriteTime.dwLowDateTime;
+            *written = ticks > UNIX_EPOCH_TICKS ? (ticks - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND : 0;
         }
-        if (layout && used <= 2) {
-            Free(layout);
-            layout = NULL;
-        }
+        if (Core_JsonMember(config, size, "preferences", &prefs, &prefsLength) &&
+            Core_JsonMember(prefs, prefsLength, "epitaxyPrefs", &epitaxy, &epitaxyLength))
+            for (i = 0; i < ARRAYSIZE(kLayoutParts) && layout; i++)
+                if (SUCCEEDED(StringCchPrintfA(name, sizeof name, "%s%s", kLayoutParts[i].name, kLayoutParts[i].scope == LAYOUT_ACCOUNT ? account : "")) &&
+                    Core_JsonMember(epitaxy, epitaxyLength, name, &value, &valueLength))
+                    layout = SetRaw(layout, &used, kLayoutParts[i].part, value, valueLength);
+        Free(config);
     }
-    Free(config);
+    if (layout) layout = ReadWebParts(p, scope, layout, &used, written);
+    if (layout && used <= 2) {
+        Free(layout);
+        layout = NULL;
+    }
     if (layout) *length = used;
     return layout;
 }
 
-/* The pins and groups of `content` (a layout of ours) put in the sidebar of
- * `p`, for the account and organization of its entries folder `dir`; what
- * else claude_desktop_config.json holds stays as it is. */
-static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *content, size_t contentLength, SyncReport *report)
+/* The parts of `content` kept in claude_desktop_config.json, and the copies
+ * of the groups and sections there, put in that file of `p`. */
+static OpResult ApplySettings(const Profile *p, const char *account, const char *scope, const char *content, size_t contentLength,
+                              SyncReport *report)
 {
     WCHAR path[LONG_PATH_CCH];
-    char account[SESSION_ID_CCH * 3], organization[SESSION_ID_CCH * 3], name[128], scope[SESSION_ID_CCH * 6 + 2], *json, *next;
+    char name[128];
     const char *value;
     size_t valueLength, used = 0, i;
     DWORD currentLength = 0;
-    char *current;
+    char *current, *json = NULL;
     BOOL there;
     OpResult result = OP_FAILED;
-    if (!p->storageDir[0] || !LayoutScopeOf(dir, account, sizeof account, organization, sizeof organization) ||
-        FAILED(StringCchPrintfA(scope, sizeof scope, "%s/%s", account, organization)) ||
-        FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir))) {
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir))) {
         CannotWrite(report, p->folder, ERROR_INVALID_DATA);
         return OP_FAILED;
     }
     current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength);
     there = current != NULL;
     if (current) {
-        json = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)currentLength + 1);
-        if (json) {
+        if ((json = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)currentLength + 1)) != NULL) {
             memcpy(json, current, currentLength);
             json[currentLength] = 0;
             used = currentLength;
@@ -920,20 +1023,18 @@ static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *cont
         json = EmptyObject(&used);
     }
     for (i = 0; i < ARRAYSIZE(kLayoutParts) && json; i++) {
-        const char *keys[4] = { "preferences", "epitaxyPrefs", name, scope };
-        char *raw;
-        if (!Core_JsonMember(content, contentLength, kLayoutParts[i].part, &value, &valueLength) ||
-            FAILED(StringCchPrintfA(name, sizeof name, "%s%s", kLayoutParts[i].name, kLayoutParts[i].scope == LAYOUT_ACCOUNT ? account : "")) ||
-            (raw = (char *)HeapAlloc(GetProcessHeap(), 0, valueLength + 1)) == NULL)
-            continue;
-        memcpy(raw, value, valueLength);
-        raw[valueLength] = 0;
-        next = Core_JsonSetNested(json, used, keys, kLayoutParts[i].scope == LAYOUT_ORGANIZATION ? 4 : 3, raw, &used);
-        Free(raw);
-        Free(json);
-        json = next;
+        const char *keys[3] = { "preferences", "epitaxyPrefs", name };
+        if (Core_JsonMember(content, contentLength, kLayoutParts[i].part, &value, &valueLength) &&
+            SUCCEEDED(StringCchPrintfA(name, sizeof name, "%s%s", kLayoutParts[i].name, kLayoutParts[i].scope == LAYOUT_ACCOUNT ? account : "")))
+            if (!SetNested(&json, &used, keys, 3, value, valueLength)) break;
     }
-    if (!json) {
+    for (i = 0; i < ARRAYSIZE(kWebParts) && json; i++) {
+        const char *keys[4] = { "preferences", "epitaxyPrefs", kWebParts[i].copy, scope };
+        if (kWebParts[i].copy && Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength) &&
+            !SetNested(&json, &used, keys, 4, value, valueLength))
+            break;
+    }
+    if (!json || i < ARRAYSIZE(kWebParts)) {
         CannotWrite(report, path, ERROR_INVALID_DATA);
         goto done;
     }
@@ -951,7 +1052,7 @@ static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *cont
     }
     if (WriteFileAt(path, json, used, p, there)) {
         result = OP_MADE;
-        Util_Log(L"the sidebar's pins and groups in %s: replaced", p->folder);
+        Util_Log(L"the sidebar's settings in %s: replaced", p->folder);
     } else if (GetLastError() == ERROR_BUSY) {
         result = OP_STOPPED;
     } else {
@@ -961,6 +1062,141 @@ done:
     Free(json);
     Free(current);
     return result;
+}
+
+/* Web storage value `name` of `store` with the parts of `content` it keeps
+ * set in it: a value whole made where there is none, a member of one only
+ * where Claude made that value; `*changed` when it changed. A member Claude
+ * keeps as something else than an object stays as it is. */
+static BOOL SetWebValue(WebStore *store, const WCHAR *name, const char *scope, const char *content, size_t contentLength, BOOL *changed)
+{
+    const char *value;
+    size_t valueLength, length = 0, used, i;
+    char *text = WebStore_Get(store, name, &length), *json = text ? Duplicate(text, length) : NULL;
+    BOOL ok = TRUE;
+    used = length;
+    for (i = 0; i < ARRAYSIZE(kWebParts); i++) {
+        const char *keys[3] = { "state", kWebParts[i].member, scope };
+        if (wcscmp(kWebParts[i].value, name) != 0 || !Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength))
+            continue;
+        if (!kWebParts[i].member) {
+            Free(json);
+            json = Duplicate(value, valueLength);
+            used = valueLength;
+        } else if (json && !SetNested(&json, &used, keys, kWebParts[i].scope == LAYOUT_ORGANIZATION ? 3 : 2, value, valueLength)) {
+            Util_Log(L"web storage %s: its %S kept, not an object there", name, kWebParts[i].part);
+        }
+    }
+    if (json && (!text || used != length || memcmp(json, text, used) != 0)) {
+        ok = WebStore_Set(store, name, json, used);
+        *changed = TRUE;
+    }
+    Free(text);
+    Free(json);
+    return ok;
+}
+
+/* The copy LSS-persisted.<copy> of part `part` of `content`: its member of
+ * "value" for `scope`, and its time now. */
+static BOOL SetWebCopy(WebStore *store, const WebPart *part, const char *scope, const char *content, size_t contentLength, BOOL *changed)
+{
+    WCHAR name[128];
+    const char *value, *inner;
+    const char *keys[2] = { "value", scope }, *timeKey[1] = { "timestamp" };
+    size_t valueLength, innerLength, length = 0, used;
+    char *text, *json, now[TIME_TEXT_BYTES];
+    BOOL ok = TRUE;
+    if (!Core_JsonMember(content, contentLength, part->part, &value, &valueLength) ||
+        FAILED(StringCchPrintfW(name, ARRAYSIZE(name), COPY_PREFIX L"%S", part->copy)))
+        return TRUE;
+    text = WebStore_Get(store, name, &length);
+    if (text && Core_JsonMember(text, length, "value", &inner, &innerLength) && Core_JsonMember(inner, innerLength, scope, &inner, &innerLength) &&
+        innerLength == valueLength && memcmp(inner, value, valueLength) == 0) {
+        Free(text);
+        return TRUE;
+    }
+    if (text) {
+        json = text;
+        used = length;
+    } else {
+        static const char kEmpty[] = "{\"value\":{},\"tabId\":\"\",\"timestamp\":0}";
+        json = Duplicate(kEmpty, sizeof kEmpty - 1);
+        used = sizeof kEmpty - 1;
+    }
+    StringCchPrintfA(now, sizeof now, "%I64u", NowMs());
+    if (json && SetNested(&json, &used, keys, 2, value, valueLength) && SetNested(&json, &used, timeKey, 1, now, strlen(now))) {
+        ok = WebStore_Set(store, name, json, used);
+        *changed = TRUE;
+    } else {
+        Util_Log(L"web storage %s: kept, not Claude's copy", name);
+    }
+    Free(json);
+    return ok;
+}
+
+/* The parts of `content` kept in the web storage of `p` written there, with
+ * its copies; the database copied to the backup first. */
+static OpResult ApplyWeb(const Profile *p, const char *scope, const char *content, size_t contentLength, SyncReport *report)
+{
+    WCHAR backup[MAX_PATH];
+    WebStore *store;
+    const WCHAR *names[ARRAYSIZE(kWebParts)];
+    const char *value;
+    size_t valueLength, i, j, count = 0;
+    BOOL changed = FALSE, ok = TRUE, any = FALSE;
+    OpResult result = OP_FAILED;
+    for (i = 0; i < ARRAYSIZE(kWebParts); i++)
+        if (Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength)) any = TRUE;
+    /* None yet (Claude makes it at its first start): the next sync sends them again. */
+    if (!any || (store = WebStore_Open(p)) == NULL) return OP_SAME;
+    for (i = 0; i < ARRAYSIZE(kWebParts); i++) {
+        for (j = 0; j < count && wcscmp(names[j], kWebParts[i].value) != 0; j++) {}
+        if (j == count) names[count++] = kWebParts[i].value;
+    }
+    for (i = 0; i < count && ok; i++) ok = SetWebValue(store, names[i], scope, content, contentLength, &changed);
+    /* The copies only where the value they copy is. */
+    for (i = 0; i < ARRAYSIZE(kWebParts) && ok; i++) {
+        size_t length = 0;
+        char *text;
+        if (!kWebParts[i].copy) continue;
+        text = WebStore_Get(store, kWebParts[i].value, &length);
+        if (text) ok = SetWebCopy(store, &kWebParts[i], scope, content, contentLength, &changed);
+        Free(text);
+    }
+    if (!ok) {
+        CannotWrite(report, p->folder, ERROR_INVALID_DATA);
+    } else if (!changed) {
+        result = OP_SAME;
+    } else if (SessionLink_Busy(p)) {
+        result = OP_STOPPED;
+    } else if (!BackupDir(p, report, backup, ARRAYSIZE(backup)) || FAILED(StringCchCatW(backup, ARRAYSIZE(backup), L"\\" CLAUDE_WEB_STORAGE))) {
+        CannotWrite(report, p->folder, GetLastError());
+    } else if (WebStore_Commit(store, backup)) {
+        result = OP_MADE;
+        Util_Log(L"the sidebar's groups and settings in the web storage of %s: replaced", p->folder);
+    } else {
+        CannotWrite(report, p->folder, GetLastError());
+    }
+    WebStore_Free(store);
+    return result;
+}
+
+/* The layout `content` (a layout of ours) put in the sidebar of `p`, for the
+ * account and organization of its entries folder `dir`: in its settings, then
+ * in its web storage. What else they hold stays as it is. */
+static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *content, size_t contentLength, SyncReport *report)
+{
+    char account[SESSION_ID_CCH * 3], scope[SESSION_ID_CCH * 6 + 2];
+    OpResult settings, web;
+    if (!p->storageDir[0] || !LayoutScopeOf(dir, account, sizeof account, scope, sizeof scope)) {
+        CannotWrite(report, p->folder, ERROR_INVALID_DATA);
+        return OP_FAILED;
+    }
+    settings = ApplySettings(p, account, scope, content, contentLength, report);
+    if (settings == OP_STOPPED || settings == OP_FAILED) return settings;
+    web = ApplyWeb(p, scope, content, contentLength, report);
+    if (web == OP_STOPPED || web == OP_FAILED) return web;
+    return settings == OP_MADE || web == OP_MADE ? OP_MADE : OP_SAME;
 }
 
 /* Each change this thread makes, told to a progress bar. */

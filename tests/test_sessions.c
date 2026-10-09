@@ -2916,6 +2916,208 @@ static void TestKeptGroups(const WCHAR *projects)
           FileHas(configs[2], "\"code-sessions-status-filter.kept-c\":\"all\""));
 }
 
+/* ------------------------------------------- the sidebar in web storage */
+
+#define UNSORTED_UTF8 "\xE6\x9C\xAA\xE5\x88\x86\xE7\xB1\xBB"   /* a group's name */
+
+static BOOL SaveBytes(const WCHAR *path, const BYTE *data, size_t length)
+{
+    HANDLE file;
+    DWORD written = 0;
+    BOOL ok;
+    if (!InFixture(path)) return FALSE;
+    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    ok = WriteFile(file, data, (DWORD)length, &written, NULL) && written == length;
+    CloseHandle(file);
+    return ok;
+}
+
+/* Claude's web storage in `storageDir` (Local Storage\leveldb), as LevelDB
+ * leaves it: CURRENT, a manifest naming log 3, and that log, one write batch
+ * of the claude.ai values `names` (`values`, UTF-8). */
+static BOOL MakeWebStorage(const WCHAR *storageDir, const WCHAR *const *names, const char *const *values, int count)
+{
+    static const char kComparator[] = "leveldb.BytewiseComparator";
+    static BYTE keys[4][128], data[4][4096], batch[16384], record[20000];
+    WCHAR dir[MAX_PATH], path[MAX_PATH], text[2048];
+    BYTE edit[64];
+    CoreLevelOp ops[4];
+    size_t editLength = 0, length;
+    int i, chars;
+    if (count > 4 || !Join(storageDir, L"Local Storage\\leveldb", dir, ARRAYSIZE(dir)) || !MakeDir(dir)) return FALSE;
+    ZeroMemory(ops, sizeof ops);
+    for (i = 0; i < count; i++) {
+        if ((chars = MultiByteToWideChar(CP_UTF8, 0, values[i], -1, text, ARRAYSIZE(text)) - 1) < 0) return FALSE;
+        ops[i].put = TRUE;
+        ops[i].key = keys[i];
+        ops[i].keyLength = Core_WebStorageKey("https://claude.ai", names[i], keys[i], sizeof keys[i]);
+        ops[i].value = data[i];
+        ops[i].valueLength = Core_WebStorageValue(text, (size_t)chars, data[i], sizeof data[i]);
+        if (!ops[i].keyLength || !ops[i].valueLength) return FALSE;
+    }
+    /* The manifest's edit: the comparator, log 3, next file 4, last sequence 0. */
+    edit[editLength++] = 1;
+    edit[editLength++] = (BYTE)(sizeof kComparator - 1);
+    memcpy(edit + editLength, kComparator, sizeof kComparator - 1);
+    editLength += sizeof kComparator - 1;
+    edit[editLength++] = 2;
+    edit[editLength++] = 3;
+    edit[editLength++] = 3;
+    edit[editLength++] = 4;
+    edit[editLength++] = 4;
+    edit[editLength++] = 0;
+    if ((length = Core_LevelLogAppend(0, edit, editLength, record, sizeof record)) == 0 || !Join(dir, L"MANIFEST-000002", path, ARRAYSIZE(path)) ||
+        !SaveBytes(path, record, length) || !SaveIn(dir, L"CURRENT", "MANIFEST-000002\n") || !SaveIn(dir, L"LOCK", ""))
+        return FALSE;
+    return (length = Core_LevelBatchWrite(1, ops, count, batch, sizeof batch)) != 0 &&
+           (length = Core_LevelLogAppend(0, batch, length, record, sizeof record)) != 0 && Join(dir, L"000003.log", path, ARRAYSIZE(path)) &&
+           SaveBytes(path, record, length);
+}
+
+/* Web storage value `name` of `p` holds `part`. */
+static BOOL WebHas(const Profile *p, const WCHAR *name, const char *part)
+{
+    WebStore *store = WebStore_Open(p);
+    size_t length = 0;
+    char *value = store ? WebStore_Get(store, name, &length) : NULL;
+    BOOL has = value && strstr(value, part) != NULL;
+    if (value) HeapFree(GetProcessHeap(), 0, value);
+    WebStore_Free(store);
+    return has;
+}
+
+/* The groups of `p` for `scope` made `groups`, as Claude would: its web storage written. */
+static BOOL SetWebGroups(const Profile *p, const char *scope, const char *groups, const WCHAR *backup)
+{
+    WebStore *store = WebStore_Open(p);
+    const char *keys[3] = { "state", "customGroupsByScope", scope };
+    size_t length = 0, setLength = 0;
+    char *value = store ? WebStore_Get(store, L"dframe-store", &length) : NULL, *set = NULL;
+    BOOL ok = value && (set = Core_JsonSetNested(value, length, keys, 3, groups, &setLength)) != NULL &&
+              WebStore_Set(store, L"dframe-store", set, setLength) && WebStore_Commit(store, backup);
+    if (value) HeapFree(GetProcessHeap(), 0, value);
+    if (set) HeapFree(GetProcessHeap(), 0, set);
+    WebStore_Free(store);
+    return ok;
+}
+
+static ULONGLONG SizeOf(const WCHAR *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return 0;
+    return ((ULONGLONG)attributes.nFileSizeHigh << 32) | attributes.nFileSizeLow;
+}
+
+/* The sidebar's groups, sections and settings, which Claude's web UI keeps in
+ * its web storage: kept the same there, for each profile's own account and
+ * organization, with Claude's copies of them alike; never while it runs. */
+static void TestWebLayout(void)
+{
+    static const WCHAR *const labels[2] = { L"Web-A", L"Web-B" };
+    static const WCHAR *const leaves[2] = { L"web\\A", L"web\\B" };
+    static const WCHAR *const accounts[2] = { L"web-a", L"web-b" };
+    static const WCHAR *const namesA[3] = { L"dframe-store", L"LSS-persisted.dframe-group-scopes", L"epitaxy-editor-prefs" };
+    static const WCHAR *const namesB[2] = { L"dframe-store", L"LSS-persisted.dframe-group-scopes" };
+    ProfileList profiles;
+    SyncReport report;
+    WCHAR entries[2][MAX_PATH], configs[2][MAX_PATH], logs[2][MAX_PATH], list[FOLDER_CCH], backup[MAX_PATH], copied[MAX_PATH];
+    char storeA[2048], copyA[1024], groups[512];
+    const char *valuesA[3], *valuesB[2];
+    ULONGLONG sizes[2];
+    HWND window;
+    int i;
+    BOOL ready = TRUE;
+
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    for (i = 0; i < profiles.count && ready; i++)
+        ready = PrepareProfile(&profiles.items[i], labels[i], leaves[i], accounts[i], L"web-organization", entries[i], ARRAYSIZE(entries[i])) &&
+                Join(profiles.items[i].storageDir, L"claude_desktop_config.json", configs[i], ARRAYSIZE(configs[i])) &&
+                Join(profiles.items[i].storageDir, L"Local Storage\\leveldb\\000003.log", logs[i], ARRAYSIZE(logs[i]));
+    profiles.items[0].syncGroup = profiles.items[1].syncGroup = 4;
+    StringCchPrintfA(storeA, sizeof storeA,
+        "{\"state\":{\"collapsed\":false,\"customGroupsByScope\":{\"web-a/web-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"" UNSORTED_UTF8 "\"}],"
+        "\"assignments\":{\"code:local_%ls\":\"cg-1\"},\"order\":{}}},"
+        "\"codeSidebarByScope\":{\"web-a/web-organization\":{\"sections\":[{\"id\":\"cg-1\",\"kind\":\"manual\",\"members\":[\"code:local_%ls\"]}]}},"
+        "\"navPinnedIds\":[\"projects\",\"artifacts\"],\"groupByByMode\":{\"code\":\"custom\"},\"sidebarRowCountsByScope\":{\"a\":1}},\"version\":1}",
+        g_keptIds[0], g_keptIds[0]);
+    StringCchPrintfA(copyA, sizeof copyA,
+        "{\"value\":{\"web-a/web-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"" UNSORTED_UTF8 "\"}],"
+        "\"assignments\":{\"code:local_%ls\":\"cg-1\"},\"order\":{}}},\"tabId\":\"\",\"timestamp\":1}", g_keptIds[0]);
+    valuesA[0] = storeA;
+    valuesA[1] = copyA;
+    valuesA[2] = "{\"state\":{\"editorFont\":\"Consolas\",\"chatTextSize\":\"l\"},\"version\":0}";
+    valuesB[0] = "{\"state\":{\"collapsed\":true,\"customGroupsByScope\":{\"web-b/web-organization\":{\"groups\":[],\"assignments\":{},\"order\":{}}},"
+                 "\"navPinnedIds\":null,\"groupByByMode\":{},\"sidebarRowCountsByScope\":{\"b\":2}},\"version\":1}";
+    valuesB[1] = "{\"value\":{},\"tabId\":\"\",\"timestamp\":5}";
+    ready = ready && WriteKeptEntry(entries[0], g_keptIds[0], "Web one", L"C:\\Fixture", AtSecond(2)) &&
+            MakeWebStorage(profiles.items[0].storageDir, namesA, valuesA, 3) && MakeWebStorage(profiles.items[1].storageDir, namesB, valuesB, 2) &&
+            Save(configs[1], "{\"preferences\":{\"epitaxyPrefs\":{\"dframe-group-scopes\":{}}},\"other\":true}") &&
+            SessionVault_GroupListName(4, list, ARRAYSIZE(list)) && Join(g_root, L"web-backup", backup, ARRAYSIZE(backup));
+    Check("web layouts: fixtures created", ready);
+    if (!ready) return;
+    Check("web layouts: the web storage is read", WebHas(&profiles.items[0], L"dframe-store", "\"name\":\"" UNSORTED_UTF8 "\"") &&
+          WebHas(&profiles.items[1], L"dframe-store", "\"collapsed\":true"));
+
+    /* The first time: the fullest of each part goes to the other profile. */
+    ZeroMemory(&report, sizeof report);
+    Check("web layouts: the group is kept", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
+    StringCchPrintfA(groups, sizeof groups, "\"customGroupsByScope\":{\"web-b/web-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"" UNSORTED_UTF8 "\"}],"
+                     "\"assignments\":{\"code:local_%ls\":\"cg-1\"}", g_keptIds[0]);
+    Check("web layouts: the groups went across, for the other profile's account", WebHas(&profiles.items[1], L"dframe-store", groups) &&
+          !WebHas(&profiles.items[1], L"dframe-store", "web-a/web-organization"));
+    Check("web layouts: the sections went across",
+          WebHas(&profiles.items[1], L"dframe-store", "\"codeSidebarByScope\":{\"web-b/web-organization\":{\"sections\":[{\"id\":\"cg-1\""));
+    Check("web layouts: the Edit sidebar choices and the grouping went across",
+          WebHas(&profiles.items[1], L"dframe-store", "\"navPinnedIds\":[\"projects\",\"artifacts\"]") &&
+          WebHas(&profiles.items[1], L"dframe-store", "\"groupByByMode\":{\"code\":\"custom\"}"));
+    Check("web layouts: what else the web UI keeps stays", WebHas(&profiles.items[1], L"dframe-store", "\"collapsed\":true") &&
+          WebHas(&profiles.items[1], L"dframe-store", "\"sidebarRowCountsByScope\":{\"b\":2}") &&
+          WebHas(&profiles.items[0], L"dframe-store", "\"sidebarRowCountsByScope\":{\"a\":1}"));
+    Check("web layouts: the web UI's copies are alike, with a new time",
+          WebHas(&profiles.items[1], L"LSS-persisted.dframe-group-scopes", "{\"value\":{\"web-b/web-organization\":{\"groups\":[{\"id\":\"cg-1\"") &&
+          !WebHas(&profiles.items[1], L"LSS-persisted.dframe-group-scopes", "\"timestamp\":5}") &&
+          WebHas(&profiles.items[1], L"LSS-persisted.dframe-code-sections", "{\"value\":{\"web-b/web-organization\":{\"sections\""));
+    Check("web layouts: the copies in the settings too",
+          FileHas(configs[1], "\"dframe-group-scopes\":{\"web-b/web-organization\":{\"groups\":[{\"id\":\"cg-1\"") && FileHas(configs[1], "\"other\":true"));
+    Check("web layouts: the editor's settings went across", WebHas(&profiles.items[1], L"epitaxy-editor-prefs", "\"editorFont\":\"Consolas\""));
+    Check("web layouts: the web storage was backed up first",
+          SUCCEEDED(StringCchPrintfW(copied, ARRAYSIZE(copied), L"%s\\%s\\Local Storage\\leveldb\\000003.log", report.backup, profiles.items[1].folder)) &&
+          FileThere(copied) && SizeOf(copied) < SizeOf(logs[1]));
+
+    sizes[0] = SizeOf(logs[0]);
+    sizes[1] = SizeOf(logs[1]);
+    ZeroMemory(&report, sizeof report);
+    Check("web layouts: kept again, nothing is written", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
+          SizeOf(logs[0]) == sizes[0] && SizeOf(logs[1]) == sizes[1]);
+
+    /* A group renamed in the other profile goes to the first. */
+    Sleep(30);
+    ready = SetWebGroups(&profiles.items[1], "web-b/web-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"Renamed\"}],\"assignments\":{},\"order\":{}}",
+                         backup);
+    ZeroMemory(&report, sizeof report);
+    Check("web layouts: a group renamed in one is renamed in the other",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
+          WebHas(&profiles.items[0], L"dframe-store", "\"web-a/web-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"Renamed\"}]") &&
+          WebHas(&profiles.items[0], L"LSS-persisted.dframe-group-scopes", "\"name\":\"Renamed\"") &&
+          FileHas(configs[0], "\"web-a/web-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"Renamed\"}]"));
+
+    /* While the other profile's Claude runs, its web storage is not written: the change waits until it closes. */
+    window = StartFakeClaude(&profiles.items[1]);
+    Sleep(30);
+    ready = window && SetWebGroups(&profiles.items[0], "web-a/web-organization",
+                                   "{\"groups\":[{\"id\":\"cg-2\",\"name\":\"Later\"}],\"assignments\":{},\"order\":{}}", backup);
+    sizes[1] = SizeOf(logs[1]);
+    ZeroMemory(&report, sizeof report);
+    Check("web layouts: a running profile's web storage is not written",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && (report.waiting & 0x2) && SizeOf(logs[1]) == sizes[1] &&
+          !WebHas(&profiles.items[1], L"dframe-store", "\"name\":\"Later\""));
+    StopFakeClaude(window);
+    Check("web layouts: it gets the change once it closes", SessionEdit_ApplyPending(NULL, &profiles.items[1]) > 0 &&
+          WebHas(&profiles.items[1], L"dframe-store", "\"web-b/web-organization\":{\"groups\":[{\"id\":\"cg-2\",\"name\":\"Later\"}]"));
+}
+
 /* Environment variable `name` kept to be put back: `*kept` NULL when it is
  * not set. FALSE when it could not be kept. */
 static BOOL KeepVariable(const WCHAR *name, WCHAR **kept)
@@ -2984,6 +3186,7 @@ int wmain(int argc, WCHAR **argv)
             TestSessionSync(projects);
             TestVault(projects);
             TestKeptGroups(projects);
+            TestWebLayout();
         }
         Check("nothing outside the fixture was given to the Recycle Bin", !g_recycle.escaped);
         StopStartedClaude();
