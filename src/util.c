@@ -345,6 +345,30 @@ void Util_Log(const WCHAR *fmt, ...)
     SetLastError(saved);
 }
 
+HANDLE Util_SyncLock(void)
+{
+    WCHAR state[MAX_PATH], name[ARRAYSIZE(SYNC_MUTEX_PREFIX) + 16];
+    HANDLE mutex;
+    DWORD wait;
+    if (!Util_StateDir(state, ARRAYSIZE(state)) ||
+        FAILED(StringCchPrintfW(name, ARRAYSIZE(name), SYNC_MUTEX_PREFIX L"%016I64x", Core_HashText(CORE_HASH_START, state))) ||
+        (mutex = CreateMutexW(NULL, FALSE, name)) == NULL)
+        return NULL;
+    wait = WaitForSingleObject(mutex, SYNC_LOCK_WAIT_MS);
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) return mutex;
+    CloseHandle(mutex);
+    Util_Log(L"another sync has run for %lu s: this one is not made", (DWORD)(SYNC_LOCK_WAIT_MS / 1000));
+    SetLastError(ERROR_TIMEOUT);
+    return NULL;
+}
+
+void Util_SyncUnlock(HANDLE lock)
+{
+    if (!lock) return;
+    ReleaseMutex(lock);
+    CloseHandle(lock);
+}
+
 /* Starts `exe args` detached from this process; `pid` (when not NULL) gets
  * its id. On failure the last error says why. */
 BOOL Util_Spawn(const WCHAR *exe, const WCHAR *args, DWORD *pid)

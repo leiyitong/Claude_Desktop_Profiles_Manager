@@ -3064,6 +3064,15 @@ static BOOL MakeWebStorage(const WCHAR *storageDir, const WCHAR *const *names, c
            SaveBytes(path, record, length);
 }
 
+/* Conflict `part` of `item` is among `conflicts`, between the profiles of `members`. */
+static BOOL HasConflict(const VaultConflict *conflicts, int count, const char *part, DWORD item, DWORD members)
+{
+    int c;
+    for (c = 0; c < count; c++)
+        if (strcmp(conflicts[c].part, part) == 0 && conflicts[c].item == item && conflicts[c].members == members) return TRUE;
+    return FALSE;
+}
+
 /* Web storage value `name` of `p` holds `part`. */
 static BOOL WebHas(const Profile *p, const WCHAR *name, const char *part)
 {
@@ -3114,8 +3123,9 @@ static void TestWebLayout(void)
     char storeA[2048], copyA[1024], groups[512];
     const char *valuesA[3], *valuesB[2];
     ULONGLONG sizes[2];
+    VaultConflict conflicts[32];
     HWND window;
-    int i;
+    int i, count;
     BOOL ready = TRUE;
 
     ZeroMemory(&profiles, sizeof profiles);
@@ -3149,9 +3159,17 @@ static void TestWebLayout(void)
     Check("web layouts: the web storage is read", WebHas(&profiles.items[0], L"dframe-store", "\"name\":\"" UNSORTED_UTF8 "\"") &&
           WebHas(&profiles.items[1], L"dframe-store", "\"collapsed\":true"));
 
-    /* The first time: the fullest of each part goes to the other profile. */
+    /* The first time, what the two hold each their own way is left to the person; the one they choose then goes across. */
     ZeroMemory(&report, sizeof report);
-    Check("web layouts: the group is kept", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
+    ready = SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0;
+    count = SessionVault_Conflicts(&profiles, 4, conflicts, ARRAYSIZE(conflicts));
+    Check("web layouts: the first time, groups held two ways are left to the person, each keeping its own",
+          ready && report.conflicts == count && HasConflict(conflicts, count, "groups", SYNC_ITEM_SIDEBAR, 0x3) &&
+          WebHas(&profiles.items[1], L"dframe-store", "\"web-b/web-organization\":{\"groups\":[]"));
+    Check("web layouts: the person chooses the first profile's", SessionVault_Decide(&profiles, 4, SYNC_ITEMS_ALL, 0) &&
+          SessionVault_Conflicts(&profiles, 4, conflicts, ARRAYSIZE(conflicts)) == 0);
+    ZeroMemory(&report, sizeof report);
+    Check("web layouts: the group is kept", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && report.conflicts == 0);
     StringCchPrintfA(groups, sizeof groups, "\"customGroupsByScope\":{\"web-b/web-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"" UNSORTED_UTF8 "\"}],"
                      "\"assignments\":{\"code:local_%ls\":\"cg-1\"}", g_keptIds[0]);
     Check("web layouts: the groups went across, for the other profile's account", WebHas(&profiles.items[1], L"dframe-store", groups) &&
@@ -3243,6 +3261,8 @@ static void TestSyncItems(void)
     const char *pane[3] = { "state", "tileLayoutBySession", NULL };
     char id0[64], id1[64];
     ULONGLONG sizes[2];
+    VaultConflict conflicts[32];
+    int count;
     HWND window;
     int i;
     BOOL ready = TRUE;
@@ -3295,11 +3315,20 @@ static void TestSyncItems(void)
     if (!ready) return;
 
     ZeroMemory(&report, sizeof report);
-    Check("sync items: the group is kept", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
+    ready = SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0;
+    count = SessionVault_Conflicts(&profiles, 5, conflicts, ARRAYSIZE(conflicts));
+    Check("sync items: the first time, values held two ways are left to the person, each keeping its own",
+          ready && HasConflict(conflicts, count, "codeSchedules", SYNC_ITEM_SETTINGS, 0x3) && HasConflict(conflicts, count, "locale", SYNC_ITEM_LANGUAGE, 0x3) &&
+          HasConflict(conflicts, count, "paneLayout", SYNC_ITEM_DETAILS, 0x3) && FileHas(configs[1], "\"ccdScheduledTasksEnabled\":false") &&
+          WebHas(&profiles.items[1], L"spa:locale", "en-US"));
+    Check("sync items: a part only one holds goes across at once", FileHas(configs[1], "\"ccAutoArchiveOnPrClose\":true"));
+    Check("sync items: the person chooses the first profile's", SessionVault_Decide(&profiles, 5, SYNC_ITEMS_ALL, 0));
+    ZeroMemory(&report, sizeof report);
+    Check("sync items: the group is kept", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && report.conflicts == 0);
     Check("sync items: the settings went across, a window's to its own copy too",
           FileHas(configs[1], "\"ccAutoArchiveOnPrClose\":true") && FileHas(configs[1], "\"keep\":1") && FileHas(configs[1], "\"selectedProjects\":[\"C:\\\\A\"]") &&
           WebHas(&profiles.items[1], copyName[0], "\"selectedProjects\":[\"C:\\\\A\"]") && !WebHas(&profiles.items[1], copyName[0], "\"timestamp\":5}"));
-    Check("sync items: the first time, the default profile's value goes across, shorter as it is",
+    Check("sync items: the person's choice went across, shorter as it is",
           FileHas(configs[1], "\"ccdScheduledTasksEnabled\":true") && FileHas(configs[0], "\"ccdScheduledTasksEnabled\":true"));
     Check("sync items: permissions chosen, the trusted folders went across", FileHas(configs[1], "\"localAgentModeTrustedFolders\":[\"C:\\\\Trusted\"]"));
     Check("sync items: the language went across, as plain text and in config.json",
@@ -3361,13 +3390,178 @@ static void TestSyncItems(void)
     ZeroMemory(&report, sizeof report);
     Check("sync items: chosen again, the new session goes across",
           ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && EntryThere(entries[1], g_keptIds[2]));
-    Check("sync items: a part synced for the first time takes the waiting default profile's value",
+    count = SessionVault_Conflicts(&profiles, 5, conflicts, ARRAYSIZE(conflicts));
+    Check("sync items: a part kept for the first time, held two ways, is left to the person though one of them is open",
+          HasConflict(conflicts, count, "defaultModel", SYNC_ITEM_MODEL, 0x3) && WebHas(&profiles.items[1], L"default-model", "claude-sonnet-5-5"));
+    ready = SessionVault_Decide(&profiles, 5, SYNC_ITEM_MODEL, 0);
+    ZeroMemory(&report, sizeof report);
+    Check("sync items: the open profile's version, chosen, goes to the other",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
           WebHas(&profiles.items[1], L"default-model", "claude-opus-5-5") && WebHas(&profiles.items[0], L"default-model", "claude-opus-5-5"));
     StopFakeClaude(window);
     Check("sync items: the waiting change is made once it closes", SessionEdit_ApplyPending(NULL, &profiles.items[0]) > 0 &&
           FileHas(configs[0], "\"selectedProjects\":[\"C:\\\\B\"]") && WebHas(&profiles.items[0], L"default-model", "claude-opus-5-5"));
     Check("sync items: the default leaves permissions out", (SessionVault_GroupItems(&profiles, 0x3) & SYNC_ITEM_PERMISSIONS) == 0 &&
           SessionVault_GroupItems(&profiles, 0x3) == SYNC_ITEMS_DEFAULT);
+}
+
+/* --------------------------------------------- one sync at a time, conflicts */
+
+typedef struct LockProbe {
+    volatile LONG taken;
+} LockProbe;
+
+static DWORD WINAPI TakeSyncLock(void *context)
+{
+    LockProbe *probe = (LockProbe *)context;
+    HANDLE lock = Util_SyncLock();
+    InterlockedExchange(&probe->taken, lock ? 1 : -1);
+    Util_SyncUnlock(lock);
+    return 0;
+}
+
+/* The local_*.json files of an entries folder. */
+static int CountEntries(const WCHAR *entries)
+{
+    WIN32_FIND_DATAW found;
+    HANDLE find = Util_FindFiles(entries, L"local_*.json", &found, FALSE);
+    int count = 0;
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    do count++; while (FindNextFileW(find, &found));
+    FindClose(find);
+    return count;
+}
+
+/* One sync at a time; a profile's view a change never reached is no change;
+ * two changes each their own way left to the person; the sidebar marked for
+ * the account's server; a profile wiped deletes nothing; an entry Claude's
+ * startup damaged is healed from a sound one. */
+static void TestReliableSync(void)
+{
+    static const WCHAR *const labels[2] = { L"Rel-A", L"Rel-B" };
+    static const WCHAR *const leaves[2] = { L"rel\\A", L"rel\\B" };
+    static const WCHAR *const accounts[2] = { L"rel-a", L"rel-b" };
+    static const WCHAR *const names[1] = { L"dframe-store" };
+    ProfileList profiles;
+    SyncReport report;
+    WCHAR entries[2][MAX_PATH], list[FOLDER_CCH], backup[MAX_PATH], path[MAX_PATH], moved[MAX_PATH], id[SESSION_ID_CCH], plan[MAX_PATH];
+    char store[2][1024], json[1024];
+    const char *values[2][1];
+    VaultConflict conflicts[16];
+    LockProbe probe;
+    HANDLE lock, thread;
+    HWND window;
+    int i, count;
+    BOOL ready = TRUE;
+
+    /* One sync at a time: a second waits for the first. */
+    ZeroMemory(&probe, sizeof probe);
+    lock = Util_SyncLock();
+    thread = lock ? CreateThread(NULL, 0, TakeSyncLock, &probe, 0, NULL) : NULL;
+    if (thread) Sleep(300);
+    Check("one sync at a time: a second sync waits while one runs", lock && thread && probe.taken == 0);
+    Util_SyncUnlock(lock);
+    if (thread) {
+        WaitForSingleObject(thread, 10000);
+        CloseHandle(thread);
+    }
+    Check("one sync at a time: it goes on once the first is done", probe.taken == 1);
+
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    for (i = 0; i < profiles.count && ready; i++)
+        ready = PrepareProfile(&profiles.items[i], labels[i], leaves[i], accounts[i], L"rel-organization", entries[i], ARRAYSIZE(entries[i]));
+    profiles.items[0].syncGroup = profiles.items[1].syncGroup = 6;
+    StringCchCopyW(profiles.defaultFolder, ARRAYSIZE(profiles.defaultFolder), profiles.items[0].folder);
+    for (i = 0; i < 2; i++) {
+        StringCchPrintfA(store[i], sizeof store[i],
+            "{\"state\":{\"customGroupsByScope\":{\"%ls/rel-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"%s\"}],\"assignments\":{},\"order\":{}}}},"
+            "\"version\":1}", accounts[i], i == 0 ? "Work" : "Home");
+        values[i][0] = store[i];
+    }
+    ready = ready && WriteKeptEntry(entries[0], g_keptIds[0], "Rel one", L"C:\\Fixture", AtSecond(2)) &&
+            WriteKeptEntry(entries[0], g_keptIds[1], "Rel two", L"C:\\Fixture", AtSecond(3)) &&
+            MakeWebStorage(profiles.items[0].storageDir, names, values[0], 1) && MakeWebStorage(profiles.items[1].storageDir, names, values[1], 1) &&
+            SessionVault_GroupListName(6, list, ARRAYSIZE(list)) && Join(g_root, L"rel-backup", backup, ARRAYSIZE(backup));
+    profiles.items[0].syncItems = profiles.items[1].syncItems = SYNC_ITEM_SESSIONS | SYNC_ITEM_SIDEBAR;
+    Check("reliable sync: fixtures created", ready);
+    if (!ready) return;
+
+    /* The first time the groups differ: the person chooses the first profile's. */
+    ZeroMemory(&report, sizeof report);
+    ready = SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.conflicts == 1 &&
+            SessionVault_Decide(&profiles, 6, SYNC_ITEM_SIDEBAR, 0);
+    ZeroMemory(&report, sizeof report);
+    ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && report.conflicts == 0;
+    Check("reliable sync: the groups chosen went across", ready && WebHas(&profiles.items[1], L"dframe-store", "\"rel-b/rel-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"Work\"}]"));
+    Check("reliable sync: Claude is told to send them to the account's server at its next start",
+          WebHas(&profiles.items[1], L"ccd-sync-pending:ccd/dframe-store", "rel-b/rel-organization"));
+
+    /* A change sent to a profile open at the time, then lost before it closed: what it still shows is no change. */
+    window = StartFakeClaude(&profiles.items[1]);
+    Sleep(30);
+    ready = window && SetWebGroups(&profiles.items[0], "rel-a/rel-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"Work 2\"}],\"assignments\":{},\"order\":{}}",
+                                   backup);
+    ZeroMemory(&report, sizeof report);
+    ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && (report.waiting & 0x2) && SessionSync_PlanPath(&profiles.items[1], plan, ARRAYSIZE(plan));
+    ready = ready && DeleteFileW(plan);   /* what waited for it is gone */
+    Sleep(30);
+    ready = ready && SetWebGroups(&profiles.items[0], "rel-a/rel-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"Work 3\"}],\"assignments\":{},\"order\":{}}",
+                                  backup);
+    ZeroMemory(&report, sizeof report);
+    Check("reliable sync: what an open profile shows of a change that never reached it is no change",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.conflicts == 0 &&
+          WebHas(&profiles.items[0], L"dframe-store", "\"name\":\"Work 3\""));
+    StopFakeClaude(window);
+    SessionEdit_ApplyPending(NULL, &profiles.items[1]);
+    Check("reliable sync: it gets the latest once it closes", WebHas(&profiles.items[1], L"dframe-store", "\"name\":\"Work 3\""));
+
+    /* Both change it each their own way: each keeps its own until the person chooses. */
+    Sleep(30);
+    ready = SetWebGroups(&profiles.items[0], "rel-a/rel-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"From A\"}],\"assignments\":{},\"order\":{}}", backup) &&
+            SetWebGroups(&profiles.items[1], "rel-b/rel-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"From B\"}],\"assignments\":{},\"order\":{}}", backup);
+    ZeroMemory(&report, sizeof report);
+    ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report);
+    count = SessionVault_Conflicts(&profiles, 6, conflicts, ARRAYSIZE(conflicts));
+    Check("reliable sync: two changes each their own way are left to the person, each keeping its own",
+          ready && count == 1 && HasConflict(conflicts, count, "groups", SYNC_ITEM_SIDEBAR, 0x3) &&
+          WebHas(&profiles.items[0], L"dframe-store", "\"name\":\"From A\"") && WebHas(&profiles.items[1], L"dframe-store", "\"name\":\"From B\""));
+    ZeroMemory(&report, sizeof report);
+    Check("reliable sync: kept again, they stay left to the person", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.conflicts == 1);
+    ZeroMemory(&report, sizeof report);
+    Check("reliable sync: the version chosen goes across", SessionVault_Decide(&profiles, 6, SYNC_ITEM_SIDEBAR, 1) &&
+          SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.conflicts == 0 &&
+          WebHas(&profiles.items[0], L"dframe-store", "\"name\":\"From B\"") && SessionVault_Conflicts(&profiles, 6, conflicts, ARRAYSIZE(conflicts)) == 0);
+
+    /* A profile whose sessions are all gone (its storage wiped): nothing is deleted elsewhere, and it gets them back. */
+    ready = Join(g_root, L"rel-moved", moved, ARRAYSIZE(moved)) && MakeDir(moved) && EntryPath(entries[1], g_keptIds[0], path, ARRAYSIZE(path));
+    for (i = 0; ready && i < 2; i++) {
+        WCHAR to[MAX_PATH];
+        ready = EntryPath(entries[1], g_keptIds[i], path, ARRAYSIZE(path)) && Join(moved, g_keptIds[i], to, ARRAYSIZE(to)) && MoveFileW(path, to);
+    }
+    ZeroMemory(&report, sizeof report);
+    Check("reliable sync: a profile that lists nothing any more deletes nothing elsewhere, and gets its sessions back",
+          ready && CountEntries(entries[1]) == 0 && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && report.removed == 0 &&
+          EntryThere(entries[0], g_keptIds[0]) && EntryThere(entries[0], g_keptIds[1]) && EntryThere(entries[1], g_keptIds[0]) &&
+          EntryThere(entries[1], g_keptIds[1]));
+
+    /* Claude's startup damaged an entry: its session's id stripped, its transcript said to be gone, and written last. */
+    StringCchPrintfW(id, ARRAYSIZE(id), L"local_%s", g_keptIds[0]);
+    StringCchPrintfA(json, sizeof json,
+        "{\"sessionId\":\"local_%ls\",\"cwd\":\"C:\\\\Fixture\",\"title\":\"Rel one\",\"transcriptUnavailable\":true,\"lastActivityAt\":%I64u}",
+        g_keptIds[0], AtSecond(50));
+    Sleep(30);
+    ready = EntryPath(entries[1], g_keptIds[0], path, ARRAYSIZE(path)) && Save(path, json);
+    ZeroMemory(&report, sizeof report);
+    ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0;
+    Check("reliable sync: a damaged entry never goes to the other profile", ready && EntryPath(entries[0], g_keptIds[0], path, ARRAYSIZE(path)) &&
+          !FileHas(path, "transcriptUnavailable") && FileHas(path, "\"cliSessionId\""));
+    Check("reliable sync: it is healed from the sound one, under its own id, with no second entry",
+          EntryPath(entries[1], g_keptIds[0], path, ARRAYSIZE(path)) && !FileHas(path, "transcriptUnavailable") && FileHas(path, "\"cliSessionId\"") &&
+          CountEntries(entries[1]) == 2);
+    ZeroMemory(&report, sizeof report);
+    Check("reliable sync: kept again, nothing changes", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
+          report.added + report.updated + report.removed == 0);
 }
 
 /* Environment variable `name` kept to be put back: `*kept` NULL when it is
@@ -3440,6 +3634,7 @@ int wmain(int argc, WCHAR **argv)
             TestKeptGroups(projects);
             TestWebLayout();
             TestSyncItems();
+            TestReliableSync();
         }
         Check("nothing outside the fixture was given to the Recycle Bin", !g_recycle.escaped);
         StopStartedClaude();

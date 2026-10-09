@@ -521,6 +521,7 @@ static EntryOutcome AddEntry(SessionSet *set, int profile, const WCHAR *file, co
     entry.userTitle = entry.title[0] && Core_EqualsI(titleSource, L"user");
     entry.starred = MemberTrue(json, length, "isStarred");
     entry.archived = MemberTrue(json, length, "isArchived");
+    entry.damaged = MemberTrue(json, length, "transcriptUnavailable");
     entry.lastActivity = MemberNumber(json, length, "lastActivityAt");
     entry.pendingStar = -1;
     entry.duplicate = -1;

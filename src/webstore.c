@@ -382,8 +382,41 @@ static BOOL BackUpFolder(const WebStore *store, const WCHAR *backup)
     return ok;
 }
 
+static size_t PutVarint(BYTE *out, ULONGLONG value)
+{
+    size_t n = 0;
+    while (value >= 0x80) {
+        out[n++] = (BYTE)(value | 0x80);
+        value >>= 7;
+    }
+    out[n++] = (BYTE)value;
+    return n;
+}
+
+/* Chromium's record of claude.ai's storage (META:<origin>, a protobuf): when
+ * it changed last (microseconds since 1601) and the size of its keys and
+ * values, as they are now. */
+static size_t OriginMeta(const WebStore *store, BYTE *out)
+{
+    FILETIME now;
+    ULONGLONG size = 0, modified;
+    size_t n = 0;
+    int i;
+    for (i = 0; i < store->count; i++)
+        if (store->entries[i].put) size += (store->entries[i].keyLength - store->prefixLength) + store->entries[i].valueLength;
+    GetSystemTimeAsFileTime(&now);
+    modified = (((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) / 10;
+    out[n++] = 0x08;
+    n += PutVarint(out + n, modified);
+    out[n++] = 0x10;
+    n += PutVarint(out + n, size);
+    return n;
+}
+
 BOOL WebStore_Commit(WebStore *store, const WCHAR *backup)
 {
+    static const BYTE kMetaKey[] = "META:" WEB_ORIGIN;
+    BYTE meta[32];
     CoreLevelOp *ops = NULL;
     BYTE *batch = NULL, *bytes = NULL;
     size_t batchLength = 0, capacity = 64, appended, start;
@@ -398,11 +431,12 @@ BOOL WebStore_Commit(WebStore *store, const WCHAR *backup)
             count++;
         }
     if (!count) return TRUE;
+    capacity += 32 + sizeof kMetaKey + sizeof meta;
     if (!BackUpFolder(store, backup)) {
         Util_Log(L"web storage %s not backed up to %s (error %lu): not written", store->dir, backup, GetLastError());
         return FALSE;
     }
-    if ((ops = (CoreLevelOp *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *ops)) == NULL ||
+    if ((ops = (CoreLevelOp *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ((size_t)count + 1) * sizeof *ops)) == NULL ||
         (batch = (BYTE *)HeapAlloc(GetProcessHeap(), 0, capacity)) == NULL)
         goto done;
     for (i = 0, count = 0; i < store->count; i++)
@@ -414,6 +448,11 @@ BOOL WebStore_Commit(WebStore *store, const WCHAR *backup)
             ops[count].valueLength = store->entries[i].valueLength;
             count++;
         }
+    ops[count].put = TRUE;
+    ops[count].key = kMetaKey;
+    ops[count].keyLength = sizeof kMetaKey - 1;
+    ops[count].value = meta;
+    ops[count++].valueLength = OriginMeta(store, meta);
     if ((batchLength = Core_LevelBatchWrite(store->lastSequence + 1, ops, count, batch, capacity)) == 0) goto done;
     /* Right after the last whole record when the log ends there; else in the
      * next block: LevelDB reads nothing more of a block after zeros (padding)

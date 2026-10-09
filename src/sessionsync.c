@@ -849,6 +849,13 @@ typedef struct WebPart {
 #define SIDEBAR_STORE   L"dframe-store"
 #define PANE_STORE      L"epitaxy.sidePaneStore.v1"
 #define COPY_PREFIX     L"LSS-persisted."
+/* Claude's window keeps the sidebar (dframe-store) per account on its server
+ * too, and at each start puts the server's over what it holds here, unless
+ * this names the account it starts on ("<account>/<organization>"): then it
+ * sends what it holds here to the server first (and clears it). The account
+ * it reconciled last is SYNC_OWNER. */
+#define SIDEBAR_PENDING L"ccd-sync-pending:ccd/dframe-store"
+#define SYNC_OWNER      L"ccd-sync-owner"
 #define WEB_NAME_CCH    160
 static const WebPart kWebParts[] = {
     { "groups", SIDEBAR_STORE, FORM_STORE, "customGroupsByScope", LAYOUT_ORGANIZATION, "dframe-group-scopes", SYNC_ITEM_SIDEBAR, FALSE },
@@ -1474,8 +1481,8 @@ static OpResult ApplyWeb(const Profile *p, const char *account, const char *scop
     WebStore *store;
     const WCHAR *names[ARRAYSIZE(kWebParts)];
     const char *value;
-    char name[128];
-    size_t valueLength, i, j, count = 0;
+    char name[128], *sidebarBefore, *sidebarAfter = NULL;
+    size_t valueLength, i, j, count = 0, sidebarLength = 0, afterLength = 0;
     BOOL changed = FALSE, ok = TRUE, any = FALSE;
     OpResult result = OP_FAILED;
     for (i = 0; i < ARRAYSIZE(kWebParts) && !any; i++)
@@ -1489,7 +1496,22 @@ static OpResult ApplyWeb(const Profile *p, const char *account, const char *scop
         for (j = 0; j < count && wcscmp(names[j], kWebParts[i].value) != 0; j++) {}
         if (j == count) names[count++] = kWebParts[i].value;
     }
+    sidebarBefore = WebStore_Get(store, SIDEBAR_STORE, &sidebarLength);
     for (i = 0; i < count && ok; i++) ok = SetWebValue(store, names[i], scope, content, contentLength, &changed);
+    /* The sidebar changed: Claude sends it to this account's server at its
+     * next start, instead of putting the server's old one over it. */
+    if (ok && (sidebarAfter = WebStore_Get(store, SIDEBAR_STORE, &afterLength)) != NULL &&
+        (!sidebarBefore || afterLength != sidebarLength || memcmp(sidebarAfter, sidebarBefore, afterLength) != 0)) {
+        size_t ownerLength = 0;
+        char *owner = WebStore_Get(store, SYNC_OWNER, &ownerLength);
+        if (owner && (ownerLength != strlen(account) || memcmp(owner, account, ownerLength) != 0))
+            Util_Log(L"the sidebar of %s: its Claude last showed another account; not sent to the server at its next start", p->folder);
+        else
+            ok = WebStore_Set(store, SIDEBAR_PENDING, scope, strlen(scope));
+        Free(owner);
+    }
+    Free(sidebarBefore);
+    Free(sidebarAfter);
     for (i = 0; i < ARRAYSIZE(kWebParts) && ok; i++) {
         FamilyWrite write;
         if (kWebParts[i].form != FORM_FAMILY || !Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength)) continue;
@@ -1651,7 +1673,7 @@ int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
     SyncReport own;
     SessionSet entries;
     WCHAR staging[MAX_PATH];
-    HANDLE lock = NULL;
+    HANDLE lock = NULL, syncLock = NULL;
     Plan plan;
     int i = 0, n = 0;
     ZeroMemory(&plan, sizeof plan);
@@ -1659,10 +1681,15 @@ int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
         ZeroMemory(&own, sizeof own);
         report = &own;
     }
-    if (!PlanDir(p, staging, ARRAYSIZE(staging)) || (lock = SessionEdit_Lock(p)) == NULL) return 0;
+    if (!PlanDir(p, staging, ARRAYSIZE(staging)) || (syncLock = Util_SyncLock()) == NULL) return 0;
+    if ((lock = SessionEdit_Lock(p)) == NULL) {
+        Util_SyncUnlock(syncLock);
+        return 0;
+    }
     if (SessionLink_Busy(p) || (n = LoadPlan(p, &plan)) <= 0) {
         if (!SessionLink_Busy(p) && n < 0) Util_Log(L"sessions sent to %s: the plan cannot be read", p->folder);
         SessionEdit_Unlock(lock);
+        Util_SyncUnlock(syncLock);
         Free(plan.ops);
         return 0;
     }
@@ -1680,6 +1707,7 @@ int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
         if (i && !SavePlan(p, plan.ops + i, plan.count - i)) Util_Log(L"sessions sent to %s: the plan could not be written", p->folder);
     }
     SessionEdit_Unlock(lock);
+    Util_SyncUnlock(syncLock);
     SessionStore_Free(&entries);
     Free(plan.ops);
     if (i) Util_Log(L"%d change(s) sent to %s made", i, p->folder);
@@ -1689,7 +1717,12 @@ int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
 /* Each profile's part to its plan, made at once where it is closed. */
 static void Send(Outbox *box, const SessionSet *set, SyncReport *report)
 {
+    HANDLE lock = Util_SyncLock();
     int p;
+    if (!lock) {
+        report->failed++;
+        return;
+    }
     for (p = 0; p < set->profiles.count; p++) {
         const Profile *profile = &set->profiles.items[p];
         if (!box->sent[p].count) continue;
@@ -1702,6 +1735,7 @@ static void Send(Outbox *box, const SessionSet *set, SyncReport *report)
         SessionSync_ApplyPending(profile, report);
         if (SessionSync_PendingCount(profile) > 0) report->waiting |= 1u << p;
     }
+    Util_SyncUnlock(lock);
 }
 
 /* ----------------------------------------------------------- planning */
