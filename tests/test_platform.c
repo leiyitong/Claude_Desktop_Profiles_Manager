@@ -4219,6 +4219,8 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #define Util_RegDeleteTree TestedUtil_RegDeleteTree
 #define Util_LocalNowTicks TestedUtil_LocalNowTicks
 #define Util_Log TestedUtil_Log
+#define Util_SyncLock TestedUtil_SyncLock
+#define Util_SyncUnlock TestedUtil_SyncUnlock
 #define Util_OpenUrl TestedUtil_OpenUrl
 #define Util_Spawn TestedUtil_Spawn
 #define Util_IsDirectoryLink TestedUtil_IsDirectoryLink
@@ -4270,6 +4272,8 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #undef Util_RegDeleteTree
 #undef Util_LocalNowTicks
 #undef Util_Log
+#undef Util_SyncLock
+#undef Util_SyncUnlock
 #undef Util_OpenUrl
 #undef Util_Spawn
 #undef Util_IsDirectoryLink

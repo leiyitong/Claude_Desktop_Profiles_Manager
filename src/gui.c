@@ -74,6 +74,7 @@ typedef struct MainState {
     BOOL         closing;          /* asked to close (installer update) */
     BOOL         pendingUninstall; /* uninstall asked while a dialog was open */
     BOOL         pendingSetUpLinks; /* links setup asked while a dialog was open */
+    BOOL         pendingConflicts;  /* a sync left conflicts to the person, not asked yet */
     BOOL         uninstallOnly;    /* started from Settings to uninstall: no manager window */
     BOOL         updating;         /* the newer release is downloading or installing */
     BOOL         installing;
@@ -1323,6 +1324,7 @@ static void JobDone(Job *job)
             SyncUi_ShowReport(g_manager.dlg, &job->profiles, &job->report, NULL);
     }
     HeapFree(GetProcessHeap(), 0, job);
+    PostMessageW(g_manager.dlg, WM_APP_SYNC_CONFLICTS, 0, 0);   /* the ones it left, or that waited for it */
 }
 
 static DWORD AllProfiles(void)
@@ -3151,6 +3153,7 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
 
     case WM_SHOWWINDOW:
         if (wp && !g_manager.uninstallOnly) SessionsView_Warm(&g_manager.profiles);
+        if (wp && g_manager.pendingConflicts) PostMessageW(dialog, WM_APP_SYNC_CONFLICTS, 0, 0);
         break;
 
     case WM_APP_SESSIONS_READY:
@@ -3365,6 +3368,18 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         g_manager.uninstallOnly = FALSE;
         return TRUE;
 
+    case WM_APP_SYNC_CONFLICTS:
+        /* From a sync of ours or of a watcher: asked once nothing else is
+         * going on, the window shown and no dialog open. */
+        g_manager.pendingConflicts = TRUE;
+        if (StateChangesBlocked() || g_manager.job || !IsWindowVisible(dialog) || !IsWindowEnabled(dialog)) return TRUE;
+        g_manager.pendingConflicts = FALSE;
+        {
+            DWORD settled = SyncUi_SettleConflicts(dialog, &g_manager.profiles);
+            if (settled) RunJob(JOB_KEEP, settled);
+        }
+        return TRUE;
+
     case WM_ENABLE:
         if (wp && g_manager.pendingUninstall) {
             g_manager.pendingUninstall = FALSE;
@@ -3374,6 +3389,7 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
             g_manager.pendingSetUpLinks = FALSE;
             PostMessageW(dialog, WM_APP_SETUPLINKS, 0, 0);
         }
+        if (wp && g_manager.pendingConflicts) PostMessageW(dialog, WM_APP_SYNC_CONFLICTS, 0, 0);
         break;
 
     case WM_DRAWITEM:

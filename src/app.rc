@@ -193,6 +193,20 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 192, 50, 15
 END
 
+IDD_CONFLICTS DIALOGEX 0, 0, 268, 214
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Sync conflicts"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_X_TEXT, 10, 10, 248, 30, SS_NOPREFIX
+    CONTROL         "", IDC_X_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 44, 248, 80
+    LTEXT           "&Keep the version of:", IDC_X_LABEL, 10, 133, 100, 10
+    COMBOBOX        IDC_X_PROFILE, 112, 130, 146, 120, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Every profile of the group then gets the version chosen; one open gets it once it closes. Until then, each keeps its own.", IDC_X_NOTE, 10, 150, 248, 30
+    DEFPUSHBUTTON   "Keep", IDOK, 154, 192, 50, 15
+    PUSHBUTTON      "Later", IDCANCEL, 208, 192, 50, 15
+END
+
 IDD_UNINSTALL DIALOGEX 0, 0, 292, 206
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Uninstall Claude Desktop Profiles Manager"
