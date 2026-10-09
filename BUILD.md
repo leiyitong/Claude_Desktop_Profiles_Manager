@@ -74,7 +74,8 @@ docs/UI-COMPONENTS.md         shared controls, scrolling views, painting and res
 docs/screenshot.png           README image
 src/app.h                     shared declarations, constants, registry paths
 src/core.c                    pure helpers (no I/O): names, links, launch arguments, log parsing, link suggestion,
-                              JSON and session entries, queued session changes, hashes, scrolling math, versions
+                              JSON and session entries, queued session changes, hashes, scrolling math, versions,
+                              LevelDB's formats (log, write batch, table, manifest, Snappy) and Local Storage's keys
 src/util.c                    known folders, registry, log file, long paths, file reading, process start, Recycle Bin
 src/localize.c                interface language selection, catalog lookup, reading direction (TR)
 src/localize.h                its declarations and TR()
@@ -97,7 +98,10 @@ src/gui.c                     manager window, its menus and dialogs, its open, q
 src/sessionstore.c            every profile's Claude Code sessions: entries, transcripts, projects, sessions in use (read only)
 src/sessionedit.c             session actions: open, copy, entry changes (made when an open profile closes), delete
 src/sessionsync.c             sessions sent between profiles: merge, several shared, copied or removed, the sidebar's
-                              pins and groups, archives exported and imported (made when an open profile closes), backups
+                              pins, groups and settings, archives exported and imported (made when an open profile
+                              closes), backups
+src/webstore.c                Claude's web storage (its Local Storage, a LevelDB database): read, and written while
+                              Claude is closed
 src/sessionvault.c            the session vault (every list of sessions kept, its versions, the sessions deleted) and the
                               groups of profiles whose sessions are kept the same (sessions without a folder moved to
                               each one's own area, sessions continued apart kept as two); a version recovered into a profile;

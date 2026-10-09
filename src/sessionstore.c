@@ -28,8 +28,8 @@
 #include <tlhelp32.h>
 
 #define PENDING_MAX_BYTES           (1024u * 1024u)
-#define ENTRIES_DIR                 L"claude-code-sessions"
-#define SCRATCH_DIR                 L"scratch-workspaces"
+#define ENTRIES_DIR                 CLAUDE_ENTRIES_DIR
+#define SCRATCH_DIR                 CLAUDE_SCRATCH_DIR
 #define CLAUDE_CODE_ENVIRONMENT     L"ccd-environment-config.json"   /* Claude's settings for the Claude Code it starts */
 #define TRANSCRIPT_EXTENSION        L".jsonl"
 #define TRANSCRIPT_EXTENSION_LENGTH (ARRAYSIZE(TRANSCRIPT_EXTENSION) - 1)

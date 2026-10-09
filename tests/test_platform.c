@@ -4534,6 +4534,8 @@ static RemoveResult FixtureRecycleLocation(HWND owner, const WCHAR *const *paths
 #define Profiles_RecycleData TestedProfiles_RecycleData
 #define Profiles_Delete TestedProfiles_Delete
 #define Profiles_SetSyncGroup TestedProfiles_SetSyncGroup
+#define Profiles_SetSyncItems TestedProfiles_SetSyncItems
+#define Profiles_SyncItems TestedProfiles_SyncItems
 /* Profiles_Load calls it before its definition. */
 int TestedProfiles_Find(const ProfileList *list, const WCHAR *folder);
 #include "../src/profiles.c"

@@ -653,6 +653,35 @@ static BOOL RestoreSessions(const ZipIn *zip, const ProfileList *list, int index
     return ok;
 }
 
+/* A restore, asked first: the archive, and the profile's folder with each
+ * folder and file in it the parts chosen replace. */
+static BOOL ConfirmRestore(HWND owner, const Profile *p, const WCHAR *archive, const BOOL *chosen)
+{
+    WCHAR *folders = (WCHAR *)Alloc(CONFIRM_CCH * sizeof(WCHAR)), question[LABEL_CCH + LONG_PATH_CCH + 128], shown[LONG_PATH_CCH];
+    const WCHAR *name = wcsrchr(archive, L'\\');
+    size_t i;
+    BOOL ok;
+    if (!folders) return FALSE;
+    SyncUi_AddLine(folders, CONFIRM_CCH, TR(L"These folders and files of it are replaced:"), FALSE);
+    SyncUi_ShortPath(p->storageDir, shown, ARRAYSIZE(shown));
+    SyncUi_AddLine(folders, CONFIRM_CCH, shown, FALSE);
+    if (chosen[PART_SESSIONS]) SyncUi_AddLine(folders, CONFIRM_CCH, CLAUDE_ENTRIES_DIR, TRUE);
+    if (chosen[PART_COWORK]) SyncUi_AddLine(folders, CONFIRM_CCH, COWORK_DIR, TRUE);
+    if (chosen[PART_SETTINGS]) {
+        for (i = 0; i < ARRAYSIZE(kSettingsFiles); i++) SyncUi_AddLine(folders, CONFIRM_CCH, kSettingsFiles[i], TRUE);
+        SyncUi_AddLine(folders, CONFIRM_CCH, CLAUDE_APP_SETTINGS, TRUE);
+    }
+    if (chosen[PART_SIGNIN]) {
+        for (i = 0; i < ARRAYSIZE(kSigninFiles); i++) SyncUi_AddLine(folders, CONFIRM_CCH, kSigninFiles[i], TRUE);
+        for (i = 0; i < ARRAYSIZE(kSigninFolders); i++) SyncUi_AddLine(folders, CONFIRM_CCH, kSigninFolders[i], TRUE);
+    }
+    if (chosen[PART_SESSIONS]) SyncUi_AddTranscriptFolder(folders, CONFIRM_CCH, TR(L"Claude Code's conversations, where a session gets a copy of its own:"));
+    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Restore \x201C%s\x201D from %s?"), p->name, name ? name + 1 : archive);
+    ok = SyncUi_Confirm(owner, IDI_WARNING, question, folders, TRUE, TR(L"Restore"));
+    Free(folders);
+    return ok;
+}
+
 BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index)
 {
     const Profile *p = &list->items[index];
@@ -700,7 +729,7 @@ BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *lis
             dialog.chosen[part] = dialog.offered[part] && part != PART_SIGNIN;
         }
     Free(manifest);
-    if (Ui_Dialog(owner, IDD_BACKUP, BackupProc, (LPARAM)&dialog) != IDOK) {
+    if (Ui_Dialog(owner, IDD_BACKUP, BackupProc, (LPARAM)&dialog) != IDOK || !ConfirmRestore(owner, p, path, dialog.chosen)) {
         Zip_Free(zip);
         return FALSE;
     }

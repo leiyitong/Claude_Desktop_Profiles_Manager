@@ -75,6 +75,9 @@
 #define STOCK_DEFAULT_NAME L"Main"
 #define CLAUDE_DESKTOP_SETTINGS L"claude_desktop_config.json"   /* in a profile's data folder */
 #define CLAUDE_APP_SETTINGS L"config.json"                      /* ...its app state: the account signed in */
+#define CLAUDE_ENTRIES_DIR  L"claude-code-sessions"             /* ...its Claude Code sessions' entries */
+#define CLAUDE_SCRATCH_DIR  L"scratch-workspaces"               /* ...the working folders of its sessions without a folder */
+#define CLAUDE_WEB_STORAGE  L"Local Storage\\leveldb"           /* ...its web UI's storage (webstore.c) */
 
 #define MAX_PROFILES       32
 C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
@@ -96,6 +99,19 @@ C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
 #define SESSION_TITLE_CCH  256
 #define SESSION_ID_CCH     64
 
+/* What a profile keeps the same as the others it syncs with (Profile.syncItems). */
+#define SYNC_ITEM_SESSIONS     0x01u   /* its sessions: new ones, titles, archived and deleted ones */
+#define SYNC_ITEM_SIDEBAR      0x02u   /* the sidebar: pins, groups, project order, filters, folded groups */
+#define SYNC_ITEM_DETAILS      0x04u   /* each session's model and effort, side pane, unread mark and cost */
+#define SYNC_ITEM_APPEARANCE   0x08u   /* fonts, the editor's settings, zoom, spelling */
+#define SYNC_ITEM_LANGUAGE     0x10u
+#define SYNC_ITEM_MODEL        0x20u   /* the default model */
+#define SYNC_ITEM_SETTINGS     0x40u   /* Claude's switches (auto-archive, Cowork, Remote Control) and Cowork's recent folders */
+#define SYNC_ITEM_PERMISSIONS  0x80u   /* folders' permission modes and their confirmations, Cowork's trusted folders */
+#define SYNC_ITEMS_ALL         0xFFu
+#define SYNC_ITEMS_DEFAULT     (SYNC_ITEMS_ALL & ~SYNC_ITEM_PERMISSIONS)
+#define SYNC_ITEM_COUNT        8
+
 /* ------------------------------------------------------------------ types */
 
 typedef struct Profile {
@@ -108,6 +124,7 @@ typedef struct Profile {
     DWORD picture;             /* the stamp of its own picture, which replaces the Claude icon; 0: none */
     BOOL  isStock;             /* the folder the regular Claude icon opens */
     int   syncGroup;           /* its sessions are kept the same as those of the profiles of this group (sessionvault.c); 0: none */
+    DWORD syncItems;           /* what that keeps the same (SYNC_ITEM_*); 0: SYNC_ITEMS_DEFAULT */
     BOOL  running;
     DWORD pid;                 /* main process when running */
 } Profile;
@@ -249,11 +266,18 @@ void         Core_ProfileAumid(const WCHAR *folder, WCHAR *out, size_t cch);
 void         Core_ShortcutFileName(const WCHAR *label, int copyNumber, WCHAR *out, size_t cch);
 ULONGLONG    Core_SystemTimeTicks(const SYSTEMTIME *st);
 BOOL         Core_PathUnder(const WCHAR *path, const WCHAR *dir);
+BOOL         Core_PathWithVariable(const WCHAR *path, const WCHAR *variable, const WCHAR *value, WCHAR *out, size_t cch);   /* "%APPDATA%\..." */
 BOOL         Core_ProfileFilePath(const Profile *p, const WCHAR *path, WCHAR *out, size_t cch);
 BOOL         Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *family, const WCHAR *area, const WCHAR *name,
                                    WCHAR *out, size_t cch);
 BOOL         Core_SameFatTime(const FILETIME *a, const FILETIME *b);
 BOOL         Core_JsonMember(const char *json, size_t len, const char *key, const char **value, size_t *valueLen);
+/* Each member of the JSON object `json`, in order: its key's raw text (between
+ * its quotes, escapes as written) and its value's. FALSE when `json` is no
+ * object, or `each` returns FALSE. */
+typedef BOOL (*CoreJsonMember)(void *context, const char *key, size_t keyLen, const char *value, size_t valueLen);
+BOOL         Core_JsonEachMember(const char *json, size_t len, CoreJsonMember each, void *context);
+BOOL         Core_JsonIsValue(const char *text, size_t len);   /* one JSON value, whole (spaces around it aside) */
 BOOL         Core_JsonString(const char *raw, size_t len, WCHAR *out, size_t cch);
 BOOL         Core_JsonNumber(const char *raw, size_t len, ULONGLONG *value);
 BOOL         Core_JsonTrue(const char *raw, size_t len);
@@ -300,6 +324,39 @@ DWORD        Core_Crc32(DWORD crc, const void *data, size_t size);
 size_t       Core_DeflateBound(size_t size);
 BOOL         Core_Deflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
 BOOL         Core_Inflate(const void *input, size_t size, void *output, size_t capacity, size_t *written);
+
+/* LevelDB, as Chromium keeps a window's web storage in it: a log of write
+ * batches, tables of sorted entries, a manifest naming the live ones. */
+typedef struct CoreLevelOp {
+    BOOL        put;          /* a value; FALSE: the key deleted */
+    const BYTE *key;
+    size_t      keyLength;
+    const BYTE *value;
+    size_t      valueLength;
+} CoreLevelOp;
+typedef BOOL (*CoreLevelEntry)(void *context, ULONGLONG sequence, const CoreLevelOp *op);
+typedef BOOL (*CoreLevelRecord)(void *context, const BYTE *record, size_t length);
+typedef struct CoreLevelManifest {
+    ULONGLONG logNumber, prevLogNumber, nextFile, lastSequence;
+    BOOL      hasLog;
+    void    (*onTable)(void *context, ULONGLONG number, BOOL added);   /* a table made live, or gone */
+    void     *context;
+} CoreLevelManifest;
+DWORD        Core_Crc32c(DWORD crc, const void *data, size_t size);
+DWORD        Core_LevelMask(DWORD crc);
+BOOL         Core_SnappyLength(const BYTE *in, size_t length, size_t *outLength);
+BOOL         Core_SnappyDecode(const BYTE *in, size_t length, BYTE *out, size_t outLength);
+/* Each whole record of a log, in order; `cleanEnd`: where the last whole one ends. */
+BOOL         Core_LevelLogRecords(const BYTE *log, size_t length, CoreLevelRecord each, void *context, size_t *cleanEnd);
+/* What to add to a log `fileLength` bytes long for one record: 0 when `capacity` is short. */
+size_t       Core_LevelLogAppend(size_t fileLength, const BYTE *record, size_t length, BYTE *out, size_t capacity);
+BOOL         Core_LevelBatchRead(const BYTE *batch, size_t length, CoreLevelEntry each, void *context);
+size_t       Core_LevelBatchWrite(ULONGLONG sequence, const CoreLevelOp *ops, int count, BYTE *out, size_t capacity);
+BOOL         Core_LevelTableRead(const BYTE *table, size_t length, CoreLevelEntry each, void *context);
+BOOL         Core_LevelManifestEdit(const BYTE *edit, size_t length, CoreLevelManifest *state);
+size_t       Core_WebStorageKey(const char *origin, const WCHAR *name, BYTE *out, size_t capacity);   /* Local Storage's key */
+size_t       Core_WebStorageValue(const WCHAR *text, size_t length, BYTE *out, size_t capacity);
+BOOL         Core_WebStorageText(const BYTE *value, size_t length, WCHAR *out, size_t cch, size_t *outLength);
 /* A process of a snapshot: its id, its parent's, and when it started (0: unknown). */
 typedef struct CoreProcess {
     DWORD     pid, parent;
@@ -387,6 +444,8 @@ BOOL         Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t
 BOOL         Profiles_Update(const WCHAR *folder, const WCHAR *label, int color, const WCHAR *badge, DWORD picture);
 BOOL         Profiles_SetDefault(const WCHAR *folder);
 BOOL         Profiles_SetSyncGroup(const WCHAR *folder, int group);   /* 0: its sessions kept apart */
+BOOL         Profiles_SetSyncItems(const WCHAR *folder, DWORD items);  /* SYNC_ITEM_*; 0: the default */
+DWORD        Profiles_SyncItems(const Profile *p);                    /* what it keeps the same, the default for none chosen */
 void         Profiles_CopySettings(const Profile *from, const Profile *to);
 RemoveResult Profiles_Delete(HWND owner, const Profile *profile);
 RemoveResult Profiles_RecycleData(HWND owner, const Profile *profile);
@@ -709,6 +768,21 @@ BOOL         SessionEdit_CopiedCwd(const WCHAR *copyId, WCHAR *cwd, size_t cch);
 HANDLE       SessionEdit_Lock(const Profile *p);   /* the lock of a profile's entry changes; NULL when not taken */
 void         SessionEdit_Unlock(HANDLE lock);
 
+/* ------------------------------------------------------------ webstore.c */
+/* Claude's web storage: the Local Storage its window keeps for claude.ai in
+ * the profile's folder. Read at any time; written, as one batch, only while
+ * that Claude is closed, its folder copied to `backup` first. Values are
+ * UTF-8 text, keys the names the window gives them. */
+typedef struct WebStore WebStore;
+WebStore *WebStore_Open(const Profile *p);   /* NULL when it has none, or it cannot be read */
+char     *WebStore_Get(const WebStore *store, const WCHAR *name, size_t *length);   /* a heap block; NULL when absent */
+BOOL      WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, size_t length);   /* waits for the commit */
+BOOL      WebStore_Commit(WebStore *store, const WCHAR *backup);
+ULONGLONG WebStore_Written(const WebStore *store);   /* when its newest file was written, ms since 1970 */
+void      WebStore_Free(WebStore *store);
+/* Each value whose name starts with `prefix` (Latin-1 names only), in no order. */
+void      WebStore_EachName(const WebStore *store, const WCHAR *prefix, void (*each)(void *context, const WCHAR *name), void *context);
+
 /* ---------------------------------------------------------- sessionsync.c */
 
 /* A change chosen elsewhere (sessionvault.c), for SessionSync_Send. */
@@ -720,11 +794,21 @@ typedef struct SyncSend {
 } SyncSend;
 
 DWORD        SessionSync_Takers(const SessionSet *set);   /* the profiles whose entries can take sessions */
-/* The pins and groups of the sidebar of `p` (its claude_desktop_config.json),
- * for the account and organization of `entriesDir`, as a layout of ours: a
- * heap block (HeapFree it), NULL when it has none. `written`: when the file
- * was written, in ms since 1970. */
+/* The pins, groups and settings of the sidebar of `p` (its
+ * claude_desktop_config.json and its web storage), for the account and
+ * organization of `entriesDir`, as a layout of ours: a heap block (HeapFree
+ * it), NULL when it has none. `written`: when they were last written, in ms
+ * since 1970. */
 char        *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *length, ULONGLONG *written);
+/* Part `index` of a layout: its name, what it belongs to (SYNC_ITEM_*), and
+ * whether it is made the same member by member (each session's own); FALSE
+ * past the last. */
+typedef struct LayoutPart {
+    const char *name;
+    DWORD       item;
+    BOOL        byKey;
+} LayoutPart;
+BOOL         SessionSync_LayoutPart(int index, LayoutPart *part);
 /* From now on, each change this thread makes in a profile calls `step` (a
  * progress bar's); NULL for none. */
 void         SessionSync_OnEachChange(void (*step)(void *context), void *context);
@@ -772,6 +856,7 @@ typedef void (*SyncProgress)(void *context, int done, int total);
 
 DWORD SessionVault_Group(const ProfileList *list, int group);   /* its profiles, one bit each; none for group 0 */
 int   SessionVault_NewGroup(const ProfileList *list);           /* the lowest group no profile is in; 0 when there is none */
+DWORD SessionVault_GroupItems(const ProfileList *list, DWORD members);   /* what all of `members` keep the same (SYNC_ITEM_*) */
 BOOL  SessionVault_GroupListName(int group, WCHAR *out, size_t cch);
 BOOL  SessionVault_ListName(const ProfileList *list, int index, WCHAR *out, size_t cch);
 /* `profiles`' list kept as `listName`; with `same`, each of them made to list
@@ -849,8 +934,29 @@ BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen
 BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen);
 BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *selected);
 BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
+/* What `members` keep the same, chosen in a dialog (IDD_SYNC_ITEMS) from `*items`: FALSE when cancelled. */
+BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items);
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles);
 BOOL SyncUi_BackUpCode(HWND owner);
+/* A change to data, said before it is made and asked: `question`, the
+ * folders it changes (`folders`: lines made with SyncUi_AddLine and
+ * SyncUi_AddSessionFolders), and, when `backedUp`, where what it replaces
+ * goes first. TRUE to go on. */
+#define CONFIRM_CCH 8192
+BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, const WCHAR *folders, BOOL backedUp, const WCHAR *button);
+void SyncUi_AddLine(WCHAR *text, size_t cch, const WCHAR *line, BOOL indent);
+void SyncUi_ShortPath(const WCHAR *path, WCHAR *out, size_t cch);   /* with %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% for its start */
+void SyncUi_AddPath(WCHAR *text, size_t cch, const WCHAR *path);   /* a path, short, on an indented line */
+/* The folders a change to the sessions of the profiles of `bits` writes in
+ * each: the entries, the working folders of sessions without a folder, and
+ * (`layout`) the sidebar's settings; with a heading. */
+void SyncUi_AddSessionFolders(WCHAR *text, size_t cch, const ProfileList *profiles, DWORD bits, BOOL layout);
+void SyncUi_AddTranscriptFolder(WCHAR *text, size_t cch, const WCHAR *heading);   /* Claude Code's conversations, under `heading` */
+/* Sessions of the profiles of `bits` written, asked first (SyncUi_Confirm):
+ * their folders, the sidebar's settings when `layout`, Claude Code's
+ * conversations when `transcripts`. */
+BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const ProfileList *profiles, DWORD bits, BOOL layout, BOOL transcripts,
+                            const WCHAR *button);
 
 /* ---------------------------------------------------------------- help.c */
 
