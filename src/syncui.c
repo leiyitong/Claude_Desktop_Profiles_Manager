@@ -313,6 +313,10 @@ void SyncUi_AddSessionFolders(WCHAR *text, size_t cch, const ProfileList *profil
         StringCchCatW(items, ARRAYSIZE(items), CLAUDE_DESKTOP_SETTINGS);
         StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
         StringCchCatW(items, ARRAYSIZE(items), CLAUDE_WEB_STORAGE);
+        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
+        StringCchCatW(items, ARRAYSIZE(items), CLAUDE_APP_SETTINGS);
+        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
+        StringCchCatW(items, ARRAYSIZE(items), L"Preferences");
     }
     for (p = 0; p < profiles->count; p++) {
         if (!(bits & (1u << p))) continue;
@@ -822,6 +826,109 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
         return FALSE;
     }
     SyncUi_ShowReport(owner, profiles, &report, NULL);
+    return TRUE;
+}
+
+/* ------------------------------------------------------- what to sync */
+
+/* Each row of the dialog: what it syncs (SYNC_ITEM_*), as the list shows it. */
+static const struct { DWORD item; const WCHAR *label; } kSyncItems[SYNC_ITEM_COUNT] = {
+    { SYNC_ITEM_SESSIONS, L"Sessions: new ones, titles, archived and deleted ones" },
+    { SYNC_ITEM_SIDEBAR, L"Sidebar: pins, groups, project order, filters" },
+    { SYNC_ITEM_DETAILS, L"Each session's model, effort, side pane, unread mark and cost" },
+    { SYNC_ITEM_APPEARANCE, L"Appearance: fonts, editor, zoom, spelling" },
+    { SYNC_ITEM_LANGUAGE, L"Interface language" },
+    { SYNC_ITEM_MODEL, L"Default model" },
+    { SYNC_ITEM_SETTINGS, L"Settings: auto-archive, Cowork, Remote Control, recent folders" },
+    { SYNC_ITEM_PERMISSIONS, L"Permissions: folders' permission modes, Cowork's trusted folders" },
+};
+
+typedef struct ItemsDialog {
+    const WCHAR *text;
+    DWORD        items;
+    HWND         rows;
+    BOOL         filling;
+} ItemsDialog;
+
+/* What the rows checked say; OK only with one at least. */
+static void ReadItems(HWND dialog, ItemsDialog *state)
+{
+    int row;
+    state->items = 0;
+    for (row = 0; row < SYNC_ITEM_COUNT; row++)
+        if (ListView_GetCheckState(state->rows, row)) state->items |= kSyncItems[row].item;
+    EnableWindow(GetDlgItem(dialog, IDOK), state->items != 0);
+}
+
+static INT_PTR CALLBACK ItemsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    ItemsDialog *state = (ItemsDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    switch (message) {
+    case WM_INITDIALOG: {
+        LVCOLUMNW column;
+        LVITEMW item;
+        int row;
+        state = (ItemsDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetDlgItemTextW(dialog, IDC_I_TEXT, state->text);
+        state->rows = GetDlgItem(dialog, IDC_I_LIST);
+        ListView_SetExtendedListViewStyle(state->rows, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        ZeroMemory(&column, sizeof column);
+        ListView_InsertColumn(state->rows, 0, &column);   /* the view it scrolls in gives it the list's width */
+        state->filling = TRUE;
+        for (row = 0; row < SYNC_ITEM_COUNT; row++) {
+            ZeroMemory(&item, sizeof item);
+            item.mask = LVIF_TEXT;
+            item.iItem = row;
+            item.pszText = (LPWSTR)TR(kSyncItems[row].label);
+            ListView_InsertItem(state->rows, &item);
+            ListView_SetCheckState(state->rows, row, (state->items & kSyncItems[row].item) != 0);
+        }
+        state->filling = FALSE;
+        Theme_SmoothView(state->rows);
+        ReadItems(dialog, state);
+        return TRUE;
+    }
+
+    case WM_CTLCOLORSTATIC:
+        return Theme_CtlColor(message, wp, lp, IDC_I_NOTE);
+
+    case WM_NOTIFY:
+        if (state && ((const NMHDR *)lp)->hwndFrom == state->rows && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
+            const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
+            if (!state->filling && (change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK))
+                ReadItems(dialog, state);
+            return TRUE;
+        }
+        break;
+
+    case WM_COMMAND:
+        if (!state) break;
+        if (LOWORD(wp) == IDOK) {
+            ReadItems(dialog, state);
+            if (state->items) EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items)
+{
+    WCHAR names[NAMES_CCH], text[NAMES_CCH + 128];
+    ItemsDialog dialog;
+    NamesOf(profiles, members, names, ARRAYSIZE(names));
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"What %s sync with each other, at each sync:"), names);
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.text = text;
+    dialog.items = *items & SYNC_ITEMS_ALL;
+    if (Ui_Dialog(owner, IDD_SYNC_ITEMS, ItemsProc, (LPARAM)&dialog) != IDOK || !dialog.items) return FALSE;
+    *items = dialog.items;
     return TRUE;
 }
 

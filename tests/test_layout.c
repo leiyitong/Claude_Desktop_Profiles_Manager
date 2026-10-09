@@ -352,6 +352,45 @@ static void PopulateBackupParts(HWND dialog)
     Theme_SmoothView(list);
 }
 
+/* What to sync, as syncui.c lists it: every row, permissions left unchecked. */
+static void PopulateSyncItems(HWND dialog)
+{
+    static const WCHAR *const kItems[] = { L"Sessions: new ones, titles, archived and deleted ones",
+                                           L"Sidebar: pins, groups, project order, filters",
+                                           L"Each session's model, effort, side pane, unread mark and cost",
+                                           L"Appearance: fonts, editor, zoom, spelling",
+                                           L"Interface language",
+                                           L"Default model",
+                                           L"Settings: auto-archive, Cowork, Remote Control, recent folders",
+                                           L"Permissions: folders' permission modes, Cowork's trusted folders" };
+    HWND list = GetDlgItem(dialog, IDC_I_LIST);
+    LVCOLUMNW column;
+    LVITEMW item;
+    int i;
+    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    ZeroMemory(&column, sizeof column);
+    ListView_InsertColumn(list, 0, &column);
+    for (i = 0; i < (int)ARRAYSIZE(kItems); i++) {
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT;
+        item.iItem = i;
+        item.pszText = (LPWSTR)TR(kItems[i]);
+        ListView_InsertItem(list, &item);
+        ListView_SetCheckState(list, i, i != (int)ARRAYSIZE(kItems) - 1);
+    }
+    Theme_SmoothView(list);
+}
+
+/* What the what-to-sync dialog says, for three profiles. */
+static void SyncItemsCaptions(HWND dialog, const WCHAR *name)
+{
+    WCHAR text[512], names[LABEL_CCH * 3 + 32];
+    SetWindowTextW(dialog, TR(L"What to sync"));
+    StringCchPrintfW(names, ARRAYSIZE(names), L"%s%s%s%s%s", name, TR(L", "), L"Work", TR(L" and "), L"Personal");
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"What %s sync with each other, at each sync:"), names);
+    SetDlgItemTextW(dialog, IDC_I_TEXT, text);
+}
+
 /* What the backup dialog says when it restores, its longest form. */
 static void BackupCaptions(HWND dialog, const WCHAR *name)
 {
@@ -458,9 +497,9 @@ static void SessionChoices(HWND dialog, const WCHAR *name)
     HWND combo = GetDlgItem(dialog, IDC_P_SYNC);
     WCHAR text[LABEL_CCH * 3 + 64], names[LABEL_CCH * 2 + 8];
     SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(L"Its own, kept apart"));
+    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(L"Not synced"));
     StringCchPrintfW(names, ARRAYSIZE(names), L"%s, %s", name, L"Work");
-    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"The same as %s"), names);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"With %s"), names);
     SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)text);
     SendMessageW(combo, CB_SETCURSEL, 1, 0);
 }
@@ -531,6 +570,10 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
     case IDD_PURGE:
         PurgeCaptions(dialog, TRUE);
         break;
+    case IDD_SYNC_ITEMS:
+        SyncItemsCaptions(dialog, name);
+        PopulateSyncItems(dialog);
+        break;
     }
 }
 
@@ -573,6 +616,8 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         RestoreCaptions(dialog, L"Private profile", FALSE);
     } else if (fixture->resource == IDD_PURGE) {
         PurgeCaptions(dialog, FALSE);
+    } else if (fixture->resource == IDD_SYNC_ITEMS) {
+        SyncItemsCaptions(dialog, L"Private profile");
     }
 }
 
@@ -1485,7 +1530,7 @@ static void CheckReopenedModal(HWND owner, LayoutFixture *fixture, const LayoutS
 static void CheckLanguageRoundTrips(void)
 {
     static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
-                                      IDD_RESTORE, IDD_PURGE };
+                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS };
     static const WCHAR *const kVisited[] = { L"zh-CN" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"en");
@@ -1580,7 +1625,7 @@ static void CheckHiddenRows(void)
         { IDD_PROFILE, IDC_P_COPY, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
         { IDD_UNINSTALL, IDC_U_KEEP, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
         /* The label is centered on the drop-down list: at some scales it ends below it. */
-        { IDD_PROFILE, IDC_P_PICTURE, { IDC_P_SYNC_LABEL, IDC_P_SYNC, 0 }, 2, "the profile dialog without its sessions" },
+        { IDD_PROFILE, IDC_P_PICTURE, { IDC_P_SYNC_LABEL, IDC_P_SYNC, IDC_P_SYNC_ITEMS }, 3, "the profile dialog without its sessions" },
     };
     size_t i, scale;
     for (i = 0; i < ARRAYSIZE(kCases); i++) for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) {
@@ -1647,7 +1692,8 @@ static void CheckHiddenRows(void)
 /* The dialogs other than the manager window, in every language and scale. */
 static void CheckDialogs(void)
 {
-    static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE };
+    static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE,
+                                      IDD_SYNC_ITEMS };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)

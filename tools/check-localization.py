@@ -69,6 +69,7 @@ NONLITERAL_CALLS = {
     "sessions.c": ["Theme_SessionsCaption"],
     "localize.c": ["key"],
     "profiles.c": ["invalid"],
+    "syncui.c": ["kSyncItems[row].label"],
 }
 # Keys the code translates through a variable, by the source file that spells
 # them: the color names (g_ColorNames), the main window's captions, column
@@ -82,6 +83,7 @@ TRANSLATED_THROUGH_VARIABLES = {
                "Use 32 characters or fewer.", "Use 48 characters or fewer.",
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
     "gui.c": ["A profile folder with this name already exists."],
+    "syncui.c": ["Sessions: new ones, titles, archived and deleted ones", "Sidebar: pins, groups, project order, filters", "Each session's model, effort, side pane, unread mark and cost", "Appearance: fonts, editor, zoom, spelling", "Interface language", "Default model", "Settings: auto-archive, Cowork, Remote Control, recent folders", "Permissions: folders' permission modes, Cowork's trusted folders"],
     "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "S&ync sessions", "Rep&air", "Set as de&fault",
                 "&Program", "&Sessions", "S&hortcuts", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
                 "Pin to &taskbar", "Pinned", "Add to Start &menu", "Remove from Start &menu", "Sessions &view", "&Back",
@@ -104,7 +106,8 @@ TOOLBAR = ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u
 ACCESS_KEY_GROUPS = {
     "profiles view": MENU_BAR + TOOLBAR + ["Sessions &view", "S&ync sessions", "Rep&air", "&Back up .claude\u2026", "&Update"] + STATUS_ACTIONS,
     "sessions view": MENU_BAR + TOOLBAR + ["&Back", "Show &archived", "&Update"] + STATUS_ACTIONS,
-    "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "Sess&ions:", "Open at &Windows sign-in",
+    "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "S&ync:", "Wha&t to sync\u2026",
+                       "Open at &Windows sign-in",
                        "Copy &settings from \u201c%s\u201d", "&Open it now to sign in"],
     "Actions menu of a profile without the session": ["&Share with\u2026", "&Copy to\u2026"],
     "Actions menu of a profile with the session": ["&Open in %s", "&Rename\u2026", "S&tar", "Uns&tar",
@@ -113,9 +116,9 @@ ACCESS_KEY_GROUPS = {
                      "Uns&tar", "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s", "&Show folder",
                      "&Delete session everywhere\u2026"],
     "profile list menu": ["&Open", "&Quit", "&Restart", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "S&ync sessions",
-                          "&Keep sessions the same as", "&Stop keeping sessions the same", "&Back up\u2026", "Restore from back&up\u2026"],
+                          "Sync &with", "Wha&t to sync\u2026", "Sto&p syncing", "&Back up\u2026", "Restore from back&up\u2026"],
     "sessions menu": ["S&ync sessions", "Merge &all sessions\u2026", "&Copy all sessions to\u2026", "&Move all sessions to\u2026",
-                      "&Keep sessions the same as", "&Stop keeping sessions the same", "U&nlink sessions folder\u2026", "E&xport sessions\u2026",
+                      "Sync &with", "Wha&t to sync\u2026", "Sto&p syncing", "U&nlink sessions folder\u2026", "E&xport sessions\u2026",
                       "&Import sessions\u2026", "Reco&ver sessions\u2026", "C&lean up deleted sessions\u2026"],
     "program menu": ["&Language", "Rep&air", "&Uninstall\u2026", "E&xit"],
     "shortcuts menu of a profile": ["Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar",

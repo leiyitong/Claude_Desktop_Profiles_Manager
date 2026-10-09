@@ -312,6 +312,25 @@ char *WebStore_Get(const WebStore *store, const WCHAR *name, size_t *length)
     return utf8;
 }
 
+void WebStore_EachName(const WebStore *store, const WCHAR *prefix, void (*each)(void *context, const WCHAR *name), void *context)
+{
+    size_t prefixLength = wcslen(prefix), skip, i;
+    WCHAR name[WEB_KEY_MAX];
+    int at;
+    if (!store) return;
+    skip = store->prefixLength + 1;   /* the origin's part, and the mark of a Latin-1 name */
+    for (at = 0; at < store->count; at++) {
+        const WebEntry *entry = &store->entries[at];
+        size_t length;
+        if (!entry->put || entry->keyLength < skip + prefixLength || entry->key[store->prefixLength] != 1) continue;
+        length = entry->keyLength - skip;
+        if (length >= ARRAYSIZE(name)) continue;
+        for (i = 0; i < length; i++) name[i] = (WCHAR)entry->key[skip + i];
+        name[length] = 0;
+        if (wcsncmp(name, prefix, prefixLength) == 0) each(context, name);
+    }
+}
+
 BOOL WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, size_t length)
 {
     BYTE key[WEB_KEY_MAX], *value;

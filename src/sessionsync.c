@@ -776,66 +776,160 @@ static OpResult ApplyIndex(const Profile *p, const WCHAR *dir, const char *conte
 
 /* ----------------------------------------------------- the sidebar's layout */
 
-/* The pins, project order and filters of Claude's sidebar, in
- * claude_desktop_config.json under preferences.epitaxyPrefs: each part by its
- * name in a layout of ours, the name Claude gives it, and whether Claude keeps
- * it for every account or per account (the account's id after the name). */
+/* What a profile shows the way it does, kept the same as a sidebar's "layout"
+ * of ours: one JSON object, each part by its name. The parts come from three
+ * places, each in a table below: Claude's settings, its window's web storage,
+ * and two files of its own. */
 typedef enum LayoutScope { LAYOUT_ANY, LAYOUT_ORGANIZATION, LAYOUT_ACCOUNT } LayoutScope;
-static const struct { const char *part, *name; LayoutScope scope; } kLayoutParts[] = {
-    { "starred", "starred-local-code-sessions", LAYOUT_ANY },
-    { "slice", "dframe-local-slice", LAYOUT_ANY },
-    { "starredGroups", "starred-session-groups", LAYOUT_ANY },
-    { "order", "code-projects-order.", LAYOUT_ACCOUNT },
-    { "statusFilter", "code-sessions-status-filter.", LAYOUT_ACCOUNT },             /* the filter's Status */
-    { "environments", "code-sessions-selected-environments-v2.", LAYOUT_ACCOUNT },  /* ...its Environment */
-    { "showEmpty", "code-sessions-show-empty-projects.", LAYOUT_ACCOUNT },          /* ...Show empty groups */
-    { "showPrStatus", "code-sessions-show-pr-status.", LAYOUT_ACCOUNT },           /* ...Show PR status */
-    { "projectsFilter", "ccd-sessions-filter", LAYOUT_ANY },                        /* the projects chosen */
+
+/* Claude's settings, in claude_desktop_config.json under "preferences": the
+ * part's name in a layout, the name Claude gives it, whether it is its
+ * window's (under epitaxyPrefs), whether Claude keeps it for every account
+ * or per account (the account's id after the name), and what it belongs to.
+ * The window keeps a copy of its own in its web storage
+ * (LSS-persisted.<name>), written alike where there is one. */
+typedef struct SettingPart {
+    const char *part, *name;
+    BOOL        window;
+    LayoutScope scope;
+    DWORD       item;
+} SettingPart;
+static const SettingPart kSettingParts[] = {
+    { "starred", "starred-local-code-sessions", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR },
+    { "slice", "dframe-local-slice", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR },
+    { "starredGroups", "starred-session-groups", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR },
+    { "order", "code-projects-order.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },
+    { "statusFilter", "code-sessions-status-filter.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },             /* the filter's Status */
+    { "environments", "code-sessions-selected-environments-v2.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },  /* ...its Environment */
+    { "showEmpty", "code-sessions-show-empty-projects.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },          /* ...Show empty groups */
+    { "showPrStatus", "code-sessions-show-pr-status.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },           /* ...Show PR status */
+    { "projectsFilter", "ccd-sessions-filter", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR },                        /* the projects chosen */
+    { "transcriptLinks", "epitaxy-transcript-links-in-preview", TRUE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "autoResume", "autoResumeRateLimitOptIn.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SETTINGS },                 /* go on after a usage limit */
+    { "folderModes", "epitaxy-folder-permission-mode.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_PERMISSIONS },       /* each folder's mode */
+    { "modeAcks", "epitaxy-perm-mode-acks.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_PERMISSIONS },                 /* ...its warning confirmed */
+    { "autoArchive", "ccAutoArchiveOnPrClose", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "coworkWebSearch", "coworkWebSearchEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "coworkBrowserTools", "coworkBrowserToolsEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "coworkBrowser", "coworkPreferredBrowser", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "coworkSchedules", "coworkScheduledTasksEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "codeSchedules", "ccdScheduledTasksEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "remoteExcluded", "remoteControlExcludedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "remotePinned", "remoteControlPinnedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
+    { "trustedFolders", "localAgentModeTrustedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_PERMISSIONS },        /* Cowork's */
 };
 
 /* The sidebar's groups and their sections, the "Edit sidebar" choices, the
- * groups folded, how sessions are grouped and sorted, and the editor's
- * settings: Claude's web UI keeps them in its web storage (webstore.c), most
- * under "state" of its value dframe-store. It keeps copies of the groups and
- * sections (dframe-group-scopes, dframe-code-sections) in the settings above
+ * groups folded, how sessions are grouped and sorted, the editor's settings,
+ * each session's model, side pane, unread mark and cost: Claude's window
+ * keeps them in its web storage (webstore.c). It keeps copies of the groups
+ * and sections (dframe-group-scopes, dframe-code-sections) in its settings
  * and in its web storage (LSS-persisted.<the same name>), and writes them from
  * dframe-store each time it starts: written in a copy alone, a change would
  * show nowhere. So these are read from the web storage and written to it and
- * to both copies alike. Each part: its name in a layout of ours, the value,
- * its member of "state" (NULL: the value whole), whether Claude keeps it per
- * account and organization (its member "<account>/<organization>"), and the
- * name of the copies. */
-#define SIDEBAR_STORE   L"dframe-store"
-#define COPY_PREFIX     L"LSS-persisted."
+ * to both copies alike. A value is one of Claude's stores ({"state": ...,
+ * "version": ...}: the part is `member` of its state, NULL for the value
+ * whole), any JSON value, plain text (a JSON string in a layout), or a family
+ * of values named `value` and a session's own id (one object by that id).
+ * Each part: its name, the value, its form, the member, whether Claude keeps
+ * it per account and organization (its member "<account>/<organization>"),
+ * the name of the copies, what it belongs to, and whether it is each
+ * session's own (an object by session, made the same member by member). */
+typedef enum WebForm { FORM_STORE, FORM_JSON, FORM_TEXT, FORM_FAMILY } WebForm;
 typedef struct WebPart {
     const char  *part;
     const WCHAR *value;
+    WebForm      form;
     const char  *member;
     LayoutScope  scope;
     const char  *copy;
+    DWORD        item;
+    BOOL         byKey;
 } WebPart;
+#define SIDEBAR_STORE   L"dframe-store"
+#define PANE_STORE      L"epitaxy.sidePaneStore.v1"
+#define COPY_PREFIX     L"LSS-persisted."
+#define WEB_NAME_CCH    160
 static const WebPart kWebParts[] = {
-    { "groups", SIDEBAR_STORE, "customGroupsByScope", LAYOUT_ORGANIZATION, "dframe-group-scopes" },
-    { "sections", SIDEBAR_STORE, "codeSidebarByScope", LAYOUT_ORGANIZATION, "dframe-code-sections" },
-    { "navPins", SIDEBAR_STORE, "navPinnedIds", LAYOUT_ANY, NULL },               /* Edit sidebar */
-    { "folded", SIDEBAR_STORE, "collapsedGroups", LAYOUT_ANY, NULL },
-    { "groupBy", SIDEBAR_STORE, "groupByByMode", LAYOUT_ANY, NULL },
-    { "sortBy", SIDEBAR_STORE, "sortByByMode", LAYOUT_ANY, NULL },
-    { "recentsType", SIDEBAR_STORE, "recentsTypeFilter", LAYOUT_ANY, NULL },      /* the filter of Recents */
-    { "recentsStatus", SIDEBAR_STORE, "recentsStatusFilter", LAYOUT_ANY, NULL },
-    { "routines", SIDEBAR_STORE, "routinesSidebarPlacement", LAYOUT_ANY, NULL },
-    { "sidebarWidth", SIDEBAR_STORE, "sidebarWidth", LAYOUT_ANY, NULL },
-    { "interfaceFont", SIDEBAR_STORE, "interfaceFont", LAYOUT_ANY, NULL },
-    { "systemFont", SIDEBAR_STORE, "systemFont", LAYOUT_ANY, NULL },
-    { "editor", L"epitaxy-editor-prefs", NULL, LAYOUT_ANY, NULL },                 /* the editor's font, theme, text size */
+    { "groups", SIDEBAR_STORE, FORM_STORE, "customGroupsByScope", LAYOUT_ORGANIZATION, "dframe-group-scopes", SYNC_ITEM_SIDEBAR, FALSE },
+    { "sections", SIDEBAR_STORE, FORM_STORE, "codeSidebarByScope", LAYOUT_ORGANIZATION, "dframe-code-sections", SYNC_ITEM_SIDEBAR, FALSE },
+    { "navPins", SIDEBAR_STORE, FORM_STORE, "navPinnedIds", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },   /* Edit sidebar */
+    { "folded", SIDEBAR_STORE, FORM_STORE, "collapsedGroups", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
+    { "groupBy", SIDEBAR_STORE, FORM_STORE, "groupByByMode", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
+    { "sortBy", SIDEBAR_STORE, FORM_STORE, "sortByByMode", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
+    { "recentsType", SIDEBAR_STORE, FORM_STORE, "recentsTypeFilter", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },   /* Recents' filter */
+    { "recentsStatus", SIDEBAR_STORE, FORM_STORE, "recentsStatusFilter", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
+    { "routines", SIDEBAR_STORE, FORM_STORE, "routinesSidebarPlacement", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
+    { "sidebarWidth", SIDEBAR_STORE, FORM_STORE, "sidebarWidth", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
+    { "interfaceFont", SIDEBAR_STORE, FORM_STORE, "interfaceFont", LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE, FALSE },
+    { "systemFont", SIDEBAR_STORE, FORM_STORE, "systemFont", LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE, FALSE },
+    { "editor", L"epitaxy-editor-prefs", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE, FALSE },   /* font, theme, text size */
+    { "zoom", L"desktop-frame.mainViewZoomFactor.v1", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE, FALSE },
+    { "locale", L"spa:locale", FORM_TEXT, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_LANGUAGE, FALSE },
+    { "localeSource", L"spa:locale-source", FORM_TEXT, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_LANGUAGE, FALSE },
+    { "defaultModel", L"default-model", FORM_TEXT, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_MODEL, FALSE },
+    { "coworkRecents", L"cowork-picker-recents", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_SETTINGS, FALSE },
+    { "pills", L"code-session-pills", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },   /* each session's model, effort */
+    { "unread", L"epitaxy-unread-v1", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
+    { "railSections", L"epitaxy.sessionRailSections", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
+    { "paneLayout", PANE_STORE, FORM_STORE, "tileLayout", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
+    { "paneSizes", PANE_STORE, FORM_STORE, "lastPaneFlexByKind", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
+    { "transcriptMode", PANE_STORE, FORM_STORE, "transcriptMode", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
+    { "transcriptModeDefault", PANE_STORE, FORM_STORE, "transcriptModeIsDefault", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
+    { "filesTree", PANE_STORE, FORM_STORE, "filesTreeShown", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
+    { "diffTree", PANE_STORE, FORM_STORE, "diffShowTree", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
+    { "paneLayouts", PANE_STORE, FORM_STORE, "tileLayoutBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
+    { "paneExpanded", PANE_STORE, FORM_STORE, "expandedTileBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
+    { "paneClosed", PANE_STORE, FORM_STORE, "closedPaneSlotsBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
+    { "transcriptModes", PANE_STORE, FORM_STORE, "transcriptModeBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
+    { "paneBands", PANE_STORE, FORM_STORE, "bandHeightsBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
+    { "costs", L"epitaxy-session-result:", FORM_FAMILY, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
 };
 
-const char *SessionSync_LayoutPart(int index)
+/* Two files of Claude's own: config.json (the app's state: its language, the
+ * zoom of the window's controls) and Chromium's Preferences (the page's zoom,
+ * spelling's languages), each part the member reached through `keys`. With
+ * `own`, the last key is the profile's own: the only member there (Chromium
+ * names its zoom by a hash of the profile's folder). */
+#define CHROMIUM_PREFERENCES L"Preferences"
+typedef struct FilePart {
+    const char  *part;
+    const WCHAR *file;
+    const char  *keys[3];
+    int          depth;
+    BOOL         own;
+    DWORD        item;
+} FilePart;
+static const FilePart kFileParts[] = {
+    { "appLocale", CLAUDE_APP_SETTINGS, { "locale", NULL, NULL }, 1, FALSE, SYNC_ITEM_LANGUAGE },
+    { "controlsZoom", CLAUDE_APP_SETTINGS, { "windowControlsZoomFactor", NULL, NULL }, 1, FALSE, SYNC_ITEM_APPEARANCE },
+    { "pageZoom", CHROMIUM_PREFERENCES, { "partition", "per_host_zoom_levels", NULL }, 3, TRUE, SYNC_ITEM_APPEARANCE },
+    { "spelling", CHROMIUM_PREFERENCES, { "spellcheck", "dictionaries", NULL }, 2, FALSE, SYNC_ITEM_APPEARANCE },
+};
+
+BOOL SessionSync_LayoutPart(int index, LayoutPart *part)
 {
-    if (index < 0) return NULL;
-    if (index < (int)ARRAYSIZE(kLayoutParts)) return kLayoutParts[index].part;
-    index -= (int)ARRAYSIZE(kLayoutParts);
-    return index < (int)ARRAYSIZE(kWebParts) ? kWebParts[index].part : NULL;
+    ZeroMemory(part, sizeof *part);
+    if (index < 0) return FALSE;
+    if (index < (int)ARRAYSIZE(kSettingParts)) {
+        part->name = kSettingParts[index].part;
+        part->item = kSettingParts[index].item;
+        return TRUE;
+    }
+    index -= (int)ARRAYSIZE(kSettingParts);
+    if (index < (int)ARRAYSIZE(kWebParts)) {
+        part->name = kWebParts[index].part;
+        part->item = kWebParts[index].item;
+        part->byKey = kWebParts[index].byKey;
+        return TRUE;
+    }
+    index -= (int)ARRAYSIZE(kWebParts);
+    if (index < (int)ARRAYSIZE(kFileParts)) {
+        part->name = kFileParts[index].part;
+        part->item = kFileParts[index].item;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 /* The account and organization an entries folder is for (its last two
@@ -854,48 +948,6 @@ static BOOL LayoutScopeOf(const WCHAR *entriesDir, char *account, size_t account
            SUCCEEDED(StringCchPrintfA(scope, scopeCap, "%s/%s", account, organization));
 }
 
-/* `json` (a heap block, freed) with its member `key` set to `raw` (`length`
- * bytes); NULL, freed, when it cannot be. */
-static char *SetRaw(char *json, size_t *used, const char *key, const char *raw, size_t length)
-{
-    size_t capacity, written = 0;
-    char *text = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1), *out = NULL;
-    if (json && text) {
-        memcpy(text, raw, length);
-        text[length] = 0;
-        capacity = *used + length + strlen(key) + 8;
-        if ((out = (char *)HeapAlloc(GetProcessHeap(), 0, capacity + 1)) != NULL && Core_JsonSetMember(json, *used, key, text, out, capacity, &written)) {
-            out[written] = 0;
-            *used = written;
-        } else {
-            Free(out);
-            out = NULL;
-        }
-    }
-    Free(text);
-    Free(json);
-    return out;
-}
-
-/* `*json` (a heap block) with the member reached through `keys` set to
- * `length` bytes of `raw`; FALSE, `*json` as it was, when it cannot be. */
-static BOOL SetNested(char **json, size_t *used, const char *const *keys, int depth, const char *raw, size_t length)
-{
-    char *text, *out = NULL;
-    size_t outLength = 0;
-    if (*json && (text = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1)) != NULL) {
-        memcpy(text, raw, length);
-        text[length] = 0;
-        out = Core_JsonSetNested(*json, *used, keys, depth, text, &outLength);
-        Free(text);
-    }
-    if (!out) return FALSE;
-    Free(*json);
-    *json = out;
-    *used = outLength;
-    return TRUE;
-}
-
 static char *Duplicate(const char *text, size_t length)
 {
     char *copy = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1);
@@ -906,63 +958,258 @@ static char *Duplicate(const char *text, size_t length)
     return copy;
 }
 
-static char *EmptyObject(size_t *used)
+/* `*json` (a heap block) with the member reached through `keys` set to
+ * `length` bytes of `raw`; FALSE, `*json` as it was, when it cannot be. */
+static BOOL SetNested(char **json, size_t *used, const char *const *keys, int depth, const char *raw, size_t length)
 {
-    char *json = (char *)HeapAlloc(GetProcessHeap(), 0, 3);
-    if (json) memcpy(json, "{}", 3);
-    *used = 2;
-    return json;
+    char *text, *out = NULL;
+    size_t outLength = 0;
+    if (*json && (text = Duplicate(raw, length)) != NULL) {
+        out = Core_JsonSetNested(*json, *used, keys, depth, text, &outLength);
+        Free(text);
+    }
+    if (!out) return FALSE;
+    Free(*json);
+    *json = out;
+    *used = outLength;
+    return TRUE;
 }
 
-/* Part `part` of the web storage value `text`: where it is. A value whole is
- * one of Claude's stores ({"state": ..., "version": ...}) or none. */
-static BOOL WebPartOf(const WebPart *part, const char *text, size_t length, const char *scope, const char **value, size_t *valueLength)
+/* `json` (a heap block, freed) with its member `key` set to `raw` (`length`
+ * bytes); NULL, freed, when it cannot be. */
+static char *SetRaw(char *json, size_t *used, const char *key, const char *raw, size_t length)
+{
+    const char *keys[1];
+    keys[0] = key;
+    if (json && SetNested(&json, used, keys, 1, raw, length)) return json;
+    Free(json);
+    return NULL;
+}
+
+static char *EmptyObject(size_t *used)
+{
+    *used = 2;
+    return Duplicate("{}", 2);
+}
+
+/* A file's time of last write, in ms since 1970; 0 when unknown. */
+static ULONGLONG WrittenAt(const WCHAR *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    ULONGLONG ticks;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return 0;
+    ticks = ((ULONGLONG)attributes.ftLastWriteTime.dwHighDateTime << 32) | attributes.ftLastWriteTime.dwLowDateTime;
+    return ticks > UNIX_EPOCH_TICKS ? (ticks - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND : 0;
+}
+
+/* A session's own id in a value of Claude's ("local_<id>") that the profile
+ * lists: an entry of that name in its entries folder `entriesDir`. */
+static BOOL ListedSession(const WCHAR *entriesDir, const char *id, size_t length)
+{
+    WCHAR wide[SESSION_ID_CCH], path[LONG_PATH_CCH];
+    size_t prefix = sizeof "local_" - 1, i;
+    if (length <= prefix || length >= ARRAYSIZE(wide) || memcmp(id, "local_", prefix) != 0) return FALSE;
+    for (i = 0; i < length; i++) {
+        char c = id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' || c == '_')) return FALSE;
+        wide[i] = (WCHAR)c;
+    }
+    wide[length] = 0;
+    return SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s.json", entriesDir, wide)) && Present(path);
+}
+
+/* An object by session being made: the members of the sessions it lists. */
+typedef struct SessionObject {
+    const WCHAR *entriesDir;
+    char        *json;
+    size_t       used;
+} SessionObject;
+
+static BOOL AddListed(void *context, const char *key, size_t keyLength, const char *value, size_t valueLength)
+{
+    SessionObject *object = (SessionObject *)context;
+    char name[SESSION_ID_CCH];
+    if (!ListedSession(object->entriesDir, key, keyLength) || FAILED(StringCchCopyNA(name, sizeof name, key, keyLength))) return TRUE;
+    object->json = SetRaw(object->json, &object->used, name, value, valueLength);
+    return object->json != NULL;
+}
+
+/* A value family's member: "<family><id>" read as the member <id>. */
+typedef struct FamilyRead {
+    const WebStore *store;
+    const WCHAR    *family;
+    SessionObject   object;
+} FamilyRead;
+
+static void AddFamilyValue(void *context, const WCHAR *name)
+{
+    FamilyRead *read = (FamilyRead *)context;
+    char id[SESSION_ID_CCH];
+    size_t prefix = wcslen(read->family), length = wcslen(name), valueLength = 0, i;
+    char *value;
+    if (!read->object.json || length <= prefix || length - prefix >= sizeof id) return;
+    for (i = prefix; i < length; i++) id[i - prefix] = (char)name[i];
+    id[length - prefix] = 0;
+    if (!ListedSession(read->object.entriesDir, id, length - prefix)) return;
+    if ((value = WebStore_Get(read->store, name, &valueLength)) != NULL && Core_JsonIsValue(value, valueLength))
+        read->object.json = SetRaw(read->object.json, &read->object.used, id, value, valueLength);
+    Free(value);
+}
+
+/* Part `part` of the web storage value `text` (`length` bytes): its JSON text
+ * (a heap block, NULL when it has none). */
+static char *WebPartOf(const WebPart *part, const char *text, size_t length, const char *scope, const WCHAR *entriesDir, size_t *outLength)
 {
     const char *state, *inner;
     size_t stateLength, innerLength;
-    if (!text || !Core_JsonMember(text, length, "state", &state, &stateLength)) return FALSE;
+    *outLength = 0;
+    if (!text) return NULL;
+    if (part->form == FORM_JSON) {
+        if (!Core_JsonIsValue(text, length)) return NULL;
+        *outLength = length;
+        return Duplicate(text, length);
+    }
+    if (part->form == FORM_TEXT) {
+        WCHAR *wide;
+        char *quoted = NULL;
+        int chars = length ? MultiByteToWideChar(CP_UTF8, 0, text, (int)length, NULL, 0) : 0;
+        if ((length && chars <= 0) || (wide = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, ((size_t)chars + 1) * sizeof(WCHAR))) == NULL) return NULL;
+        if (chars) MultiByteToWideChar(CP_UTF8, 0, text, (int)length, wide, chars);
+        wide[chars] = 0;
+        if ((quoted = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)chars * 12 + 3)) != NULL && Core_JsonQuote(wide, quoted, (size_t)chars * 12 + 3)) {
+            *outLength = strlen(quoted);
+        } else {
+            Free(quoted);
+            quoted = NULL;
+        }
+        Free(wide);
+        return quoted;
+    }
+    if (!Core_JsonMember(text, length, "state", &state, &stateLength)) return NULL;
     if (!part->member) {
-        *value = text;
-        *valueLength = length;
-        return TRUE;
+        *outLength = length;
+        return Duplicate(text, length);
     }
     if (!Core_JsonMember(state, stateLength, part->member, &inner, &innerLength) ||
         (part->scope == LAYOUT_ORGANIZATION && !Core_JsonMember(inner, innerLength, scope, &inner, &innerLength)))
-        return FALSE;
-    *value = inner;
-    *valueLength = innerLength;
-    return TRUE;
+        return NULL;
+    if (part->byKey) {
+        SessionObject object;
+        object.entriesDir = entriesDir;
+        object.json = EmptyObject(&object.used);
+        if (!object.json || !Core_JsonEachMember(inner, innerLength, AddListed, &object)) {
+            Free(object.json);
+            return NULL;
+        }
+        *outLength = object.used;
+        return object.json;
+    }
+    *outLength = innerLength;
+    return Duplicate(inner, innerLength);
 }
 
 /* The parts of `layout` (a heap block, freed) read from the web storage of
  * `p`; `written` made the time its newest file was written, when later. */
-static char *ReadWebParts(const Profile *p, const char *scope, char *layout, size_t *used, ULONGLONG *written)
+static char *ReadWebParts(const Profile *p, const char *scope, const WCHAR *entriesDir, char *layout, size_t *used, ULONGLONG *written)
 {
     WebStore *store = WebStore_Open(p);
     const WCHAR *read = NULL;
-    char *text = NULL;
-    const char *value;
+    char *text = NULL, *value;
     size_t length = 0, valueLength, i;
     if (!store) return layout;
     if (written) *written = max(*written, WebStore_Written(store));
     for (i = 0; i < ARRAYSIZE(kWebParts) && layout; i++) {
+        if (kWebParts[i].form == FORM_FAMILY) {
+            FamilyRead family;
+            family.store = store;
+            family.family = kWebParts[i].value;
+            family.object.entriesDir = entriesDir;
+            family.object.json = EmptyObject(&family.object.used);
+            WebStore_EachName(store, kWebParts[i].value, AddFamilyValue, &family);
+            if (family.object.json && family.object.used > 2)
+                layout = SetRaw(layout, used, kWebParts[i].part, family.object.json, family.object.used);
+            Free(family.object.json);
+            continue;
+        }
         if (!read || wcscmp(read, kWebParts[i].value) != 0) {
             Free(text);
             text = WebStore_Get(store, kWebParts[i].value, &length);
             read = kWebParts[i].value;
         }
-        if (WebPartOf(&kWebParts[i], text, length, scope, &value, &valueLength))
+        if ((value = WebPartOf(&kWebParts[i], text, length, scope, entriesDir, &valueLength)) != NULL)
             layout = SetRaw(layout, used, kWebParts[i].part, value, valueLength);
+        Free(value);
     }
     Free(text);
     WebStore_Free(store);
     return layout;
 }
 
+/* The only member of an object, when it has one alone. */
+typedef struct OnlyMember {
+    const char *key, *value;
+    size_t      keyLength, valueLength;
+    int         count;
+} OnlyMember;
+
+static BOOL SeeOnly(void *context, const char *key, size_t keyLength, const char *value, size_t valueLength)
+{
+    OnlyMember *only = (OnlyMember *)context;
+    only->key = key;
+    only->keyLength = keyLength;
+    only->value = value;
+    only->valueLength = valueLength;
+    return ++only->count == 1;
+}
+
+/* The member of `json` reached through `keys`: with `own`, the last key is
+ * the only member of the object before it (its name in `*ownKey`). */
+static BOOL FileMember(const char *json, size_t length, const FilePart *part, const char **value, size_t *valueLength, char *ownKey, size_t ownCap)
+{
+    int level, last = part->own ? part->depth - 1 : part->depth;
+    *value = json;
+    *valueLength = length;
+    for (level = 0; level < last; level++)
+        if (!Core_JsonMember(*value, *valueLength, part->keys[level], value, valueLength)) return FALSE;
+    if (part->own) {
+        OnlyMember only;
+        ZeroMemory(&only, sizeof only);
+        if (!Core_JsonEachMember(*value, *valueLength, SeeOnly, &only) || only.count != 1 || FAILED(StringCchCopyNA(ownKey, ownCap, only.key, only.keyLength)))
+            return FALSE;
+        *value = only.value;
+        *valueLength = only.valueLength;
+    }
+    return TRUE;
+}
+
+static char *ReadFileParts(const Profile *p, char *layout, size_t *used, ULONGLONG *written)
+{
+    const WCHAR *read = NULL;
+    WCHAR path[LONG_PATH_CCH];
+    char *text = NULL, own[128];
+    const char *value;
+    DWORD length = 0;
+    size_t valueLength, i;
+    for (i = 0; i < ARRAYSIZE(kFileParts) && layout; i++) {
+        if (!read || wcscmp(read, kFileParts[i].file) != 0) {
+            Free(text);
+            text = NULL;
+            read = kFileParts[i].file;
+            if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", p->storageDir, read)) ||
+                (text = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &length)) == NULL)
+                continue;
+            if (written) *written = max(*written, WrittenAt(path));
+        }
+        if (text && FileMember(text, length, &kFileParts[i], &value, &valueLength, own, sizeof own))
+            layout = SetRaw(layout, used, kFileParts[i].part, value, valueLength);
+    }
+    Free(text);
+    return layout;
+}
+
 char *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *length, ULONGLONG *written)
 {
     WCHAR path[LONG_PATH_CCH];
-    WIN32_FILE_ATTRIBUTE_DATA attributes;
     char account[SESSION_ID_CCH * 3], scope[SESSION_ID_CCH * 6 + 2], name[128], *config, *layout;
     const char *prefs, *epitaxy, *value;
     size_t prefsLength, epitaxyLength, valueLength, used = 0, i;
@@ -973,25 +1220,48 @@ char *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *
         FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir)) || (layout = EmptyObject(&used)) == NULL)
         return NULL;
     if ((config = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &size)) != NULL) {
-        if (written && GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) {
-            ULONGLONG ticks = ((ULONGLONG)attributes.ftLastWriteTime.dwHighDateTime << 32) | attributes.ftLastWriteTime.dwLowDateTime;
-            *written = ticks > UNIX_EPOCH_TICKS ? (ticks - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND : 0;
+        if (written) *written = WrittenAt(path);
+        if (Core_JsonMember(config, size, "preferences", &prefs, &prefsLength)) {
+            if (!Core_JsonMember(prefs, prefsLength, "epitaxyPrefs", &epitaxy, &epitaxyLength)) epitaxy = NULL;
+            for (i = 0; i < ARRAYSIZE(kSettingParts) && layout; i++) {
+                const SettingPart *part = &kSettingParts[i];
+                if (part->window && !epitaxy) continue;
+                if (SUCCEEDED(StringCchPrintfA(name, sizeof name, "%s%s", part->name, part->scope == LAYOUT_ACCOUNT ? account : "")) &&
+                    (part->window ? Core_JsonMember(epitaxy, epitaxyLength, name, &value, &valueLength)
+                                  : Core_JsonMember(prefs, prefsLength, name, &value, &valueLength)))
+                    layout = SetRaw(layout, &used, part->part, value, valueLength);
+            }
         }
-        if (Core_JsonMember(config, size, "preferences", &prefs, &prefsLength) &&
-            Core_JsonMember(prefs, prefsLength, "epitaxyPrefs", &epitaxy, &epitaxyLength))
-            for (i = 0; i < ARRAYSIZE(kLayoutParts) && layout; i++)
-                if (SUCCEEDED(StringCchPrintfA(name, sizeof name, "%s%s", kLayoutParts[i].name, kLayoutParts[i].scope == LAYOUT_ACCOUNT ? account : "")) &&
-                    Core_JsonMember(epitaxy, epitaxyLength, name, &value, &valueLength))
-                    layout = SetRaw(layout, &used, kLayoutParts[i].part, value, valueLength);
         Free(config);
     }
-    if (layout) layout = ReadWebParts(p, scope, layout, &used, written);
+    if (layout) layout = ReadWebParts(p, scope, entriesDir, layout, &used, written);
+    if (layout) layout = ReadFileParts(p, layout, &used, written);
     if (layout && used <= 2) {
         Free(layout);
         layout = NULL;
     }
     if (layout) *length = used;
     return layout;
+}
+
+/* `path`, a file of `p`, made `json` (`used` bytes) unless it is that
+ * already (`current`), backed up first. */
+static OpResult WriteLayoutFile(const Profile *p, const WCHAR *path, const char *current, DWORD currentLength, const char *json, size_t used,
+                                const WCHAR *what, SyncReport *report)
+{
+    if (current && used == currentLength && memcmp(current, json, used) == 0) return OP_SAME;
+    if (SessionLink_Busy(p)) return OP_STOPPED;
+    if (current && !BackUp(p, path, FALSE, report)) {
+        CannotWrite(report, path, GetLastError());
+        return OP_FAILED;
+    }
+    if (WriteFileAt(path, json, used, p, current != NULL)) {
+        Util_Log(L"%s in %s: replaced", what, p->folder);
+        return OP_MADE;
+    }
+    if (GetLastError() == ERROR_BUSY) return OP_STOPPED;
+    CannotWrite(report, path, GetLastError());
+    return OP_FAILED;
 }
 
 /* The parts of `content` kept in claude_desktop_config.json, and the copies
@@ -1004,64 +1274,73 @@ static OpResult ApplySettings(const Profile *p, const char *account, const char 
     const char *value;
     size_t valueLength, used = 0, i;
     DWORD currentLength = 0;
-    char *current, *json = NULL;
-    BOOL there;
-    OpResult result = OP_FAILED;
+    char *current, *json;
+    BOOL ok = TRUE;
+    OpResult result;
     if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir))) {
         CannotWrite(report, p->folder, ERROR_INVALID_DATA);
         return OP_FAILED;
     }
     current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength);
-    there = current != NULL;
     if (current) {
-        if ((json = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)currentLength + 1)) != NULL) {
-            memcpy(json, current, currentLength);
-            json[currentLength] = 0;
-            used = currentLength;
-        }
+        json = Duplicate(current, currentLength);
+        used = currentLength;
     } else {
         json = EmptyObject(&used);
     }
-    for (i = 0; i < ARRAYSIZE(kLayoutParts) && json; i++) {
-        const char *keys[3] = { "preferences", "epitaxyPrefs", name };
-        if (Core_JsonMember(content, contentLength, kLayoutParts[i].part, &value, &valueLength) &&
-            SUCCEEDED(StringCchPrintfA(name, sizeof name, "%s%s", kLayoutParts[i].name, kLayoutParts[i].scope == LAYOUT_ACCOUNT ? account : "")))
-            if (!SetNested(&json, &used, keys, 3, value, valueLength)) break;
+    for (i = 0; i < ARRAYSIZE(kSettingParts) && json && ok; i++) {
+        const char *window[3] = { "preferences", "epitaxyPrefs", name }, *app[2] = { "preferences", name };
+        if (Core_JsonMember(content, contentLength, kSettingParts[i].part, &value, &valueLength) &&
+            SUCCEEDED(StringCchPrintfA(name, sizeof name, "%s%s", kSettingParts[i].name, kSettingParts[i].scope == LAYOUT_ACCOUNT ? account : "")))
+            ok = kSettingParts[i].window ? SetNested(&json, &used, window, 3, value, valueLength) : SetNested(&json, &used, app, 2, value, valueLength);
     }
-    for (i = 0; i < ARRAYSIZE(kWebParts) && json; i++) {
+    for (i = 0; i < ARRAYSIZE(kWebParts) && json && ok; i++) {
         const char *keys[4] = { "preferences", "epitaxyPrefs", kWebParts[i].copy, scope };
-        if (kWebParts[i].copy && Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength) &&
-            !SetNested(&json, &used, keys, 4, value, valueLength))
-            break;
+        if (kWebParts[i].copy && Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength))
+            ok = SetNested(&json, &used, keys, 4, value, valueLength);
     }
-    if (!json || i < ARRAYSIZE(kWebParts)) {
+    if (!json || !ok) {
         CannotWrite(report, path, ERROR_INVALID_DATA);
-        goto done;
-    }
-    if (current && used == currentLength && memcmp(current, json, used) == 0) {
-        result = OP_SAME;
-        goto done;
-    }
-    if (SessionLink_Busy(p)) {
-        result = OP_STOPPED;
-        goto done;
-    }
-    if (there && !BackUp(p, path, FALSE, report)) {
-        CannotWrite(report, path, GetLastError());
-        goto done;
-    }
-    if (WriteFileAt(path, json, used, p, there)) {
-        result = OP_MADE;
-        Util_Log(L"the sidebar's settings in %s: replaced", p->folder);
-    } else if (GetLastError() == ERROR_BUSY) {
-        result = OP_STOPPED;
+        result = OP_FAILED;
     } else {
-        CannotWrite(report, path, GetLastError());
+        result = WriteLayoutFile(p, path, current, currentLength, json, used, L"the sidebar's settings", report);
     }
-done:
     Free(json);
     Free(current);
     return result;
+}
+
+/* A member `key` of the object `*json` reached through `keys` (`depth` of
+ * them) set to `value`, the objects on the way made where missing. */
+static BOOL SetMemberOf(char **json, size_t *used, const char *const *keys, int depth, const char *key, const char *value, size_t valueLength)
+{
+    const char *path[4];
+    int level;
+    if (depth > 3) return FALSE;
+    for (level = 0; level < depth; level++) path[level] = keys[level];
+    path[depth] = key;
+    return SetNested(json, used, path, depth + 1, value, valueLength);
+}
+
+typedef struct KeyedWrite {
+    char       **json;
+    size_t      *used;
+    const char  *keys[3];
+    int          depth;
+    BOOL         ok;
+} KeyedWrite;
+
+/* A session's member of a part by session: set under its own id, which a
+ * profile that does not list that session has none of. */
+static BOOL SetKeyed(void *context, const char *key, size_t keyLength, const char *value, size_t valueLength)
+{
+    KeyedWrite *write = (KeyedWrite *)context;
+    char name[SESSION_ID_CCH];
+    if (keyLength <= sizeof "local_" - 1 || memcmp(key, "local_", sizeof "local_" - 1) != 0 ||
+        FAILED(StringCchCopyNA(name, sizeof name, key, keyLength)))
+        return TRUE;
+    if (!SetMemberOf(write->json, write->used, write->keys, write->depth, name, value, valueLength)) write->ok = FALSE;
+    return TRUE;
 }
 
 /* Web storage value `name` of `store` with the parts of `content` it keeps
@@ -1073,21 +1352,46 @@ static BOOL SetWebValue(WebStore *store, const WCHAR *name, const char *scope, c
     const char *value;
     size_t valueLength, length = 0, used, i;
     char *text = WebStore_Get(store, name, &length), *json = text ? Duplicate(text, length) : NULL;
-    BOOL ok = TRUE;
+    BOOL ok = TRUE, set = FALSE;
     used = length;
     for (i = 0; i < ARRAYSIZE(kWebParts); i++) {
-        const char *keys[3] = { "state", kWebParts[i].member, scope };
-        if (wcscmp(kWebParts[i].value, name) != 0 || !Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength))
+        const WebPart *part = &kWebParts[i];
+        const char *keys[3] = { "state", part->member, scope };
+        if (part->form == FORM_FAMILY || wcscmp(part->value, name) != 0 || !Core_JsonMember(content, contentLength, part->part, &value, &valueLength))
             continue;
-        if (!kWebParts[i].member) {
+        if (part->form == FORM_TEXT) {
+            WCHAR *wide = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (valueLength + 1) * sizeof(WCHAR));
+            int bytes;
+            if (wide && Core_JsonString(value, valueLength, wide, valueLength + 1) &&
+                (bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL)) > 0) {
+                Free(json);
+                if ((json = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)bytes)) != NULL) {
+                    WideCharToMultiByte(CP_UTF8, 0, wide, -1, json, bytes, NULL, NULL);
+                    used = (size_t)bytes - 1;
+                    set = TRUE;
+                }
+            }
+            Free(wide);
+        } else if (part->form == FORM_JSON || !part->member) {
             Free(json);
             json = Duplicate(value, valueLength);
             used = valueLength;
-        } else if (json && !SetNested(&json, &used, keys, kWebParts[i].scope == LAYOUT_ORGANIZATION ? 3 : 2, value, valueLength)) {
-            Util_Log(L"web storage %s: its %S kept, not an object there", name, kWebParts[i].part);
+            set = TRUE;
+        } else if (json && part->byKey) {
+            KeyedWrite write;
+            write.json = &json;
+            write.used = &used;
+            write.keys[0] = "state";
+            write.keys[1] = part->member;
+            write.depth = 2;
+            write.ok = TRUE;
+            if (!Core_JsonEachMember(value, valueLength, SetKeyed, &write) || !write.ok)
+                Util_Log(L"web storage %s: its %S kept, not an object there", name, part->part);
+        } else if (json && !SetNested(&json, &used, keys, part->scope == LAYOUT_ORGANIZATION ? 3 : 2, value, valueLength)) {
+            Util_Log(L"web storage %s: its %S kept, not an object there", name, part->part);
         }
     }
-    if (json && (!text || used != length || memcmp(json, text, used) != 0)) {
+    if (json && (set || text) && (!text || used != length || memcmp(json, text, used) != 0)) {
         ok = WebStore_Set(store, name, json, used);
         *changed = TRUE;
     }
@@ -1096,25 +1400,52 @@ static BOOL SetWebValue(WebStore *store, const WCHAR *name, const char *scope, c
     return ok;
 }
 
-/* The copy LSS-persisted.<copy> of part `part` of `content`: its member of
- * "value" for `scope`, and its time now. */
-static BOOL SetWebCopy(WebStore *store, const WebPart *part, const char *scope, const char *content, size_t contentLength, BOOL *changed)
+/* The values of family part `part` of `content`: each "<family><id>" made
+ * its member <id>, where the profile lists that session. */
+typedef struct FamilyWrite {
+    WebStore    *store;
+    const WCHAR *family;
+    BOOL        *changed;
+    BOOL         ok;
+} FamilyWrite;
+
+static BOOL SetFamilyValue(void *context, const char *key, size_t keyLength, const char *value, size_t valueLength)
 {
-    WCHAR name[128];
-    const char *value, *inner;
+    FamilyWrite *write = (FamilyWrite *)context;
+    WCHAR name[WEB_NAME_CCH];
+    size_t prefix = wcslen(write->family), i, length = 0;
+    char *current;
+    if (keyLength <= sizeof "local_" - 1 || memcmp(key, "local_", sizeof "local_" - 1) != 0 || prefix + keyLength >= ARRAYSIZE(name))
+        return TRUE;
+    StringCchCopyW(name, ARRAYSIZE(name), write->family);
+    for (i = 0; i < keyLength; i++) name[prefix + i] = (WCHAR)(unsigned char)key[i];
+    name[prefix + keyLength] = 0;
+    current = WebStore_Get(write->store, name, &length);
+    if (!current || length != valueLength || memcmp(current, value, valueLength) != 0) {
+        if (WebStore_Set(write->store, name, value, valueLength)) *write->changed = TRUE;
+        else write->ok = FALSE;
+    }
+    Free(current);
+    return TRUE;
+}
+
+/* The copy `name` (LSS-persisted.<...>) of a part `value` of a layout: its
+ * "value" (its member `scope`, with one) made it, and its time now. One
+ * there is none of is made only with `make`. */
+static BOOL SetWebCopy(WebStore *store, const WCHAR *name, const char *scope, const char *value, size_t valueLength, BOOL make, BOOL *changed)
+{
+    const char *inner;
     const char *keys[2] = { "value", scope }, *timeKey[1] = { "timestamp" };
-    size_t valueLength, innerLength, length = 0, used;
+    size_t innerLength, length = 0, used;
     char *text, *json, now[TIME_TEXT_BYTES];
     BOOL ok = TRUE;
-    if (!Core_JsonMember(content, contentLength, part->part, &value, &valueLength) ||
-        FAILED(StringCchPrintfW(name, ARRAYSIZE(name), COPY_PREFIX L"%S", part->copy)))
-        return TRUE;
     text = WebStore_Get(store, name, &length);
-    if (text && Core_JsonMember(text, length, "value", &inner, &innerLength) && Core_JsonMember(inner, innerLength, scope, &inner, &innerLength) &&
-        innerLength == valueLength && memcmp(inner, value, valueLength) == 0) {
+    if (text && Core_JsonMember(text, length, "value", &inner, &innerLength) &&
+        (!scope || Core_JsonMember(inner, innerLength, scope, &inner, &innerLength)) && innerLength == valueLength && memcmp(inner, value, valueLength) == 0) {
         Free(text);
         return TRUE;
     }
+    if (!text && !make) return TRUE;
     if (text) {
         json = text;
         used = length;
@@ -1124,7 +1455,7 @@ static BOOL SetWebCopy(WebStore *store, const WebPart *part, const char *scope, 
         used = sizeof kEmpty - 1;
     }
     StringCchPrintfA(now, sizeof now, "%I64u", NowMs());
-    if (json && SetNested(&json, &used, keys, 2, value, valueLength) && SetNested(&json, &used, timeKey, 1, now, strlen(now))) {
+    if (json && SetNested(&json, &used, keys, scope ? 2 : 1, value, valueLength) && SetNested(&json, &used, timeKey, 1, now, strlen(now))) {
         ok = WebStore_Set(store, name, json, used);
         *changed = TRUE;
     } else {
@@ -1135,33 +1466,57 @@ static BOOL SetWebCopy(WebStore *store, const WebPart *part, const char *scope, 
 }
 
 /* The parts of `content` kept in the web storage of `p` written there, with
- * its copies; the database copied to the backup first. */
-static OpResult ApplyWeb(const Profile *p, const char *scope, const char *content, size_t contentLength, SyncReport *report)
+ * the copies of the groups, sections and settings; the database copied to
+ * the backup first. */
+static OpResult ApplyWeb(const Profile *p, const char *account, const char *scope, const char *content, size_t contentLength, SyncReport *report)
 {
-    WCHAR backup[MAX_PATH];
+    WCHAR backup[MAX_PATH], copy[128];
     WebStore *store;
     const WCHAR *names[ARRAYSIZE(kWebParts)];
     const char *value;
+    char name[128];
     size_t valueLength, i, j, count = 0;
     BOOL changed = FALSE, ok = TRUE, any = FALSE;
     OpResult result = OP_FAILED;
-    for (i = 0; i < ARRAYSIZE(kWebParts); i++)
+    for (i = 0; i < ARRAYSIZE(kWebParts) && !any; i++)
         if (Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength)) any = TRUE;
+    for (i = 0; i < ARRAYSIZE(kSettingParts) && !any; i++)
+        if (kSettingParts[i].window && Core_JsonMember(content, contentLength, kSettingParts[i].part, &value, &valueLength)) any = TRUE;
     /* None yet (Claude makes it at its first start): the next sync sends them again. */
     if (!any || (store = WebStore_Open(p)) == NULL) return OP_SAME;
     for (i = 0; i < ARRAYSIZE(kWebParts); i++) {
+        if (kWebParts[i].form == FORM_FAMILY) continue;
         for (j = 0; j < count && wcscmp(names[j], kWebParts[i].value) != 0; j++) {}
         if (j == count) names[count++] = kWebParts[i].value;
     }
     for (i = 0; i < count && ok; i++) ok = SetWebValue(store, names[i], scope, content, contentLength, &changed);
-    /* The copies only where the value they copy is. */
+    for (i = 0; i < ARRAYSIZE(kWebParts) && ok; i++) {
+        FamilyWrite write;
+        if (kWebParts[i].form != FORM_FAMILY || !Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength)) continue;
+        write.store = store;
+        write.family = kWebParts[i].value;
+        write.changed = &changed;
+        write.ok = TRUE;
+        ok = Core_JsonEachMember(value, valueLength, SetFamilyValue, &write) && write.ok;
+    }
+    /* The copies of the groups and sections only where the value they copy is. */
     for (i = 0; i < ARRAYSIZE(kWebParts) && ok; i++) {
         size_t length = 0;
         char *text;
-        if (!kWebParts[i].copy) continue;
+        if (!kWebParts[i].copy || !Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength) ||
+            FAILED(StringCchPrintfW(copy, ARRAYSIZE(copy), COPY_PREFIX L"%S", kWebParts[i].copy)))
+            continue;
         text = WebStore_Get(store, kWebParts[i].value, &length);
-        if (text) ok = SetWebCopy(store, &kWebParts[i], scope, content, contentLength, &changed);
+        if (text) ok = SetWebCopy(store, copy, scope, value, valueLength, TRUE, &changed);
         Free(text);
+    }
+    /* The window's own copies of its settings, where it has them. */
+    for (i = 0; i < ARRAYSIZE(kSettingParts) && ok; i++) {
+        if (!kSettingParts[i].window || !Core_JsonMember(content, contentLength, kSettingParts[i].part, &value, &valueLength) ||
+            FAILED(StringCchPrintfA(name, sizeof name, "%s%s", kSettingParts[i].name, kSettingParts[i].scope == LAYOUT_ACCOUNT ? account : "")) ||
+            FAILED(StringCchPrintfW(copy, ARRAYSIZE(copy), COPY_PREFIX L"%S", name)))
+            continue;
+        ok = SetWebCopy(store, copy, NULL, value, valueLength, FALSE, &changed);
     }
     if (!ok) {
         CannotWrite(report, p->folder, ERROR_INVALID_DATA);
@@ -1181,22 +1536,71 @@ static OpResult ApplyWeb(const Profile *p, const char *scope, const char *conten
     return result;
 }
 
-/* The layout `content` (a layout of ours) put in the sidebar of `p`, for the
- * account and organization of its entries folder `dir`: in its settings, then
- * in its web storage. What else they hold stays as it is. */
+/* The parts of `content` kept in config.json and Chromium's Preferences put
+ * in those files of `p`. */
+static OpResult ApplyFiles(const Profile *p, const char *content, size_t contentLength, SyncReport *report)
+{
+    static const WCHAR *const kFiles[] = { CLAUDE_APP_SETTINGS, CHROMIUM_PREFERENCES };
+    OpResult result = OP_SAME;
+    size_t f, i;
+    for (f = 0; f < ARRAYSIZE(kFiles) && result != OP_STOPPED && result != OP_FAILED; f++) {
+        WCHAR path[LONG_PATH_CCH];
+        DWORD currentLength = 0;
+        char *current, *json, own[128];
+        const char *value, *found;
+        size_t valueLength, foundLength, used;
+        BOOL any = FALSE;
+        OpResult one;
+        for (i = 0; i < ARRAYSIZE(kFileParts) && !any; i++)
+            if (wcscmp(kFileParts[i].file, kFiles[f]) == 0 && Core_JsonMember(content, contentLength, kFileParts[i].part, &value, &valueLength)) any = TRUE;
+        /* Only a file Claude made: a profile not started yet gets them at the next sync. */
+        if (!any || FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", p->storageDir, kFiles[f])) ||
+            (current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength)) == NULL)
+            continue;
+        json = Duplicate(current, currentLength);
+        used = currentLength;
+        for (i = 0; i < ARRAYSIZE(kFileParts) && json; i++) {
+            const FilePart *part = &kFileParts[i];
+            const char *keys[3];
+            int level;
+            if (wcscmp(part->file, kFiles[f]) != 0 || !Core_JsonMember(content, contentLength, part->part, &value, &valueLength)) continue;
+            for (level = 0; level < part->depth; level++) keys[level] = part->keys[level];
+            if (part->own) {
+                if (!FileMember(json, used, part, &found, &foundLength, own, sizeof own)) continue;   /* none of its own yet */
+                keys[part->depth - 1] = own;
+            }
+            if (!SetNested(&json, &used, keys, part->depth, value, valueLength))
+                Util_Log(L"%s of %s: its %S kept, not an object there", kFiles[f], p->folder, part->part);
+        }
+        one = json ? WriteLayoutFile(p, path, current, currentLength, json, used, kFiles[f], report) : OP_FAILED;
+        if (one != OP_SAME) result = one;
+        Free(json);
+        Free(current);
+    }
+    return result;
+}
+
+/* The layout `content` (a layout of ours) put in `p`, for the account and
+ * organization of its entries folder `dir`: in its settings, its web storage
+ * and its two files. What else they hold stays as it is. */
 static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *content, size_t contentLength, SyncReport *report)
 {
     char account[SESSION_ID_CCH * 3], scope[SESSION_ID_CCH * 6 + 2];
-    OpResult settings, web;
+    OpResult results[3];
+    int i;
+    BOOL made = FALSE;
     if (!p->storageDir[0] || !LayoutScopeOf(dir, account, sizeof account, scope, sizeof scope)) {
         CannotWrite(report, p->folder, ERROR_INVALID_DATA);
         return OP_FAILED;
     }
-    settings = ApplySettings(p, account, scope, content, contentLength, report);
-    if (settings == OP_STOPPED || settings == OP_FAILED) return settings;
-    web = ApplyWeb(p, scope, content, contentLength, report);
-    if (web == OP_STOPPED || web == OP_FAILED) return web;
-    return settings == OP_MADE || web == OP_MADE ? OP_MADE : OP_SAME;
+    results[0] = ApplySettings(p, account, scope, content, contentLength, report);
+    if (results[0] == OP_STOPPED || results[0] == OP_FAILED) return results[0];
+    results[1] = ApplyWeb(p, account, scope, content, contentLength, report);
+    if (results[1] == OP_STOPPED || results[1] == OP_FAILED) return results[1];
+    results[2] = ApplyFiles(p, content, contentLength, report);
+    if (results[2] == OP_STOPPED || results[2] == OP_FAILED) return results[2];
+    for (i = 0; i < 3; i++) made |= results[i] == OP_MADE;
+    return made ? OP_MADE : OP_SAME;
 }
 
 /* Each change this thread makes, told to a progress bar. */

@@ -711,6 +711,36 @@ BOOL Core_JsonMember(const char *json, size_t len, const char *key, const char *
     return FALSE;
 }
 
+BOOL Core_JsonEachMember(const char *json, size_t len, CoreJsonMember each, void *context)
+{
+    size_t i, keyEnd, end;
+    i = SkipSpace(json, len, SkipByteOrderMark(json, len));
+    if (i >= len || json[i] != '{') return FALSE;
+    i = SkipSpace(json, len, i + 1);
+    if (i < len && json[i] == '}') return TRUE;
+    while (i < len && json[i] == '"') {
+        const char *key = json + i + 1;
+        if ((keyEnd = StringEnd(json, len, i)) == 0) return FALSE;
+        i = SkipSpace(json, len, keyEnd);
+        if (i >= len || json[i] != ':') return FALSE;
+        i = SkipSpace(json, len, i + 1);
+        if ((end = ValueEnd(json, len, i)) == 0 || end == i) return FALSE;
+        if (!each(context, key, (size_t)(json + keyEnd - 1 - key), json + i, end - i)) return FALSE;
+        i = SkipSpace(json, len, end);
+        if (i < len && json[i] == '}') return TRUE;
+        if (i >= len || json[i] != ',') return FALSE;
+        i = SkipSpace(json, len, i + 1);
+    }
+    return FALSE;
+}
+
+BOOL Core_JsonIsValue(const char *text, size_t len)
+{
+    size_t start = SkipSpace(text, len, 0), end;
+    if (start >= len || (end = ValueEnd(text, len, start)) == 0 || end == start) return FALSE;
+    return SkipSpace(text, len, end) == len;
+}
+
 /* Appends `codePoint` in UTF-8 at out[*length], leaving room for a
  * terminating zero in the `cap` bytes: FALSE, nothing appended, when it does
  * not fit. */

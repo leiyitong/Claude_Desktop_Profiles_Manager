@@ -2939,13 +2939,13 @@ static BOOL SaveBytes(const WCHAR *path, const BYTE *data, size_t length)
 static BOOL MakeWebStorage(const WCHAR *storageDir, const WCHAR *const *names, const char *const *values, int count)
 {
     static const char kComparator[] = "leveldb.BytewiseComparator";
-    static BYTE keys[4][128], data[4][4096], batch[16384], record[20000];
+    static BYTE keys[8][128], data[8][4096], batch[32768], record[40000];
     WCHAR dir[MAX_PATH], path[MAX_PATH], text[2048];
     BYTE edit[64];
-    CoreLevelOp ops[4];
+    CoreLevelOp ops[8];
     size_t editLength = 0, length;
     int i, chars;
-    if (count > 4 || !Join(storageDir, L"Local Storage\\leveldb", dir, ARRAYSIZE(dir)) || !MakeDir(dir)) return FALSE;
+    if (count > 8 || !Join(storageDir, L"Local Storage\\leveldb", dir, ARRAYSIZE(dir)) || !MakeDir(dir)) return FALSE;
     ZeroMemory(ops, sizeof ops);
     for (i = 0; i < count; i++) {
         if ((chars = MultiByteToWideChar(CP_UTF8, 0, values[i], -1, text, ARRAYSIZE(text)) - 1) < 0) return FALSE;
@@ -3118,6 +3118,169 @@ static void TestWebLayout(void)
           WebHas(&profiles.items[1], L"dframe-store", "\"web-b/web-organization\":{\"groups\":[{\"id\":\"cg-2\",\"name\":\"Later\"}]"));
 }
 
+/* Value `name` of the web storage of `p` with the member reached through
+ * `keys` set to `raw`, as Claude would write it. */
+static BOOL SetWebMember(const Profile *p, const WCHAR *name, const char *const *keys, int depth, const char *raw, const WCHAR *backup)
+{
+    WebStore *store = WebStore_Open(p);
+    size_t length = 0, setLength = 0;
+    char *value = store ? WebStore_Get(store, name, &length) : NULL, *set = NULL;
+    BOOL ok = value && (set = Core_JsonSetNested(value, length, keys, depth, raw, &setLength)) != NULL &&
+              WebStore_Set(store, name, set, setLength) && WebStore_Commit(store, backup);
+    if (value) HeapFree(GetProcessHeap(), 0, value);
+    if (set) HeapFree(GetProcessHeap(), 0, set);
+    WebStore_Free(store);
+    return ok;
+}
+
+/* What profiles sync, chosen item by item: Claude's settings and its window's
+ * copies of them, plain text values, its own files (Chromium's zoom under
+ * each profile's own key), each session's own values made the same session
+ * by session; what is not chosen stays, sessions too. */
+static void TestSyncItems(void)
+{
+    static const WCHAR *const labels[2] = { L"Items-A", L"Items-B" };
+    static const WCHAR *const leaves[2] = { L"items\\A", L"items\\B" };
+    static const WCHAR *const accounts[2] = { L"items-a", L"items-b" };
+    static const WCHAR *const namesA[4] = { L"spa:locale", L"default-model", L"epitaxy.sidePaneStore.v1", L"epitaxy-session-result:local_cdcdcdcd-0000-4000-8000-000000000001" };
+    static const WCHAR *const namesB[3] = { L"spa:locale", L"default-model", L"epitaxy.sidePaneStore.v1" };
+    static const WCHAR *const copyName[1] = { L"LSS-persisted.ccd-sessions-filter" };
+    ProfileList profiles;
+    SyncReport report;
+    WCHAR entries[2][MAX_PATH], configs[2][MAX_PATH], apps[2][MAX_PATH], chromium[2][MAX_PATH], logs[2][MAX_PATH];
+    WCHAR list[FOLDER_CCH], backup[MAX_PATH];
+    char paneA[1024], paneB[1024], part[256];
+    const char *valuesA[4], *valuesB[3], *copyValue[1];
+    const char *pane[3] = { "state", "tileLayoutBySession", NULL };
+    char id0[64], id1[64];
+    ULONGLONG sizes[2];
+    HWND window;
+    int i;
+    BOOL ready = TRUE;
+
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    for (i = 0; i < profiles.count && ready; i++)
+        ready = PrepareProfile(&profiles.items[i], labels[i], leaves[i], accounts[i], L"items-organization", entries[i], ARRAYSIZE(entries[i])) &&
+                Join(profiles.items[i].storageDir, L"claude_desktop_config.json", configs[i], ARRAYSIZE(configs[i])) &&
+                Join(profiles.items[i].storageDir, L"config.json", apps[i], ARRAYSIZE(apps[i])) &&
+                Join(profiles.items[i].storageDir, L"Preferences", chromium[i], ARRAYSIZE(chromium[i])) &&
+                Join(profiles.items[i].storageDir, L"Local Storage\\leveldb\\000003.log", logs[i], ARRAYSIZE(logs[i]));
+    profiles.items[0].syncGroup = profiles.items[1].syncGroup = 5;
+    profiles.items[0].syncItems = profiles.items[1].syncItems = SYNC_ITEMS_ALL & ~SYNC_ITEM_MODEL;
+    StringCchCopyW(profiles.defaultFolder, ARRAYSIZE(profiles.defaultFolder), profiles.items[0].folder);
+    StringCchPrintfA(id0, sizeof id0, "local_%ls", g_keptIds[0]);
+    StringCchPrintfA(id1, sizeof id1, "local_%ls", g_keptIds[1]);
+    StringCchPrintfA(paneA, sizeof paneA,
+        "{\"state\":{\"tileLayout\":{\"root\":\"a\"},\"tileLayoutBySession\":{\"%s\":{\"root\":\"s0\"},"
+        "\"local_ffffffff-0000-4000-8000-000000000009\":{\"root\":\"x\"}},\"currentSessionId\":\"%s\"},\"version\":6}", id0, id0);
+    StringCchPrintfA(paneB, sizeof paneB,
+        "{\"state\":{\"tileLayout\":{\"root\":\"b\"},\"tileLayoutBySession\":{\"%s\":{\"root\":\"s1\"}},\"currentSessionId\":\"%s\"},\"version\":6}",
+        id1, id1);
+    valuesA[0] = "zh-CN";
+    valuesA[1] = "claude-opus-5-5";
+    valuesA[2] = paneA;
+    valuesA[3] = "{\"v\":2,\"costUSD\":1.5}";
+    valuesB[0] = "en-US";
+    valuesB[1] = "claude-sonnet-5-5";
+    valuesB[2] = paneB;
+    copyValue[0] = "{\"value\":{\"state\":{\"selectedProjects\":[]},\"version\":0},\"tabId\":\"\",\"timestamp\":5}";
+    ready = ready && WriteKeptEntry(entries[0], g_keptIds[0], "Items one", L"C:\\Fixture", AtSecond(2)) &&
+            WriteKeptEntry(entries[1], g_keptIds[1], "Items two", L"C:\\Fixture", AtSecond(3)) &&
+            MakeWebStorage(profiles.items[0].storageDir, namesA, valuesA, 4) && MakeWebStorage(profiles.items[1].storageDir, namesB, valuesB, 3) &&
+            Save(configs[0], "{\"preferences\":{\"ccAutoArchiveOnPrClose\":true,\"ccdScheduledTasksEnabled\":true,\"localAgentModeTrustedFolders\":[\"C:\\\\Trusted\"],"
+                             "\"epitaxyPrefs\":{\"ccd-sessions-filter\":{\"state\":{\"selectedProjects\":[\"C:\\\\A\"]},\"version\":0}}}}") &&
+            Save(configs[1], "{\"preferences\":{\"keep\":1,\"ccdScheduledTasksEnabled\":false}}") &&
+            Save(apps[0], "{\"lastKnownAccountUuid\":\"items-a\",\"locale\":\"zh-CN\",\"windowControlsZoomFactor\":1.25}") &&
+            Save(apps[1], "{\"lastKnownAccountUuid\":\"items-b\",\"locale\":\"en-US\"}") &&
+            Save(chromium[0], "{\"partition\":{\"per_host_zoom_levels\":{\"111\":{\"claude.ai\":0.75}}},\"spellcheck\":{\"dictionaries\":[\"en-US\",\"fr\"]}}") &&
+            Save(chromium[1], "{\"partition\":{\"per_host_zoom_levels\":{\"222\":{\"claude.ai\":0.5}}},\"spellcheck\":{\"dictionaries\":[\"en-US\"]}}") &&
+            SessionVault_GroupListName(5, list, ARRAYSIZE(list)) && Join(g_root, L"items-backup", backup, ARRAYSIZE(backup));
+    /* B's window keeps its own copy of a setting: a value LevelDB adds with a later batch. */
+    if (ready) {
+        WebStore *store = WebStore_Open(&profiles.items[1]);
+        ready = store && WebStore_Set(store, copyName[0], copyValue[0], strlen(copyValue[0])) && WebStore_Commit(store, backup);
+        WebStore_Free(store);
+    }
+    Check("sync items: fixtures created", ready);
+    if (!ready) return;
+
+    ZeroMemory(&report, sizeof report);
+    Check("sync items: the group is kept", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
+    Check("sync items: the settings went across, a window's to its own copy too",
+          FileHas(configs[1], "\"ccAutoArchiveOnPrClose\":true") && FileHas(configs[1], "\"keep\":1") && FileHas(configs[1], "\"selectedProjects\":[\"C:\\\\A\"]") &&
+          WebHas(&profiles.items[1], copyName[0], "\"selectedProjects\":[\"C:\\\\A\"]") && !WebHas(&profiles.items[1], copyName[0], "\"timestamp\":5}"));
+    Check("sync items: the first time, the default profile's value goes across, shorter as it is",
+          FileHas(configs[1], "\"ccdScheduledTasksEnabled\":true") && FileHas(configs[0], "\"ccdScheduledTasksEnabled\":true"));
+    Check("sync items: permissions chosen, the trusted folders went across", FileHas(configs[1], "\"localAgentModeTrustedFolders\":[\"C:\\\\Trusted\"]"));
+    Check("sync items: the language went across, as plain text and in config.json",
+          WebHas(&profiles.items[1], L"spa:locale", "zh-CN") && FileHas(apps[1], "\"locale\":\"zh-CN\"") &&
+          FileHas(apps[1], "\"windowControlsZoomFactor\":1.25") && FileHas(apps[1], "\"lastKnownAccountUuid\":\"items-b\""));
+    Check("sync items: the default model, not chosen, stays", WebHas(&profiles.items[1], L"default-model", "claude-sonnet-5-5") &&
+          WebHas(&profiles.items[0], L"default-model", "claude-opus-5-5"));
+    Check("sync items: Chromium's zoom under the profile's own key, its spelling languages",
+          FileHas(chromium[1], "\"222\":{\"claude.ai\":0.75}") && !FileHas(chromium[1], "\"111\"") &&
+          FileHas(chromium[1], "\"dictionaries\":[\"en-US\",\"fr\"]"));
+    StringCchPrintfA(part, sizeof part, "\"%s\":{\"root\":\"s0\"}", id0);
+    Check("sync items: a session's pane goes to the profile without it", WebHas(&profiles.items[1], L"epitaxy.sidePaneStore.v1", part));
+    StringCchPrintfA(part, sizeof part, "\"%s\":{\"root\":\"s1\"}", id1);
+    Check("sync items: ...both ways, each session's own", WebHas(&profiles.items[0], L"epitaxy.sidePaneStore.v1", part) &&
+          WebHas(&profiles.items[1], L"epitaxy.sidePaneStore.v1", part));
+    StringCchPrintfA(part, sizeof part, "\"currentSessionId\":\"%s\"", id1);
+    Check("sync items: a session no profile lists, and what is not synced, stay where they are",
+          !WebHas(&profiles.items[1], L"epitaxy.sidePaneStore.v1", "ffffffff") && WebHas(&profiles.items[0], L"epitaxy.sidePaneStore.v1", "ffffffff") &&
+          WebHas(&profiles.items[1], L"epitaxy.sidePaneStore.v1", part) && WebHas(&profiles.items[1], L"epitaxy.sidePaneStore.v1", "\"tileLayout\":{\"root\":\"a\"}"));
+    Check("sync items: a session's cost, a value of its own", WebHas(&profiles.items[1], L"epitaxy-session-result:local_cdcdcdcd-0000-4000-8000-000000000001", "\"costUSD\":1.5"));
+
+    sizes[0] = SizeOf(logs[0]);
+    sizes[1] = SizeOf(logs[1]);
+    ZeroMemory(&report, sizeof report);
+    Check("sync items: kept again, nothing is written", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
+          SizeOf(logs[0]) == sizes[0] && SizeOf(logs[1]) == sizes[1]);
+
+    /* Two sessions' panes changed at once, one in each profile: both changes kept. */
+    Sleep(30);
+    pane[2] = id0;
+    ready = SetWebMember(&profiles.items[1], L"epitaxy.sidePaneStore.v1", pane, 3, "{\"root\":\"s0b\"}", backup);
+    pane[2] = id1;
+    ready = ready && SetWebMember(&profiles.items[0], L"epitaxy.sidePaneStore.v1", pane, 3, "{\"root\":\"s1a\"}", backup);
+    ZeroMemory(&report, sizeof report);
+    ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0;
+    for (i = 0; i < 2 && ready; i++) {
+        StringCchPrintfA(part, sizeof part, "\"%s\":{\"root\":\"s0b\"}", id0);
+        ready = WebHas(&profiles.items[i], L"epitaxy.sidePaneStore.v1", part);
+        StringCchPrintfA(part, sizeof part, "\"%s\":{\"root\":\"s1a\"}", id1);
+        ready = ready && WebHas(&profiles.items[i], L"epitaxy.sidePaneStore.v1", part);
+    }
+    Check("sync items: each session's change goes across, though the other profile changed another's", ready);
+
+    /* Sessions not chosen: a new one stays in its profile, and goes once they are again. */
+    profiles.items[0].syncItems = profiles.items[1].syncItems = SYNC_ITEM_SIDEBAR;
+    ready = WriteKeptEntry(entries[0], g_keptIds[2], "Items three", L"C:\\Fixture", AtSecond(4));
+    ZeroMemory(&report, sizeof report);
+    Check("sync items: sessions not chosen stay in their profile",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && !EntryThere(entries[1], g_keptIds[2]) &&
+          EntryThere(entries[1], g_keptIds[0]) && EntryThere(entries[0], g_keptIds[1]));
+    /* The default profile open, a change waiting for it: what it shows of a part synced for the first time still counts. */
+    window = StartFakeClaude(&profiles.items[0]);
+    Sleep(30);
+    ready = window && Save(configs[1], "{\"preferences\":{\"keep\":1,\"ccdScheduledTasksEnabled\":true,"
+                                       "\"epitaxyPrefs\":{\"ccd-sessions-filter\":{\"state\":{\"selectedProjects\":[\"C:\\\\B\"]},\"version\":0}}}}");
+    ZeroMemory(&report, sizeof report);
+    ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && (report.waiting & 0x1);
+    profiles.items[0].syncItems = profiles.items[1].syncItems = 0;
+    ZeroMemory(&report, sizeof report);
+    Check("sync items: chosen again, the new session goes across",
+          ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && EntryThere(entries[1], g_keptIds[2]));
+    Check("sync items: a part synced for the first time takes the waiting default profile's value",
+          WebHas(&profiles.items[1], L"default-model", "claude-opus-5-5") && WebHas(&profiles.items[0], L"default-model", "claude-opus-5-5"));
+    StopFakeClaude(window);
+    Check("sync items: the waiting change is made once it closes", SessionEdit_ApplyPending(NULL, &profiles.items[0]) > 0 &&
+          FileHas(configs[0], "\"selectedProjects\":[\"C:\\\\B\"]") && WebHas(&profiles.items[0], L"default-model", "claude-opus-5-5"));
+    Check("sync items: the default leaves permissions out", (SessionVault_GroupItems(&profiles, 0x3) & SYNC_ITEM_PERMISSIONS) == 0 &&
+          SessionVault_GroupItems(&profiles, 0x3) == SYNC_ITEMS_DEFAULT);
+}
+
 /* Environment variable `name` kept to be put back: `*kept` NULL when it is
  * not set. FALSE when it could not be kept. */
 static BOOL KeepVariable(const WCHAR *name, WCHAR **kept)
@@ -3187,6 +3350,7 @@ int wmain(int argc, WCHAR **argv)
             TestVault(projects);
             TestKeptGroups(projects);
             TestWebLayout();
+            TestSyncItems();
         }
         Check("nothing outside the fixture was given to the Recycle Bin", !g_recycle.escaped);
         StopStartedClaude();

@@ -1295,7 +1295,7 @@ static char *LayoutOf(const SessionSet *set, int m, size_t *length, ULONGLONG *w
 /* The parts of a layout (SessionSync_LayoutPart) are each made the same on
  * their own: a running Claude rewrites its settings all the time, and a part
  * it rewrote changes none of the others. */
-#define LAYOUT_PARTS_MAX 64
+#define LAYOUT_PARTS_MAX 96
 
 /* Part `part` of `layout`: its hash, 0 when it has none; where its value is. */
 static ULONGLONG PartOf(const char *layout, size_t length, const char *part, const char **value, size_t *valueLength)
@@ -1330,15 +1330,167 @@ static char *WithPart(char *json, size_t *used, const char *key, const char *raw
     return out;
 }
 
+/* The keys of the objects of a part by session, each once. */
+typedef struct KeySet {
+    char  **keys;
+    size_t *lengths;
+    int     count, capacity;
+} KeySet;
+
+static BOOL AddKey(void *context, const char *key, size_t keyLength, const char *value, size_t valueLength)
+{
+    KeySet *set = (KeySet *)context;
+    int i;
+    (void)value;
+    (void)valueLength;
+    for (i = 0; i < set->count; i++)
+        if (set->lengths[i] == keyLength && memcmp(set->keys[i], key, keyLength) == 0) return TRUE;
+    if (set->count == set->capacity) {
+        int capacity = set->capacity ? set->capacity * 2 : 64;
+        char **keys = (char **)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)capacity * sizeof *keys);
+        size_t *lengths = (size_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)capacity * sizeof *lengths);
+        if (!keys || !lengths) {
+            Free(keys);
+            Free(lengths);
+            return FALSE;
+        }
+        if (set->count) {
+            memcpy(keys, set->keys, (size_t)set->count * sizeof *keys);
+            memcpy(lengths, set->lengths, (size_t)set->count * sizeof *lengths);
+        }
+        Free(set->keys);
+        Free(set->lengths);
+        set->keys = keys;
+        set->lengths = lengths;
+        set->capacity = capacity;
+    }
+    if ((set->keys[set->count] = CopyOf(key, keyLength)) == NULL) return FALSE;
+    set->lengths[set->count++] = keyLength;
+    return TRUE;
+}
+
+/* Member `key` of the object `object`: its hash, 0 when it has none. */
+static ULONGLONG MemberHash(const char *object, size_t length, const char *key, const char **value, size_t *valueLength)
+{
+    ULONGLONG hash;
+    if (!object || !Core_JsonMember(object, length, key, value, valueLength)) return 0;
+    hash = Core_HashBytes(CORE_HASH_START, *value, *valueLength);
+    return hash ? hash : 1;
+}
+
+/* Part `part` of the members' layouts made the same session by session: each
+ * session's member the latest changed since the base, as a part is (the
+ * first time, the preferred member's, else the fullest); one no member has
+ * any more is gone. A heap block (an object), NULL without memory or when no
+ * member has the part. */
+static char *MergeByKey(const char *part, char *const *contents, const size_t *lengths, const ULONGLONG *written, const Member *members,
+                        const BOOL *waits, int preferred, int n, const char *baseContent, size_t baseLength, size_t *outLength)
+{
+    const char *objects[MAX_PROFILES], *baseObject = NULL, *value;
+    size_t objectLengths[MAX_PROFILES], baseObjectLength = 0, valueLength, used = 2;
+    MirrorSide sides[MAX_PROFILES], baseSide;
+    KeySet keys;
+    char *merged, *next, *name;
+    int m, k, any = 0;
+    ZeroMemory(&keys, sizeof keys);
+    *outLength = 0;
+    for (m = 0; m < n; m++) {
+        objects[m] = NULL;
+        objectLengths[m] = 0;
+        if (!contents[m] || !Core_JsonMember(contents[m], lengths[m], part, &objects[m], &objectLengths[m])) continue;
+        any++;
+        if (!Core_JsonEachMember(objects[m], objectLengths[m], AddKey, &keys)) objects[m] = NULL;
+    }
+    if (baseContent && Core_JsonMember(baseContent, baseLength, part, &baseObject, &baseObjectLength) &&
+        !Core_JsonEachMember(baseObject, baseObjectLength, AddKey, &keys))
+        baseObject = NULL;
+    if (!any || (merged = CopyOf("{}", 2)) == NULL) {
+        for (k = 0; k < keys.count; k++) Free(keys.keys[k]);
+        Free(keys.keys);
+        Free(keys.lengths);
+        return NULL;
+    }
+    for (k = 0; k < keys.count && merged; k++) {
+        ULONGLONG baseHash = MemberHash(baseObject, baseObjectLength, keys.keys[k], &value, &valueLength);
+        const char *chosen = NULL;
+        size_t chosenLength = 0, longest = 0;
+        int winner = -1, listed = 0;
+        for (m = 0; m < n; m++) {
+            ZeroMemory(&sides[m], sizeof sides[m]);
+            sides[m].state = MIRROR_MISSING;
+            if ((sides[m].hash = MemberHash(objects[m], objectLengths[m], keys.keys[k], &value, &valueLength)) == 0) continue;
+            if (baseContent && members[m].state != MEMBER_KEPT) continue;
+            if (waits[m] && baseHash) continue;
+            sides[m].state = MIRROR_LISTED;
+            sides[m].time = written[m];
+            listed++;
+            if (!baseHash && (winner < 0 || (winner != preferred && (m == preferred || valueLength > longest)))) {
+                winner = m;
+                longest = valueLength;
+            }
+        }
+        if (!listed) continue;   /* gone from every member that has a say */
+        if (baseHash) {
+            ZeroMemory(&baseSide, sizeof baseSide);
+            baseSide.state = MIRROR_LISTED;
+            baseSide.hash = baseHash;
+            winner = Core_MirrorResolve(sides, n, &baseSide);
+        }
+        if (winner >= 0 && winner < n) {
+            MemberHash(objects[winner], objectLengths[winner], keys.keys[k], &chosen, &chosenLength);
+        } else if (winner == n && baseHash) {
+            MemberHash(baseObject, baseObjectLength, keys.keys[k], &chosen, &chosenLength);
+        }
+        if (!chosen || (name = CopyOf(keys.keys[k], keys.lengths[k])) == NULL) continue;
+        merged = WithPart(merged, &used, name, chosen, chosenLength);
+        Free(name);
+    }
+    for (k = 0; k < keys.count; k++) Free(keys.keys[k]);
+    Free(keys.keys);
+    Free(keys.lengths);
+    next = merged;
+    if (next) *outLength = used;
+    return next;
+}
+
+static BOOL AddMemberHash(void *context, const char *key, size_t keyLength, const char *value, size_t valueLength)
+{
+    ULONGLONG *sum = (ULONGLONG *)context;
+    *sum += Core_HashBytes(Core_HashBytes(CORE_HASH_START, key, keyLength), value, valueLength);
+    return TRUE;
+}
+
+/* The hash of a part by session, whatever the order of its members: each
+ * profile lists its sessions in an order of its own. 0 for none. */
+static ULONGLONG KeyedHash(const char *object, size_t length)
+{
+    ULONGLONG sum = 0;
+    if (!Core_JsonEachMember(object, length, AddMemberHash, &sum)) return Core_HashBytes(CORE_HASH_START, object, length) | 1;
+    return sum ? sum : 1;
+}
+
+/* What `members` keep the same: what each of them does. */
+DWORD SessionVault_GroupItems(const ProfileList *list, DWORD members)
+{
+    DWORD items = SYNC_ITEMS_ALL;
+    int i;
+    for (i = 0; i < list->count; i++)
+        if (members & (1u << i)) items &= Profiles_SyncItems(&list->items[i]);
+    return items;
+}
+
 /* The pins and groups of the sidebar, the same in every member: each part
- * the latest changed since the base, as the archived sessions are. */
-static BOOL ResolveLayout(const SessionSet *set, const Member *members, const VaultList *base, BOOL same, Changes *changes, VaultList *next)
+ * the latest changed since the base, as the archived sessions are. Only the
+ * parts of `items`. A part kept for the first time takes the value of the
+ * `preferred` member (the default profile, -1 for none) where it has one. */
+static BOOL ResolveLayout(const SessionSet *set, const Member *members, const VaultList *base, BOOL same, DWORD items, int preferred,
+                          Changes *changes, VaultList *next)
 {
     MirrorSide sides[MAX_PROFILES], baseSide;
     char *contents[MAX_PROFILES], *baseContent = NULL, *content, *layout;
     size_t lengths[MAX_PROFILES], used = 2;
     ULONGLONG written[MAX_PROFILES], hashes[LAYOUT_PARTS_MAX], hash;
-    const char *part;
+    LayoutPart part;
     DWORD baseLength = 0;
     BOOL waits[MAX_PROFILES], ok = TRUE;
     int n = set->profiles.count, m, p;
@@ -1347,35 +1499,47 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
     ZeroMemory(written, sizeof written);
     ZeroMemory(hashes, sizeof hashes);
     for (m = 0; m < n; m++) {
-        /* Sent to it while it was open: what it shows is no change, it gets
-         * the base's once it closes. */
+        /* Sent to it while it was open: what it shows of the parts sent is
+         * no change, it gets the base's once it closes. */
         waits[m] = members[m].taker && Queued(&members[m], SYNC_LAYOUT, LAYOUT_KEY) != NULL;
-        if (members[m].taker && !waits[m]) contents[m] = LayoutOf(set, m, &lengths[m], &written[m]);
+        if (members[m].taker) contents[m] = LayoutOf(set, m, &lengths[m], &written[m]);
     }
     if (base->layout) baseContent = LoadObject(base->layout, &baseLength);
     if ((content = CopyOf("{}", 2)) == NULL) {
         ok = FALSE;
         goto done;
     }
-    for (p = 0; p < LAYOUT_PARTS_MAX && (part = SessionSync_LayoutPart(p)) != NULL && content; p++) {
+    for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part) && content; p++) {
         const char *value = NULL, *baseValue = NULL;
         size_t valueLength = 0, baseValueLength = 0, longest = 0;
-        ULONGLONG baseHash = PartOf(baseContent, baseLength, part, &baseValue, &baseValueLength);
+        ULONGLONG baseHash;
         int winner = -1;
+        if (!(part.item & items)) continue;
+        if (part.byKey) {
+            char *merged = MergeByKey(part.name, contents, lengths, written, members, waits, preferred, n, baseContent, baseLength, &valueLength);
+            if (merged) {
+                hashes[p] = KeyedHash(merged, valueLength);
+                content = WithPart(content, &used, part.name, merged, valueLength);
+                Free(merged);
+            }
+            continue;
+        }
+        baseHash = PartOf(baseContent, baseLength, part.name, &baseValue, &baseValueLength);
         for (m = 0; m < n; m++) {
             ZeroMemory(&sides[m], sizeof sides[m]);
             sides[m].state = MIRROR_MISSING;
-            if ((sides[m].hash = PartOf(contents[m], lengths[m], part, &value, &valueLength)) == 0) continue;
+            if ((sides[m].hash = PartOf(contents[m], lengths[m], part.name, &value, &valueLength)) == 0) continue;
             /* New to the group's list, or with a list of its own it lost: it
              * takes the group's layout, and what it showed changes none. */
             if (baseContent && members[m].state != MEMBER_KEPT) continue;
+            if (waits[m] && baseHash) continue;
             sides[m].state = MIRROR_LISTED;
             sides[m].time = written[m];
             /* Kept for the first time (the list, or this part of it): no
              * change to go by, and a running Claude writes its settings all
-             * the time. The fullest part is the one the user built: it goes
-             * to the others. */
-            if (!baseHash && (winner < 0 || valueLength > longest)) {
+             * the time. The default profile's goes to the others; without
+             * it, the fullest, the one the user built. */
+            if (!baseHash && (winner < 0 || (winner != preferred && (m == preferred || valueLength > longest)))) {
                 winner = m;
                 longest = valueLength;
             }
@@ -1388,13 +1552,13 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
         }
         value = NULL;
         if (winner >= 0 && winner < n) {
-            hashes[p] = PartOf(contents[winner], lengths[winner], part, &value, &valueLength);
+            hashes[p] = PartOf(contents[winner], lengths[winner], part.name, &value, &valueLength);
         } else if (winner == n && baseHash) {
             hashes[p] = baseHash;
             value = baseValue;
             valueLength = baseValueLength;
         }
-        if (value) content = WithPart(content, &used, part, value, valueLength);
+        if (value) content = WithPart(content, &used, part.name, value, valueLength);
     }
     if (!content) {
         ok = FALSE;
@@ -1413,9 +1577,18 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
         char *mapped;
         BOOL holds = TRUE;
         if (!members[m].taker) continue;
-        for (p = 0; p < LAYOUT_PARTS_MAX && (part = SessionSync_LayoutPart(p)) != NULL; p++)
-            if (hashes[p] && PartOf(waits[m] ? baseContent : contents[m], waits[m] ? baseLength : lengths[m], part, NULL, NULL) != hashes[p])
-                holds = FALSE;
+        for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++) {
+            const char *shown;
+            size_t shownLength;
+            ULONGLONG has;
+            if (!hashes[p]) continue;
+            if (waits[m] && PartOf(baseContent, baseLength, part.name, NULL, NULL))
+                has = PartOf(baseContent, baseLength, part.name, &shown, &shownLength);
+            else
+                has = PartOf(contents[m], lengths[m], part.name, &shown, &shownLength);
+            if (has && part.byKey) has = KeyedHash(shown, shownLength);
+            if (has != hashes[p]) holds = FALSE;
+        }
         if (holds) continue;
         ids.set = set;
         ids.profile = m;
@@ -1441,9 +1614,11 @@ static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName,
     Changes changes;
     WCHAR latest[MAX_PATH];
     int n, m, r, i, baseOnly = 0;
-    BOOL ok = TRUE;
+    BOOL ok = TRUE, sessions;
+    DWORD items = same ? SessionVault_GroupItems(list, profiles) : SYNC_ITEMS_ALL;
 
     if ((n = Subset(list, profiles, &members)) == 0) return TRUE;
+    sessions = (items & SYNC_ITEM_SESSIONS) != 0;
     /* What waits for a closed member first: the sync reads what it will hold. */
     for (m = 0; m < n; m++)
         if (!Claude_IsRunning(&members.items[m])) SessionEdit_ApplyPending(NULL, &members.items[m]);
@@ -1456,21 +1631,28 @@ static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName,
     for (i = 0; i < base.count; i++)
         if (SessionStore_FindRow(&set, base.items[i].key) < 0) baseOnly++;
     if (progress) {
-        progress->total += set.rowCount + baseOnly + 1;
+        progress->total += (sessions ? set.rowCount + baseOnly : 0) + 1;
         Step(progress, 0);
     }
 
-    for (r = 0; r < set.rowCount && ok; r++) {
-        ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, &changes, &next);
-        Step(progress, 1);
-    }
-    for (i = 0; i < base.count && ok; i++)
-        if (SessionStore_FindRow(&set, base.items[i].key) < 0) {
-            ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, &changes, &next);
+    if (sessions) {
+        for (r = 0; r < set.rowCount && ok; r++) {
+            ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, &changes, &next);
             Step(progress, 1);
         }
-    if (ok) ok = ResolveIndex(&set, member, &base, same, &changes, &next);
-    if (ok) ok = ResolveLayout(&set, member, &base, same, &changes, &next);
+        for (i = 0; i < base.count && ok; i++)
+            if (SessionStore_FindRow(&set, base.items[i].key) < 0) {
+                ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, &changes, &next);
+                Step(progress, 1);
+            }
+        if (ok) ok = ResolveIndex(&set, member, &base, same, &changes, &next);
+    } else {
+        /* Sessions not kept the same: the list stays as it was, to go on
+         * from once they are again (a session gone since is gone then). */
+        for (i = 0; i < base.count && ok; i++) ok = AddItem(&next, base.items[i].key, base.items[i].hash, base.items[i].activity);
+        next.index = base.index;
+    }
+    if (ok) ok = ResolveLayout(&set, member, &base, same, items, Profiles_Find(&members, members.defaultFolder), &changes, &next);
     Step(progress, 1);
     /* Sessions Claude marked deleted that no list names: deleted before the vault knew them. */
     for (m = 0; m < n && ok; m++)

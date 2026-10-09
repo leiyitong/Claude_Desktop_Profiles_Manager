@@ -82,8 +82,9 @@ BEGIN
     EDITTEXT        IDC_P_BADGE, 52, 52, 30, 14, ES_AUTOHSCROLL
     PUSHBUTTON      L"Choose &picture\x2026", IDC_P_PICTURE, 88, 52, 80, 14
     PUSHBUTTON      "Re&move picture", IDC_P_NO_PICTURE, 172, 52, 72, 14
-    LTEXT           "Sess&ions:", IDC_P_SYNC_LABEL, 10, 76, 40, 10
-    COMBOBOX        IDC_P_SYNC, 52, 73, 206, 200, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "S&ync:", IDC_P_SYNC_LABEL, 10, 76, 40, 10
+    COMBOBOX        IDC_P_SYNC, 52, 73, 132, 200, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      L"Wha&t to sync\x2026", IDC_P_SYNC_ITEMS, 188, 72, 70, 14
     LTEXT           "", IDC_P_FOLDER, 10, 92, 248, 18, SS_NOPREFIX
     LTEXT           "", IDC_P_ERROR, 10, 92, 248, 18, SS_NOPREFIX | NOT WS_VISIBLE
     AUTOCHECKBOX    "Open at &Windows sign-in", IDC_P_STARTUP, 10, 114, 200, 10
@@ -178,6 +179,18 @@ BEGIN
     LTEXT           "They go to the Recycle Bin. A conversation in use, or new and in no list, is not shown.", IDC_C_NOTE, 10, 184, 280, 18
     DEFPUSHBUTTON   "Delete", IDOK, 186, 214, 50, 15
     PUSHBUTTON      "Cancel", IDCANCEL, 240, 214, 50, 15
+END
+
+IDD_SYNC_ITEMS DIALOGEX 0, 0, 268, 214
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "What to sync"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_I_TEXT, 10, 10, 248, 20, SS_NOPREFIX
+    CONTROL         "", IDC_I_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, 10, 34, 248, 112
+    LTEXT           "Synced, a folder's permission mode lets Claude act without asking there in every profile. Each sync takes what changed last.", IDC_I_NOTE, 10, 152, 248, 30
+    DEFPUSHBUTTON   "OK", IDOK, 154, 192, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 208, 192, 50, 15
 END
 
 IDD_UNINSTALL DIALOGEX 0, 0, 292, 206

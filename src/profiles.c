@@ -16,6 +16,7 @@
 #define VALUE_BADGE           L"Badge"            /* the badge's own text, absent for the initial */
 #define VALUE_PICTURE         L"Picture"          /* the stamp of its own picture (icons.c), absent for none */
 #define VALUE_SYNC_SESSIONS   L"SyncSessions"     /* the group whose sessions it keeps the same (1 to MAX_PROFILES), absent for none */
+#define VALUE_SYNC_ITEMS      L"SyncItems"        /* what that keeps the same (SYNC_ITEM_*), absent for the default */
 #define VALUE_DEFAULT_PROFILE L"DefaultProfile"   /* under REG_ROOT */
 
 static void ProfileKey(const WCHAR *folder, WCHAR *out, size_t cch)
@@ -61,7 +62,7 @@ BOOL Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, const WCHAR 
 static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isStock, const ClaudePackage *pkg)
 {
     WCHAR key[MAX_PATH], localAppData[MAX_PATH], badge[BADGE_CCH];
-    DWORD color, picture, sync;
+    DWORD color, picture, sync, items;
     ZeroMemory(p, sizeof *p);
     StringCchCopyW(p->folder, ARRAYSIZE(p->folder), folder);
     if (FAILED(StringCchPrintfW(p->dataDir, ARRAYSIZE(p->dataDir), L"%s\\%s", appData, folder))) p->dataDir[0] = 0;
@@ -77,6 +78,22 @@ static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isS
     if (Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_BADGE, badge, ARRAYSIZE(badge))) Core_CleanBadge(badge, p->badge, ARRAYSIZE(p->badge));
     if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_PICTURE, &picture)) p->picture = picture;
     p->syncGroup = Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, &sync) && sync >= 1 && sync <= MAX_PROFILES ? (int)sync : 0;
+    if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_ITEMS, &items)) p->syncItems = items & SYNC_ITEMS_ALL;
+}
+
+DWORD Profiles_SyncItems(const Profile *p)
+{
+    return p->syncItems ? p->syncItems : SYNC_ITEMS_DEFAULT;
+}
+
+BOOL Profiles_SetSyncItems(const WCHAR *folder, DWORD items)
+{
+    WCHAR key[MAX_PATH];
+    LSTATUS status;
+    ProfileKey(folder, key, ARRAYSIZE(key));
+    if (items & SYNC_ITEMS_ALL) return Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_ITEMS, items & SYNC_ITEMS_ALL);
+    status = Util_RegDeleteValue(HKEY_CURRENT_USER, key, VALUE_SYNC_ITEMS);
+    return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
 }
 
 BOOL Profiles_SetSyncGroup(const WCHAR *folder, int group)
@@ -85,6 +102,7 @@ BOOL Profiles_SetSyncGroup(const WCHAR *folder, int group)
     LSTATUS status;
     ProfileKey(folder, key, ARRAYSIZE(key));
     if (group >= 1 && group <= MAX_PROFILES) return Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, (DWORD)group);
+    Util_RegDeleteValue(HKEY_CURRENT_USER, key, VALUE_SYNC_ITEMS);   /* syncing with none, it syncs nothing */
     status = Util_RegDeleteValue(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS);
     return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
 }

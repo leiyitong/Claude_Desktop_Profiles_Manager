@@ -99,6 +99,19 @@ C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
 #define SESSION_TITLE_CCH  256
 #define SESSION_ID_CCH     64
 
+/* What a profile keeps the same as the others it syncs with (Profile.syncItems). */
+#define SYNC_ITEM_SESSIONS     0x01u   /* its sessions: new ones, titles, archived and deleted ones */
+#define SYNC_ITEM_SIDEBAR      0x02u   /* the sidebar: pins, groups, project order, filters, folded groups */
+#define SYNC_ITEM_DETAILS      0x04u   /* each session's model and effort, side pane, unread mark and cost */
+#define SYNC_ITEM_APPEARANCE   0x08u   /* fonts, the editor's settings, zoom, spelling */
+#define SYNC_ITEM_LANGUAGE     0x10u
+#define SYNC_ITEM_MODEL        0x20u   /* the default model */
+#define SYNC_ITEM_SETTINGS     0x40u   /* Claude's switches (auto-archive, Cowork, Remote Control) and Cowork's recent folders */
+#define SYNC_ITEM_PERMISSIONS  0x80u   /* folders' permission modes and their confirmations, Cowork's trusted folders */
+#define SYNC_ITEMS_ALL         0xFFu
+#define SYNC_ITEMS_DEFAULT     (SYNC_ITEMS_ALL & ~SYNC_ITEM_PERMISSIONS)
+#define SYNC_ITEM_COUNT        8
+
 /* ------------------------------------------------------------------ types */
 
 typedef struct Profile {
@@ -111,6 +124,7 @@ typedef struct Profile {
     DWORD picture;             /* the stamp of its own picture, which replaces the Claude icon; 0: none */
     BOOL  isStock;             /* the folder the regular Claude icon opens */
     int   syncGroup;           /* its sessions are kept the same as those of the profiles of this group (sessionvault.c); 0: none */
+    DWORD syncItems;           /* what that keeps the same (SYNC_ITEM_*); 0: SYNC_ITEMS_DEFAULT */
     BOOL  running;
     DWORD pid;                 /* main process when running */
 } Profile;
@@ -258,6 +272,12 @@ BOOL         Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *famil
                                    WCHAR *out, size_t cch);
 BOOL         Core_SameFatTime(const FILETIME *a, const FILETIME *b);
 BOOL         Core_JsonMember(const char *json, size_t len, const char *key, const char **value, size_t *valueLen);
+/* Each member of the JSON object `json`, in order: its key's raw text (between
+ * its quotes, escapes as written) and its value's. FALSE when `json` is no
+ * object, or `each` returns FALSE. */
+typedef BOOL (*CoreJsonMember)(void *context, const char *key, size_t keyLen, const char *value, size_t valueLen);
+BOOL         Core_JsonEachMember(const char *json, size_t len, CoreJsonMember each, void *context);
+BOOL         Core_JsonIsValue(const char *text, size_t len);   /* one JSON value, whole (spaces around it aside) */
 BOOL         Core_JsonString(const char *raw, size_t len, WCHAR *out, size_t cch);
 BOOL         Core_JsonNumber(const char *raw, size_t len, ULONGLONG *value);
 BOOL         Core_JsonTrue(const char *raw, size_t len);
@@ -416,6 +436,8 @@ BOOL         Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t
 BOOL         Profiles_Update(const WCHAR *folder, const WCHAR *label, int color, const WCHAR *badge, DWORD picture);
 BOOL         Profiles_SetDefault(const WCHAR *folder);
 BOOL         Profiles_SetSyncGroup(const WCHAR *folder, int group);   /* 0: its sessions kept apart */
+BOOL         Profiles_SetSyncItems(const WCHAR *folder, DWORD items);  /* SYNC_ITEM_*; 0: the default */
+DWORD        Profiles_SyncItems(const Profile *p);                    /* what it keeps the same, the default for none chosen */
 void         Profiles_CopySettings(const Profile *from, const Profile *to);
 RemoveResult Profiles_Delete(HWND owner, const Profile *profile);
 RemoveResult Profiles_RecycleData(HWND owner, const Profile *profile);
@@ -750,6 +772,8 @@ BOOL      WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, siz
 BOOL      WebStore_Commit(WebStore *store, const WCHAR *backup);
 ULONGLONG WebStore_Written(const WebStore *store);   /* when its newest file was written, ms since 1970 */
 void      WebStore_Free(WebStore *store);
+/* Each value whose name starts with `prefix` (Latin-1 names only), in no order. */
+void      WebStore_EachName(const WebStore *store, const WCHAR *prefix, void (*each)(void *context, const WCHAR *name), void *context);
 
 /* ---------------------------------------------------------- sessionsync.c */
 
@@ -768,7 +792,15 @@ DWORD        SessionSync_Takers(const SessionSet *set);   /* the profiles whose 
  * it), NULL when it has none. `written`: when they were last written, in ms
  * since 1970. */
 char        *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *length, ULONGLONG *written);
-const char  *SessionSync_LayoutPart(int index);   /* the name of a layout's part `index`; NULL past the last */
+/* Part `index` of a layout: its name, what it belongs to (SYNC_ITEM_*), and
+ * whether it is made the same member by member (each session's own); FALSE
+ * past the last. */
+typedef struct LayoutPart {
+    const char *name;
+    DWORD       item;
+    BOOL        byKey;
+} LayoutPart;
+BOOL         SessionSync_LayoutPart(int index, LayoutPart *part);
 /* From now on, each change this thread makes in a profile calls `step` (a
  * progress bar's); NULL for none. */
 void         SessionSync_OnEachChange(void (*step)(void *context), void *context);
@@ -816,6 +848,7 @@ typedef void (*SyncProgress)(void *context, int done, int total);
 
 DWORD SessionVault_Group(const ProfileList *list, int group);   /* its profiles, one bit each; none for group 0 */
 int   SessionVault_NewGroup(const ProfileList *list);           /* the lowest group no profile is in; 0 when there is none */
+DWORD SessionVault_GroupItems(const ProfileList *list, DWORD members);   /* what all of `members` keep the same (SYNC_ITEM_*) */
 BOOL  SessionVault_GroupListName(int group, WCHAR *out, size_t cch);
 BOOL  SessionVault_ListName(const ProfileList *list, int index, WCHAR *out, size_t cch);
 /* `profiles`' list kept as `listName`; with `same`, each of them made to list
@@ -882,6 +915,8 @@ BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen
 BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen);
 BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *selected);
 BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
+/* What `members` keep the same, chosen in a dialog (IDD_SYNC_ITEMS) from `*items`: FALSE when cancelled. */
+BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items);
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles);
 BOOL SyncUi_BackUpCode(HWND owner);
 /* A change to data, said before it is made and asked: `question`, the

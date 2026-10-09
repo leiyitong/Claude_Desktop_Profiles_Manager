@@ -17,6 +17,7 @@
 #define IDD_BACKUP        107
 #define IDD_RESTORE       108
 #define IDD_PURGE         109
+#define IDD_SYNC_ITEMS    110
 
 /* main window; the ids of the commands its menus give are the buttons' they stand for */
 #define IDC_STATUS         1000
@@ -51,6 +52,7 @@
 #define IDC_COPY_ALL       1033   /* the sessions menu */
 #define IDC_MOVE_ALL       1034
 #define IDC_SAME_STOP      1036   /* the sessions menu */
+#define IDC_SYNC_ITEMS     1037
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -81,6 +83,7 @@
 #define IDC_P_NAME_LABEL  1113
 #define IDC_P_COLOR_LABEL 1114
 #define IDC_P_BADGE_LABEL 1115
+#define IDC_P_SYNC_ITEMS  1116
 
 /* uninstall dialog */
 #define IDC_U_KEEP        1200
@@ -117,6 +120,11 @@
 #define IDC_C_LIST        2001
 #define IDC_C_BACKUP      2002
 #define IDC_C_NOTE        2003
+
+/* what profiles keep the same */
+#define IDC_I_TEXT        2100
+#define IDC_I_LIST        2101
+#define IDC_I_NOTE        2102
 
 /* message box */
 #define IDC_M_ICON        1300

@@ -609,6 +609,23 @@ static BOOL MemberIs(const char *json, const char *key, const char *expect)
     return expect && n == strlen(expect) && memcmp(v, expect, n) == 0;
 }
 
+typedef struct Members {
+    char key[4][32], value[4][64];
+    int  count, stopAt;
+} Members;
+
+static BOOL SeeMember(void *context, const char *key, size_t keyLen, const char *value, size_t valueLen)
+{
+    Members *seen = (Members *)context;
+    if (seen->stopAt && seen->count == seen->stopAt) return FALSE;
+    if (seen->count < 4) {
+        StringCchCopyNA(seen->key[seen->count], sizeof seen->key[0], key, keyLen);
+        StringCchCopyNA(seen->value[seen->count], sizeof seen->value[0], value, valueLen);
+    }
+    seen->count++;
+    return TRUE;
+}
+
 static void TestJsonAndVersions(void)
 {
     const char *cfg = "\xEF\xBB\xBF{ \"preferences\": {\"menuBarEnabled\": true, \"x\": [1, \"]\"]},\n"
@@ -671,6 +688,29 @@ static void TestJsonAndVersions(void)
         Check("json number: unsigned overflow refused", !Core_JsonNumber("18446744073709551616", 20, &t));
         Check("json true", Core_JsonMember(rec, strlen(rec), "isStarred", &v, &n) && Core_JsonTrue(v, n));
         Check("json false", Core_JsonMember(rec, strlen(rec), "isArchived", &v, &n) && !Core_JsonTrue(v, n));
+    }
+
+    {
+        static const char obj[] = " { \"a\\\"b\" : [1, {\"x\":\"}\"}] , \"local_1\":{\"k\":2},\"n\":null } ";
+        Members seen;
+        ZeroMemory(&seen, sizeof seen);
+        Check("json members: each, in order, keys and values as written",
+              Core_JsonEachMember(obj, strlen(obj), SeeMember, &seen) && seen.count == 3 &&
+              strcmp(seen.key[0], "a\\\"b") == 0 && strcmp(seen.value[0], "[1, {\"x\":\"}\"}]") == 0 &&
+              strcmp(seen.key[1], "local_1") == 0 && strcmp(seen.value[1], "{\"k\":2}") == 0 &&
+              strcmp(seen.key[2], "n") == 0 && strcmp(seen.value[2], "null") == 0);
+        ZeroMemory(&seen, sizeof seen);
+        Check("json members: an empty object has none", Core_JsonEachMember("{ }", 3, SeeMember, &seen) && seen.count == 0);
+        Check("json members: not an object, or cut short, refused",
+              !Core_JsonEachMember("[1]", 3, SeeMember, &seen) && !Core_JsonEachMember("{\"a\":1", 6, SeeMember, &seen) &&
+              !Core_JsonEachMember("{\"a\":1 \"b\":2}", 13, SeeMember, &seen));
+        seen.stopAt = 1;
+        seen.count = 0;
+        Check("json members: stopped when told", !Core_JsonEachMember(obj, strlen(obj), SeeMember, &seen) && seen.count == 1);
+        Check("json value: one whole value", Core_JsonIsValue(" [1,{\"a\":\"]\"}] ", 15) && Core_JsonIsValue("1.0954", 6) &&
+              Core_JsonIsValue("\"en-US\"", 7) && Core_JsonIsValue("null", 4));
+        Check("json value: plain text, two values or a cut one refused",
+              !Core_JsonIsValue("en-US x", 7) && !Core_JsonIsValue("{\"a\":1} 2", 9) && !Core_JsonIsValue("{\"a\":1", 6) && !Core_JsonIsValue("  ", 2));
     }
 
     Check("version: v1.2.3", Core_ParseVersion(L"v1.2.3", a) && a[0] == 1 && a[1] == 2 && a[2] == 3 && a[3] == 0);
