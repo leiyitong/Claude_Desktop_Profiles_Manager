@@ -142,8 +142,10 @@ void Tray_Apply(const ClaudePackage *pkg, const Profile *profile)
         WaitForClaude(host);
         id = FindClaudeIconId(host);
     }
+    /* No window for it yet: Claude has not made its icon, and the window's
+     * creation paints it again (taskbar.c). */
     if (!id) {
-        Util_Log(L"%s shows no notification-area icon to color", profile->folder);
+        if (host) Util_Log(L"%s shows no notification-area icon to color", profile->folder);
         return;
     }
     image = Icons_CreateTray(pkg, profile, NotificationIconSize(), !UsesLightTheme(L"SystemUsesLightTheme", FALSE));

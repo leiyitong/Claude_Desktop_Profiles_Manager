@@ -4712,45 +4712,52 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
 #define VERSION_SAMPLE                L"2026.12.31 23:59"   /* the longest version the label shows */
 #define CLAUDE_VERSION_SAMPLE         L"2.99999.99"         /* the longest Claude Desktop version the status shows */
 
-/* A button, with every caption it shows (catalog keys) and its icon (a
- * character of Windows' icon font, 0 for none) in its tint. */
+/* A button, with every caption it shows (catalog keys) and the icon that
+ * goes with each (a character of Windows' icon font, 0 for none) in its
+ * tint. */
 typedef struct MainButton {
     int id;
     const WCHAR *captions[2];
-    WCHAR glyph;
-    ThemeTint tint;
+    WCHAR glyphs[2];
+    ThemeTint tints[2];
 } MainButton;
 
 /* The toolbar, left to right, in groups: the profiles' Claude, the profiles,
  * the default one. Each icon in the color of what it does: green starts,
  * red stops or deletes, a gold star for the default. */
 static const MainButton kMainToolbar[] = {
-    { IDC_OPEN, { L"&Open", NULL }, 0xE768, THEME_TINT_GREEN }, { IDC_STOP, { L"&Quit", NULL }, 0xE71A, THEME_TINT_RED },
-    { IDC_RESTART, { L"&Restart", NULL }, 0xE72C, THEME_TINT_BLUE },
-    { IDC_NEW, { L"&New\x2026", NULL }, 0xE710, THEME_TINT_TEAL }, { IDC_EDIT, { L"&Edit\x2026", NULL }, 0xE70F, THEME_TINT_PURPLE },
-    { IDC_DELETE, { L"&Delete\x2026", NULL }, 0xE74D, THEME_TINT_RED },
-    { IDC_DEFAULT, { L"Set as de&fault", NULL }, 0xE735, THEME_TINT_GOLD }
+    { IDC_OPEN, { L"&Open", NULL }, { 0xE768, 0 }, { THEME_TINT_GREEN, THEME_TINT_NONE } },
+    { IDC_STOP, { L"&Quit", NULL }, { 0xE71A, 0 }, { THEME_TINT_RED, THEME_TINT_NONE } },
+    { IDC_RESTART, { L"&Restart", NULL }, { 0xE72C, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE } },
+    { IDC_NEW, { L"&New\x2026", NULL }, { 0xE710, 0 }, { THEME_TINT_TEAL, THEME_TINT_NONE } },
+    { IDC_EDIT, { L"&Edit\x2026", NULL }, { 0xE70F, 0 }, { THEME_TINT_PURPLE, THEME_TINT_NONE } },
+    { IDC_DELETE, { L"&Delete\x2026", NULL }, { 0xE74D, 0 }, { THEME_TINT_RED, THEME_TINT_NONE } },
+    { IDC_DEFAULT, { L"Set as de&fault", NULL }, { 0xE735, 0 }, { THEME_TINT_GOLD, THEME_TINT_NONE } }
 };
 static const int kMainToolbarGroups[] = { 3, 6 };   /* the actions that start a group of their own */
 /* The column's actions on the profiles, below the view's button. */
 static const MainButton kMainColumn[] = {
-    { IDC_SYNC, { L"S&ync sessions", NULL }, 0xE895, THEME_TINT_BLUE }, { IDC_REPAIR, { L"Rep&air", NULL }, 0xE90F, THEME_TINT_AMBER }
+    { IDC_SYNC, { L"S&ync sessions", NULL }, { 0xE895, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE } },
+    { IDC_REPAIR, { L"Rep&air", NULL }, { 0xE90F, 0 }, { THEME_TINT_AMBER, THEME_TINT_NONE } },
+    { IDC_SET_UP_LINKS, { L"Fix claude:// &links", NULL }, { 0xE71B, 0 }, { THEME_TINT_TEAL, THEME_TINT_NONE } }
 };
-/* The menu bar's menus. */
+/* The menu bar's menus, left to right. */
 static const MainButton kMainMenus[] = {
-    { IDC_MENU_APP, { L"&Program", NULL }, 0, THEME_TINT_NONE }, { IDC_MENU_SESSIONS, { L"&Sessions", NULL }, 0, THEME_TINT_NONE },
-    { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL }, 0, THEME_TINT_NONE }
+    { IDC_MENU_SESSIONS, { L"&Sessions", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_MENU_APP, { L"&Program", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } }
 };
 /* The shortcuts menu's commands, each in the state its profile is in. */
 static const MainButton kMainShortcuts[] = {
-    { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" }, 0, THEME_TINT_NONE },
-    { IDC_SC_SAVEAS, { L"Create s&hortcut\x2026", NULL }, 0, THEME_TINT_NONE },
-    { IDC_SC_PIN, { L"Pin to &taskbar", L"Pinned" }, 0, THEME_TINT_NONE },
-    { IDC_SC_START, { L"Add to Start &menu", L"Remove from Start &menu" }, 0, THEME_TINT_NONE }
+    { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_SC_SAVEAS, { L"Create s&hortcut\x2026", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_SC_PIN, { L"Pin to &taskbar", L"Pinned" }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_SC_START, { L"Add to Start &menu", L"Remove from Start &menu" }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } }
 };
-static const MainButton kMainSessions = { IDC_SESSIONS, { L"Sessions &view  >", L"<  &Back" }, 0, THEME_TINT_NONE };
-static const MainButton kMainStatusAction = { IDC_STATUS_ACTION, { L"&Get Claude", L"Set up l&inks" }, 0, THEME_TINT_NONE };
-static const MainButton kMainUpdate = { IDC_UPDATE, { L"&Update", NULL }, 0, THEME_TINT_NONE };
+/* The view's button: to the sessions, a speech bubble; back to the profiles, an arrow. */
+static const MainButton kMainSessions = { IDC_SESSIONS, { L"Sessions &view", L"&Back" }, { 0xE8BD, 0xE72B }, { THEME_TINT_PURPLE, THEME_TINT_NONE } };
+static const MainButton kMainStatusAction = { IDC_STATUS_ACTION, { L"&Get Claude", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } };
+static const MainButton kMainUpdate = { IDC_UPDATE, { L"&Update", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } };
 
 static const MainButton *MainButtonOf(int id)
 {
@@ -4776,13 +4783,21 @@ const WCHAR *Theme_MainCaption(int id, int state)
     return state && button->captions[1] ? button->captions[1] : button->captions[0];
 }
 
-/* The toolbar's and the column's buttons get their icons. */
+void Theme_SetMainGlyph(HWND dialog, int id, int state)
+{
+    const MainButton *button = MainButtonOf(id);
+    int shown = state && button && button->glyphs[1] ? 1 : 0;
+    if (button) Theme_SetGlyph(GetDlgItem(dialog, id), button->glyphs[shown], button->tints[shown]);
+}
+
+/* The toolbar's and the column's buttons get their icons; the view's
+ * button keeps the one of the view it leads to (Theme_SetMainGlyph). */
 static void ApplyMainGlyphs(HWND dialog)
 {
     size_t i;
-    for (i = 0; i < ARRAYSIZE(kMainToolbar); i++)
-        Theme_SetGlyph(GetDlgItem(dialog, kMainToolbar[i].id), kMainToolbar[i].glyph, kMainToolbar[i].tint);
-    for (i = 0; i < ARRAYSIZE(kMainColumn); i++) Theme_SetGlyph(GetDlgItem(dialog, kMainColumn[i].id), kMainColumn[i].glyph, kMainColumn[i].tint);
+    for (i = 0; i < ARRAYSIZE(kMainToolbar); i++) Theme_SetMainGlyph(dialog, kMainToolbar[i].id, 0);
+    for (i = 0; i < ARRAYSIZE(kMainColumn); i++) Theme_SetMainGlyph(dialog, kMainColumn[i].id, 0);
+    if (!GlyphOf(GetDlgItem(dialog, IDC_SESSIONS))) Theme_SetMainGlyph(dialog, IDC_SESSIONS, 0);
 }
 
 /* The version label's texts in each state (MainVersion), each with one %s:
@@ -4892,7 +4907,8 @@ static void MainButtonBudget(HWND dialog, const DialogBase *base, UINT dpi, cons
     HWND control = GetDlgItem(dialog, button->id);
     RECT source;
     size_t i;
-    int tallestFont = 0, glyph = GlyphWidth(control, (HFONT)SendMessageW(control, WM_GETFONT, 0, 0), button->glyph);
+    HFONT font = (HFONT)SendMessageW(control, WM_GETFONT, 0, 0);
+    int tallestFont = 0, glyph = max(GlyphWidth(control, font, button->glyphs[0]), GlyphWidth(control, font, button->glyphs[1]));
     LayoutSourceRect(dialog, base, control, dpi, &source);
     *width = source.right - source.left;
     for (i = 0; i < ARRAYSIZE(button->captions) && button->captions[i]; i++)
@@ -4960,7 +4976,7 @@ static void MainCheckBoxBudget(HWND control, int *width, int *height)
  * the tallest of them. */
 static void MeasureMainButtons(HWND dialog, const DialogBase *base, MainBudget *budget)
 {
-    static const MainButton *const kColumn[] = { &kMainColumn[0], &kMainColumn[1], &kMainSessions, &kMainStatusAction, &kMainUpdate };
+    static const MainButton *const kColumn[] = { &kMainSessions, &kMainStatusAction, &kMainUpdate };
     UINT dpi = budget->dpi;
     int i, group, width, height;
     for (i = 0; i < (int)ARRAYSIZE(kMainToolbar); i++) {
@@ -4970,8 +4986,8 @@ static void MeasureMainButtons(HWND dialog, const DialogBase *base, MainBudget *
         for (group = 0; group < (int)ARRAYSIZE(kMainToolbarGroups); group++)
             if (kMainToolbarGroups[group] == i) budget->toolbarTotal += budget->groupGap;
     }
-    for (i = 0; i < (int)ARRAYSIZE(kColumn); i++) {
-        MainButtonBudget(dialog, base, dpi, kColumn[i], &width, &height);
+    for (i = 0; i < (int)(ARRAYSIZE(kColumn) + ARRAYSIZE(kMainColumn)); i++) {
+        MainButtonBudget(dialog, base, dpi, i < (int)ARRAYSIZE(kColumn) ? kColumn[i] : &kMainColumn[i - (int)ARRAYSIZE(kColumn)], &width, &height);
         budget->column = max(budget->column, width);
         budget->buttonHeight = max(budget->buttonHeight, height);
     }

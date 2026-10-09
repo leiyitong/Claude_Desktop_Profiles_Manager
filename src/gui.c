@@ -45,8 +45,8 @@
 /* What changed outside the window, told by the thread that waits for it. */
 enum { CHANGE_PROFILES = 1, CHANGE_LINKS = 2, CHANGE_PACKAGES = 4, CHANGE_PINS = 8 };
 
-/* What the button beside the status does (IDC_STATUS_ACTION). */
-typedef enum StatusAction { STATUS_ACTION_NONE, STATUS_ACTION_GET_CLAUDE, STATUS_ACTION_SET_UP_LINKS } StatusAction;
+/* What the button below the status does (IDC_STATUS_ACTION). */
+typedef enum StatusAction { STATUS_ACTION_NONE, STATUS_ACTION_GET_CLAUDE } StatusAction;
 
 typedef struct MainState {
     HWND         dlg;
@@ -416,12 +416,11 @@ static void UpdateStatus(void)
         action = STATUS_ACTION_GET_CLAUDE;
     } else if (Handler_UserChoice() != USERCHOICE_OURS) {
         StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainStatus(MAIN_STATUS_NO_LINKS)), version);
-        action = STATUS_ACTION_SET_UP_LINKS;
     } else {
         StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainStatus(MAIN_STATUS_ROUTED)), version);
     }
     SetTextIfChanged(IDC_STATUS, text);
-    SetTextIfChanged(IDC_STATUS_ACTION, TR(Theme_MainCaption(IDC_STATUS_ACTION, action != STATUS_ACTION_GET_CLAUDE)));
+    SetTextIfChanged(IDC_STATUS_ACTION, TR(Theme_MainCaption(IDC_STATUS_ACTION, 0)));
     /* Never hide the focused control. */
     if (action == STATUS_ACTION_NONE && GetFocus() == GetDlgItem(g_manager.dlg, IDC_STATUS_ACTION))
         FocusView(g_manager.dlg, SessionsView_Shown());
@@ -499,6 +498,7 @@ static void UpdateButtons(void)
     EnableControl(IDC_DELETE, Deletable(selected) != 0);
     EnableControl(IDC_SYNC, selected && idle);
     EnableControl(IDC_REPAIR, idle);
+    EnableControl(IDC_SET_UP_LINKS, g_manager.pkg.found);
     EnableControl(IDC_DEFAULT, p && !isDefault);
 }
 
@@ -1997,13 +1997,13 @@ static void FillShortcutsMenu(HMENU menu, DWORD selected)
     const Profile *one = SelectedProfile();
     AppendMenuW(menu, MF_STRING | (selected && !(one && g_manager.onDesktop) ? 0 : MF_GRAYED), IDC_SC_DESKTOP,
                 TR(Theme_MainCaption(IDC_SC_DESKTOP, one && g_manager.onDesktop)));
-    AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDC_SC_SAVEAS, TR(Theme_MainCaption(IDC_SC_SAVEAS, 0)));
+    AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDC_SC_SAVEAS, TR(Theme_MainCaption(IDC_SC_SAVEAS, 0)));
     AppendMenuW(menu, MF_STRING | (selected && !(one && g_manager.pinned) ? 0 : MF_GRAYED), IDC_SC_PIN,
                 TR(Theme_MainCaption(IDC_SC_PIN, one && g_manager.pinned)));
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDC_SC_START, TR(Theme_MainCaption(IDC_SC_START, one && g_manager.inStartMenu)));
 }
 
-/* The menu bar's Program menu: its language, links, repair, uninstall and exit. */
+/* The menu bar's Program menu: its language, repair, uninstall and exit. */
 static void FillProgramMenu(HMENU menu)
 {
     HMENU languages = CreatePopupMenu();
@@ -2016,14 +2016,13 @@ static void FillProgramMenu(HMENU menu)
                         Localize_LanguageName(i));
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)languages, TR(L"&Language"));
     }
-    AppendMenuW(menu, MF_STRING | (g_manager.pkg.found ? 0 : MF_GRAYED), IDC_SET_UP_LINKS, TR(L"Set up l&inks\x2026"));
     AppendMenuW(menu, MF_STRING | (g_manager.job ? MF_GRAYED : 0), IDC_REPAIR, TR(Theme_MainCaption(IDC_REPAIR, 0)));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDC_UNINSTALL, TR(L"&Uninstall\x2026"));
     AppendMenuW(menu, MF_STRING, IDM_EXIT, TR(L"E&xit"));
 }
 
-/* The window's menu bar: Program, Sessions and Shortcuts, named in the
+/* The window's menu bar: Sessions, Program and Shortcuts, named in the
  * current language; what each holds is made as it opens. */
 static void MakeMenuBar(HWND dialog)
 {
@@ -2039,8 +2038,8 @@ static void MakeMenuBar(HWND dialog)
         g_manager.programMenu = g_manager.sessionsMenu = g_manager.shortcutsMenu = NULL;
         return;
     }
-    AppendMenuW(bar, MF_POPUP, (UINT_PTR)g_manager.programMenu, TR(Theme_MainCaption(IDC_MENU_APP, 0)));
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)g_manager.sessionsMenu, TR(Theme_MainCaption(IDC_MENU_SESSIONS, 0)));
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)g_manager.programMenu, TR(Theme_MainCaption(IDC_MENU_APP, 0)));
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)g_manager.shortcutsMenu, TR(Theme_MainCaption(IDC_MENU_SHORTCUTS, 0)));
     if (!SetMenu(dialog, bar)) {
         DestroyMenu(bar);   /* with its menus */
@@ -2051,7 +2050,7 @@ static void MakeMenuBar(HWND dialog)
 /* The menu bar's names in a new language. */
 static void NameMenuBar(void)
 {
-    static const int kMenus[] = { IDC_MENU_APP, IDC_MENU_SESSIONS, IDC_MENU_SHORTCUTS };
+    static const int kMenus[] = { IDC_MENU_SESSIONS, IDC_MENU_APP, IDC_MENU_SHORTCUTS };
     HMENU bar = GetMenu(g_manager.dlg);
     UINT i;
     if (!bar) return;
@@ -2169,7 +2168,7 @@ static void ListMenu(LPARAM pos)
 /* The profiles and the sessions share the window: Sessions view swaps them,
  * and becomes "< Back" in the same place. The toolbar stays: in the
  * sessions view it acts on the profile shown. */
-static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_NOTE };
+static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_SET_UP_LINKS, IDC_NOTE };
 
 static const WCHAR *SessionsButtonCaption(BOOL sessionsShown)
 {
@@ -2190,6 +2189,7 @@ void Gui_ShowSessions(HWND dialog, const ClaudePackage *package, BOOL showSessio
         SessionsView_Leave();
     }
     SetDlgItemTextW(dialog, IDC_SESSIONS, SessionsButtonCaption(showSessions));
+    Theme_SetMainGlyph(dialog, IDC_SESSIONS, showSessions);
     Theme_LayoutMain(dialog);
     SessionsView_Resize();
 }
@@ -2384,6 +2384,62 @@ static void StopWatchingOutside(void)
     g_manager.outsideThread = g_manager.outsideStop = NULL;
 }
 
+/* Several profiles' shortcuts in one folder the user picks (the desktop at
+ * first), each named after its profile; a name already there gets a
+ * number. */
+static void SaveShortcuts(void)
+{
+    ListSelection selection;
+    IFileOpenDialog *folderDialog = NULL;
+    IShellItem *desktop = NULL, *result = NULL;
+    FILEOPENDIALOGOPTIONS options = 0;
+    WCHAR folder[MAX_PATH], name[MAX_PATH], path[MAX_PATH];
+    PWSTR chosen = NULL;
+    HRESULT hr;
+    int i, p, copy;
+    TakeSelection(&selection);
+    hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog, (void **)&folderDialog);
+    if (FAILED(hr)) {
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The shortcut could not be created (error 0x%08lX)."), (unsigned long)hr);
+        return;
+    }
+    IFileOpenDialog_SetTitle(folderDialog, TR(L"Create the shortcuts in"));
+    if (SUCCEEDED(IFileOpenDialog_GetOptions(folderDialog, &options)))
+        IFileOpenDialog_SetOptions(folderDialog, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    if (SUCCEEDED(SHCreateItemInKnownFolder(&FOLDERID_Desktop, 0, NULL, &IID_IShellItem, (void **)&desktop))) {
+        IFileOpenDialog_SetDefaultFolder(folderDialog, desktop);
+        IShellItem_Release(desktop);
+    }
+    hr = IFileOpenDialog_Show(folderDialog, g_manager.dlg);
+    if (SUCCEEDED(hr) && !StateChangesBlocked() && SUCCEEDED(hr = IFileOpenDialog_GetResult(folderDialog, &result))) {
+        if (SUCCEEDED(hr = IShellItem_GetDisplayName(result, SIGDN_FILESYSPATH, &chosen))) {
+            StringCchCopyW(folder, ARRAYSIZE(folder), chosen);
+            CoTaskMemFree(chosen);
+            for (i = 0; i < selection.count && !StateChangesBlocked(); i++) {
+                Profile profile;
+                if ((p = Profiles_Find(&g_manager.profiles, selection.folders[i])) < 0) continue;
+                profile = g_manager.profiles.items[p];
+                for (copy = 1; copy < 100; copy++) {
+                    Core_ShortcutFileName(profile.name, copy, name, ARRAYSIZE(name));
+                    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", folder, name))) {
+                        path[0] = 0;
+                        break;
+                    }
+                    if (Util_QueryPath(path, NULL) == PATH_MISSING) break;
+                }
+                if (!path[0] || copy == 100) Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The path is too long."));
+                else CreateShortcutAt(&profile, path);
+            }
+        }
+        IShellItem_Release(result);
+    }
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The shortcut could not be created (error 0x%08lX)."), (unsigned long)hr);
+    IFileOpenDialog_Release(folderDialog);
+}
+
+/* Create shortcut: for one profile, saved where and as the user says; for
+ * several, into one folder. */
 static void DoSaveShortcut(void)
 {
     const Profile *selected = SelectedProfile();
@@ -2396,7 +2452,10 @@ static void DoSaveShortcut(void)
     FILEOPENDIALOGOPTIONS options = 0;
     HRESULT hr;
 
-    if (!selected) return;
+    if (!selected) {
+        if (SelectedProfiles()) SaveShortcuts();
+        return;
+    }
     p = *selected;
     hr = CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileSaveDialog, (void **)&saveDialog);
     if (FAILED(hr)) {
@@ -2533,16 +2592,27 @@ static void SetUpLinks(void)
 static void DoStatusAction(void)
 {
     if (g_manager.statusAction == STATUS_ACTION_GET_CLAUDE) Util_OpenUrl(APP_DOWNLOAD_URL);
-    else if (g_manager.statusAction == STATUS_ACTION_SET_UP_LINKS) SetUpLinks();
 }
 
-/* The program menu's Set up links: links that already come here are said so. */
-static void DoSetUpLinks(void)
+/* Fix claude:// links: the program registered for them again (what an
+ * earlier version, another app or a Claude update left wrong comes back),
+ * then, unless links already come here, Windows asks which app opens them. */
+static void DoFixLinks(void)
 {
-    if (g_manager.pkg.found && Handler_UserChoice() == USERCHOICE_OURS)
-        Ui_Message(g_manager.dlg, MB_ICONINFORMATION, TR(L"claude:// links already open in " APP_NAME L"."));
+    WCHAR exe[MAX_PATH];
+    if (StateChangesBlocked() || !g_manager.pkg.found) return;
+    FinishShellWork();
+    if (!Util_InstallExe(exe, ARRAYSIZE(exe)) || !Handler_Register(exe)) {
+        Util_Log(L"could not register for claude:// links (error %lu)", GetLastError());
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(APP_NAME L" could not be registered as an app for claude:// links."));
+        return;
+    }
+    Util_Log(L"registered for claude:// links again");
+    if (Handler_UserChoice() == USERCHOICE_OURS)
+        Ui_Message(g_manager.dlg, MB_ICONINFORMATION, TR(L"claude:// links open in " APP_NAME L". Its registration was written again."));
     else
         SetUpLinks();
+    UpdateStatus();
 }
 
 /* ------------------------------------------------------------------ repair */
@@ -3070,7 +3140,7 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         case IDC_COPY_ALL:      DoSessions(SESSIONS_COPY_ALL); return TRUE;
         case IDC_MOVE_ALL:      DoSessions(SESSIONS_MOVE_ALL); return TRUE;
         case IDC_SAME_STOP:     DoStopSame(); return TRUE;
-        case IDC_SET_UP_LINKS:  DoSetUpLinks(); return TRUE;
+        case IDC_SET_UP_LINKS:  DoFixLinks(); return TRUE;
         case IDC_NEW:           DoNew(); return TRUE;
         case IDC_EDIT:          DoEdit(); return TRUE;
         case IDC_DELETE:        DoDelete(); return TRUE;

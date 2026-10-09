@@ -967,6 +967,7 @@ typedef enum ThemeTint {
 } ThemeTint;
 void     Theme_SetGlyph(HWND button, WCHAR glyph, ThemeTint tint);   /* an icon before a push button's caption: a character of Windows' icon font, 0 for none */
 COLORREF Theme_TintColor(ThemeTint tint);   /* in the current mode; the caption's color for none, and in a contrast theme */
+void     Theme_SetMainGlyph(HWND dialog, int id, int state);   /* the manager window's button `id` gets the icon of its caption in `state` */
 BOOL     Theme_CheckBoxSize(HWND control, SIZE *size);
 void     Theme_CreateFonts(HWND dialog, ThemeFonts *fonts);
 void     Theme_FreeFonts(ThemeFonts *fonts);

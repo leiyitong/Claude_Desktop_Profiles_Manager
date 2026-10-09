@@ -444,9 +444,8 @@ static void MainCaptions(HWND dialog, const LayoutFixture *fixture)
         StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainStatus(fixture->links == LINKS_ROUTED ? MAIN_STATUS_ROUTED : MAIN_STATUS_NO_LINKS)),
                          L"2.16120.0");
         SetDlgItemTextW(dialog, IDC_STATUS, text);
-        SetWindowTextW(statusAction, TR(Theme_MainCaption(IDC_STATUS_ACTION, 1)));
     }
-    ShowWindow(statusAction, fixture->links == LINKS_ROUTED ? SW_HIDE : SW_SHOW);
+    ShowWindow(statusAction, fixture->links == CLAUDE_MISSING ? SW_SHOW : SW_HIDE);   /* Get Claude; links are fixed from the column */
     StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainVersion(fixture->version)),
                      fixture->version == MAIN_VERSION_BUILD ? L"2026.12.31 23:59" : L"9.8.7");
     SetDlgItemTextW(dialog, IDC_VERSION, text);
@@ -546,6 +545,7 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainNote()), name);
         SetDlgItemTextW(dialog, IDC_NOTE, text);
         SetDlgItemTextW(dialog, IDC_SESSIONS, TR(Theme_MainCaption(IDC_SESSIONS, fixture->sessions)));
+        Theme_SetMainGlyph(dialog, IDC_SESSIONS, fixture->sessions);
         MainCaptions(dialog, fixture);
     } else if (fixture->resource == IDD_PROFILE) {
         HWND combo = GetDlgItem(dialog, IDC_P_COLOR);
@@ -579,7 +579,7 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
 /* The menu bar gui.c gives the window (MakeMenuBar): its three menus, named. */
 static void AddMockMenuBar(HWND dialog)
 {
-    static const int kMenus[] = { IDC_MENU_APP, IDC_MENU_SESSIONS, IDC_MENU_SHORTCUTS };
+    static const int kMenus[] = { IDC_MENU_SESSIONS, IDC_MENU_APP, IDC_MENU_SHORTCUTS };
     HMENU bar = CreateMenu();
     size_t i;
     for (i = 0; bar && i < ARRAYSIZE(kMenus); i++) AppendMenuW(bar, MF_POPUP, (UINT_PTR)CreatePopupMenu(), TR(Theme_MainCaption(kMenus[i], 0)));
@@ -614,12 +614,13 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_NOTE };
+    static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_SET_UP_LINKS, IDC_NOTE };
     static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
     size_t i;
     for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
     for (i = 0; i < ARRAYSIZE(kSessionControls); i++) ShowWindow(GetDlgItem(dialog, kSessionControls[i]), SW_SHOW);
     SetDlgItemTextW(dialog, IDC_SESSIONS, TR(Theme_MainCaption(IDC_SESSIONS, 1)));
+    Theme_SetMainGlyph(dialog, IDC_SESSIONS, 1);
     SendDlgItemMessageW(dialog, IDC_S_SEARCH, EM_SETCUEBANNER, TRUE, (LPARAM)TR(L"Search this profile's sessions"));
     Theme_LayoutMain(dialog);
 }
@@ -991,13 +992,13 @@ static void CheckNoteGeometry(HWND dialog, const LayoutFixture *fixture)
 {
     HWND note = GetDlgItem(dialog, IDC_NOTE);
     RECT client, table = RelativeRect(dialog, fixture->tableViewport), placed = RelativeRect(dialog, note);
-    RECT repair = RelativeRect(dialog, GetDlgItem(dialog, IDC_REPAIR)), status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS));
+    RECT links = RelativeRect(dialog, GetDlgItem(dialog, IDC_SET_UP_LINKS)), status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS));
     GetClientRect(dialog, &client);
     Check(fixture, note, "note stays beside the table and inside the dialog",
           placed.left >= table.right && placed.top >= 0 && placed.right <= client.right && placed.bottom <= client.bottom);
     Check(fixture, note, "note fits the table's vertical band", placed.bottom <= table.bottom);
     Check(fixture, note, "the complete note fits between the column's last action and its foot",
-          placed.top >= repair.bottom && placed.bottom <= status.top);
+          placed.top >= links.bottom && placed.bottom <= status.top);
 }
 
 static BOOL IntentionalEllipsis(HWND control)
@@ -1959,7 +1960,8 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
  * is on screen meanwhile: messages are handled between steps (PumpMessages). */
 static void CheckMainFrameMessages(void)
 {
-    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR, IDC_DEFAULT };
+    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_REPAIR,
+                                    IDC_SET_UP_LINKS };
     LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];
