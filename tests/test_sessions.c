@@ -2775,8 +2775,9 @@ static void TestKeptGroups(const WCHAR *projects)
         "\"dframe-local-slice\":{\"pinnedOrder\":[\"code:local_%ls\"]},"
         "\"dframe-group-scopes\":{\"%ls/kept-organization\":{\"groups\":[{\"id\":\"cg-1\",\"name\":\"Lunwen\"}],"
         "\"assignments\":{\"code:local_%ls\":\"cg-1\"}},\"other/org\":{\"groups\":[]}},"
-        "\"code-projects-order.%ls\":[\"C:\\\\Work\"],\"unrelated\":1}},\"window\":2}",
-        g_keptIds[0], g_keptIds[0], accounts[0], g_keptIds[0], accounts[0]);
+        "\"code-projects-order.%ls\":[\"C:\\\\Work\"],\"code-sessions-status-filter.%ls\":\"all\","
+        "\"ccd-sessions-filter\":{\"state\":{\"selectedProjects\":[\"C:\\\\Work\"]},\"version\":0},\"unrelated\":1}},\"window\":2}",
+        g_keptIds[0], g_keptIds[0], accounts[0], g_keptIds[0], accounts[0], accounts[0]);
     ready = Save(configs[0], layout) && Save(configs[1], "{\"preferences\":{\"keep\":1},\"other\":true}");
     Check("kept layouts: fixtures created", ready);
     ZeroMemory(&report, sizeof report);
@@ -2784,6 +2785,9 @@ static void TestKeptGroups(const WCHAR *projects)
     StringCchPrintfA(scope, sizeof scope, "\"%ls/kept-organization\":{\"groups\":[{\"id\":\"cg-1\"", accounts[1]);
     Check("kept layouts: the pins went across", FileHas(configs[1], "\"starred-local-code-sessions\":[\"local_cdcdcdcd-0000-4000-8000-000000000001\"]") &&
           FileHas(configs[1], "\"pinnedOrder\":[\"code:local_cdcdcdcd-0000-4000-8000-000000000001\"]"));
+    Check("kept layouts: the sidebar's filters went across, for the other profile's account",
+          FileHas(configs[1], "\"code-sessions-status-filter.kept-b\":\"all\"") &&
+          FileHas(configs[1], "\"ccd-sessions-filter\":{\"state\":{\"selectedProjects\":[\"C:\\\\Work\"]},\"version\":0}"));
     Check("kept layouts: the groups went across, for the other profile's account", FileHas(configs[1], scope) &&
           FileHas(configs[1], "\"code-projects-order.kept-b\":[\"C:\\\\Work\"]"));
     Check("kept layouts: what else the settings hold stays", FileHas(configs[1], "\"keep\":1") && FileHas(configs[1], "\"other\":true") &&

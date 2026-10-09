@@ -776,11 +776,14 @@ static OpResult ApplyIndex(const Profile *p, const WCHAR *dir, const char *conte
 
 /* ----------------------------------------------------- the sidebar's layout */
 
-/* The pins and groups of Claude's sidebar, in claude_desktop_config.json
- * under preferences.epitaxyPrefs: each part by its name in a layout of ours,
- * the name Claude gives it, and whether Claude keeps it for every account,
- * per account and organization (its member "<account>/<organization>"), or
- * per account (the account's id after the name). */
+/* The pins, groups and filters of Claude's sidebar, in
+ * claude_desktop_config.json under preferences.epitaxyPrefs: each part by its
+ * name in a layout of ours, the name Claude gives it, and whether Claude keeps
+ * it for every account, per account and organization (its member
+ * "<account>/<organization>"), or per account (the account's id after the
+ * name). What else the sidebar shows (the menu "Edit sidebar" sets, the
+ * groups folded) Claude keeps in its web storage alone, a database of its
+ * own: not kept the same. */
 typedef enum LayoutScope { LAYOUT_ANY, LAYOUT_ORGANIZATION, LAYOUT_ACCOUNT } LayoutScope;
 static const struct { const char *part, *name; LayoutScope scope; } kLayoutParts[] = {
     { "starred", "starred-local-code-sessions", LAYOUT_ANY },
@@ -789,6 +792,11 @@ static const struct { const char *part, *name; LayoutScope scope; } kLayoutParts
     { "groups", "dframe-group-scopes", LAYOUT_ORGANIZATION },
     { "sections", "dframe-code-sections", LAYOUT_ORGANIZATION },
     { "order", "code-projects-order.", LAYOUT_ACCOUNT },
+    { "statusFilter", "code-sessions-status-filter.", LAYOUT_ACCOUNT },             /* the filter's Status */
+    { "environments", "code-sessions-selected-environments-v2.", LAYOUT_ACCOUNT },  /* ...its Environment */
+    { "showEmpty", "code-sessions-show-empty-projects.", LAYOUT_ACCOUNT },          /* ...Show empty groups */
+    { "showPrStatus", "code-sessions-show-pr-status.", LAYOUT_ACCOUNT },           /* ...Show PR status */
+    { "projectsFilter", "ccd-sessions-filter", LAYOUT_ANY },                        /* the projects chosen */
 };
 
 /* The account and organization an entries folder is for (its last two

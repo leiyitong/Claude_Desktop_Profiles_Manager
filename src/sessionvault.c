@@ -1295,7 +1295,8 @@ static char *LayoutOf(const SessionSet *set, int m, size_t *length, ULONGLONG *w
 /* The parts of a layout (SessionSync_ReadLayout), each made the same on its
  * own: a running Claude rewrites its settings all the time, and a part it
  * rewrote changes none of the others. */
-static const char *const kLayoutParts[] = { "starred", "slice", "starredGroups", "groups", "sections", "order" };
+static const char *const kLayoutParts[] = { "starred", "slice", "starredGroups", "groups", "sections", "order",
+                                            "statusFilter", "environments", "showEmpty", "showPrStatus", "projectsFilter" };
 
 /* Part `part` of `layout`: its hash, 0 when it has none; where its value is. */
 static ULONGLONG PartOf(const char *layout, size_t length, const char *part, const char **value, size_t *valueLength)
