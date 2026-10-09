@@ -1295,8 +1295,8 @@ static char *LayoutOf(const SessionSet *set, int m, size_t *length, ULONGLONG *w
 /* The parts of a layout (SessionSync_ReadLayout), each made the same on its
  * own: a running Claude rewrites its settings all the time, and a part it
  * rewrote changes none of the others. */
-static const char *const kLayoutParts[] = { "starred", "slice", "starredGroups", "groups", "sections", "order",
-                                            "statusFilter", "environments", "showEmpty", "showPrStatus", "projectsFilter" };
+static const char *const kLayoutParts[] = { "starred", "slice", "starredGroups", "order", "statusFilter", "environments", "showEmpty",
+                                            "showPrStatus", "projectsFilter" };
 
 /* Part `part` of `layout`: its hash, 0 when it has none; where its value is. */
 static ULONGLONG PartOf(const char *layout, size_t length, const char *part, const char **value, size_t *valueLength)
@@ -1366,6 +1366,9 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
             ZeroMemory(&sides[m], sizeof sides[m]);
             sides[m].state = MIRROR_MISSING;
             if ((sides[m].hash = PartOf(contents[m], lengths[m], kLayoutParts[p], &value, &valueLength)) == 0) continue;
+            /* New to the group's list, or with a list of its own it lost: it
+             * takes the group's layout, and what it showed changes none. */
+            if (baseContent && members[m].state != MEMBER_KEPT) continue;
             sides[m].state = MIRROR_LISTED;
             sides[m].time = written[m];
             /* Kept for the first time: no change to go by, and a running

@@ -2769,7 +2769,8 @@ static void TestKeptGroups(const WCHAR *projects)
     Check("kept groups: nothing crossed between groups", !EntryThere(entries[2], g_keptIds[0]) && !EntryThere(entries[0], g_keptIds[1]));
     Check("kept groups: the progress went forward to its end", g_steps > 0 && g_lastTotal > 0);
 
-    /* The sidebar's pins and groups of A, for its account, go to B for B's; what else B's settings hold stays. */
+    /* The sidebar's pins, project order and filters of A, for its account, go to B for B's; its groups, which Claude's web
+     * storage keeps, and what else B's settings hold stay. */
     StringCchPrintfA(layout, sizeof layout,
         "{\"preferences\":{\"epitaxyPrefs\":{\"starred-local-code-sessions\":[\"local_%ls\"],"
         "\"dframe-local-slice\":{\"pinnedOrder\":[\"code:local_%ls\"]},"
@@ -2788,7 +2789,9 @@ static void TestKeptGroups(const WCHAR *projects)
     Check("kept layouts: the sidebar's filters went across, for the other profile's account",
           FileHas(configs[1], "\"code-sessions-status-filter.kept-b\":\"all\"") &&
           FileHas(configs[1], "\"ccd-sessions-filter\":{\"state\":{\"selectedProjects\":[\"C:\\\\Work\"]},\"version\":0}"));
-    Check("kept layouts: the groups went across, for the other profile's account", FileHas(configs[1], scope) &&
+    Check("kept layouts: the groups stay where they are, for Claude's web storage keeps them",
+          !FileHas(configs[1], "dframe-group-scopes") && !FileHas(configs[1], scope));
+    Check("kept layouts: the project order went across, for the other profile's account",
           FileHas(configs[1], "\"code-projects-order.kept-b\":[\"C:\\\\Work\"]"));
     Check("kept layouts: what else the settings hold stays", FileHas(configs[1], "\"keep\":1") && FileHas(configs[1], "\"other\":true") &&
           !FileHas(configs[1], "\"unrelated\"") && !FileHas(configs[1], "other/org"));
@@ -2802,22 +2805,21 @@ static void TestKeptGroups(const WCHAR *projects)
           ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && FileHas(configs[0], "\"starred-local-code-sessions\":[]") &&
           FileHas(configs[0], "\"window\":2"));
 
-    /* Each part on its own: a pin added in one, then the sections rewritten in the other (as a running Claude does): both kept. */
+    /* Each part on its own: a pin added in one, then a filter set in the other: both kept. */
     Sleep(30);
     StringCchPrintfA(layout, sizeof layout, "{\"preferences\":{\"epitaxyPrefs\":{\"starred-local-code-sessions\":[\"local_%ls\"]}},\"window\":2}",
                      g_keptIds[0]);
     ready = Save(configs[0], layout);
     Sleep(30);
     StringCchPrintfA(layout, sizeof layout,
-        "{\"preferences\":{\"epitaxyPrefs\":{\"dframe-code-sections\":{\"%ls/kept-organization\":{\"sections\":[{\"id\":\"pinned\",\"hidden\":false}]}}}},"
-        "\"other\":true}", accounts[1]);
+        "{\"preferences\":{\"epitaxyPrefs\":{\"code-sessions-show-pr-status.%ls\":false}},\"other\":true}", accounts[1]);
     ready = ready && Save(configs[1], layout);
     ZeroMemory(&report, sizeof report);
     Check("kept layouts: parts changed in two profiles are kept", ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0);
-    StringCchPrintfA(scope, sizeof scope, "\"%ls/kept-organization\":{\"sections\":[{\"id\":\"pinned\",\"hidden\":false}]", accounts[0]);
-    Check("kept layouts: the pin of one went to the other, rewritten later",
+    Check("kept layouts: the pin of one went to the other, set later",
           FileHas(configs[1], "\"starred-local-code-sessions\":[\"local_cdcdcdcd-0000-4000-8000-000000000001\"]"));
-    Check("kept layouts: the sections of the other went to the first, for its account", FileHas(configs[0], scope));
+    Check("kept layouts: the filter of the other went to the first, for its account",
+          FileHas(configs[0], "\"code-sessions-show-pr-status.kept-a\":false"));
     Check("kept layouts: a part neither changed is given back where it was missing",
           FileHas(configs[0], "\"code-projects-order.kept-a\":[\"C:\\\\Work\"]") &&
           FileHas(configs[1], "\"code-projects-order.kept-b\":[\"C:\\\\Work\"]"));
@@ -2833,7 +2835,7 @@ static void TestKeptGroups(const WCHAR *projects)
     Sleep(30);
     StringCchPrintfA(layout, sizeof layout,
         "{\"preferences\":{\"epitaxyPrefs\":{\"starred-local-code-sessions\":[\"local_%ls\"],"
-        "\"dframe-code-sections\":{\"%ls/kept-organization\":{\"sections\":[{\"id\":\"pinned\",\"hidden\":true}]}}}},\"other\":true}",
+        "\"code-sessions-show-pr-status.%ls\":true}},\"other\":true}",
         g_keptIds[0], accounts[1]);
     ready = window && Save(configs[1], layout);
     ZeroMemory(&report, sizeof report);
@@ -2902,6 +2904,16 @@ static void TestKeptGroups(const WCHAR *projects)
     Check("kept forks: the original transcript is left as it was", FileHas(transcript, "\"uuid\":\"c1\"") && FileHas(transcript, "\"uuid\":\"c2\""));
     ZeroMemory(&report, sizeof report);
     Check("kept forks: kept again, no other fork", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.forked == 0);
+
+    /* A profile new to the group takes its layout: what it showed before, newer as it is, changes none. */
+    Sleep(30);
+    StringCchPrintfA(layout, sizeof layout, "{\"preferences\":{\"epitaxyPrefs\":{\"code-sessions-status-filter.%ls\":\"archived\"}}}", accounts[2]);
+    ready = Save(configs[2], layout);
+    ZeroMemory(&report, sizeof report);
+    Check("kept layouts: a profile new to the group takes its filter, and changes none",
+          ready && SessionVault_Keep(&profiles, 0x7, list, TRUE, &report) && report.failed == 0 &&
+          FileHas(configs[0], "\"code-sessions-status-filter.kept-a\":\"all\"") &&
+          FileHas(configs[2], "\"code-sessions-status-filter.kept-c\":\"all\""));
 }
 
 /* Environment variable `name` kept to be put back: `*kept` NULL when it is
