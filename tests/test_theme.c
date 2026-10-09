@@ -4639,6 +4639,162 @@ static void TestPushButtons(void)
     DeleteObject(font);
 }
 
+/* The columns of `canvas` whose pixels stand out from `back`, inside a
+ * frame (rows `top` to `bottom`, columns as far in from the sides as `top`
+ * is from the top): the first and the last; FALSE when none does. */
+static BOOL InkColumns(const Canvas *canvas, int top, int bottom, COLORREF back, int *first, int *last)
+{
+    int x, y;
+    *first = canvas->width;
+    *last = -1;
+    for (y = max(0, top); y < min(canvas->height, bottom); y++)
+        for (x = max(0, top); x < canvas->width - max(0, top); x++)
+            if (StandsOut(PixelAt(canvas, x, y), back)) {
+                *first = min(*first, x);
+                *last = max(*last, x);
+            }
+    return *last >= 0;
+}
+
+/* A push button with an icon (Theme_SetGlyph), in both modes: drawn as the
+ * theme's buttons are (its frame and fill as Theme_DrawButton's), the icon
+ * before the caption and the two centered together. */
+static void TestGlyphButtons(void)
+{
+    HWND host = ThemedHost(), buttons[2];
+    HFONT font = DialogFont();
+    Canvas shown[2] = { { 0 }, { 0 } }, face = { 0 };
+    RECT client = { 0, 0, 0, 0 };
+    int kind, x, y, firstInk[2], lastInk[2], differ = 0;
+    BOOL captured = TRUE;
+    for (kind = 0; kind < 2; kind++) {
+        buttons[kind] = CreateWindowExW(0, WC_BUTTONW, L"New", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 10 + 40 * kind, 140, 30, host, NULL,
+                                        GetModuleHandleW(NULL), NULL);
+        if (buttons[kind]) SendMessageW(buttons[kind], WM_SETFONT, (WPARAM)font, FALSE);
+    }
+    if (!buttons[0] || !buttons[1]) {
+        Check("icon buttons: created", FALSE);
+        for (kind = 0; kind < 2; kind++) if (buttons[kind]) DestroyWindow(buttons[kind]);
+        DeleteObject(font);
+        return;
+    }
+    Theme_SetGlyph(buttons[1], 0xE710, THEME_TINT_NONE);
+    Theme_Apply(host);
+    ShowWindow(host, SW_SHOWNOACTIVATE);
+    for (kind = 0; kind < 2; kind++) {
+        BufferedPaintStopAllAnimations(buttons[kind]);
+        RedrawWindow(buttons[kind], NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        GetClientRect(buttons[kind], &client);
+        captured = captured && CanvasOpen(&shown[kind], client.right, client.bottom, RGB(1, 2, 3)) && CopyClient(buttons[kind], &shown[kind]) &&
+                   HasImage(&shown[kind], "icon buttons");
+    }
+    if (captured && CanvasOpen(&face, client.right, client.bottom, RGB(1, 2, 3))) {
+        COLORREF back;
+        UINT format = DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_HIDEPREFIX;
+        Theme_DrawButton(buttons[1], face.dc, &client, L"", font, 0, format);
+        back = PixelAt(&face, client.right / 2, client.bottom / 2);
+        /* The frame and the fill, away from the caption: the top and bottom rows, the left and right ends. */
+        for (y = 0; y < client.bottom; y++) for (x = 0; x < client.right; x++)
+            if ((y < 4 || y >= client.bottom - 4 || x < 4 || x >= client.right - 4) && PixelAt(&shown[1], x, y) != PixelAt(&face, x, y)) differ++;
+        Check("icon buttons: the frame and fill are the theme's button's", differ == 0);
+        if (differ) printf("        %d frame pixels differ\n", differ);
+        if (!InkColumns(&shown[0], 4, client.bottom - 4, back, &firstInk[0], &lastInk[0]) ||
+            !InkColumns(&shown[1], 4, client.bottom - 4, back, &firstInk[1], &lastInk[1])) {
+            Check("icon buttons: both captions drawn", FALSE);
+        } else {
+            Check("icon buttons: the icon shows before the caption, the caption moves right",
+                  firstInk[1] < firstInk[0] && lastInk[1] > lastInk[0]);
+            Check("icon buttons: the icon and the caption are centered together",
+                  abs((firstInk[1] - 0) - (client.right - 1 - lastInk[1])) <= MulDiv(3, (int)GetDpiForWindow(buttons[1]), 96));
+        }
+    }
+    CanvasClose(&face);
+    for (kind = 0; kind < 2; kind++) CanvasClose(&shown[kind]);
+    /* A filled star in gold: its tint, and the caption's color once disabled. */
+    Theme_SetGlyph(buttons[1], 0xE735, THEME_TINT_GOLD);
+    for (kind = 0; kind < 2; kind++) {
+        Canvas star = { 0 };
+        int tinted = 0;
+        EnableWindow(buttons[1], kind == 0);
+        BufferedPaintStopAllAnimations(buttons[1]);
+        RedrawWindow(buttons[1], NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        GetClientRect(buttons[1], &client);
+        if (CanvasOpen(&star, client.right, client.bottom, RGB(1, 2, 3)) && CopyClient(buttons[1], &star) && HasImage(&star, "icon buttons")) {
+            for (y = 0; y < client.bottom; y++) for (x = 0; x < client.right; x++)
+                if (PixelAt(&star, x, y) == Theme_TintColor(THEME_TINT_GOLD)) tinted++;
+            if (kind == 0) Check("icon buttons: the icon is drawn in its tint", tinted > 0 || HighContrastOn());
+            else Check("icon buttons: a disabled button's icon is not tinted", tinted == 0);
+        }
+        CanvasClose(&star);
+    }
+    EnableWindow(buttons[1], TRUE);
+    ShowWindow(host, SW_HIDE);
+    for (kind = 0; kind < 2; kind++) DestroyWindow(buttons[kind]);
+    DeleteObject(font);
+}
+
+/* A window's menu bar in dark mode: Windows draws it light, the theme draws
+ * it on the window's face with its names in light text, and covers the
+ * light line Windows draws under it. */
+static void TestDarkMenuBar(void)
+{
+    HWND window;
+    HMENU bar, menus[2];
+    MENUBARINFO info;
+    RECT frame, area, client;
+    Canvas shown = { 0 };
+    COLORREF faceColor = Theme_Color(THEME_FACE);
+    int x, y, facePixels = 0, ink = 0, samples = 0, line = 0;
+    if (SkipInLight("the dark menu bar") || HighContrastOn()) return;
+    window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED, WC_STATICW, L"", WS_POPUP | WS_CAPTION | WS_CLIPCHILDREN,
+                             0, 0, 400, 160, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    bar = CreateMenu();
+    menus[0] = CreatePopupMenu();
+    menus[1] = CreatePopupMenu();
+    if (!window || !bar || !menus[0] || !menus[1]) {
+        Check("dark menu bar: window and menus created", FALSE);
+        if (window) DestroyWindow(window);
+        return;
+    }
+    SetLayeredWindowAttributes(window, 0, 1, LWA_ALPHA);
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)menus[0], L"&Program");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)menus[1], L"&Sessions");
+    SetMenu(window, bar);
+    Theme_Apply(window);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    RedrawWindow(window, NULL, NULL, RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
+    PumpMessages();
+    ZeroMemory(&info, sizeof info);
+    info.cbSize = sizeof info;
+    if (GetMenuBarInfo(window, OBJID_MENU, 0, &info) && GetWindowRect(window, &frame) && GetClientRect(window, &client)) {
+        POINT origin = { 0, 0 };
+        area = info.rcBar;
+        OffsetRect(&area, -frame.left, -frame.top);
+        ClientToScreen(window, &origin);
+        area.bottom = origin.y - frame.top;   /* down to the client's top: the line under the bar too */
+        if (CanvasOpen(&shown, area.right - area.left, area.bottom - area.top, RGB(1, 2, 3)) &&
+            CopyFromWindow(window, TRUE, &area, &shown, 0, 0) && HasImage(&shown, "dark menu bar")) {
+            for (y = 0; y < shown.height; y++) for (x = 0; x < shown.width; x++) {
+                COLORREF color = PixelAt(&shown, x, y);
+                samples++;
+                if (color == faceColor) facePixels++;
+                else if (StandsOut(color, faceColor) && (GetRValue(color) + GetGValue(color) + GetBValue(color)) / 3 > 96) ink++;
+            }
+            for (x = 0; x < shown.width; x++)
+                if (PixelAt(&shown, x, shown.height - 1) == faceColor) line++;
+            Check("dark menu bar: the bar is the window's face", samples > 0 && facePixels * 10 >= samples * 7);
+            Check("dark menu bar: the menus' names are light text on it", ink > 0);
+            Check("dark menu bar: the line under it is the face too", line == shown.width);
+            if (facePixels * 10 < samples * 7 || !ink || line != shown.width)
+                printf("        face %d of %d pixels, ink %d, line %d of %d\n", facePixels, samples, ink, line, shown.width);
+        }
+    } else {
+        Check("dark menu bar: its place is known", FALSE);
+    }
+    CanvasClose(&shown);
+    DestroyWindow(window);   /* with its menu bar */
+}
+
 /* A window of every kind the theme serves, themed, drawn, then destroyed with
  * its controls. */
 static void ThemedRound(void)
@@ -4973,6 +5129,7 @@ int wmain(void)
     TestEditReentrantPause();
     TestEditPrinting();
     TestPushButtons();
+    TestGlyphButtons();
     TestDropDownButton();
     TestDropDownWidth();
     TestDropDownList();
@@ -5007,6 +5164,7 @@ int wmain(void)
     TestLink();
     TestSidebarNoteCuts();
     TestBuffer();
+    TestDarkMenuBar();
     TestResourceLifetime();
     if (g_themedHost) DestroyWindow(g_themedHost);
     printf("Theme tests: %d checks, %d failure(s).\n", g_checks, g_failures);

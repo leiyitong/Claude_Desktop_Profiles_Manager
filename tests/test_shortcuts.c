@@ -829,6 +829,87 @@ static void CheckStartMenuPlaces(void)
           !StartMenuVisitor(inStartMenu, &info, TRUE, &search) && search.found);
 }
 
+/* ------------------------------------------------- notification area */
+
+#define TRAY_TEST_SIZE 32
+
+/* An icon's colors, top row first. */
+static BOOL IconPixels(HICON icon, DWORD *pixels)
+{
+    ICONINFO info;
+    BITMAPINFO bitmap;
+    HDC dc;
+    BOOL ok = FALSE;
+    if (!icon || !GetIconInfo(icon, &info)) return FALSE;
+    ZeroMemory(&bitmap, sizeof bitmap);
+    bitmap.bmiHeader.biSize = sizeof bitmap.bmiHeader;
+    bitmap.bmiHeader.biWidth = TRAY_TEST_SIZE;
+    bitmap.bmiHeader.biHeight = -TRAY_TEST_SIZE;
+    bitmap.bmiHeader.biPlanes = 1;
+    bitmap.bmiHeader.biBitCount = 32;
+    bitmap.bmiHeader.biCompression = BI_RGB;
+    if (info.hbmColor && (dc = GetDC(NULL)) != NULL) {
+        ok = GetDIBits(dc, info.hbmColor, 0, TRAY_TEST_SIZE, pixels, &bitmap, DIB_RGB_COLORS) == TRAY_TEST_SIZE;
+        ReleaseDC(NULL, dc);
+    }
+    if (info.hbmColor) DeleteObject(info.hbmColor);
+    if (info.hbmMask) DeleteObject(info.hbmMask);
+    return ok;
+}
+
+/* Whether the profile's notification-area icon (icons.c) is its own icon. */
+static BOOL TrayIsOwnIcon(const ClaudePackage *pkg, const Profile *profile)
+{
+    static DWORD tray[TRAY_TEST_SIZE * TRAY_TEST_SIZE], own[TRAY_TEST_SIZE * TRAY_TEST_SIZE];
+    HICON trayIcon = Icons_CreateTray(pkg, profile, TRAY_TEST_SIZE, TRUE), ownIcon = Icons_Create(pkg, profile, TRAY_TEST_SIZE);
+    BOOL same = trayIcon && ownIcon && IconPixels(trayIcon, tray) && IconPixels(ownIcon, own) && memcmp(tray, own, sizeof tray) == 0;
+    if (trayIcon) DestroyIcon(trayIcon);
+    if (ownIcon) DestroyIcon(ownIcon);
+    return same;
+}
+
+/* The notification-area icon: Claude's tray glyph (a private copy of the
+ * program's icon stands for it) in the profile's color, and a profile's
+ * picture of its own when it has one, as on its shortcuts. */
+static void CheckTrayPicture(void)
+{
+    static DWORD picture[PICTURE_SIZE * PICTURE_SIZE];
+    WCHAR source[MAX_PATH], *slash = NULL, folders[3][MAX_PATH] = { { 0 } }, glyph[MAX_PATH] = { 0 }, pictures[MAX_PATH];
+    ClaudePackage pkg;
+    Profile profile;
+    int i;
+    BOOL ready;
+    ZeroMemory(&pkg, sizeof pkg);
+    ZeroMemory(&profile, sizeof profile);
+    StringCchCopyW(profile.folder, ARRAYSIZE(profile.folder), FIXTURE_FOLDER);
+    StringCchCopyW(profile.name, ARRAYSIZE(profile.name), L"Fixture");
+    profile.color = 2;
+    pkg.found = TRUE;
+    /* The program's own icon, beside the tests' sources, as Claude's tray glyph. */
+    ready = MultiByteToWideChar(CP_UTF8, 0, __FILE__, -1, source, ARRAYSIZE(source)) > 0 && (slash = wcsrchr(source, L'\\')) != NULL;
+    if (ready) {
+        *slash = 0;
+        ready = (slash = wcsrchr(source, L'\\')) != NULL && SUCCEEDED(StringCchCopyW(slash + 1, ARRAYSIZE(source) - (size_t)(slash + 1 - source), L"src\\app.ico"));
+    }
+    ready = ready && PrivatePath(L"package", folders[0], ARRAYSIZE(folders[0])) &&
+            SUCCEEDED(StringCchPrintfW(folders[1], ARRAYSIZE(folders[1]), L"%s\\app", folders[0])) &&
+            SUCCEEDED(StringCchPrintfW(folders[2], ARRAYSIZE(folders[2]), L"%s\\resources", folders[1])) &&
+            SUCCEEDED(StringCchPrintfW(glyph, ARRAYSIZE(glyph), L"%s\\Tray-Win32-Dark.ico", folders[2])) &&
+            CreateDirectoryW(folders[0], NULL) && CreateDirectoryW(folders[1], NULL) && CreateDirectoryW(folders[2], NULL) &&
+            CopyFileW(source, glyph, FALSE) && SUCCEEDED(StringCchCopyW(pkg.installDir, ARRAYSIZE(pkg.installDir), folders[0]));
+    Check("tray: a private Claude tray glyph is in place", ready);
+    if (ready) {
+        Check("tray: a profile without a picture shows Claude's glyph in its color", !TrayIsOwnIcon(&pkg, &profile));
+        for (i = 0; i < PICTURE_SIZE * PICTURE_SIZE; i++) picture[i] = 0xFF000000u | (i % PICTURE_SIZE < PICTURE_SIZE / 2 ? 0x00C04020u : 0x002080E0u);
+        Check("tray: a profile's picture is saved", Icons_SavePicture(profile.folder, picture, &profile.picture));
+        Check("tray: a profile with a picture of its own shows it there too", profile.picture && TrayIsOwnIcon(&pkg, &profile));
+        Icons_DeletePicture(profile.folder);
+    }
+    DeleteFileW(glyph);
+    for (i = 2; i >= 0; i--) RemoveDirectoryW(folders[i]);
+    if (PrivatePath(L"pictures", pictures, ARRAYSIZE(pictures))) RemoveDirectoryW(pictures);
+}
+
 /* The private folder and what the tests left in it (not a tree). */
 static BOOL RemovePrivateFolder(void)
 {
@@ -891,6 +972,7 @@ int wmain(void)
     CheckRenamedPaths();
     CheckLanguagePass();
     CheckFolderReadOnce();
+    CheckTrayPicture();
 
     privateUser = OpenPrivateUserKey(keyPath, ARRAYSIZE(keyPath));
     if (privateUser && RegOverridePredefKey(HKEY_CURRENT_USER, privateUser) == ERROR_SUCCESS) {

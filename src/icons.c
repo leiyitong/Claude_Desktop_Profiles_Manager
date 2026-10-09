@@ -804,8 +804,10 @@ static COLORREF Lighten(COLORREF color, int percent)
 }
 
 /* Claude's notification-area glyph (its own file, read from the installed
- * package) in the profile's color, lightened on a dark taskbar. The badged
- * icon when that glyph cannot be read. */
+ * package) in the profile's color, lightened on a dark taskbar; a profile
+ * with a picture of its own shows that picture there too, as on its
+ * shortcuts and taskbar button. The badged icon when that glyph cannot be
+ * read. */
 HICON Icons_CreateTray(const ClaudePackage *pkg, const Profile *profile, int size, BOOL darkTaskbar)
 {
     WCHAR path[MAX_PATH];
@@ -815,6 +817,7 @@ HICON Icons_CreateTray(const ClaudePackage *pkg, const Profile *profile, int siz
     int i;
 
     if (size < MIN_ICON_SIZE || size > MAX_ICON_SIZE) return NULL;
+    if (profile->picture && (icon = Icons_Create(pkg, profile, size)) != NULL) return icon;
     if (darkTaskbar) color = Lighten(color, TRAY_LIGHTEN_PERCENT);
     tint = ((DWORD)GetRValue(color) << 16) | ((DWORD)GetGValue(color) << 8) | GetBValue(color);
     pixels = (DWORD *)Alloc((size_t)size * size * sizeof(DWORD));

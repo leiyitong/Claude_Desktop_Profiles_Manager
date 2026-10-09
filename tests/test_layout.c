@@ -438,16 +438,14 @@ static void MainCaptions(HWND dialog, const LayoutFixture *fixture)
     WCHAR text[2048];
     HWND statusAction = GetDlgItem(dialog, IDC_STATUS_ACTION);
     if (fixture->links == CLAUDE_MISSING) {
-        SetDlgItemTextW(dialog, IDC_STATUS, TR(L"Claude Desktop is not installed."));
+        SetDlgItemTextW(dialog, IDC_STATUS, TR(Theme_MainStatus(MAIN_STATUS_NO_CLAUDE)));
         SetWindowTextW(statusAction, TR(Theme_MainCaption(IDC_STATUS_ACTION, 0)));
     } else {
-        StringCchPrintfW(text, ARRAYSIZE(text), fixture->links == LINKS_ROUTED
-            ? TR(L"Claude Desktop %s \x00B7 claude:// links are routed correctly")
-            : TR(L"Claude Desktop %s \x00B7 claude:// links are not set up yet"), L"2.16120.0");
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainStatus(fixture->links == LINKS_ROUTED ? MAIN_STATUS_ROUTED : MAIN_STATUS_NO_LINKS)),
+                         L"2.16120.0");
         SetDlgItemTextW(dialog, IDC_STATUS, text);
-        SetWindowTextW(statusAction, TR(Theme_MainCaption(IDC_STATUS_ACTION, 1)));
     }
-    ShowWindow(statusAction, fixture->links == LINKS_ROUTED ? SW_HIDE : SW_SHOW);
+    ShowWindow(statusAction, fixture->links == CLAUDE_MISSING ? SW_SHOW : SW_HIDE);   /* Get Claude; links are fixed from the column */
     StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainVersion(fixture->version)),
                      fixture->version == MAIN_VERSION_BUILD ? L"2026.12.31 23:59" : L"9.8.7");
     SetDlgItemTextW(dialog, IDC_VERSION, text);
@@ -547,6 +545,7 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainNote()), name);
         SetDlgItemTextW(dialog, IDC_NOTE, text);
         SetDlgItemTextW(dialog, IDC_SESSIONS, TR(Theme_MainCaption(IDC_SESSIONS, fixture->sessions)));
+        Theme_SetMainGlyph(dialog, IDC_SESSIONS, fixture->sessions);
         MainCaptions(dialog, fixture);
     } else if (fixture->resource == IDD_PROFILE) {
         HWND combo = GetDlgItem(dialog, IDC_P_COLOR);
@@ -577,6 +576,16 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
     }
 }
 
+/* The menu bar gui.c gives the window (MakeMenuBar): its three menus, named. */
+static void AddMockMenuBar(HWND dialog)
+{
+    static const int kMenus[] = { IDC_MENU_SESSIONS, IDC_MENU_APP, IDC_MENU_SHORTCUTS };
+    HMENU bar = CreateMenu();
+    size_t i;
+    for (i = 0; bar && i < ARRAYSIZE(kMenus); i++) AppendMenuW(bar, MF_POPUP, (UINT_PTR)CreatePopupMenu(), TR(Theme_MainCaption(kMenus[i], 0)));
+    if (bar && !SetMenu(dialog, bar)) DestroyMenu(bar);
+}
+
 /* What gui.c does to its window before theming it: the table's styles and
  * smooth view, the sessions view's controls in theirs, "Sessions >"
  * semibold. */
@@ -589,6 +598,7 @@ static void PrepareMainWindow(HWND dialog, LayoutFixture *fixture)
     if (fixture->realSessions) SessionsView_Init(dialog);
     fixture->treeViewport = Theme_SmoothView(fixture->tree);
     fixture->profilesViewport = Theme_SmoothView(GetDlgItem(dialog, IDC_S_PROFILES));
+    AddMockMenuBar(dialog);
     Theme_SetStrong(GetDlgItem(dialog, IDC_SESSIONS));
 }
 
@@ -604,13 +614,13 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR,
-                                            IDC_DEFAULT, IDC_NOTE };
+    static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_SET_UP_LINKS, IDC_NOTE };
     static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
     size_t i;
     for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
     for (i = 0; i < ARRAYSIZE(kSessionControls); i++) ShowWindow(GetDlgItem(dialog, kSessionControls[i]), SW_SHOW);
     SetDlgItemTextW(dialog, IDC_SESSIONS, TR(Theme_MainCaption(IDC_SESSIONS, 1)));
+    Theme_SetMainGlyph(dialog, IDC_SESSIONS, 1);
     SendDlgItemMessageW(dialog, IDC_S_SEARCH, EM_SETCUEBANNER, TRUE, (LPARAM)TR(L"Search this profile's sessions"));
     Theme_LayoutMain(dialog);
 }
@@ -982,13 +992,13 @@ static void CheckNoteGeometry(HWND dialog, const LayoutFixture *fixture)
 {
     HWND note = GetDlgItem(dialog, IDC_NOTE);
     RECT client, table = RelativeRect(dialog, fixture->tableViewport), placed = RelativeRect(dialog, note);
-    RECT setDefault = RelativeRect(dialog, GetDlgItem(dialog, IDC_DEFAULT)), overwrite = RelativeRect(dialog, GetDlgItem(dialog, IDC_REPAIR));
+    RECT links = RelativeRect(dialog, GetDlgItem(dialog, IDC_SET_UP_LINKS)), status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS));
     GetClientRect(dialog, &client);
     Check(fixture, note, "note stays beside the table and inside the dialog",
           placed.left >= table.right && placed.top >= 0 && placed.right <= client.right && placed.bottom <= client.bottom);
     Check(fixture, note, "note fits the table's vertical band", placed.bottom <= table.bottom);
-    Check(fixture, GetDlgItem(dialog, IDC_DEFAULT), "default button fits between the side bar's last action and the complete note",
-          setDefault.top >= overwrite.bottom && setDefault.bottom <= placed.top);
+    Check(fixture, note, "the complete note fits between the column's last action and its foot",
+          placed.top >= links.bottom && placed.bottom <= status.top);
 }
 
 static BOOL IntentionalEllipsis(HWND control)
@@ -1071,36 +1081,34 @@ static void CheckText(const LayoutFixture *fixture, HWND control)
     ReleaseDC(control, dc);
 }
 
-/* The middle of the first line of `label`'s text (drawn at its top), in the
- * dialog's client. */
-static int FirstLineMiddle(HWND dialog, HWND label)
+/* The toolbar in one row above the body, left to right; the column beside
+ * the list (or the sessions' panes): the view's button level with the
+ * body's top, the status above the version, the foot (the version, or
+ * Update) on the body's bottom. */
+static void CheckMainBands(HWND dialog, const LayoutFixture *fixture)
 {
-    TEXTMETRICW metrics = { 0 };
-    RECT rect = RelativeRect(dialog, label);
-    HDC dc = GetDC(label);
-    if (dc) {
-        HGDIOBJ previous = SelectObject(dc, (HFONT)SendMessageW(label, WM_GETFONT, 0, 0));
-        GetTextMetricsW(dc, &metrics);
-        SelectObject(dc, previous);
-        ReleaseDC(label, dc);
-    }
-    return rect.top + metrics.tmHeight / 2;
-}
-
-/* The status and the version read on the same line as the header's
- * buttons (a button centers its caption, a label draws at its top). */
-static void CheckLabelsLevelWithButtons(HWND dialog, const LayoutFixture *fixture)
-{
-    static const struct { int label, button; const char *name; } kRows[] = {
-        { IDC_STATUS, IDC_MENU_APP, "the status's text is level with the header buttons' captions" },
-        { IDC_VERSION, IDC_SESSIONS, "the version is level with the header buttons' captions" }
-    };
+    static const int kToolbar[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT };
+    HWND update = GetDlgItem(dialog, IDC_UPDATE);
+    RECT first = RelativeRect(dialog, GetDlgItem(dialog, kToolbar[0])), view = RelativeRect(dialog, GetDlgItem(dialog, IDC_SESSIONS));
+    RECT body = RelativeRect(dialog, fixture->sessions ? fixture->profilesViewport : fixture->tableViewport);
+    RECT status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS)), version = RelativeRect(dialog, GetDlgItem(dialog, IDC_VERSION));
+    RECT last = (GetWindowLongW(update, GWL_STYLE) & WS_VISIBLE) ? RelativeRect(dialog, update) : version;
+    BOOL row = TRUE, order = TRUE;
     size_t i;
-    for (i = 0; i < ARRAYSIZE(kRows); i++) {
-        HWND label = GetDlgItem(dialog, kRows[i].label);
-        RECT button = RelativeRect(dialog, GetDlgItem(dialog, kRows[i].button));
-        Check(fixture, label, kRows[i].name, abs(FirstLineMiddle(dialog, label) - (button.top + button.bottom) / 2) <= 1);
+    for (i = 1; i < ARRAYSIZE(kToolbar); i++) {
+        RECT button = RelativeRect(dialog, GetDlgItem(dialog, kToolbar[i])), before = RelativeRect(dialog, GetDlgItem(dialog, kToolbar[i - 1]));
+        row = row && button.top == first.top && button.bottom == first.bottom;
+        order = order && button.left > before.right;
     }
+    Check(fixture, GetDlgItem(dialog, kToolbar[0]), "the toolbar's buttons share one row", row);
+    Check(fixture, GetDlgItem(dialog, kToolbar[0]), "the toolbar's buttons go left to right, apart", order);
+    Check(fixture, GetDlgItem(dialog, kToolbar[0]), "the toolbar sits above the body, where the content starts",
+          first.bottom < body.top && first.left == body.left);
+    Check(fixture, GetDlgItem(dialog, IDC_SESSIONS), "the view's button tops the column, level with the body",
+          view.top == body.top && view.left > body.right);
+    Check(fixture, GetDlgItem(dialog, IDC_STATUS), "the status sits above the version, in the column",
+          status.bottom <= version.top && status.left == view.left && version.left == view.left && version.right == view.right);
+    Check(fixture, GetDlgItem(dialog, IDC_VERSION), "the column's foot ends on the body's bottom", last.bottom == body.bottom);
 }
 
 /* Every visible control inside the client, captioned whole and apart from
@@ -1130,7 +1138,7 @@ static void CheckGeometry(HWND dialog, const LayoutFixture *fixture)
             if (!clear) printf("        other=%d overlap=%ldx%ld\n", GetDlgCtrlID(controls[j]), overlap.right - overlap.left, overlap.bottom - overlap.top);
         }
     }
-    if (fixture->resource == IDD_MAIN) CheckLabelsLevelWithButtons(dialog, fixture);
+    if (fixture->resource == IDD_MAIN) CheckMainBands(dialog, fixture);
 }
 
 /* The table's columns as gui.c sizes them by default, and every Role
@@ -1530,7 +1538,7 @@ static void MeasureScalesAgainstWorkArea(void)
         g_scaleFits[scale] = FALSE;
         if (dialog && Theme_MainMinimum(dialog, &minimum) && GetMonitorInfoW(MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST), &monitor)) {
             SetRect(&frame, 0, 0, minimum.cx, minimum.cy);
-            AdjustWindowRectExForDpi(&frame, (DWORD)GetWindowLongW(dialog, GWL_STYLE), FALSE, (DWORD)GetWindowLongW(dialog, GWL_EXSTYLE),
+            AdjustWindowRectExForDpi(&frame, (DWORD)GetWindowLongW(dialog, GWL_STYLE), GetMenu(dialog) != NULL, (DWORD)GetWindowLongW(dialog, GWL_EXSTYLE),
                                      GetDpiForWindow(dialog));
             g_scaleFits[scale] = frame.right - frame.left <= monitor.rcWork.right - monitor.rcWork.left &&
                                  frame.bottom - frame.top <= monitor.rcWork.bottom - monitor.rcWork.top;
@@ -1884,7 +1892,7 @@ static void ResizeMainFixture(HWND dialog, LayoutFixture *fixture, int width, in
     MONITORINFO monitor = { sizeof monitor };
     SetRect(&frame, 0, 0, width, height);
     Check(fixture, NULL, "main resize frame computed from native styles",
-          AdjustWindowRectExForDpi(&frame, (DWORD)GetWindowLongW(dialog, GWL_STYLE), FALSE,
+          AdjustWindowRectExForDpi(&frame, (DWORD)GetWindowLongW(dialog, GWL_STYLE), GetMenu(dialog) != NULL,
                                    (DWORD)GetWindowLongW(dialog, GWL_EXSTYLE), GetDpiForWindow(dialog)));
     GetMonitorInfoW(MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST), &monitor);
     SetWindowPos(dialog, NULL, monitor.rcWork.left, monitor.rcWork.top, frame.right - frame.left, frame.bottom - frame.top,
@@ -1928,11 +1936,11 @@ static void DescribeFrame(const char *what, HWND dialog, const RECT *expected)
 
 /* The content has a bounded reading width (THEME_MAIN_READING_WIDTH_DIPS, or
  * the minimum when wider): a client up to it is filled within the margins,
- * a wider one keeps that width, centered. The header spans it: the first
- * menu to the view's button. */
+ * a wider one keeps that width, centered. It spans from the toolbar's first
+ * button to the column's right edge. */
 static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE minimum, const char *name)
 {
-    HWND row = GetDlgItem(dialog, IDC_MENU_APP);
+    HWND row = GetDlgItem(dialog, IDC_OPEN);
     RECT client, group = RelativeRect(dialog, row), last = RelativeRect(dialog, GetDlgItem(dialog, IDC_SESSIONS));
     int dpi = (int)GetDpiForWindow(dialog), margin = MulDiv(THEME_MAIN_MARGIN_DIPS, dpi, 96);
     int reading = max(minimum.cx, MulDiv(THEME_MAIN_READING_WIDTH_DIPS, dpi, 96)), left, right;
@@ -1952,7 +1960,8 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
  * is on screen meanwhile: messages are handled between steps (PumpMessages). */
 static void CheckMainFrameMessages(void)
 {
-    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR, IDC_DEFAULT };
+    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_REPAIR,
+                                    IDC_SET_UP_LINKS };
     LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];
@@ -2175,7 +2184,7 @@ static void CheckResponsiveMain(void)
             RECT native = { 0, 0, 0, 0 };
             native.right = minimum.cx;
             native.bottom = minimum.cy;
-            AdjustWindowRectExForDpi(&native, (DWORD)GetWindowLongW(dialog, GWL_STYLE), FALSE,
+            AdjustWindowRectExForDpi(&native, (DWORD)GetWindowLongW(dialog, GWL_STYLE), GetMenu(dialog) != NULL,
                                      (DWORD)GetWindowLongW(dialog, GWL_EXSTYLE), GetDpiForWindow(dialog));
             SendMessageW(dialog, WM_GETMINMAXINFO, 0, (LPARAM)&tracking);
             Check(&fixture, NULL, "native tracking enforces the shared client minimum including its frame",
@@ -2197,7 +2206,7 @@ static void CheckResponsiveMain(void)
             Check(&fixture, NULL, "fitting and note updates retain the user's frame and position", EqualRect(&before, &after));
 
             table = RelativeRect(dialog, fixture.tableViewport);
-            group = RelativeRect(dialog, GetDlgItem(dialog, IDC_MENU_APP));
+            group = RelativeRect(dialog, GetDlgItem(dialog, IDC_OPEN));
             note = RelativeRect(dialog, GetDlgItem(dialog, IDC_NOTE));
             setDefault = RelativeRect(dialog, GetDlgItem(dialog, IDC_DEFAULT));
             sessionProfiles = RelativeRect(dialog, fixture.profilesViewport);
@@ -2252,15 +2261,20 @@ static void CheckResponsiveMain(void)
             LOGFONTW font;
             SIZE altered, returned;
             DWORD gdiBefore, gdiAfter;
-            int repeat;
+            int repeat, widths[2][4];
             GetObjectW(original, sizeof font, &font);
             font.lfHeight *= 2;
             larger = CreateFontIndirectW(&font);
             Check(&fixture, header, "header-only larger test font created", larger != NULL);
             if (larger) {
+                Theme_ProfileColumnWidths(fixture.table, &widths[0][0], &widths[0][1], &widths[0][2], &widths[0][3]);
                 SendMessageW(header, WM_SETFONT, (WPARAM)larger, FALSE);
-                Check(&fixture, header, "header-only font change invalidates the intrinsic budget",
-                      Theme_MainMinimum(dialog, &altered) && altered.cy > minimum.cy);
+                Check(&fixture, header, "header-only font change invalidates the intrinsic budget", Theme_MainMinimum(dialog, &altered));
+                Theme_ProfileColumnWidths(fixture.table, &widths[1][0], &widths[1][1], &widths[1][2], &widths[1][3]);
+                /* A column is as wide as its title or its widest value, whichever is wider: one of them grows. */
+                Check(&fixture, header, "the columns' titles are measured again in the header's new font",
+                      (widths[1][1] > widths[0][1] || widths[1][2] > widths[0][2] || widths[1][3] > widths[0][3]) &&
+                      altered.cx >= minimum.cx && altered.cy >= minimum.cy);
                 SendMessageW(header, WM_SETFONT, (WPARAM)original, FALSE);
                 Check(&fixture, header, "header font round trip restores the common minimum",
                       Theme_MainMinimum(dialog, &returned) && returned.cx == minimum.cx && returned.cy == minimum.cy);

@@ -46,7 +46,7 @@ Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project s
    use throwaway profiles (`%APPDATA%\Claude-<test>`) and remove them after.
 9. **claude:// goes through the user's default-app choice.** Only Windows'
    chooser or Settings can set it (the choice is signed): never write
-   `UserChoice`/`UserChoiceLatest`. **Set up links** only deletes another
+   `UserChoice`/`UserChoiceLatest`. **Fix claude:// links** only deletes another
    app's choice, so that Windows asks again. `HKCU\Software\Classes\claude` is Claude's
    own key (Claude rewrites it at every start); do not rely on it.
 10. **Pins are written by `taskbar-pin.c` only.** One entry per profile in
