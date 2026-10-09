@@ -4739,7 +4739,7 @@ static const int kMainToolbarGroups[] = { 3, 6 };   /* the actions that start a 
 static const MainButton kMainColumn[] = {
     { IDC_SYNC, { L"S&ync sessions", NULL }, { 0xE895, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE } },
     { IDC_REPAIR, { L"Rep&air", NULL }, { 0xE90F, 0 }, { THEME_TINT_AMBER, THEME_TINT_NONE } },
-    { IDC_SET_UP_LINKS, { L"Fix claude:// &links", NULL }, { 0xE71B, 0 }, { THEME_TINT_TEAL, THEME_TINT_NONE } }
+    { IDC_BACKUP_CODE, { L"&Back up .claude\x2026", NULL }, { 0xE74E, 0 }, { THEME_TINT_GREEN, THEME_TINT_NONE } }
 };
 /* The menu bar's menus, left to right. */
 static const MainButton kMainMenus[] = {

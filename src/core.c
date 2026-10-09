@@ -550,6 +550,19 @@ BOOL Core_PathUnder(const WCHAR *path, const WCHAR *dir)
            path[dirLength] == L'/';
 }
 
+/* `path` with its start written as `%variable%` when that start is the
+ * variable's `value` (a whole folder, case-insensitive): FALSE, and `path`
+ * as it is, when it is not. */
+BOOL Core_PathWithVariable(const WCHAR *path, const WCHAR *variable, const WCHAR *value, WCHAR *out, size_t cch)
+{
+    size_t valueLength = value ? Core_TrimmedPathLength(value) : 0;
+    if (path && variable && *variable && valueLength && Core_PathUnder(path, value) &&
+        SUCCEEDED(StringCchPrintfW(out, cch, L"%%%s%%%s", variable, path + valueLength)))
+        return TRUE;
+    if (FAILED(StringCchCopyW(out, cch, path ? path : L""))) out[0] = 0;
+    return FALSE;
+}
+
 /* Where Claude's package keeps what it writes to AppData for itself:
  * %LOCALAPPDATA%\Packages\<family>\LocalCache\<area>\<name> (area: Local or Roaming). */
 BOOL Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *family, const WCHAR *area, const WCHAR *name,
@@ -696,6 +709,36 @@ BOOL Core_JsonMember(const char *json, size_t len, const char *key, const char *
         i = SkipSpace(json, len, i + 1);
     }
     return FALSE;
+}
+
+BOOL Core_JsonEachMember(const char *json, size_t len, CoreJsonMember each, void *context)
+{
+    size_t i, keyEnd, end;
+    i = SkipSpace(json, len, SkipByteOrderMark(json, len));
+    if (i >= len || json[i] != '{') return FALSE;
+    i = SkipSpace(json, len, i + 1);
+    if (i < len && json[i] == '}') return TRUE;
+    while (i < len && json[i] == '"') {
+        const char *key = json + i + 1;
+        if ((keyEnd = StringEnd(json, len, i)) == 0) return FALSE;
+        i = SkipSpace(json, len, keyEnd);
+        if (i >= len || json[i] != ':') return FALSE;
+        i = SkipSpace(json, len, i + 1);
+        if ((end = ValueEnd(json, len, i)) == 0 || end == i) return FALSE;
+        if (!each(context, key, (size_t)(json + keyEnd - 1 - key), json + i, end - i)) return FALSE;
+        i = SkipSpace(json, len, end);
+        if (i < len && json[i] == '}') return TRUE;
+        if (i >= len || json[i] != ',') return FALSE;
+        i = SkipSpace(json, len, i + 1);
+    }
+    return FALSE;
+}
+
+BOOL Core_JsonIsValue(const char *text, size_t len)
+{
+    size_t start = SkipSpace(text, len, 0), end;
+    if (start >= len || (end = ValueEnd(text, len, start)) == 0 || end == start) return FALSE;
+    return SkipSpace(text, len, end) == len;
 }
 
 /* Appends `codePoint` in UTF-8 at out[*length], leaving room for a
@@ -2100,4 +2143,507 @@ int Core_ProcessDescendants(const CoreProcess *processes, int count, int root, B
         }
     }
     return marked;
+}
+
+/* ---------------------------------------------------------------- LevelDB */
+
+/* What Chromium keeps a window's web storage in (Claude's Local Storage):
+ * the formats of LevelDB 1.x as its doc/ describes them. A log holds write
+ * batches in 32 KiB blocks, each record behind a header (a masked CRC32C of
+ * its type and data, its length, its type); a table holds sorted entries in
+ * blocks (Snappy-compressed or not), found through an index block its footer
+ * points to; the manifest is a log of version edits (which tables and log
+ * are live, the last sequence number). Only what reading every live entry,
+ * and adding one write batch to the log, need. */
+
+#define LEVEL_BLOCK         32768u   /* a log's block */
+#define LEVEL_HEADER        7u       /* a log record's header: checksum, length, type */
+#define LEVEL_FOOTER        48u      /* a table's footer */
+#define LEVEL_MAGIC         0xdb4775248b80fb57ULL
+#define LEVEL_MASK_DELTA    0xa282ead8u
+
+enum { LEVEL_FULL = 1, LEVEL_FIRST = 2, LEVEL_MIDDLE = 3, LEVEL_LAST = 4 };
+
+static DWORD g_crc32cTable[256];
+
+DWORD Core_Crc32c(DWORD crc, const void *data, size_t size)
+{
+    const BYTE *bytes = (const BYTE *)data;
+    size_t i;
+    if (!g_crc32cTable[1]) {
+        DWORD n, k, c;
+        for (n = 0; n < 256; n++) {
+            for (c = n, k = 0; k < 8; k++) c = (c & 1) ? 0x82f63b78u ^ (c >> 1) : c >> 1;
+            g_crc32cTable[n] = c;
+        }
+    }
+    crc = ~crc;
+    for (i = 0; i < size; i++) crc = g_crc32cTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+/* LevelDB stores a CRC that covers data holding CRCs rotated and offset. */
+DWORD Core_LevelMask(DWORD crc)
+{
+    return ((crc >> 15) | (crc << 17)) + LEVEL_MASK_DELTA;
+}
+
+/* A varint at `*at`, before `end`; FALSE when it runs past it or past 64 bits. */
+static BOOL LevelVarint(const BYTE *data, size_t end, size_t *at, ULONGLONG *value)
+{
+    int shift;
+    *value = 0;
+    for (shift = 0; shift < 64 && *at < end; shift += 7) {
+        BYTE b = data[(*at)++];
+        *value |= (ULONGLONG)(b & 0x7F) << shift;
+        if (!(b & 0x80)) return TRUE;
+    }
+    return FALSE;
+}
+
+static size_t LevelPutVarint(BYTE *out, ULONGLONG value)
+{
+    size_t n = 0;
+    while (value >= 0x80) {
+        out[n++] = (BYTE)(value | 0x80);
+        value >>= 7;
+    }
+    out[n++] = (BYTE)value;
+    return n;
+}
+
+static ULONGLONG LevelFixed64(const BYTE *p)
+{
+    ULONGLONG value = 0;
+    int i;
+    for (i = 7; i >= 0; i--) value = (value << 8) | p[i];
+    return value;
+}
+
+static DWORD LevelFixed32(const BYTE *p)
+{
+    return (DWORD)p[0] | ((DWORD)p[1] << 8) | ((DWORD)p[2] << 16) | ((DWORD)p[3] << 24);
+}
+
+BOOL Core_SnappyLength(const BYTE *in, size_t length, size_t *outLength)
+{
+    size_t at = 0;
+    ULONGLONG value;
+    if (!LevelVarint(in, length, &at, &value) || value > (ULONGLONG)SIZE_MAX / 2) return FALSE;
+    *outLength = (size_t)value;
+    return TRUE;
+}
+
+/* Snappy's raw format: the length, then literals and copies of what came
+ * before. FALSE when `in` is not that, or does not fill `out` exactly. */
+BOOL Core_SnappyDecode(const BYTE *in, size_t length, BYTE *out, size_t outLength)
+{
+    size_t at = 0, written = 0, n, offset, i;
+    ULONGLONG total;
+    if (!LevelVarint(in, length, &at, &total) || total != outLength) return FALSE;
+    while (at < length) {
+        BYTE tag = in[at++];
+        switch (tag & 3) {
+        case 0:
+            n = tag >> 2;
+            if (n >= 60) {
+                size_t bytes = n - 59, k;
+                if (at + bytes > length) return FALSE;
+                for (n = 0, k = 0; k < bytes; k++) n |= (size_t)in[at + k] << (8 * k);
+                at += bytes;
+            }
+            n += 1;
+            if (n > length - at || n > outLength - written) return FALSE;
+            memcpy(out + written, in + at, n);
+            at += n;
+            written += n;
+            continue;
+        case 1:
+            if (at >= length) return FALSE;
+            n = ((tag >> 2) & 7) + 4;
+            offset = ((size_t)(tag >> 5) << 8) | in[at++];
+            break;
+        case 2:
+            if (at + 2 > length) return FALSE;
+            n = (size_t)(tag >> 2) + 1;
+            offset = (size_t)in[at] | ((size_t)in[at + 1] << 8);
+            at += 2;
+            break;
+        default:
+            if (at + 4 > length) return FALSE;
+            n = (size_t)(tag >> 2) + 1;
+            offset = LevelFixed32(in + at);
+            at += 4;
+            break;
+        }
+        if (offset == 0 || offset > written || n > outLength - written) return FALSE;
+        for (i = 0; i < n; i++, written++) out[written] = out[written - offset];
+    }
+    return written == outLength;
+}
+
+BOOL Core_LevelLogRecords(const BYTE *log, size_t length, CoreLevelRecord each, void *context, size_t *cleanEnd)
+{
+    BYTE *whole = NULL;
+    size_t at = 0, used = 0, capacity = 0;
+    BOOL inRecord = FALSE, ok = TRUE;
+    *cleanEnd = 0;
+    while (at + LEVEL_HEADER <= length) {
+        size_t left = LEVEL_BLOCK - at % LEVEL_BLOCK, size;
+        DWORD stored;
+        BYTE type;
+        if (left < LEVEL_HEADER) {   /* a block's trailer */
+            at += left;
+            continue;
+        }
+        stored = LevelFixed32(log + at);
+        size = (size_t)log[at + 4] | ((size_t)log[at + 5] << 8);
+        type = log[at + 6];
+        if (type == 0 && size == 0) {   /* zeros to the end of the block */
+            at += left;
+            continue;
+        }
+        if (size > left - LEVEL_HEADER || at + LEVEL_HEADER + size > length ||
+            Core_LevelMask(Core_Crc32c(0, log + at + 6, 1 + size)) != stored)
+            break;   /* a record cut short, or garbage: what follows is not read */
+        if (type == LEVEL_FULL) {
+            if (!each(context, log + at + LEVEL_HEADER, size)) ok = FALSE;
+            inRecord = FALSE;
+        } else if (type == LEVEL_FIRST || ((type == LEVEL_MIDDLE || type == LEVEL_LAST) && inRecord)) {
+            if (type == LEVEL_FIRST) used = 0;
+            if (used + size > capacity) {
+                size_t grown = max(capacity * 2, used + size + 4096);
+                BYTE *bigger = whole ? (BYTE *)HeapReAlloc(GetProcessHeap(), 0, whole, grown) : (BYTE *)HeapAlloc(GetProcessHeap(), 0, grown);
+                if (!bigger) {
+                    ok = FALSE;
+                    break;
+                }
+                whole = bigger;
+                capacity = grown;
+            }
+            memcpy(whole + used, log + at + LEVEL_HEADER, size);
+            used += size;
+            inRecord = type != LEVEL_LAST;
+            if (type == LEVEL_LAST && !each(context, whole, used)) ok = FALSE;
+        }
+        at += LEVEL_HEADER + size;
+        if (!inRecord) *cleanEnd = at;
+    }
+    if (whole) HeapFree(GetProcessHeap(), 0, whole);
+    return ok;
+}
+
+size_t Core_LevelLogAppend(size_t fileLength, const BYTE *record, size_t length, BYTE *out, size_t capacity)
+{
+    size_t written = 0, offset = fileLength % LEVEL_BLOCK, done = 0;
+    BOOL first = TRUE;
+    do {
+        size_t left = LEVEL_BLOCK - offset, size;
+        DWORD crc;
+        BYTE type;
+        if (left < LEVEL_HEADER) {
+            if (written + left > capacity) return 0;
+            memset(out + written, 0, left);
+            written += left;
+            offset = 0;
+            continue;
+        }
+        size = min(length - done, left - LEVEL_HEADER);
+        type = (BYTE)(first && done + size == length ? LEVEL_FULL : first ? LEVEL_FIRST : done + size == length ? LEVEL_LAST : LEVEL_MIDDLE);
+        if (written + LEVEL_HEADER + size > capacity) return 0;
+        out[written + 4] = (BYTE)size;
+        out[written + 5] = (BYTE)(size >> 8);
+        out[written + 6] = type;
+        memcpy(out + written + LEVEL_HEADER, record + done, size);
+        crc = Core_LevelMask(Core_Crc32c(0, out + written + 6, 1 + size));
+        out[written] = (BYTE)crc;
+        out[written + 1] = (BYTE)(crc >> 8);
+        out[written + 2] = (BYTE)(crc >> 16);
+        out[written + 3] = (BYTE)(crc >> 24);
+        written += LEVEL_HEADER + size;
+        offset = (offset + LEVEL_HEADER + size) % LEVEL_BLOCK;
+        done += size;
+        first = FALSE;
+    } while (done < length);
+    return written;
+}
+
+BOOL Core_LevelBatchRead(const BYTE *batch, size_t length, CoreLevelEntry each, void *context)
+{
+    ULONGLONG sequence, count, i, keyLength, valueLength;
+    size_t at = 12;
+    if (length < 12) return FALSE;
+    sequence = LevelFixed64(batch);
+    count = LevelFixed32(batch + 8);
+    for (i = 0; i < count; i++) {
+        CoreLevelOp op;
+        BYTE type;
+        if (at >= length) return FALSE;
+        type = batch[at++];
+        if ((type != 0 && type != 1) || !LevelVarint(batch, length, &at, &keyLength) || keyLength > length - at) return FALSE;
+        ZeroMemory(&op, sizeof op);
+        op.put = type == 1;
+        op.key = batch + at;
+        op.keyLength = (size_t)keyLength;
+        at += (size_t)keyLength;
+        if (op.put) {
+            if (!LevelVarint(batch, length, &at, &valueLength) || valueLength > length - at) return FALSE;
+            op.value = batch + at;
+            op.valueLength = (size_t)valueLength;
+            at += (size_t)valueLength;
+        }
+        if (!each(context, sequence + i, &op)) return FALSE;
+    }
+    return at == length;
+}
+
+size_t Core_LevelBatchWrite(ULONGLONG sequence, const CoreLevelOp *ops, int count, BYTE *out, size_t capacity)
+{
+    size_t at = 12;
+    int i, b;
+    if (capacity < 12) return 0;
+    for (b = 0; b < 8; b++) out[b] = (BYTE)(sequence >> (8 * b));
+    for (b = 0; b < 4; b++) out[8 + b] = (BYTE)((DWORD)count >> (8 * b));
+    for (i = 0; i < count; i++) {
+        size_t need = 1 + 10 + ops[i].keyLength + (ops[i].put ? 10 + ops[i].valueLength : 0);
+        if (need > capacity - at) return 0;
+        out[at++] = (BYTE)(ops[i].put ? 1 : 0);
+        at += LevelPutVarint(out + at, ops[i].keyLength);
+        memcpy(out + at, ops[i].key, ops[i].keyLength);
+        at += ops[i].keyLength;
+        if (ops[i].put) {
+            at += LevelPutVarint(out + at, ops[i].valueLength);
+            memcpy(out + at, ops[i].value, ops[i].valueLength);
+            at += ops[i].valueLength;
+        }
+    }
+    return at;
+}
+
+/* A block of a table (`handle`: its offset and size), as it is or Snappy-
+ * decompressed (a heap block, freed by the caller); NULL when it cannot be. */
+static BYTE *LevelTableBlock(const BYTE *table, size_t length, ULONGLONG offset, ULONGLONG size, size_t *blockLength)
+{
+    BYTE *block = NULL;
+    size_t inflated;
+    if (offset > length || size > length - offset || length - offset - size < 5) return NULL;
+    if (table[offset + size] == 0) {
+        if ((block = (BYTE *)HeapAlloc(GetProcessHeap(), 0, (size_t)max(size, 1))) != NULL) memcpy(block, table + offset, (size_t)size);
+        *blockLength = (size_t)size;
+        return block;
+    }
+    if (table[offset + size] != 1 || !Core_SnappyLength(table + offset, (size_t)size, &inflated) || inflated > (64u << 20) ||
+        (block = (BYTE *)HeapAlloc(GetProcessHeap(), 0, max(inflated, 1))) == NULL)
+        return NULL;
+    if (!Core_SnappyDecode(table + offset, (size_t)size, block, inflated)) {
+        HeapFree(GetProcessHeap(), 0, block);
+        return NULL;
+    }
+    *blockLength = inflated;
+    return block;
+}
+
+typedef BOOL (*LevelBlockEntry)(void *context, const BYTE *key, size_t keyLength, const BYTE *value, size_t valueLength);
+
+/* Each entry of a table's block: keys share a prefix with the one before. */
+static BOOL LevelBlockEntries(const BYTE *block, size_t length, LevelBlockEntry each, void *context)
+{
+    BYTE *key = NULL;
+    size_t end, at = 0, keyLength = 0, capacity = 0;
+    DWORD restarts;
+    BOOL ok = TRUE;
+    if (length < 4) return FALSE;
+    restarts = LevelFixed32(block + length - 4);
+    if (restarts > (length - 4) / 4) return FALSE;
+    end = length - 4 - 4 * (size_t)restarts;
+    while (ok && at < end) {
+        ULONGLONG shared, unshared, valueLength;
+        if (!LevelVarint(block, end, &at, &shared) || !LevelVarint(block, end, &at, &unshared) || !LevelVarint(block, end, &at, &valueLength) ||
+            shared > keyLength || unshared > end - at || valueLength > end - at - unshared) {
+            ok = FALSE;
+            break;
+        }
+        if ((size_t)(shared + unshared) > capacity) {
+            size_t grown = (size_t)(shared + unshared) + 256;
+            BYTE *bigger = key ? (BYTE *)HeapReAlloc(GetProcessHeap(), 0, key, grown) : (BYTE *)HeapAlloc(GetProcessHeap(), 0, grown);
+            if (!bigger) {
+                ok = FALSE;
+                break;
+            }
+            key = bigger;
+            capacity = grown;
+        }
+        memcpy(key + shared, block + at, (size_t)unshared);
+        keyLength = (size_t)(shared + unshared);
+        at += (size_t)unshared;
+        ok = each(context, key, keyLength, block + at, (size_t)valueLength);
+        at += (size_t)valueLength;
+    }
+    if (key) HeapFree(GetProcessHeap(), 0, key);
+    return ok;
+}
+
+typedef struct LevelTableRead {
+    const BYTE    *table;
+    size_t         length;
+    CoreLevelEntry each;
+    void          *context;
+} LevelTableRead;
+
+/* A data block's entry: its internal key is the user key, then the sequence
+ * and the type (0: deleted, 1: a value) in eight bytes. */
+static BOOL LevelDataEntry(void *context, const BYTE *key, size_t keyLength, const BYTE *value, size_t valueLength)
+{
+    LevelTableRead *read = (LevelTableRead *)context;
+    CoreLevelOp op;
+    ULONGLONG trailer;
+    if (keyLength < 8) return FALSE;
+    trailer = LevelFixed64(key + keyLength - 8);
+    ZeroMemory(&op, sizeof op);
+    op.put = (trailer & 0xFF) == 1;
+    op.key = key;
+    op.keyLength = keyLength - 8;
+    op.value = op.put ? value : NULL;
+    op.valueLength = op.put ? valueLength : 0;
+    return read->each(read->context, trailer >> 8, &op);
+}
+
+/* An index block's entry: the data block it points to. */
+static BOOL LevelIndexEntry(void *context, const BYTE *key, size_t keyLength, const BYTE *value, size_t valueLength)
+{
+    LevelTableRead *read = (LevelTableRead *)context;
+    ULONGLONG offset, size;
+    size_t at = 0, blockLength = 0;
+    BYTE *block;
+    BOOL ok;
+    (void)key;
+    (void)keyLength;
+    if (!LevelVarint(value, valueLength, &at, &offset) || !LevelVarint(value, valueLength, &at, &size) ||
+        (block = LevelTableBlock(read->table, read->length, offset, size, &blockLength)) == NULL)
+        return FALSE;
+    ok = LevelBlockEntries(block, blockLength, LevelDataEntry, read);
+    HeapFree(GetProcessHeap(), 0, block);
+    return ok;
+}
+
+BOOL Core_LevelTableRead(const BYTE *table, size_t length, CoreLevelEntry each, void *context)
+{
+    LevelTableRead read;
+    const BYTE *footer;
+    ULONGLONG ignored, offset, size;
+    size_t at = 0, indexLength = 0;
+    BYTE *index;
+    BOOL ok;
+    if (length < LEVEL_FOOTER) return FALSE;
+    footer = table + length - LEVEL_FOOTER;
+    if (LevelFixed64(footer + LEVEL_FOOTER - 8) != LEVEL_MAGIC || !LevelVarint(footer, LEVEL_FOOTER - 8, &at, &ignored) ||
+        !LevelVarint(footer, LEVEL_FOOTER - 8, &at, &ignored) || !LevelVarint(footer, LEVEL_FOOTER - 8, &at, &offset) ||
+        !LevelVarint(footer, LEVEL_FOOTER - 8, &at, &size) || (index = LevelTableBlock(table, length, offset, size, &indexLength)) == NULL)
+        return FALSE;
+    read.table = table;
+    read.length = length;
+    read.each = each;
+    read.context = context;
+    ok = LevelBlockEntries(index, indexLength, LevelIndexEntry, &read);
+    HeapFree(GetProcessHeap(), 0, index);
+    return ok;
+}
+
+BOOL Core_LevelManifestEdit(const BYTE *edit, size_t length, CoreLevelManifest *state)
+{
+    size_t at = 0;
+    while (at < length) {
+        ULONGLONG tag, a, b, size;
+        if (!LevelVarint(edit, length, &at, &tag)) return FALSE;
+        switch (tag) {
+        case 1:   /* the comparator's name */
+            if (!LevelVarint(edit, length, &at, &size) || size > length - at) return FALSE;
+            at += (size_t)size;
+            break;
+        case 2:
+            if (!LevelVarint(edit, length, &at, &state->logNumber)) return FALSE;
+            state->hasLog = TRUE;
+            break;
+        case 3:
+            if (!LevelVarint(edit, length, &at, &state->nextFile)) return FALSE;
+            break;
+        case 4:
+            if (!LevelVarint(edit, length, &at, &a)) return FALSE;
+            state->lastSequence = max(state->lastSequence, a);
+            break;
+        case 5:   /* a compaction's place: a level, an internal key */
+            if (!LevelVarint(edit, length, &at, &a) || !LevelVarint(edit, length, &at, &size) || size > length - at) return FALSE;
+            at += (size_t)size;
+            break;
+        case 6:   /* a table gone: its level and number */
+            if (!LevelVarint(edit, length, &at, &a) || !LevelVarint(edit, length, &at, &b)) return FALSE;
+            if (state->onTable) state->onTable(state->context, b, FALSE);
+            break;
+        case 7: { /* a new table: level, number, size, smallest and largest keys */
+            ULONGLONG number;
+            if (!LevelVarint(edit, length, &at, &a) || !LevelVarint(edit, length, &at, &number) || !LevelVarint(edit, length, &at, &b))
+                return FALSE;
+            if (!LevelVarint(edit, length, &at, &size) || size > length - at) return FALSE;
+            at += (size_t)size;
+            if (!LevelVarint(edit, length, &at, &size) || size > length - at) return FALSE;
+            at += (size_t)size;
+            if (state->onTable) state->onTable(state->context, number, TRUE);
+            break;
+        }
+        case 9:
+            if (!LevelVarint(edit, length, &at, &state->prevLogNumber)) return FALSE;
+            break;
+        default:
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* Chromium's Local Storage, in that database: a key of origin `origin` is
+ * "_<origin>", a zero, then the script's key: 1 and its Latin-1 bytes, or 0
+ * and its UTF-16LE; a value is 1 and Latin-1, or 0 and UTF-16LE, Latin-1
+ * when every character fits. */
+static size_t WebStorageString(const WCHAR *text, size_t length, BYTE *out, size_t capacity)
+{
+    size_t i, at = 1;
+    BOOL latin = TRUE;
+    for (i = 0; i < length; i++)
+        if (text[i] > 0xFF) latin = FALSE;
+    if (capacity < 1 + length * (latin ? 1 : 2)) return 0;
+    out[0] = (BYTE)(latin ? 1 : 0);
+    for (i = 0; i < length; i++) {
+        out[at++] = (BYTE)text[i];
+        if (!latin) out[at++] = (BYTE)(text[i] >> 8);
+    }
+    return at;
+}
+
+size_t Core_WebStorageKey(const char *origin, const WCHAR *name, BYTE *out, size_t capacity)
+{
+    size_t prefix = strlen(origin), written;
+    if (capacity < prefix + 2) return 0;
+    out[0] = '_';
+    memcpy(out + 1, origin, prefix);
+    out[prefix + 1] = 0;
+    written = WebStorageString(name, wcslen(name), out + prefix + 2, capacity - prefix - 2);
+    return written ? prefix + 2 + written : 0;
+}
+
+size_t Core_WebStorageValue(const WCHAR *text, size_t length, BYTE *out, size_t capacity)
+{
+    return WebStorageString(text, length, out, capacity);
+}
+
+BOOL Core_WebStorageText(const BYTE *value, size_t length, WCHAR *out, size_t cch, size_t *outLength)
+{
+    size_t i, n;
+    if (length < 1 || (value[0] != 0 && value[0] != 1)) return FALSE;
+    n = value[0] == 1 ? length - 1 : (length - 1) / 2;
+    if (value[0] == 0 && (length - 1) % 2) return FALSE;
+    if (n + 1 > cch) return FALSE;
+    for (i = 0; i < n; i++) out[i] = value[0] == 1 ? (WCHAR)value[1 + i] : (WCHAR)(value[1 + 2 * i] | (value[2 + 2 * i] << 8));
+    out[n] = 0;
+    *outLength = n;
+    return TRUE;
 }

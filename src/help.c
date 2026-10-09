@@ -37,9 +37,10 @@ static const WCHAR *Answer(int topic)
                   L"inside Claude's app folder, which uninstalling Claude removes; the others' in %APPDATA%\\Claude-<name>. Claude shows only "
                   L"the conversations its list names.");
     case 2:
-        return TR(L"Select a profile, open the Sessions menu, choose Keep sessions the same as, then the other profile; or choose it in the "
-                  L"profile's Edit\x2026 dialog. From then on, each time one of them closes, or opens through this program, what changed in its "
-                  L"list goes to the others: new conversations, titles, stars, archived and deleted ones. The content is shared already.\n\n"
+        return TR(L"Select a profile, open the Sessions menu, choose Sync with, then the other profile; or choose it under Sync in the "
+                  L"profile's Edit\x2026 dialog. What to sync\x2026, in the same menu, chooses what they keep the same. From then on, each time "
+                  L"one of them closes, or opens through this program, what changed in one goes to the others: new conversations, titles, "
+                  L"stars, archived and deleted ones, and the rest you chose. The content is shared already.\n\n"
                   L"Use one profile at a time: a profile that is open gets the others' changes once it closes.");
     case 3:
         return TR(L"Claude alone has one sign-in and one list of conversations. Here each profile has its own folder, so its own sign-in, "
@@ -67,10 +68,10 @@ static const WCHAR *Answer(int topic)
     default:
         return TR(L"Uninstalling Claude removes Main's folder: its sign-in, settings and list. The conversations in .claude stay, and so do "
                   L"the other profiles.\n\n"
-                  L"Before: quit Claude, right-click Main and choose Back up\x2026, then choose Back up .claude\x2026 in the Sessions menu.\n\n"
-                  L"After installing Claude again: open Main from this program, sign in with the same account, then quit it. If its sessions "
-                  L"are kept the same as another profile's, its list comes back by itself; if not, use Recover sessions\x2026 in the Sessions "
-                  L"menu.\n\n"
+                  L"Before: quit Claude, right-click Main and choose Back up\x2026, then click Back up .claude\x2026 on the right of the "
+                  L"window.\n\n"
+                  L"After installing Claude again: open Main from this program, sign in with the same account, then quit it. If it syncs "
+                  L"with another profile, its list comes back by itself; if not, use Recover sessions\x2026 in the Sessions menu.\n\n"
                   L"Uninstalling this program asks which profiles to keep: keep them all.");
     }
 }

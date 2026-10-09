@@ -261,6 +261,116 @@ void SyncUi_ShowReport(HWND owner, const ProfileList *profiles, const SyncReport
     Ui_Message(owner, report->failed ? MB_ICONWARNING : MB_ICONINFORMATION, L"%s", text);
 }
 
+/* ----------------------------------------------------------- confirming */
+
+/* An indented line keeps its indent: no-break spaces, where a line never
+ * breaks. */
+void SyncUi_AddLine(WCHAR *text, size_t cch, const WCHAR *line, BOOL indent)
+{
+    if (indent) StringCchCatW(text, cch, L"\x00A0\x00A0\x00A0\x00A0");
+    StringCchCatW(text, cch, line);
+    StringCchCatW(text, cch, L"\n");
+}
+
+void SyncUi_ShortPath(const WCHAR *path, WCHAR *out, size_t cch)
+{
+    static const WCHAR *const kVariables[] = { L"LOCALAPPDATA", L"APPDATA", L"USERPROFILE" };
+    WCHAR value[MAX_PATH];
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kVariables); i++) {
+        DWORD length = GetEnvironmentVariableW(kVariables[i], value, ARRAYSIZE(value));
+        if (length && length < ARRAYSIZE(value) && Core_PathWithVariable(path, kVariables[i], value, out, cch)) return;
+    }
+    if (FAILED(StringCchCopyW(out, cch, path))) out[0] = 0;
+}
+
+void SyncUi_AddPath(WCHAR *text, size_t cch, const WCHAR *path)
+{
+    WCHAR shown[LONG_PATH_CCH];
+    SyncUi_ShortPath(path, shown, ARRAYSIZE(shown));
+    SyncUi_AddLine(text, cch, shown, TRUE);
+}
+
+/* Where profile `p`'s files are, outside Claude's package. */
+static const WCHAR *StorageOf(const Profile *p)
+{
+    return p->storageDir[0] ? p->storageDir : p->dataDir;
+}
+
+#define FOLDERS_PROFILES_SHOWN 8   /* profiles a question names the folders of before saying how many more */
+
+/* Each profile of `bits`: its name, its folder, then what in it changes. */
+void SyncUi_AddSessionFolders(WCHAR *text, size_t cch, const ProfileList *profiles, DWORD bits, BOOL layout)
+{
+    WCHAR line[128], items[256];
+    int p, listed = 0, more = 0;
+    SyncUi_AddLine(text, cch, TR(L"These folders change (an open profile's once it closes):"), FALSE);
+    StringCchCopyW(items, ARRAYSIZE(items), CLAUDE_ENTRIES_DIR);
+    StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
+    StringCchCatW(items, ARRAYSIZE(items), CLAUDE_SCRATCH_DIR);
+    if (layout) {
+        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
+        StringCchCatW(items, ARRAYSIZE(items), CLAUDE_DESKTOP_SETTINGS);
+        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
+        StringCchCatW(items, ARRAYSIZE(items), CLAUDE_WEB_STORAGE);
+        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
+        StringCchCatW(items, ARRAYSIZE(items), CLAUDE_APP_SETTINGS);
+        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
+        StringCchCatW(items, ARRAYSIZE(items), L"Preferences");
+    }
+    for (p = 0; p < profiles->count; p++) {
+        if (!(bits & (1u << p))) continue;
+        if (listed == FOLDERS_PROFILES_SHOWN) {
+            more++;
+            continue;
+        }
+        SyncUi_AddLine(text, cch, profiles->items[p].name, FALSE);
+        SyncUi_AddPath(text, cch, StorageOf(&profiles->items[p]));
+        SyncUi_AddLine(text, cch, items, TRUE);
+        listed++;
+    }
+    if (more && SUCCEEDED(StringCchPrintfW(line, ARRAYSIZE(line), TR(L"and %d more profiles"), more))) SyncUi_AddLine(text, cch, line, FALSE);
+}
+
+void SyncUi_AddTranscriptFolder(WCHAR *text, size_t cch, const WCHAR *heading)
+{
+    WCHAR projects[MAX_PATH];
+    if (!SessionStore_ProjectsDir(projects, ARRAYSIZE(projects))) return;
+    SyncUi_AddLine(text, cch, heading, FALSE);
+    SyncUi_AddPath(text, cch, projects);
+}
+
+BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, const WCHAR *folders, BOOL backedUp, const WCHAR *button)
+{
+    WCHAR *text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (CONFIRM_CCH + 1024) * sizeof(WCHAR)), state[MAX_PATH], backups[MAX_PATH];
+    BOOL ok;
+    if (!text) return FALSE;
+    StringCchCopyW(text, CONFIRM_CCH + 1024, question);
+    StringCchCatW(text, CONFIRM_CCH + 1024, L"\n\n");
+    StringCchCatW(text, CONFIRM_CCH + 1024, folders);
+    if (backedUp && Util_StateDir(state, ARRAYSIZE(state)) && SUCCEEDED(StringCchPrintfW(backups, ARRAYSIZE(backups), L"%s\\backups", state))) {
+        SyncUi_AddLine(text, CONFIRM_CCH + 1024, TR(L"What is replaced or removed is backed up first to:"), FALSE);
+        SyncUi_AddPath(text, CONFIRM_CCH + 1024, backups);
+    }
+    ok = Ui_Ask(owner, icon ? icon : IDI_QUESTION, text, button, TR(L"Cancel"), FALSE);
+    HeapFree(GetProcessHeap(), 0, text);
+    return ok;
+}
+
+BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const ProfileList *profiles, DWORD bits, BOOL layout, BOOL transcripts,
+                            const WCHAR *button)
+{
+    WCHAR *folders = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, CONFIRM_CCH * sizeof(WCHAR));
+    BOOL ok;
+    if (!folders) return FALSE;
+    folders[0] = 0;
+    SyncUi_AddSessionFolders(folders, CONFIRM_CCH, profiles, bits, layout);
+    if (transcripts) SyncUi_AddTranscriptFolder(folders, CONFIRM_CCH, TR(L"Claude Code's conversations, where a session gets a copy of its own:"));
+    ok = SyncUi_Confirm(owner, NULL, question, folders, TRUE, button);
+    HeapFree(GetProcessHeap(), 0, folders);
+    return ok;
+}
+
 /* ------------------------------------------------------------- sessions */
 
 /* Every profile's sessions read now, the user told when they cannot be. */
@@ -285,6 +395,7 @@ static BOOL EnoughTakers(HWND owner, const SessionSet *set, DWORD *takers)
 
 BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles)
 {
+    WCHAR names[NAMES_CCH], question[NAMES_CCH + 128];
     SessionSet set;
     SyncDialog dialog;
     SyncReport report;
@@ -300,6 +411,9 @@ BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles)
     dialog.profiles = profiles;
     dialog.takers = dialog.chosen = takers;
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
+    NamesOf(profiles, dialog.chosen, names, ARRAYSIZE(names));
+    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Merge the sessions of %s?"), names);
+    if (!SyncUi_ConfirmSessions(owner, question, profiles, dialog.chosen, FALSE, FALSE, TR(L"Merge"))) return FALSE;
     /* Read again: the dialog may have been open a while. */
     if (!LoadSessions(owner, profiles, &set)) return FALSE;
     ZeroMemory(&report, sizeof report);
@@ -311,7 +425,7 @@ BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles)
 
 BOOL SyncUi_CopyAll(HWND owner, const ProfileList *profiles, DWORD sources, BOOL move)
 {
-    WCHAR names[NAMES_CCH];
+    WCHAR names[NAMES_CCH], targets[NAMES_CCH], question[3 * NAMES_CCH + 512];
     SessionSet set;
     SyncDialog dialog;
     SyncReport report;
@@ -343,9 +457,15 @@ BOOL SyncUi_CopyAll(HWND owner, const ProfileList *profiles, DWORD sources, BOOL
     dialog.chosen = BitCount(takers) == 1 ? takers : 0;   /* one to choose: it is */
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
     NamesOf(profiles, sources, names, ARRAYSIZE(names));
-    if (move && !Ui_Ask(owner, IDI_QUESTION, TR(L"The sessions will be taken out of the profiles they come from once the others list them. "
-                                                L"What is taken out is kept in a backup first.\n\nMove them?"),
-                        TR(L"Move"), TR(L"Cancel"), FALSE))
+    NamesOf(profiles, dialog.chosen, targets, ARRAYSIZE(targets));
+    if (move)
+        StringCchPrintfW(question, ARRAYSIZE(question),
+                         TR(L"Move every session of %s to %s?\n\nOnce %s list them, they are taken out of %s, and Claude's marks that they were "
+                            L"deleted are left there, so that Claude does not take them in again."),
+                         names, targets, targets, names);
+    else
+        StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Copy every session of %s to %s?"), names, targets);
+    if (!SyncUi_ConfirmSessions(owner, question, profiles, dialog.chosen | (move ? sources : 0), FALSE, FALSE, move ? TR(L"Move") : TR(L"Copy")))
         return FALSE;
     if (!LoadSessions(owner, profiles, &set)) return FALSE;
     rows = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)max(set.rowCount, 1) * sizeof *rows);
@@ -502,7 +622,7 @@ BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen
 
 BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
 {
-    WCHAR path[LONG_PATH_CCH], first[256];
+    WCHAR path[LONG_PATH_CCH], first[256], names[NAMES_CCH], question[NAMES_CCH + LONG_PATH_CCH + 128];
     const WCHAR *name;
     SessionSet set;
     SyncDialog dialog;
@@ -530,7 +650,11 @@ BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
     dialog.takers = takers;
     dialog.chosen = (chosen & takers) ? chosen & takers : takers;
     dialog.archive = name ? name + 1 : path;
-    if (!ChooseProfiles(owner, &dialog) || !LoadSessions(owner, profiles, &set)) return FALSE;
+    if (!ChooseProfiles(owner, &dialog)) return FALSE;
+    NamesOf(profiles, dialog.chosen, names, ARRAYSIZE(names));
+    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Import the sessions of %s into %s?"), dialog.archive, names);
+    if (!SyncUi_ConfirmSessions(owner, question, profiles, dialog.chosen, FALSE, TRUE, TR(L"Import")) || !LoadSessions(owner, profiles, &set))
+        return FALSE;
     ZeroMemory(&report, sizeof report);
     old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
     ok = SessionSync_Import(&set, path, dialog.chosen, &sessions, &report);
@@ -660,6 +784,7 @@ static INT_PTR CALLBACK RestoreProc(HWND dialog, UINT message, WPARAM wp, LPARAM
 
 BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *selected)
 {
+    WCHAR when[64], question[LABEL_CCH + 256];
     RestoreDialog dialog;
     SyncReport report;
     const Profile *p;
@@ -681,6 +806,14 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
         HeapFree(GetProcessHeap(), 0, dialog.versions);
         return FALSE;
     }
+    FormatWhen(dialog.versions[dialog.chosen].time, when, ARRAYSIZE(when));
+    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Write the list of sessions of %s back into \x201C%s\x201D?\n\nIt lists those sessions again; "
+                                                       L"the ones deleted by then get Claude's marks that they were deleted."),
+                     when, p->name);
+    if (!SyncUi_ConfirmSessions(owner, question, profiles, 1u << dialog.profile, TRUE, FALSE, TR(L"Recover"))) {
+        HeapFree(GetProcessHeap(), 0, dialog.versions);
+        return FALSE;
+    }
     ZeroMemory(&report, sizeof report);
     ok = SessionVault_Restore(profiles, dialog.profile, dialog.list, dialog.versions[dialog.chosen].name, &report);
     HeapFree(GetProcessHeap(), 0, dialog.versions);
@@ -693,6 +826,109 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
         return FALSE;
     }
     SyncUi_ShowReport(owner, profiles, &report, NULL);
+    return TRUE;
+}
+
+/* ------------------------------------------------------- what to sync */
+
+/* Each row of the dialog: what it syncs (SYNC_ITEM_*), as the list shows it. */
+static const struct { DWORD item; const WCHAR *label; } kSyncItems[SYNC_ITEM_COUNT] = {
+    { SYNC_ITEM_SESSIONS, L"Sessions: new ones, titles, archived and deleted ones" },
+    { SYNC_ITEM_SIDEBAR, L"Sidebar: pins, groups, project order, filters" },
+    { SYNC_ITEM_DETAILS, L"Each session's model, effort, side pane, unread mark and cost" },
+    { SYNC_ITEM_APPEARANCE, L"Appearance: fonts, editor, zoom, spelling" },
+    { SYNC_ITEM_LANGUAGE, L"Interface language" },
+    { SYNC_ITEM_MODEL, L"Default model" },
+    { SYNC_ITEM_SETTINGS, L"Settings: auto-archive, Cowork, Remote Control, recent folders" },
+    { SYNC_ITEM_PERMISSIONS, L"Permissions: folders' permission modes, Cowork's trusted folders" },
+};
+
+typedef struct ItemsDialog {
+    const WCHAR *text;
+    DWORD        items;
+    HWND         rows;
+    BOOL         filling;
+} ItemsDialog;
+
+/* What the rows checked say; OK only with one at least. */
+static void ReadItems(HWND dialog, ItemsDialog *state)
+{
+    int row;
+    state->items = 0;
+    for (row = 0; row < SYNC_ITEM_COUNT; row++)
+        if (ListView_GetCheckState(state->rows, row)) state->items |= kSyncItems[row].item;
+    EnableWindow(GetDlgItem(dialog, IDOK), state->items != 0);
+}
+
+static INT_PTR CALLBACK ItemsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    ItemsDialog *state = (ItemsDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    switch (message) {
+    case WM_INITDIALOG: {
+        LVCOLUMNW column;
+        LVITEMW item;
+        int row;
+        state = (ItemsDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetDlgItemTextW(dialog, IDC_I_TEXT, state->text);
+        state->rows = GetDlgItem(dialog, IDC_I_LIST);
+        ListView_SetExtendedListViewStyle(state->rows, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        ZeroMemory(&column, sizeof column);
+        ListView_InsertColumn(state->rows, 0, &column);   /* the view it scrolls in gives it the list's width */
+        state->filling = TRUE;
+        for (row = 0; row < SYNC_ITEM_COUNT; row++) {
+            ZeroMemory(&item, sizeof item);
+            item.mask = LVIF_TEXT;
+            item.iItem = row;
+            item.pszText = (LPWSTR)TR(kSyncItems[row].label);
+            ListView_InsertItem(state->rows, &item);
+            ListView_SetCheckState(state->rows, row, (state->items & kSyncItems[row].item) != 0);
+        }
+        state->filling = FALSE;
+        Theme_SmoothView(state->rows);
+        ReadItems(dialog, state);
+        return TRUE;
+    }
+
+    case WM_CTLCOLORSTATIC:
+        return Theme_CtlColor(message, wp, lp, IDC_I_NOTE);
+
+    case WM_NOTIFY:
+        if (state && ((const NMHDR *)lp)->hwndFrom == state->rows && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
+            const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
+            if (!state->filling && (change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK))
+                ReadItems(dialog, state);
+            return TRUE;
+        }
+        break;
+
+    case WM_COMMAND:
+        if (!state) break;
+        if (LOWORD(wp) == IDOK) {
+            ReadItems(dialog, state);
+            if (state->items) EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items)
+{
+    WCHAR names[NAMES_CCH], text[NAMES_CCH + 128];
+    ItemsDialog dialog;
+    NamesOf(profiles, members, names, ARRAYSIZE(names));
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"What %s sync with each other, at each sync:"), names);
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.text = text;
+    dialog.items = *items & SYNC_ITEMS_ALL;
+    if (Ui_Dialog(owner, IDD_SYNC_ITEMS, ItemsProc, (LPARAM)&dialog) != IDOK || !dialog.items) return FALSE;
+    *items = dialog.items;
     return TRUE;
 }
 
@@ -870,6 +1106,62 @@ static BOOL RestoreChosen(HWND owner, const ProfileList *profiles, const PurgeIt
     return restored > 0;
 }
 
+#define PURGE_FOLDERS_SHOWN 12   /* folders the clean-up names before saying how many more */
+
+/* The folders the files of the conversations chosen are in, each once, on
+ * lines of `text`: PURGE_FOLDERS_SHOWN of them, then how many more. */
+static void AddPurgeFolders(WCHAR *text, size_t cch, const PurgeItem *items, const int *chosen, int n)
+{
+    const WCHAR **ids = (const WCHAR **)HeapAlloc(GetProcessHeap(), 0, (size_t)max(n, 1) * sizeof *ids);
+    WCHAR (*paths)[LONG_PATH_CCH] = NULL, (*folders)[LONG_PATH_CCH] = NULL, error[512], line[128];
+    int count = 0, folderCount = 0, i, j;
+    if (!ids) return;
+    for (i = 0; i < n; i++) ids[i] = items[chosen[i]].id;
+    if (SessionEdit_ListTranscriptFiles(ids, n, &paths, &count, error, ARRAYSIZE(error)) &&
+        (folders = (WCHAR (*)[LONG_PATH_CCH])HeapAlloc(GetProcessHeap(), 0, (size_t)max(count, 1) * sizeof *folders)) != NULL) {
+        for (i = 0; i < count; i++) {
+            WCHAR *slash;
+            if (FAILED(StringCchCopyW(folders[folderCount], LONG_PATH_CCH, paths[i])) || (slash = wcsrchr(folders[folderCount], L'\\')) == NULL)
+                continue;
+            *slash = 0;
+            for (j = 0; j < folderCount && !Core_PathEquals(folders[j], folders[folderCount]); j++) {}
+            if (j == folderCount) folderCount++;
+        }
+        for (i = 0; i < folderCount && i < PURGE_FOLDERS_SHOWN; i++) SyncUi_AddPath(text, cch, folders[i]);
+        if (folderCount > PURGE_FOLDERS_SHOWN && SUCCEEDED(StringCchPrintfW(line, ARRAYSIZE(line), TR(L"and %d more folders"),
+                                                                           folderCount - PURGE_FOLDERS_SHOWN)))
+            SyncUi_AddLine(text, cch, line, TRUE);
+    }
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    if (folders) HeapFree(GetProcessHeap(), 0, folders);
+    HeapFree(GetProcessHeap(), 0, (void *)ids);
+}
+
+/* The clean-up, asked first: how many conversations, the folders their
+ * files go from, and where Claude Code's folder is copied first when that
+ * was chosen. */
+static BOOL ConfirmPurge(HWND owner, const PurgeItem *items, const int *chosen, int n, BOOL backUp)
+{
+    WCHAR *folders = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, CONFIRM_CCH * sizeof(WCHAR)), question[256], code[MAX_PATH], copy[MAX_PATH],
+          line[2 * MAX_PATH], shown[MAX_PATH];
+    BOOL ok;
+    if (!folders) return FALSE;
+    folders[0] = 0;
+    SyncUi_AddLine(folders, CONFIRM_CCH, TR(L"Their files go to the Recycle Bin from these folders:"), FALSE);
+    AddPurgeFolders(folders, CONFIRM_CCH, items, chosen, n);
+    if (backUp && SessionPurge_CodeFolder(code, ARRAYSIZE(code)) && SessionPurge_BackupName(copy, ARRAYSIZE(copy))) {
+        SyncUi_ShortPath(code, shown, ARRAYSIZE(shown));
+        if (SUCCEEDED(StringCchPrintfW(line, ARRAYSIZE(line), TR(L"First, Claude Code's folder %s is copied to:"), shown))) {
+            SyncUi_AddLine(folders, CONFIRM_CCH, line, FALSE);
+            SyncUi_AddPath(folders, CONFIRM_CCH, copy);
+        }
+    }
+    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Move %d conversations to the Recycle Bin?"), n);
+    ok = SyncUi_Confirm(owner, IDI_WARNING, question, folders, FALSE, TR(L"Move to the Recycle Bin"));
+    HeapFree(GetProcessHeap(), 0, folders);
+    return ok;
+}
+
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
 {
     WCHAR error[LONG_PATH_CCH];
@@ -902,7 +1194,8 @@ BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
             if (dialog.checked[i]) chosen[n++] = i;
     if (action == IDC_C_RESTORE && n) {
         changed = RestoreChosen(owner, profiles, items, chosen, n);
-    } else if (action == IDOK && n && (!dialog.backUp || CopyCodeFolder(owner, FALSE))) {
+    } else if (action == IDOK && n && ConfirmPurge(owner, items, chosen, n, dialog.backUp) &&
+               (!dialog.backUp || CopyCodeFolder(owner, FALSE))) {
         result = SessionPurge_Delete(owner, profiles, items, chosen, n, &deleted, error, ARRAYSIZE(error));
         if (result == REMOVE_DONE) Ui_Message(owner, MB_ICONINFORMATION, TR(L"Conversations moved to the Recycle Bin: %d"), deleted);
         else if (result == REMOVE_FAILED) Ui_Message(owner, MB_ICONWARNING, TR(L"The conversations could not be deleted. %s"), error);

@@ -199,7 +199,7 @@ static void FocusView(HWND dialog, BOOL sessions)
 
 /* Where a profile's session entries are: its own folder, another profile's,
  * a folder of the user's, or none yet (sessionlink.c); with its own, the
- * group whose sessions it keeps the same, all of them named. */
+ * other profiles it syncs with, named. */
 static const WCHAR *SessionsFolderText(int i, WCHAR *text, size_t cch)
 {
     WCHAR names[MAX_PROFILES * (LABEL_CCH + 8)];
@@ -209,8 +209,8 @@ static const WCHAR *SessionsFolderText(int i, WCHAR *text, size_t cch)
     switch (state.kind) {
     case LINK_OWN:
         if (group) {
-            JoinNames(SessionVault_Group(&g_manager.profiles, group), names, ARRAYSIZE(names));
-            StringCchPrintfW(text, cch, TR(L"\x21C4 Group %d: %s"), group, names);
+            JoinNames(SessionVault_Group(&g_manager.profiles, group) & ~(1u << i), names, ARRAYSIZE(names));
+            StringCchPrintfW(text, cch, TR(L"\x21C4 Synced with %s"), names);
             return text;
         }
         return TR(Theme_SessionsFolderState(0));
@@ -500,7 +500,6 @@ static void UpdateButtons(void)
     EnableControl(IDC_DELETE, Deletable(selected) != 0);
     EnableControl(IDC_SYNC, selected && idle);
     EnableControl(IDC_REPAIR, idle);
-    EnableControl(IDC_SET_UP_LINKS, g_manager.pkg.found);
     EnableControl(IDC_DEFAULT, p && !isDefault);
 }
 
@@ -621,6 +620,7 @@ typedef struct ProfileDialog {
     BOOL           startup;
     BOOL           copy;
     int            sync;       /* once closed, what its sessions do: 0 kept apart, a group joined, or -1 - a profile to keep them the same as */
+    DWORD          syncItems;  /* what it syncs with them, chosen in the dialog (SYNC_ITEM_*); 0: as it was */
     int            syncAt[MAX_PROFILES + 1];   /* each choice's value */
     WCHAR          syncFolder[FOLDER_CCH];     /* once closed, the profile chosen to keep the same as, when one is */
     HICON          preview;
@@ -810,19 +810,19 @@ static void FillSessionChoices(HWND dialog, ProfileDialog *state)
         else if (current != g_manager.profiles.items[i].syncGroup) current = 0;
     }
     SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)(state->several ? TR(L"Their own, kept apart") : TR(L"Its own, kept apart")));
+    SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(L"Not synced"));
     state->syncAt[count++] = 0;
     for (group = 1; group <= MAX_PROFILES; group++) {
         if ((members = SessionVault_Group(&g_manager.profiles, group) & ~editing) == 0) continue;
         JoinNames(members, names, ARRAYSIZE(names));
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"The same as %s"), names);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"With %s"), names);
         if (SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)text) < 0) continue;
         if (group == current) selected = count;
         state->syncAt[count++] = group;
     }
     for (i = 0; i < g_manager.profiles.count && count < (int)ARRAYSIZE(state->syncAt); i++) {
         if ((editing & (1u << i)) || g_manager.profiles.items[i].syncGroup) continue;
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"The same as %s"), g_manager.profiles.items[i].name);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"With %s"), g_manager.profiles.items[i].name);
         if (SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)text) < 0) continue;
         state->syncAt[count++] = -1 - i;
     }
@@ -833,6 +833,26 @@ static int ChosenSessions(HWND dialog, const ProfileDialog *state)
 {
     LRESULT i = SendDlgItemMessageW(dialog, IDC_P_SYNC, CB_GETCURSEL, 0, 0);
     return i >= 0 && i < (LRESULT)ARRAYSIZE(state->syncAt) ? state->syncAt[i] : 0;
+}
+
+/* The other profiles a choice of the dialog syncs with: a group, or a
+ * profile and its group. */
+static DWORD SyncedWith(int choice)
+{
+    int other = -1 - choice;
+    if (choice > 0) return SessionVault_Group(&g_manager.profiles, choice);
+    if (choice < 0 && other < g_manager.profiles.count)
+        return (1u << other) | SessionVault_Group(&g_manager.profiles, g_manager.profiles.items[other].syncGroup);
+    return 0;
+}
+
+/* What the profiles edited sync with those chosen, picked in a dialog of its own. */
+static void ChooseDialogItems(HWND dialog, ProfileDialog *state)
+{
+    DWORD editing = DialogProfiles(state), others = SyncedWith(ChosenSessions(dialog, state)) & ~editing, items;
+    if (!others) return;
+    items = state->syncItems ? state->syncItems : SessionVault_GroupItems(&g_manager.profiles, others);
+    if (SyncUi_ChooseItems(dialog, &g_manager.profiles, editing | others, &items)) state->syncItems = items;
 }
 
 static BOOL ValidateProfileDialog(HWND dialog, ProfileDialog *state, BOOL showError)
@@ -910,6 +930,7 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
         SetWindowTextW(dialog, state->several ? TR(L"Edit profiles") : state->existing ? TR(L"Edit profile") : TR(L"New profile"));
         FillSessionChoices(dialog, state);
+        EnableWindow(GetDlgItem(dialog, IDC_P_SYNC_ITEMS), ChosenSessions(dialog, state) != 0);
         if (state->several) {
             /* Several profiles: what they share, their sessions; the rows of the rest close (Theme_FitDialog). */
             static const int kOwn[] = { IDC_P_NAME_LABEL, IDC_P_NAME, IDC_P_COLOR_LABEL, IDC_P_COLOR, IDC_P_PREVIEW, IDC_P_BADGE_LABEL,
@@ -985,6 +1006,12 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
             return TRUE;
         case IDC_P_COLOR:
             if (HIWORD(wp) == CBN_SELCHANGE) UpdatePreview(dialog, state);
+            return TRUE;
+        case IDC_P_SYNC:
+            if (HIWORD(wp) == CBN_SELCHANGE) EnableWindow(GetDlgItem(dialog, IDC_P_SYNC_ITEMS), ChosenSessions(dialog, state) != 0);
+            return TRUE;
+        case IDC_P_SYNC_ITEMS:
+            if (HIWORD(wp) == BN_CLICKED) ChooseDialogItems(dialog, state);
             return TRUE;
         case IDOK:
             if (!ValidateProfileDialog(dialog, state, TRUE)) return TRUE;
@@ -1347,6 +1374,16 @@ static void DoQuit(BOOL restart)
 
 /* ----------------------------------------------------- sessions kept the same */
 
+/* The profiles of `members` sync `items` (SYNC_ITEM_*) with each other from now on. */
+static void SetGroupItems(DWORD members, DWORD items)
+{
+    int i;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if ((members & (1u << i)) && !Profiles_SetSyncItems(g_manager.profiles.items[i].folder, items))
+            Util_Log(L"could not keep what %s syncs (error %lu)", g_manager.profiles.items[i].folder, GetLastError());
+    Refresh(FALSE);
+}
+
 /* A group left with one profile keeps nothing the same: it is no group. */
 static void DropLoneGroups(void)
 {
@@ -1365,12 +1402,19 @@ static void DropLoneGroups(void)
 static int SetSessionsChoice(DWORD bits, int choice)
 {
     int group = choice, i;
+    DWORD joined, items;
     if (choice < 0) {
         int other = -1 - choice;
         if (other >= g_manager.profiles.count) return 0;
         group = g_manager.profiles.items[other].syncGroup ? g_manager.profiles.items[other].syncGroup : SessionVault_NewGroup(&g_manager.profiles);
         if (!group) return 0;
         bits |= 1u << other;
+    }
+    /* A profile joining syncs what the others there do. */
+    if (group && (joined = SessionVault_Group(&g_manager.profiles, group) & ~bits) != 0) {
+        items = SessionVault_GroupItems(&g_manager.profiles, joined);
+        for (i = 0; i < g_manager.profiles.count; i++)
+            if (bits & (1u << i)) Profiles_SetSyncItems(g_manager.profiles.items[i].folder, items);
     }
     for (i = 0; i < g_manager.profiles.count; i++)
         if ((bits & (1u << i)) && g_manager.profiles.items[i].syncGroup != group &&
@@ -1447,10 +1491,11 @@ static void DoNew(void)
     }
     /* It gets the group's sessions once it is signed in. */
     if (dialog.sync) {
-        int other;
+        int other, group;
         /* The list was read again: the profile chosen is found by its folder. */
         if (dialog.sync < 0) dialog.sync = (other = Profiles_Find(&g_manager.profiles, dialog.syncFolder)) >= 0 ? -1 - other : 0;
-        if (dialog.sync) SetSessionsChoice(1u << i, dialog.sync);
+        if (dialog.sync && (group = SetSessionsChoice(1u << i, dialog.sync)) != 0 && dialog.syncItems)
+            SetGroupItems(SessionVault_Group(&g_manager.profiles, group), dialog.syncItems);
         if ((i = Profiles_Find(&g_manager.profiles, folder)) < 0) return;
     }
     SelectProfileRow(folder);
@@ -1461,10 +1506,41 @@ static void DoNew(void)
     if (dialog.openNow && !StateChangesBlocked()) RunJob(JOB_OPEN, 1u << i);
 }
 
+/* Profiles that will keep the same sessions (`together`), asked first: what
+ * keeping them the same does, and the folders it writes. */
+static BOOL ConfirmKeepSame(DWORD together)
+{
+    WCHAR names[MAX_PROFILES * (LABEL_CCH + 16)], question[1024 + ARRAYSIZE(names)];
+    JoinNames(together, names, ARRAYSIZE(names));
+    StringCchPrintfW(question, ARRAYSIZE(question),
+                     TR(L"Keep the sessions of %s the same?\n\nFrom then on, each time one of them closes or opens, what changed in one goes to "
+                        L"the others: new sessions, titles, stars, pins and groups, archived and deleted ones. A session two of them went on "
+                        L"with apart is kept as two. One that loses its list, when Claude is reinstalled, gets it back."),
+                     names);
+    return SyncUi_ConfirmSessions(g_manager.dlg, question, &g_manager.profiles, together, TRUE, TRUE, TR(L"Keep the same"));
+}
+
+/* Sync sessions: the sessions that change are those of the groups of the
+ * profiles selected; asked first, with their folders. Profiles in no group
+ * change nothing (only the vault keeps a version of their lists). */
+static BOOL ConfirmSync(DWORD selected)
+{
+    WCHAR names[MAX_PROFILES * (LABEL_CCH + 16)], question[256 + ARRAYSIZE(names)];
+    DWORD changed = 0;
+    int i;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if ((selected & (1u << i)) && g_manager.profiles.items[i].syncGroup)
+            changed |= SessionVault_Group(&g_manager.profiles, g_manager.profiles.items[i].syncGroup);
+    if (!(changed & (changed - 1))) return TRUE;
+    JoinNames(changed, names, ARRAYSIZE(names));
+    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Make the sessions of %s the same now?"), names);
+    return SyncUi_ConfirmSessions(g_manager.dlg, question, &g_manager.profiles, changed, TRUE, TRUE, TR(L"Sync"));
+}
+
 /* The profiles of `folders` keep their sessions as a profile dialog chose
- * (`sync`; a profile chosen by its folder, `syncFolder`), made the same at
- * once when they joined a group. */
-static void ApplySessionsChoice(WCHAR (*folders)[FOLDER_CCH], int count, int sync, const WCHAR *syncFolder)
+ * (`sync`; a profile chosen by its folder, `syncFolder`), syncing `items`
+ * (0: what they did), made the same at once when they joined a group. */
+static void ApplySessionsChoice(WCHAR (*folders)[FOLDER_CCH], int count, int sync, const WCHAR *syncFolder, DWORD items)
 {
     DWORD bits = 0, changed = 0;
     int i, at, group;
@@ -1473,9 +1549,20 @@ static void ApplySessionsChoice(WCHAR (*folders)[FOLDER_CCH], int count, int syn
             bits |= 1u << at;
             if (sync < 0 || g_manager.profiles.items[at].syncGroup != sync) changed |= 1u << at;
         }
-    if (!changed) return;
+    if (!changed) {
+        if (items && sync > 0) SetGroupItems(SessionVault_Group(&g_manager.profiles, sync), items);
+        return;
+    }
     if (sync < 0 && (sync = (at = Profiles_Find(&g_manager.profiles, syncFolder)) >= 0 ? -1 - at : 0) == 0) return;
-    if ((group = SetSessionsChoice(bits, sync)) != 0) RunJob(JOB_SYNC, SessionVault_Group(&g_manager.profiles, group));
+    /* Joining a group (of another profile's, or an existing one) changes sessions: asked first. */
+    if (sync < 0 && !ConfirmKeepSame(bits | (1u << (-1 - sync)) |
+                                     SessionVault_Group(&g_manager.profiles, g_manager.profiles.items[-1 - sync].syncGroup)))
+        return;
+    if (sync > 0 && !ConfirmKeepSame(bits | SessionVault_Group(&g_manager.profiles, sync))) return;
+    if ((group = SetSessionsChoice(bits, sync)) != 0) {
+        if (items) SetGroupItems(SessionVault_Group(&g_manager.profiles, group), items);
+        RunJob(JOB_SYNC, SessionVault_Group(&g_manager.profiles, group));
+    }
 }
 
 /* Several profiles edited together: what they share, how their sessions are kept. */
@@ -1489,7 +1576,7 @@ static void DoEditSeveral(DWORD selected)
     if (Ui_Dialog(g_manager.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&dialog) != IDOK || StateChangesBlocked()) return;
     for (i = 0; i < g_manager.profiles.count; i++)
         if (selected & (1u << i)) StringCchCopyW(folders[count++], FOLDER_CCH, g_manager.profiles.items[i].folder);
-    ApplySessionsChoice(folders, count, dialog.sync, dialog.syncFolder);
+    ApplySessionsChoice(folders, count, dialog.sync, dialog.syncFolder, dialog.syncItems);
 }
 
 static void DoEdit(void)
@@ -1544,20 +1631,25 @@ static void DoEdit(void)
     g_manager.shortcutStateFolder[0] = 0;
     UpdateButtons();
     StringCchCopyW(folder[0], FOLDER_CCH, before.folder);
-    ApplySessionsChoice(folder, 1, dialog.sync, dialog.syncFolder);
+    ApplySessionsChoice(folder, 1, dialog.sync, dialog.syncFolder, dialog.syncItems);
 }
 
 static BOOL ConfirmDelete(const Profile *p)
 {
-    WCHAR text[512 + MAX_PATH], target[MAX_PATH];
-    if (Profiles_LinkTarget(p, target, ARRAYSIZE(target)))
+    WCHAR text[512 + 3 * MAX_PATH], target[MAX_PATH], shownTarget[MAX_PATH], folder[MAX_PATH];
+    SyncUi_ShortPath(p->storageDir[0] ? p->storageDir : p->dataDir, folder, ARRAYSIZE(folder));
+    if (Profiles_LinkTarget(p, target, ARRAYSIZE(target))) {
+        SyncUi_ShortPath(target, shownTarget, ARRAYSIZE(shownTarget));
         StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Delete the profile \x201C%s\x201D?\n\nIts folder is a link to\n%s\nThe data in that folder stays on disk. The link, the profile's shortcuts and Claude's local files for it (logs and cache) are removed."),
-                         p->name, target);
-    else
+                         TR(L"Delete the profile \x201C%s\x201D?\n\nIts folder\n    %s\nis a link to\n    %s\nThe data in that folder stays on disk. The link, "
+                            L"the profile's shortcuts and Claude's local files for it (logs and cache) are removed."),
+                         p->name, folder, shownTarget);
+    } else {
         StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Delete the profile \x201C%s\x201D?\n\nIts data folder (sign-in, local history, Claude Code and Cowork files) goes to the Recycle Bin and its shortcuts are removed."),
-                         p->name);
+                         TR(L"Delete the profile \x201C%s\x201D?\n\nIts data folder goes to the Recycle Bin, with its sign-in, local history, Claude "
+                            L"Code and Cowork files:\n    %s\nIts shortcuts are removed."),
+                         p->name, folder);
+    }
     return Ui_Ask(g_manager.dlg, IDI_WARNING, text, TR(L"Delete profile"), TR(L"Cancel"), TRUE);
 }
 
@@ -1576,7 +1668,7 @@ static BOOL RefuseIfRunning(const Profile *p)
 static void DeleteSeveral(DWORD bits)
 {
     ListSelection chosen;
-    WCHAR names[MAX_PROFILES * (LABEL_CCH + 8)], text[ARRAYSIZE(names) + 1024];
+    WCHAR names[MAX_PROFILES * (LABEL_CCH + 8)], text[ARRAYSIZE(names) + 1024 + MAX_PROFILES * (MAX_PATH + 8)];
     int i, p, seen = 0, total = 0;
     ZeroMemory(&chosen, sizeof chosen);
     names[0] = 0;
@@ -1591,9 +1683,14 @@ static void DeleteSeveral(DWORD bits)
         seen++;
     }
     StringCchPrintfW(text, ARRAYSIZE(text),
-                     TR(L"Delete the profiles %s?\n\nTheir data folders (sign-in, local history, Claude Code and Cowork files) go to the Recycle Bin, "
-                        L"except a folder that is a link, which stays on disk. Their shortcuts are removed."),
+                     TR(L"Delete the profiles %s?\n\nTheir data folders go to the Recycle Bin, with their sign-in, local history, Claude Code "
+                        L"and Cowork files (a folder that is a link stays on disk):"),
                      names);
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if (bits & (1u << i))
+            SyncUi_AddPath(text, ARRAYSIZE(text), g_manager.profiles.items[i].storageDir[0] ? g_manager.profiles.items[i].storageDir
+                                                                                             : g_manager.profiles.items[i].dataDir);
+    SyncUi_AddLine(text, ARRAYSIZE(text), TR(L"Their shortcuts are removed."), FALSE);
     if (!Ui_Ask(g_manager.dlg, IDI_WARNING, text, TR(L"Delete profiles"), TR(L"Cancel"), TRUE) || StateChangesBlocked()) return;
     FinishShellWork();
     SessionsView_PauseWatching();
@@ -1794,7 +1891,7 @@ static DWORD LinkedProfiles(DWORD selected)
 /* The profiles selected whose session folder is linked get one of their own again. */
 static void DoUnlink(void)
 {
-    WCHAR text[1024], error[512 + 2 * LONG_PATH_CCH], errors[4 * (512 + 2 * LONG_PATH_CCH)];
+    WCHAR text[1024], folders[CONFIRM_CCH], error[512 + 2 * LONG_PATH_CCH], errors[4 * (512 + 2 * LONG_PATH_CCH)];
     const Profile *first = NULL;
     DWORD linked = LinkedProfiles(SelectedProfiles());
     int i, count = 0;
@@ -1814,7 +1911,16 @@ static void DoUnlink(void)
                          TR(L"Give the %d linked profiles selected session folders of their own again?\n\nEach one keeps the sessions its shared folder lists now; "
                             L"from then on the lists go apart."),
                          count);
-    if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Unlink"), TR(L"Cancel"), FALSE)) return;
+    folders[0] = 0;
+    SyncUi_AddLine(folders, ARRAYSIZE(folders), TR(L"These folders become folders of their own:"), FALSE);
+    for (i = 0; i < g_manager.profiles.count; i++) {
+        WCHAR folder[LONG_PATH_CCH];
+        const Profile *p = &g_manager.profiles.items[i];
+        if ((linked & (1u << i)) &&
+            SUCCEEDED(StringCchPrintfW(folder, ARRAYSIZE(folder), L"%s\\" CLAUDE_ENTRIES_DIR, p->storageDir[0] ? p->storageDir : p->dataDir)))
+            SyncUi_AddPath(folders, ARRAYSIZE(folders), folder);
+    }
+    if (!SyncUi_Confirm(g_manager.dlg, NULL, text, folders, FALSE, TR(L"Unlink"))) return;
     FinishShellWork();
     errors[0] = 0;
     SessionsView_PauseWatching();
@@ -1856,20 +1962,14 @@ static BOOL SameSelected(DWORD selected)
  * through a link) becomes their own again first, which needs them closed. */
 static void DoKeepSame(int other)
 {
-    WCHAR names[MAX_PROFILES * (LABEL_CCH + 16)], text[1024 + ARRAYSIZE(names)], error[512 + 2 * LONG_PATH_CCH];
+    WCHAR error[512 + 2 * LONG_PATH_CCH];
     DWORD involved, linked, together;
     int i, group;
     if (StateChangesBlocked() || other < 0 || other >= g_manager.profiles.count) return;
     involved = SelectedProfiles() & ~(1u << other);
     if (!involved) return;
     together = involved | (1u << other) | SessionVault_Group(&g_manager.profiles, g_manager.profiles.items[other].syncGroup);
-    JoinNames(together, names, ARRAYSIZE(names));
-    StringCchPrintfW(text, ARRAYSIZE(text),
-                     TR(L"Keep the sessions of %s the same?\n\nFrom then on, each time one of them closes or opens, what changed in one goes to "
-                        L"the others: new sessions, titles, stars, pins and groups, archived and deleted ones. A session two of them went on "
-                        L"with apart is kept as two. One that loses its list, when Claude is reinstalled, gets it back."),
-                     names);
-    if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, TR(L"Keep the same"), TR(L"Cancel"), FALSE)) return;
+    if (!ConfirmKeepSame(together)) return;
     linked = LinkedProfiles(together);
     for (i = 0; i < g_manager.profiles.count; i++)
         if ((linked & (1u << i)) && LinkBusy(&g_manager.profiles.items[i])) return;
@@ -1943,6 +2043,20 @@ static void AskKeepAgain(void)
     PostMessageW(g_manager.dlg, WM_APP_KEEP_SESSIONS, 0, 0);
 }
 
+/* What the profiles selected sync with the others they sync with, chosen. */
+static void DoSyncItems(void)
+{
+    DWORD selected = SelectedProfiles(), members = 0, items;
+    int i;
+    if (StateChangesBlocked()) return;
+    for (i = 0; i < g_manager.profiles.count && !members; i++)
+        if ((selected & (1u << i)) && g_manager.profiles.items[i].syncGroup)
+            members = SessionVault_Group(&g_manager.profiles, g_manager.profiles.items[i].syncGroup);
+    if (!members) return;
+    items = SessionVault_GroupItems(&g_manager.profiles, members);
+    if (SyncUi_ChooseItems(g_manager.dlg, &g_manager.profiles, members, &items)) SetGroupItems(members, items);
+}
+
 /* Once the window opened: a session folder linked to another profile's (which
  * Claude no longer writes through) offered a folder of its own, its sessions
  * kept the same as that profile's; then the session lists kept, the ones kept
@@ -2005,8 +2119,8 @@ static void ClearMenu(HMENU menu)
     while (GetMenuItemCount(menu) > 0) DeleteMenu(menu, 0, MF_BYPOSITION);   /* with its submenus */
 }
 
-/* Keep sessions the same as (the other profiles, checked when the ones
- * selected keep theirs already), and Stop keeping them the same. */
+/* Sync with (the other profiles, checked when the ones selected sync with
+ * them already), Stop syncing, and What to sync. */
 static void AppendKeepSame(HMENU menu, DWORD selected)
 {
     HMENU same = CreatePopupMenu();
@@ -2021,8 +2135,9 @@ static void AppendKeepSame(HMENU menu, DWORD selected)
         AppendMenuW(same, MF_STRING | (joined ? MF_CHECKED : 0), IDM_LIST_SAME_FIRST + (UINT)i, label);
     }
     if (same)
-        AppendMenuW(menu, MF_POPUP | (selected && GetMenuItemCount(same) > 0 ? 0 : MF_GRAYED), (UINT_PTR)same, TR(L"&Keep sessions the same as"));
-    AppendMenuW(menu, MF_STRING | (SameSelected(selected) ? 0 : MF_GRAYED), IDC_SAME_STOP, TR(L"&Stop keeping sessions the same"));
+        AppendMenuW(menu, MF_POPUP | (selected && GetMenuItemCount(same) > 0 ? 0 : MF_GRAYED), (UINT_PTR)same, TR(L"Sync &with"));
+    AppendMenuW(menu, MF_STRING | (SameSelected(selected) ? 0 : MF_GRAYED), IDC_SYNC_ITEMS, TR(L"Wha&t to sync\x2026"));
+    AppendMenuW(menu, MF_STRING | (SameSelected(selected) ? 0 : MF_GRAYED), IDC_SAME_STOP, TR(L"Sto&p syncing"));
 }
 
 /* The menu bar's Sessions menu. */
@@ -2042,7 +2157,6 @@ static void FillSessionsMenu(HMENU menu, DWORD selected)
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (g_manager.profiles.count ? 0 : MF_GRAYED), IDC_RESTORE, TR(L"Reco&ver sessions\x2026"));
     AppendMenuW(menu, MF_STRING, IDC_PURGE, TR(L"Recently de&leted\x2026"));
-    AppendMenuW(menu, MF_STRING, IDC_BACKUP_CODE, TR(L"&Back up .claude\x2026"));
 }
 
 /* The menu bar's Shortcuts menu: the state shown is of a profile selected
@@ -2228,7 +2342,7 @@ static void ListMenu(LPARAM pos)
 /* The profiles and the sessions share the window: Sessions view swaps them,
  * and becomes "< Back" in the same place. The toolbar stays: in the
  * sessions view it acts on the profile shown. */
-static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_SET_UP_LINKS, IDC_NOTE };
+static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_BACKUP_CODE, IDC_NOTE };
 
 static const WCHAR *SessionsButtonCaption(BOOL sessionsShown)
 {
@@ -2654,26 +2768,7 @@ static void DoStatusAction(void)
     if (g_manager.statusAction == STATUS_ACTION_GET_CLAUDE) Util_OpenUrl(APP_DOWNLOAD_URL);
 }
 
-/* Fix claude:// links: the program registered for them again (what an
- * earlier version, another app or a Claude update left wrong comes back),
- * then, unless links already come here, Windows asks which app opens them. */
-static void DoFixLinks(void)
-{
-    WCHAR exe[MAX_PATH];
-    if (StateChangesBlocked() || !g_manager.pkg.found) return;
-    FinishShellWork();
-    if (!Util_InstallExe(exe, ARRAYSIZE(exe)) || !Handler_Register(exe)) {
-        Util_Log(L"could not register for claude:// links (error %lu)", GetLastError());
-        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(APP_NAME L" could not be registered as an app for claude:// links."));
-        return;
-    }
-    Util_Log(L"registered for claude:// links again");
-    if (Handler_UserChoice() == USERCHOICE_OURS)
-        Ui_Message(g_manager.dlg, MB_ICONINFORMATION, TR(L"claude:// links open in " APP_NAME L". Its registration was written again."));
-    else
-        SetUpLinks();
-    UpdateStatus();
-}
+
 
 /* ------------------------------------------------------------------ repair */
 
@@ -2729,18 +2824,57 @@ static void HealIcons(const ProfileList *list);
  * the profiles' icons, shortcuts and pins, session folders still linked,
  * session groups of one profile, changes waiting for profiles that are gone;
  * then every profile's sessions kept, the groups made the same. */
+/* Repair, asked first: what it does, and where: the program's registry
+ * keys, the folders of its shortcuts and pins, its own folder, and the
+ * sessions' folders of the profiles kept the same or still linked. */
+static BOOL ConfirmRepair(void)
+{
+    static const WCHAR *const kKeys[] = { REG_PROGID, REG_ROOT, REG_REGISTERED, REG_UNINSTALL };
+    static const KNOWNFOLDERID *const kFolders[] = { &FOLDERID_Desktop, &FOLDERID_Programs, &FOLDERID_UserPinned };
+    WCHAR *folders = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, CONFIRM_CCH * sizeof(WCHAR)), line[LONG_PATH_CCH], state[MAX_PATH];
+    DWORD sessions = LinkedProfiles(AllProfiles());
+    size_t i;
+    int p;
+    BOOL ok;
+    if (!folders) return FALSE;
+    folders[0] = 0;
+    SyncUi_AddLine(folders, CONFIRM_CCH, TR(L"The program's registration, shortcuts and taskbar pins:"), FALSE);
+    for (i = 0; i < ARRAYSIZE(kKeys); i++)
+        if (SUCCEEDED(StringCchPrintfW(line, ARRAYSIZE(line), L"HKCU\\%s", kKeys[i]))) SyncUi_AddLine(folders, CONFIRM_CCH, line, TRUE);
+    for (i = 0; i < ARRAYSIZE(kFolders); i++) {
+        PWSTR known = NULL;
+        if (SUCCEEDED(SHGetKnownFolderPath(kFolders[i], 0, NULL, &known)) &&
+            SUCCEEDED(StringCchPrintfW(line, ARRAYSIZE(line), L"%s%s", known, kFolders[i] == &FOLDERID_UserPinned ? L"\\TaskBar" : L"")))
+            SyncUi_AddPath(folders, CONFIRM_CCH, line);
+        CoTaskMemFree(known);
+    }
+    if (Util_StateDir(state, ARRAYSIZE(state))) {
+        SyncUi_AddLine(folders, CONFIRM_CCH, TR(L"Its own folder (the profiles' icons, the changes waiting for them):"), FALSE);
+        SyncUi_AddPath(folders, CONFIRM_CCH, state);
+    }
+    for (p = 0; p < g_manager.profiles.count; p++)
+        if (g_manager.profiles.items[p].syncGroup) sessions |= 1u << p;
+    if (sessions) {
+        SyncUi_AddSessionFolders(folders, CONFIRM_CCH, &g_manager.profiles, sessions, TRUE);
+        SyncUi_AddTranscriptFolder(folders, CONFIRM_CCH, TR(L"Claude Code's conversations, where a session gets a copy of its own:"));
+    }
+    ok = SyncUi_Confirm(g_manager.dlg, NULL,
+                        TR(L"Repair " APP_NAME L"?\n\nIt registers the program again, for claude:// links too (when they do not open here, "
+                           L"Windows then asks which app opens them), puts its taskbar pins, shortcuts and icons right, gives the profiles whose "
+                           L"session folder is still a link one of their own (their sessions kept the same instead), drops the changes waiting "
+                           L"for profiles that are gone, then keeps every profile's sessions."),
+                        folders, sessions != 0, TR(L"Repair"));
+    HeapFree(GetProcessHeap(), 0, folders);
+    return ok;
+}
+
 static void DoRepair(void)
 {
     WCHAR text[1024], error[512 + 2 * LONG_PATH_CCH], errors[4 * (512 + 2 * LONG_PATH_CCH)];
     LinkState state;
     int i, unlinked = 0, dropped;
     if (StateChangesBlocked() || g_manager.job) return;
-    if (!Ui_Ask(g_manager.dlg, IDI_QUESTION,
-                TR(L"Repair " APP_NAME L"?\n\nIt registers the program again, puts its taskbar pins, shortcuts and icons right, gives the "
-                   L"profiles whose session folder is still a link one of their own (their sessions kept the same instead), drops the changes "
-                   L"waiting for profiles that are gone, then keeps every profile's sessions."),
-                TR(L"Repair"), TR(L"Cancel"), FALSE))
-        return;
+    if (!ConfirmRepair()) return;
     FinishShellWork();
     Install_Repair();
     TaskbarPin_RepairOurs();
@@ -2786,6 +2920,8 @@ static void DoRepair(void)
     }
     Util_Log(L"repair: %d session folder(s) given back, %d plan(s) dropped", unlinked, dropped);
     Ui_Message(g_manager.dlg, errors[0] ? MB_ICONWARNING : MB_ICONINFORMATION, L"%s", text);
+    /* Registered again above: Windows asks which app opens claude:// links when it is not this one. */
+    if (g_manager.pkg.found && Handler_UserChoice() != USERCHOICE_OURS && !StateChangesBlocked()) SetUpLinks();
     RunJob(JOB_KEEP, AllProfiles());
 }
 
@@ -3197,12 +3333,12 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         case IDC_OPEN:          DoOpen(); return TRUE;
         case IDC_STOP:          DoQuit(FALSE); return TRUE;
         case IDC_RESTART:       DoQuit(TRUE); return TRUE;
-        case IDC_SYNC:          RunJob(JOB_SYNC, SelectedProfiles()); return TRUE;
+        case IDC_SYNC:          if (ConfirmSync(SelectedProfiles())) RunJob(JOB_SYNC, SelectedProfiles()); return TRUE;
         case IDC_REPAIR:        DoRepair(); return TRUE;
         case IDC_COPY_ALL:      DoSessions(SESSIONS_COPY_ALL); return TRUE;
         case IDC_MOVE_ALL:      DoSessions(SESSIONS_MOVE_ALL); return TRUE;
         case IDC_SAME_STOP:     DoStopSame(); return TRUE;
-        case IDC_SET_UP_LINKS:  DoFixLinks(); return TRUE;
+        case IDC_SYNC_ITEMS:    DoSyncItems(); return TRUE;
         case IDC_NEW:           DoNew(); return TRUE;
         case IDC_EDIT:          DoEdit(); return TRUE;
         case IDC_DELETE:        DoDelete(); return TRUE;
