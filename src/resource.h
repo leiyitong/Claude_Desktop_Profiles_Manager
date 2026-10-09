@@ -50,7 +50,7 @@
 #define IDC_PROGRESS       1032
 #define IDC_COPY_ALL       1033   /* the sessions menu */
 #define IDC_MOVE_ALL       1034
-#define IDC_SET_UP_LINKS   1035   /* the program menu */
+#define IDC_SET_UP_LINKS   1035   /* Fix claude:// links, in the column */
 #define IDC_SAME_STOP      1036   /* the sessions menu */
 #define IDC_MENU_HELP      1037   /* Help: its questions (IDC_HELP is a cursor's id) */
 

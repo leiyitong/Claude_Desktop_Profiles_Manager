@@ -1,6 +1,6 @@
 /*
- * Help: what someone new to the program asks first, in plain words. The Help
- * menu in the header lists the questions; each answer shows in a message.
+ * Help: what someone new to the program asks first, in plain words. The menu
+ * bar's Help menu lists the questions; each answer shows in a message.
  */
 #include "app.h"
 
@@ -75,20 +75,17 @@ static const WCHAR *Answer(int topic)
     }
 }
 
-void Help_Show(HWND owner, HWND button)
+/* The menu bar's Help menu: the questions, filled as it opens. */
+void Help_FillMenu(HMENU menu)
 {
-    HMENU menu = CreatePopupMenu();
-    RECT below;
-    UINT command;
     int topic;
-    if (!menu) return;
     for (topic = 0; topic < HELP_TOPICS; topic++) AppendMenuW(menu, MF_STRING, IDM_HELP_FIRST + (UINT)topic, Question(topic));
-    if (!button || !GetWindowRect(button, &below)) {
-        GetWindowRect(owner, &below);
-        below.bottom = below.top;
-    }
-    command = Theme_TrackDropDown(owner, menu, &below);
-    DestroyMenu(menu);
-    if (command < IDM_HELP_FIRST || command >= IDM_HELP_FIRST + HELP_TOPICS) return;
+}
+
+/* A question chosen: its answer in a message. FALSE for another command. */
+BOOL Help_Command(HWND owner, UINT command)
+{
+    if (command < IDM_HELP_FIRST || command >= IDM_HELP_FIRST + HELP_TOPICS) return FALSE;
     Ui_Ask(owner, IDI_INFORMATION, Answer((int)(command - IDM_HELP_FIRST)), TR(L"OK"), NULL, FALSE);
+    return TRUE;
 }

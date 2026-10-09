@@ -770,6 +770,139 @@ void Theme_DrawButton(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFO
     DrawLabel(dc, text, font, &label, format);
 }
 
+/* ------------------------------------------------------- buttons' icons */
+
+#define GLYPH_PROP     L"ClaudeDesktopProfilesManager.Glyph"   /* a push button's icon: a character of Windows' icon font, its tint above */
+#define GLYPH_GAP_DIPS 8                                       /* between a button's icon and its caption */
+
+/* Windows' icon font, Segoe Fluent Icons (Windows 11) or else Segoe MDL2
+ * Assets (Windows 10), `pixels` high; NULL when it has neither. */
+static HFONT CreateGlyphFont(int pixels)
+{
+    static const WCHAR *const kFaces[] = { L"Segoe Fluent Icons", L"Segoe MDL2 Assets" };
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kFaces); i++) {
+        WCHAR face[LF_FACESIZE];
+        HFONT font = CreateFontW(-pixels, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 CLEARTYPE_QUALITY, DEFAULT_PITCH, kFaces[i]);
+        HDC dc = font ? GetDC(NULL) : NULL;
+        BOOL found = FALSE;
+        if (dc) {
+            HGDIOBJ old = SelectObject(dc, font);
+            found = GetTextFaceW(dc, ARRAYSIZE(face), face) > 0 && _wcsicmp(face, kFaces[i]) == 0;
+            SelectObject(dc, old);
+            ReleaseDC(NULL, dc);
+        }
+        if (found) return font;
+        if (font) DeleteObject(font);
+    }
+    return NULL;
+}
+
+/* The icon font for captions in `textFont`: a sixth larger than its text,
+ * as Windows' own command bars show them. One is kept, for the last size. */
+static HFONT GlyphFont(HFONT textFont)
+{
+    static HFONT cached;
+    static int cachedPixels;
+    LOGFONTW text;
+    int pixels;
+    if (!textFont || !GetObjectW(textFont, sizeof text, &text) || text.lfHeight == 0) return NULL;
+    pixels = MulDiv(abs(text.lfHeight), 7, 6);
+    if (pixels != cachedPixels) {
+        if (cached) DeleteObject(cached);
+        cached = CreateGlyphFont(pixels);
+        cachedPixels = pixels;
+    }
+    return cached;
+}
+
+/* Each tint, light and dark: Windows 11's own status and accent colors, the
+ * light shade dark enough on a light button, the dark one light enough on a
+ * dark button, its fill under the mouse included. */
+static const COLORREF kTints[THEME_TINTS][2] = {
+    { 0, 0 },
+    { RGB(0x0F, 0x7B, 0x0F), RGB(0x6C, 0xCB, 0x5F) },   /* green: success */
+    { RGB(0xC4, 0x2B, 0x1C), RGB(0xFF, 0x99, 0xA4) },   /* red: critical */
+    { RGB(0x00, 0x5F, 0xB8), RGB(0x60, 0xCD, 0xFF) },   /* blue: the accent */
+    { RGB(0x03, 0x83, 0x87), RGB(0x4C, 0xC2, 0xC4) },   /* teal */
+    { RGB(0x87, 0x64, 0xB8), RGB(0xC2, 0xA6, 0xFF) },   /* purple */
+    { RGB(0x9D, 0x5D, 0x00), RGB(0xFF, 0xB9, 0x00) },   /* amber: caution */
+    { RGB(0xC2, 0x7C, 0x0E), RGB(0xFF, 0xC8, 0x3D) }    /* gold: a star */
+};
+
+COLORREF Theme_TintColor(ThemeTint tint)
+{
+    if (tint <= THEME_TINT_NONE || tint >= THEME_TINTS || g_highContrast) return g_dark ? g_palette.color[THEME_TEXT] : GetSysColor(COLOR_BTNTEXT);
+    return kTints[tint][g_dark ? 1 : 0];
+}
+
+void Theme_SetGlyph(HWND button, WCHAR glyph, ThemeTint tint)
+{
+    if (!button) return;
+    if (glyph) SetPropW(button, GLYPH_PROP, (HANDLE)((UINT_PTR)glyph | ((UINT_PTR)tint << 16)));
+    else RemovePropW(button, GLYPH_PROP);
+    InvalidateRect(button, NULL, FALSE);
+}
+
+static WCHAR GlyphOf(HWND button)
+{
+    return (WCHAR)((UINT_PTR)GetPropW(button, GLYPH_PROP) & 0xFFFF);
+}
+
+static ThemeTint TintOf(HWND button)
+{
+    return (ThemeTint)(((UINT_PTR)GetPropW(button, GLYPH_PROP) >> 16) & 0xFF);
+}
+
+/* What a button's icon adds to its caption's width: the icon and the gap
+ * after it; 0 without an icon or an icon font. */
+static int GlyphWidth(HWND button, HFONT textFont, WCHAR glyph)
+{
+    HFONT font = glyph ? GlyphFont(textFont) : NULL;
+    HDC dc = font ? GetDC(button) : NULL;
+    SIZE size = { 0, 0 };
+    if (dc) {
+        HGDIOBJ old = SelectObject(dc, font);
+        GetTextExtentPoint32W(dc, &glyph, 1, &size);
+        SelectObject(dc, old);
+        ReleaseDC(button, dc);
+    }
+    return size.cx ? size.cx + ScaleForWindow(button, GLYPH_GAP_DIPS) : 0;
+}
+
+/* A push button with an icon before its caption, the two centered together,
+ * the icon in its tint; disabled, and on a dark button's bright blue while
+ * pressed, in the caption's color (see ButtonFace). */
+static void DrawGlyphButton(HWND button, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state, UINT format, WCHAR glyph,
+                            ThemeTint tint)
+{
+    COLORREF caption;
+    HFONT glyphFont = GlyphFont(font);
+    RECT measured = { 0, 0, 0, 0 }, label = *rc, icon;
+    HGDIOBJ old;
+    SIZE glyphSize = { 0, 0 };
+    int gap = ScaleForWindow(button, GLYPH_GAP_DIPS), left;
+    if (!glyphFont) {
+        Theme_DrawButton(button, dc, rc, text, font, state, format);
+        return;
+    }
+    ButtonFace(button, dc, rc, state);
+    old = SelectObject(dc, font);
+    DrawTextW(dc, text, -1, &measured, DT_CALCRECT | DT_SINGLELINE | (format & (DT_HIDEPREFIX | DT_NOPREFIX)) | Localize_ReadingFlags());
+    SelectObject(dc, glyphFont);
+    GetTextExtentPoint32W(dc, &glyph, 1, &glyphSize);
+    SelectObject(dc, old);
+    left = rc->left + max(0, (int)(rc->right - rc->left) - (glyphSize.cx + gap + measured.right)) / 2;
+    SetRect(&icon, left, rc->top, left + glyphSize.cx, rc->bottom);
+    caption = GetTextColor(dc);
+    if (!(state & THEME_BUTTON_DISABLED) && !(g_dark && (state & THEME_BUTTON_PRESSED))) SetTextColor(dc, Theme_TintColor(tint));
+    DrawLabel(dc, &glyph, glyphFont, &icon, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    SetTextColor(dc, caption);
+    label.left = icon.right + gap;
+    DrawLabel(dc, text, font, &label, (format & ~(UINT)(DT_CENTER | DT_RIGHT)) | DT_LEFT | DT_END_ELLIPSIS);
+}
+
 #define DROPDOWN_LABEL_INSET_DIPS 8   /* before a drop-down button's label */
 #define SWATCH_DIPS               12  /* a choice's color swatch (THEME_CHOICE_SWATCH) */
 #define SWATCH_GAP_DIPS           6   /* between the swatch and the label */
@@ -974,11 +1107,15 @@ static LRESULT ButtonCustomDraw(const NMCUSTOMDRAW *customDraw)
         state |= THEME_BUTTON_DEFAULT;
     GetWindowTextW(button, text, ARRAYSIZE(text));
     format = TextFormatForCues(button, DT_SINGLELINE | DT_CENTER | DT_VCENTER, &showFocus);
-    Theme_DrawButton(button, customDraw->hdc, &customDraw->rc, text, (HFONT)SendMessageW(button, WM_GETFONT, 0, 0), state, format);
+    if (GlyphOf(button))
+        DrawGlyphButton(button, customDraw->hdc, &customDraw->rc, text, (HFONT)SendMessageW(button, WM_GETFONT, 0, 0), state, format,
+                        GlyphOf(button), TintOf(button));
+    else
+        Theme_DrawButton(button, customDraw->hdc, &customDraw->rc, text, (HFONT)SendMessageW(button, WM_GETFONT, 0, 0), state, format);
     if ((customDraw->uItemState & CDIS_FOCUS) && showFocus) {
         InflateRect(&focus, -FocusRectangleInset(button), -FocusRectangleInset(button));
-        SetTextColor(customDraw->hdc, g_palette.color[THEME_TEXT]);
-        SetBkColor(customDraw->hdc, g_palette.button);
+        SetTextColor(customDraw->hdc, g_dark ? g_palette.color[THEME_TEXT] : GetSysColor(COLOR_BTNTEXT));
+        SetBkColor(customDraw->hdc, g_dark ? g_palette.button : GetSysColor(COLOR_3DFACE));
         DrawFocusRect(customDraw->hdc, &focus);
     }
     return CDRF_SKIPDEFAULT;
@@ -3939,13 +4076,118 @@ static void ForgetDialog(HWND dialog)
     if (font) DeleteObject(font);
 }
 
-/* Every themed dialog, whatever dialog it is: in dark mode its push buttons
- * and check boxes are drawn here, and in both modes its list view rows and
- * its drop-down lists; it answers WM_GETFONT with the font ApplyDialogFont
- * made, and frees what the theme keeps on it. */
+/* ------------------------------------------------------------ menu bar */
+
+/* A window's menu bar stays light in dark mode: Windows has no dark class
+ * for it. It asks its window to draw it first, through two messages it does
+ * not document (the ones Windows' own dark apps and common editors answer),
+ * with these structures. */
+#define WM_UAHDRAWMENU     0x0091
+#define WM_UAHDRAWMENUITEM 0x0092
+
+typedef struct UahMenu {
+    HMENU menu;
+    HDC   dc;
+    DWORD flags;
+} UahMenu;
+
+typedef struct UahMenuItem {
+    int   position;
+    DWORD metrics[8];        /* the item's sizes in the bar or in a menu */
+    DWORD popupMetrics[5];   /* a menu's column widths, and whether they change */
+} UahMenuItem;
+
+typedef struct UahDrawMenuItem {
+    DRAWITEMSTRUCT draw;
+    UahMenu        menu;
+    UahMenuItem    item;
+} UahDrawMenuItem;
+
+/* The menu bar, in window coordinates. */
+static BOOL MenuBarRect(HWND window, RECT *bar)
+{
+    MENUBARINFO info;
+    RECT frame;
+    ZeroMemory(&info, sizeof info);
+    info.cbSize = sizeof info;
+    if (!GetMenuBarInfo(window, OBJID_MENU, 0, &info) || !GetWindowRect(window, &frame)) return FALSE;
+    *bar = info.rcBar;
+    OffsetRect(bar, -frame.left, -frame.top);
+    return TRUE;
+}
+
+/* The bar on the window's face, each menu's name in the text color (muted
+ * while the window is inactive or the menu disabled), the one under the
+ * mouse on a button's fill and the open one on a disabled button's frame
+ * color, as Explorer's dark menus. */
+static void DrawDarkMenuBar(HWND window, UINT msg, const void *data)
+{
+    if (msg == WM_UAHDRAWMENU) {
+        const UahMenu *menu = (const UahMenu *)data;
+        RECT bar;
+        if (MenuBarRect(window, &bar)) {
+            bar.top -= 1;   /* Windows' own line above it */
+            FillRect(menu->dc, &bar, g_brush[THEME_FACE]);
+        }
+    } else {
+        const UahDrawMenuItem *item = (const UahDrawMenuItem *)data;
+        WCHAR text[256];
+        MENUITEMINFOW info;
+        UINT state = item->draw.itemState, format = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
+        BOOL muted = (state & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED)) != 0;
+        COLORREF fill = (state & ODS_SELECTED) ? g_palette.buttonOff : (state & ODS_HOTLIGHT) ? g_palette.button : g_palette.color[THEME_FACE];
+        RECT rc = item->draw.rcItem;
+        HBRUSH brush = CreateSolidBrush(fill);
+        ZeroMemory(&info, sizeof info);
+        info.cbSize = sizeof info;
+        info.fMask = MIIM_STRING;
+        info.dwTypeData = text;
+        info.cch = ARRAYSIZE(text) - 1;
+        text[0] = 0;
+        GetMenuItemInfoW(item->menu.menu, (UINT)item->item.position, TRUE, &info);
+        if (state & ODS_NOACCEL) format |= DT_HIDEPREFIX;
+        if (brush) {
+            FillRect(item->menu.dc, &rc, brush);
+            DeleteObject(brush);
+        }
+        SetBkMode(item->menu.dc, TRANSPARENT);
+        SetTextColor(item->menu.dc, g_palette.color[muted ? THEME_MUTED : THEME_TEXT]);
+        DrawTextW(item->menu.dc, text, -1, &rc, format | Localize_ReadingFlags());
+    }
+}
+
+/* The light line Windows draws under the menu bar, over the client area's
+ * top edge, painted over in the face color. */
+static void CoverMenuBarLine(HWND window)
+{
+    RECT client, frame;
+    HDC dc;
+    if (!GetClientRect(window, &client) || !GetWindowRect(window, &frame)) return;
+    MapWindowPoints(window, NULL, (POINT *)&client, 2);
+    OffsetRect(&client, -frame.left, -frame.top);
+    client.bottom = client.top;
+    client.top -= 1;
+    if ((dc = GetWindowDC(window)) == NULL) return;
+    FillRect(dc, &client, g_brush[THEME_FACE]);
+    ReleaseDC(window, dc);
+}
+
+/* Every themed dialog, whatever dialog it is: in dark mode its push buttons,
+ * check boxes and menu bar are drawn here, and in both modes its list view
+ * rows and its drop-down lists; it answers WM_GETFONT with the font
+ * ApplyDialogFont made, and frees what the theme keeps on it. */
 static LRESULT CALLBACK DialogSubclass(HWND dialog, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
 {
     (void)ref;
+    if (g_dark && !g_highContrast && (msg == WM_UAHDRAWMENU || msg == WM_UAHDRAWMENUITEM) && lp && GetMenu(dialog)) {
+        DrawDarkMenuBar(dialog, msg, (const void *)lp);
+        return TRUE;
+    }
+    if (g_dark && !g_highContrast && (msg == WM_NCPAINT || msg == WM_NCACTIVATE) && GetMenu(dialog)) {
+        LRESULT result = DefSubclassProc(dialog, msg, wp, lp);
+        CoverMenuBarLine(dialog);
+        return result;
+    }
     if ((msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) || (msg == WM_ENABLE && !wp) ||
         (msg == WM_SHOWWINDOW && !wp) || msg == WM_CANCELMODE || msg == WM_ENTERMENULOOP || msg == WM_ENTERSIZEMOVE)
         EnumChildWindows(dialog, HideDialogTip, 0);
@@ -3967,7 +4209,8 @@ static LRESULT CALLBACK DialogSubclass(HWND dialog, UINT msg, WPARAM wp, LPARAM 
     }
     if (msg == WM_NOTIFY && ((const NMHDR *)lp)->code == NM_CUSTOMDRAW) {
         HWND from = ((const NMHDR *)lp)->hwndFrom;
-        if (g_dark && IsPushButton(from)) return ButtonCustomDraw((const NMCUSTOMDRAW *)lp);
+        /* A button with an icon is drawn here in both modes: Windows draws none beside a caption. */
+        if ((g_dark || GlyphOf(from)) && IsPushButton(from)) return ButtonCustomDraw((const NMCUSTOMDRAW *)lp);
         if (g_dark && IsCheckBox(from)) return CheckBoxCustomDraw((const NMCUSTOMDRAW *)lp);
         if (IsClass(from, WC_LISTVIEWW)) return ListCustomDraw((NMLVCUSTOMDRAW *)lp);
     } else if (msg == WM_NCDESTROY) {
@@ -4452,65 +4695,110 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
 /* The manager window: what every control needs in every language and
  * script font is measured once per DPI and font (MeasureMain, a cached
  * MainBudget); a new size only places the controls (Theme_LayoutMain).
- * The header holds the menus on the left, the status (or the progress of a
- * sync) in the middle, the version and the view's button on the right; the
- * list fills the body, the profiles' actions beside it. */
+ * Under the menu bar (gui.c makes it), the toolbar acts on the profiles
+ * selected; below it, the body: the list (or the sessions view's profiles
+ * and tree) and, on its right, a column: the view's button on top, then the
+ * profiles' other actions and the note (or the sessions' details), and at
+ * its foot Claude Desktop's version and the state of claude:// links (or the
+ * progress of a sync in their place), this program's version and Update. */
 #define MAIN_SIDE_GAP_DIPS            12
 #define MAIN_RESOURCE_WIDTH_DIPS      821    /* IDD_MAIN's 420 x 282 dialog units in its 9 pt font */
 #define MAIN_RESOURCE_HEIGHT_DIPS     522
-#define MAIN_STATUS_MINIMUM_DIPS      120    /* the status text, or the progress of a sync, between the menus and the version */
-#define SIDEBAR_GROUP_GAP_DIPS        12     /* between the side bar's groups of actions */
-#define SIDEBAR_DEFAULT_GAP_DIPS      9      /* "Set as default" below the other actions */
-#define SIDEBAR_NOTE_GAP_DIPS         9      /* between "Set as default" and the note below it */
+#define MAIN_GROUP_GAP_DIPS           12     /* between the toolbar's groups, and the column's */
+#define COLUMN_NOTE_GAP_DIPS          9      /* above the note */
+#define DETAILS_MINIMUM_ROWS          4      /* the sessions' details are at least as tall as this many buttons */
 #define DETAILS_PADDING_DIPS          12     /* around the caption of the details' button */
 #define ARCHIVED_INSET_DIPS           5      /* "Show archived" ends before the tree: room before the details */
 #define VERSION_SAMPLE                L"2026.12.31 23:59"   /* the longest version the label shows */
+#define CLAUDE_VERSION_SAMPLE         L"2.99999.99"         /* the longest Claude Desktop version the status shows */
 
-/* A button, with every caption it shows (catalog keys). */
+/* A button, with every caption it shows (catalog keys) and the icon that
+ * goes with each (a character of Windows' icon font, 0 for none) in its
+ * tint. */
 typedef struct MainButton {
     int id;
     const WCHAR *captions[2];
+    WCHAR glyphs[2];
+    ThemeTint tints[2];
 } MainButton;
 
-/* The side bar, top down: the profiles' Claude, the profiles, their sessions and the program. */
-static const MainButton kMainActions[] = {
-    { IDC_OPEN, { L"&Open", NULL } }, { IDC_STOP, { L"&Quit", NULL } }, { IDC_RESTART, { L"&Restart", NULL } },
-    { IDC_NEW, { L"&New\x2026", NULL } }, { IDC_EDIT, { L"&Edit\x2026", NULL } }, { IDC_DELETE, { L"&Delete\x2026", NULL } },
-    { IDC_SYNC, { L"S&ync sessions", NULL } }, { IDC_REPAIR, { L"Rep&air", NULL } },
-    { IDC_DEFAULT, { L"Set as de&fault", NULL } }
+/* The toolbar, left to right, in groups: the profiles' Claude, the profiles,
+ * the default one. Each icon in the color of what it does: green starts,
+ * red stops or deletes, a gold star for the default. */
+static const MainButton kMainToolbar[] = {
+    { IDC_OPEN, { L"&Open", NULL }, { 0xE768, 0 }, { THEME_TINT_GREEN, THEME_TINT_NONE } },
+    { IDC_STOP, { L"&Quit", NULL }, { 0xE71A, 0 }, { THEME_TINT_RED, THEME_TINT_NONE } },
+    { IDC_RESTART, { L"&Restart", NULL }, { 0xE72C, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE } },
+    { IDC_NEW, { L"&New\x2026", NULL }, { 0xE710, 0 }, { THEME_TINT_TEAL, THEME_TINT_NONE } },
+    { IDC_EDIT, { L"&Edit\x2026", NULL }, { 0xE70F, 0 }, { THEME_TINT_PURPLE, THEME_TINT_NONE } },
+    { IDC_DELETE, { L"&Delete\x2026", NULL }, { 0xE74D, 0 }, { THEME_TINT_RED, THEME_TINT_NONE } },
+    { IDC_DEFAULT, { L"Set as de&fault", NULL }, { 0xE735, 0 }, { THEME_TINT_GOLD, THEME_TINT_NONE } }
 };
-#define MAIN_STACKED_ACTIONS (ARRAYSIZE(kMainActions) - 1)   /* all but "Set as default", which sits above the note */
-static const int kMainActionGroups[] = { 3, 6 };            /* the actions that start a group of their own */
+static const int kMainToolbarGroups[] = { 3, 6 };   /* the actions that start a group of their own */
+/* The column's actions on the profiles, below the view's button. */
+static const MainButton kMainColumn[] = {
+    { IDC_SYNC, { L"S&ync sessions", NULL }, { 0xE895, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE } },
+    { IDC_REPAIR, { L"Rep&air", NULL }, { 0xE90F, 0 }, { THEME_TINT_AMBER, THEME_TINT_NONE } },
+    { IDC_SET_UP_LINKS, { L"Fix claude:// &links", NULL }, { 0xE71B, 0 }, { THEME_TINT_TEAL, THEME_TINT_NONE } }
+};
+/* The menu bar's menus, left to right. */
 static const MainButton kMainMenus[] = {
-    { IDC_MENU_APP, { L"&Program", NULL } }, { IDC_MENU_SESSIONS, { L"&Sessions", NULL } }, { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL } },
-    { IDC_MENU_HELP, { L"Help", NULL } }   /* no access key: it would be one more shortcut */
+    { IDC_MENU_SESSIONS, { L"&Sessions", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_MENU_APP, { L"&Program", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_MENU_HELP, { L"Help", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } }   /* no access key: it would be one more shortcut */
 };
 /* The shortcuts menu's commands, each in the state its profile is in. */
 static const MainButton kMainShortcuts[] = {
-    { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" } },
-    { IDC_SC_SAVEAS, { L"Create s&hortcut\x2026", NULL } },
-    { IDC_SC_PIN, { L"Pin to &taskbar", L"Pinned" } },
-    { IDC_SC_START, { L"Add to Start &menu", L"Remove from Start &menu" } }
+    { IDC_SC_DESKTOP, { L"Create shortcut on des&ktop", L"Shortcut on desktop" }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_SC_SAVEAS, { L"Create s&hortcut\x2026", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_SC_PIN, { L"Pin to &taskbar", L"Pinned" }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
+    { IDC_SC_START, { L"Add to Start &menu", L"Remove from Start &menu" }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } }
 };
-static const MainButton kMainSessions = { IDC_SESSIONS, { L"Sessions &view  >", L"<  &Back" } };
-static const MainButton kMainStatusAction = { IDC_STATUS_ACTION, { L"&Get Claude", L"Set up l&inks" } };
-static const MainButton kMainUpdate = { IDC_UPDATE, { L"&Update", NULL } };
+/* The view's button: to the sessions, a speech bubble; back to the profiles, an arrow. */
+static const MainButton kMainSessions = { IDC_SESSIONS, { L"Sessions &view", L"&Back" }, { 0xE8BD, 0xE72B }, { THEME_TINT_PURPLE, THEME_TINT_NONE } };
+static const MainButton kMainStatusAction = { IDC_STATUS_ACTION, { L"&Get Claude", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } };
+static const MainButton kMainUpdate = { IDC_UPDATE, { L"&Update", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } };
+
+static const MainButton *MainButtonOf(int id)
+{
+    static const MainButton *const single[] = { &kMainSessions, &kMainStatusAction, &kMainUpdate };
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kMainToolbar); i++)
+        if (kMainToolbar[i].id == id) return &kMainToolbar[i];
+    for (i = 0; i < ARRAYSIZE(kMainColumn); i++)
+        if (kMainColumn[i].id == id) return &kMainColumn[i];
+    for (i = 0; i < ARRAYSIZE(kMainMenus); i++)
+        if (kMainMenus[i].id == id) return &kMainMenus[i];
+    for (i = 0; i < ARRAYSIZE(kMainShortcuts); i++)
+        if (kMainShortcuts[i].id == id) return &kMainShortcuts[i];
+    for (i = 0; i < ARRAYSIZE(single); i++)
+        if (single[i]->id == id) return single[i];
+    return NULL;
+}
 
 const WCHAR *Theme_MainCaption(int id, int state)
 {
-    static const MainButton *const single[] = { &kMainSessions, &kMainStatusAction, &kMainUpdate };
-    const MainButton *button = NULL;
-    size_t i;
-    for (i = 0; i < ARRAYSIZE(kMainActions); i++)
-        if (kMainActions[i].id == id) button = &kMainActions[i];
-    for (i = 0; i < ARRAYSIZE(kMainMenus); i++)
-        if (kMainMenus[i].id == id) button = &kMainMenus[i];
-    for (i = 0; i < ARRAYSIZE(kMainShortcuts); i++)
-        if (kMainShortcuts[i].id == id) button = &kMainShortcuts[i];
-    for (i = 0; i < ARRAYSIZE(single); i++)
-        if (single[i]->id == id) button = single[i];
+    const MainButton *button = MainButtonOf(id);
     if (!button) return NULL;
     return state && button->captions[1] ? button->captions[1] : button->captions[0];
+}
+
+void Theme_SetMainGlyph(HWND dialog, int id, int state)
+{
+    const MainButton *button = MainButtonOf(id);
+    int shown = state && button && button->glyphs[1] ? 1 : 0;
+    if (button) Theme_SetGlyph(GetDlgItem(dialog, id), button->glyphs[shown], button->tints[shown]);
+}
+
+/* The toolbar's and the column's buttons get their icons; the view's
+ * button keeps the one of the view it leads to (Theme_SetMainGlyph). */
+static void ApplyMainGlyphs(HWND dialog)
+{
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kMainToolbar); i++) Theme_SetMainGlyph(dialog, kMainToolbar[i].id, 0);
+    for (i = 0; i < ARRAYSIZE(kMainColumn); i++) Theme_SetMainGlyph(dialog, kMainColumn[i].id, 0);
+    if (!GlyphOf(GetDlgItem(dialog, IDC_SESSIONS))) Theme_SetMainGlyph(dialog, IDC_SESSIONS, 0);
 }
 
 /* The version label's texts in each state (MainVersion), each with one %s:
@@ -4521,7 +4809,14 @@ static const WCHAR *const kMainVersions[MAIN_VERSIONS] = {
     L"Downloading version %s\x2026",
     L"Installing the new version\x2026"
 };
-/* The note under Set as default; its argument: the profile the regular Claude icon opens. */
+/* The status in each state (MainStatus), its %s Claude Desktop's version:
+ * Claude Desktop's version on a line of its own, the links' state below. */
+static const WCHAR *const kMainStatuses[MAIN_STATUSES] = {
+    L"Claude Desktop is not installed.",
+    L"Claude Desktop %s\nclaude:// links are not set up yet",
+    L"Claude Desktop %s\nclaude:// links are routed correctly"
+};
+/* The note under the column's actions; its argument: the profile the regular Claude icon opens. */
 static const WCHAR kMainNote[] = L"The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \x201C%s\x201D.";
 /* The sessions details' captions the main window's minimum keeps room for (SessionsCaption). */
 static const WCHAR *const kSessionsCaptions[SESSIONS_CAPTIONS] = { L"Actions", L"Delete session everywhere\x2026" };
@@ -4529,6 +4824,11 @@ static const WCHAR *const kSessionsCaptions[SESSIONS_CAPTIONS] = { L"Actions", L
 const WCHAR *Theme_MainVersion(MainVersion state)
 {
     return state >= 0 && state < MAIN_VERSIONS ? kMainVersions[state] : kMainVersions[MAIN_VERSION_BUILD];
+}
+
+const WCHAR *Theme_MainStatus(MainStatus state)
+{
+    return state >= 0 && state < MAIN_STATUSES ? kMainStatuses[state] : kMainStatuses[MAIN_STATUS_NO_CLAUDE];
 }
 
 const WCHAR *Theme_MainNote(void)
@@ -4549,10 +4849,10 @@ typedef struct MainBudget {
     ULONGLONG fontKey;
     BOOL initialized, measuring;
     SIZE minimum;
-    int margin, gap, sideGap, sidebar, headerHeight, buttonHeight, headerRow;
-    int menuWidth[ARRAYSIZE(kMainMenus)], menusWidth, statusActionWidth, versionWidth, updateWidth;
-    int profileWidth, roleWidth, dataMinimum, sessionsMinimum, profilesPane, detailsPane, archivedWidth;
-    int noteHeight, minimumBody;
+    int margin, gap, sideGap, groupGap, column, buttonHeight, searchRow;
+    int toolbarWidth[ARRAYSIZE(kMainToolbar)], toolbarTotal;
+    int profileWidth, roleWidth, dataMinimum, sessionsMinimum, profilesPane, archivedWidth;
+    int noteHeight, footHeight, minimumBody;
 } MainBudget;
 
 static BOOL IsMainDialog(HWND dialog)
@@ -4601,18 +4901,19 @@ static int MainKeyWidth(HWND control, const WCHAR *key, int *tallestFont)
     return MeasureEveryLanguage(control, &key, 1, NULL, DT_SINGLELINE | (IsClass(control, WC_BUTTONW) ? 0 : DT_NOPREFIX), 0, tallestFont).cx;
 }
 
-/* A button as wide as its widest caption in any language, as tall as the
- * tallest text, and never smaller than in the resource. */
+/* A button as wide as its widest caption in any language and its icon, as
+ * tall as the tallest text, and never smaller than in the resource. */
 static void MainButtonBudget(HWND dialog, const DialogBase *base, UINT dpi, const MainButton *button, int *width, int *height)
 {
     HWND control = GetDlgItem(dialog, button->id);
     RECT source;
     size_t i;
-    int tallestFont = 0;
+    HFONT font = (HFONT)SendMessageW(control, WM_GETFONT, 0, 0);
+    int tallestFont = 0, glyph = max(GlyphWidth(control, font, button->glyphs[0]), GlyphWidth(control, font, button->glyphs[1]));
     LayoutSourceRect(dialog, base, control, dpi, &source);
     *width = source.right - source.left;
     for (i = 0; i < ARRAYSIZE(button->captions) && button->captions[i]; i++)
-        *width = max(*width, MainKeyWidth(control, button->captions[i], &tallestFont) + MulDiv(BUTTON_PADDING_DIPS, (int)dpi, 96));
+        *width = max(*width, MainKeyWidth(control, button->captions[i], &tallestFont) + glyph + MulDiv(BUTTON_PADDING_DIPS, (int)dpi, 96));
     *height = max(source.bottom - source.top, tallestFont ? tallestFont + MulDiv(BUTTON_TEXT_MARGIN_DIPS, (int)dpi, 96) : 0);
 }
 
@@ -4636,9 +4937,8 @@ static ULONGLONG HashControlFont(ULONGLONG key, HWND control)
 
 static ULONGLONG MainFontKey(HWND dialog)
 {
-    static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_SYNC, IDC_REPAIR, IDC_DEFAULT,
-        IDC_MENU_APP, IDC_MENU_SESSIONS, IDC_MENU_SHORTCUTS, IDC_MENU_HELP, IDC_SESSIONS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_ARCHIVED,
-        IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE };
+    static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_REPAIR,
+        IDC_SESSIONS, IDC_STATUS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_ARCHIVED, IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE };
     HWND list = MainViewContent(dialog, IDC_LIST);
     ULONGLONG key = Core_HashBytes(CORE_HASH_START, &g_dark, sizeof g_dark);
     size_t i;
@@ -4659,23 +4959,6 @@ static BOOL CachedProfileWidths(HWND list, int *profile, int *role, int *dataMin
     return TRUE;
 }
 
-/* How far below the top of a row `rowHeight` px tall a line of text in `font`
- * (NULL: the control's own) starts, so that it sits where the captions of the
- * row's buttons sit: a label draws its text at its top, a button centers it. */
-static int TextLineOffset(HWND control, HFONT font, int rowHeight)
-{
-    TEXTMETRICW metrics;
-    HDC dc = GetDC(control);
-    HGDIOBJ old;
-    int offset = 0;
-    if (!dc) return 0;
-    old = SelectObject(dc, font ? font : (HFONT)SendMessageW(control, WM_GETFONT, 0, 0));
-    if (GetTextMetricsW(dc, &metrics)) offset = max(0, (rowHeight - metrics.tmHeight) / 2);
-    SelectObject(dc, old);
-    ReleaseDC(control, dc);
-    return offset;
-}
-
 /* A check box's widest caption in any language, with its glyph. */
 static void MainCheckBoxBudget(HWND control, int *width, int *height)
 {
@@ -4689,55 +4972,51 @@ static void MainCheckBoxBudget(HWND control, int *width, int *height)
 #define LIST_FRAME_PX    2       /* the least of the profile list's frame, a pixel on each side */
 #define NOTE_SAMPLE_NAME L"WW"   /* a name the note shows cut to one character: its shortest text */
 
-/* Every button of the window: the side bar's width, the menus', the
- * header's, and the tallest of them. */
+/* Every button of the window: the toolbar's, each as wide as it needs, and
+ * the column's width (its buttons', the details', the widest of them), and
+ * the tallest of them. */
 static void MeasureMainButtons(HWND dialog, const DialogBase *base, MainBudget *budget)
 {
+    static const MainButton *const kColumn[] = { &kMainSessions, &kMainStatusAction, &kMainUpdate };
     UINT dpi = budget->dpi;
-    int i, width, height;
-    for (i = 0; i < (int)ARRAYSIZE(kMainActions); i++) {
-        MainButtonBudget(dialog, base, dpi, &kMainActions[i], &width, &height);
-        budget->sidebar = max(budget->sidebar, width);
+    int i, group, width, height;
+    for (i = 0; i < (int)ARRAYSIZE(kMainToolbar); i++) {
+        MainButtonBudget(dialog, base, dpi, &kMainToolbar[i], &budget->toolbarWidth[i], &height);
+        budget->buttonHeight = max(budget->buttonHeight, height);
+        budget->toolbarTotal += budget->toolbarWidth[i] + (i ? budget->gap : 0);
+        for (group = 0; group < (int)ARRAYSIZE(kMainToolbarGroups); group++)
+            if (kMainToolbarGroups[group] == i) budget->toolbarTotal += budget->groupGap;
+    }
+    for (i = 0; i < (int)(ARRAYSIZE(kColumn) + ARRAYSIZE(kMainColumn)); i++) {
+        MainButtonBudget(dialog, base, dpi, i < (int)ARRAYSIZE(kColumn) ? kColumn[i] : &kMainColumn[i - (int)ARRAYSIZE(kColumn)], &width, &height);
+        budget->column = max(budget->column, width);
         budget->buttonHeight = max(budget->buttonHeight, height);
     }
-    /* The view's button sits above the side bar, as wide. */
-    MainButtonBudget(dialog, base, dpi, &kMainSessions, &width, &height);
-    budget->sidebar = max(budget->sidebar, width);
-    budget->buttonHeight = max(budget->buttonHeight, height);
-    for (i = 0; i < (int)ARRAYSIZE(kMainMenus); i++) {
-        MainButtonBudget(dialog, base, dpi, &kMainMenus[i], &budget->menuWidth[i], &height);
-        budget->menusWidth += budget->menuWidth[i] + (i ? budget->gap : 0);
-        budget->buttonHeight = max(budget->buttonHeight, height);
-    }
-    /* The status action and Update take the others' height. */
-    MainButtonBudget(dialog, base, dpi, &kMainStatusAction, &budget->statusActionWidth, &height);
-    MainButtonBudget(dialog, base, dpi, &kMainUpdate, &budget->updateWidth, &height);
-    budget->versionWidth = MeasureEveryLanguage(GetDlgItem(dialog, IDC_VERSION), kMainVersions, MAIN_VERSIONS, VERSION_SAMPLE,
-                                                DT_SINGLELINE | DT_NOPREFIX, 0, NULL).cx + LABEL_SLACK_PX;
 }
 
-/* The sessions view's panes: the profiles' side bar and the details as in
- * the resource (the details at least as wide as their widest button and
- * their Actions box in its widest language: sessions.c sizes the box to the
- * current one, Theme_DropDownWidth), and the tree's, under the search box and
- * "Show archived". Returns the tree pane's least width; the search box's and
- * the check box's heights go to `searchHeight` and `archivedHeight`. */
-static int MeasureSessionsPanes(HWND dialog, const DialogBase *base, MainBudget *budget, int *searchHeight, int *archivedHeight)
+/* The sessions view's panes: the profiles' side bar as in the resource, the
+ * details at least as wide as their widest button and their Actions box in
+ * its widest language (sessions.c sizes the box to the current one,
+ * Theme_DropDownWidth): the column is as wide; and the tree's, under the
+ * search box and "Show archived". Returns the tree pane's least width; the
+ * search row's height goes to the budget. */
+static int MeasureSessionsPanes(HWND dialog, const DialogBase *base, MainBudget *budget)
 {
     HWND search = GetDlgItem(dialog, IDC_S_SEARCH), details = GetDlgItem(dialog, IDC_S_DETAILS);
     RECT source;
     UINT dpi = budget->dpi;
-    int searchWidth, textWidth, tallestFont;
-    MainCheckBoxBudget(GetDlgItem(dialog, IDC_S_ARCHIVED), &budget->archivedWidth, archivedHeight);
+    int searchWidth, textWidth, tallestFont, searchHeight, archivedHeight;
+    MainCheckBoxBudget(GetDlgItem(dialog, IDC_S_ARCHIVED), &budget->archivedWidth, &archivedHeight);
     LayoutSourceRect(dialog, base, GetDlgItem(dialog, IDC_S_PROFILES), dpi, &source);
     budget->profilesPane = source.right - source.left;
     LayoutSourceRect(dialog, base, details, dpi, &source);
-    budget->detailsPane = max(source.right - source.left,
+    budget->column = max(budget->column, max(source.right - source.left,
         max(MainKeyWidth(details, kSessionsCaptions[SESSIONS_DELETE_EVERYWHERE], NULL) + MulDiv(DETAILS_PADDING_DIPS, (int)dpi, 96),
-            MainKeyWidth(details, kSessionsCaptions[SESSIONS_ACTIONS], NULL) + DropDownFrameWidth(details)));
+            MainKeyWidth(details, kSessionsCaptions[SESSIONS_ACTIONS], NULL) + DropDownFrameWidth(details))));
     LayoutSourceRect(dialog, base, search, dpi, &source);
     searchWidth = source.right - source.left;
-    LayoutTextBudget(search, searchWidth, FALSE, &textWidth, searchHeight, &tallestFont);
+    LayoutTextBudget(search, searchWidth, FALSE, &textWidth, &searchHeight, &tallestFont);
+    budget->searchRow = max(budget->buttonHeight, max(searchHeight, archivedHeight));
     return searchWidth + budget->gap + budget->archivedWidth + MulDiv(ARCHIVED_INSET_DIPS, (int)dpi, 96);
 }
 
@@ -4751,40 +5030,49 @@ static int ListFramePx(HWND dialog, HWND list)
     return max(LIST_FRAME_PX, (int)(outer.right - outer.left - inner.right));
 }
 
+/* The column's foot at its tallest: the status in any state and language,
+ * wrapped at the column's width (or the progress, as tall as a button, in
+ * its place), the status action, the version in any state and Update. */
+static int MainFootHeight(HWND dialog, const MainBudget *budget)
+{
+    int status = MeasureEveryLanguage(GetDlgItem(dialog, IDC_STATUS), kMainStatuses, MAIN_STATUSES, CLAUDE_VERSION_SAMPLE,
+                                      DT_WORDBREAK | DT_NOPREFIX, budget->column, NULL).cy + LABEL_SLACK_PX;
+    int version = MeasureEveryLanguage(GetDlgItem(dialog, IDC_VERSION), kMainVersions, MAIN_VERSIONS, VERSION_SAMPLE,
+                                       DT_WORDBREAK | DT_NOPREFIX, budget->column, NULL).cy + LABEL_SLACK_PX;
+    return max(status, budget->buttonHeight) + budget->gap + budget->buttonHeight + budget->gap + version + budget->gap + budget->buttonHeight;
+}
+
 static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
 {
     HWND list = MainViewContent(dialog, IDC_LIST);
     RECT source;
-    int textWidth, textHeight, tallestFont, searchHeight, archivedHeight, treePane, groupGap;
+    int treePane, listColumns, profilesColumn, sessionsColumn;
     UINT dpi = budget->dpi;
     budget->margin = MulDiv(THEME_MAIN_MARGIN_DIPS, (int)dpi, 96);
     budget->gap = MulDiv(THEME_MAIN_GAP_DIPS, (int)dpi, 96);
     budget->sideGap = MulDiv(MAIN_SIDE_GAP_DIPS, (int)dpi, 96);
-    groupGap = MulDiv(SIDEBAR_GROUP_GAP_DIPS, (int)dpi, 96);
+    budget->groupGap = MulDiv(MAIN_GROUP_GAP_DIPS, (int)dpi, 96);
     budget->measuring = TRUE;
     Theme_ProfileColumnWidths(list, &budget->profileWidth, &budget->roleWidth, &budget->dataMinimum, &budget->sessionsMinimum);
     MeasureMainButtons(dialog, base, budget);
-    treePane = MeasureSessionsPanes(dialog, base, budget, &searchHeight, &archivedHeight);
-    LayoutTextBudget(ListView_GetHeader(list), 0, FALSE, &textWidth, &textHeight, &tallestFont);
-    budget->headerHeight = tallestFont + MulDiv(BUTTON_TEXT_MARGIN_DIPS, (int)dpi, 96);
+    treePane = MeasureSessionsPanes(dialog, base, budget);
     LayoutSourceRect(dialog, base, GetDlgItem(dialog, IDC_LIST), dpi, &source);
     budget->minimumBody = source.bottom - source.top;
-    /* As wide as the list's columns and the side bar, the sessions' panes,
-     * and the header with room for the status; never narrower than the
-     * resource. */
-    budget->minimum.cx = max(budget->profileWidth + budget->roleWidth + budget->dataMinimum + budget->sessionsMinimum + ListFramePx(dialog, list) +
-                                 budget->sidebar + budget->sideGap,
-                             budget->profilesPane + treePane + budget->detailsPane + 2 * budget->gap) + 2 * budget->margin;
-    budget->minimum.cx = max(budget->minimum.cx, budget->menusWidth + MulDiv(MAIN_STATUS_MINIMUM_DIPS, (int)dpi, 96) + budget->statusActionWidth +
-                             budget->versionWidth + budget->updateWidth + 4 * budget->gap + budget->sideGap + budget->sidebar + 2 * budget->margin);
+    /* As wide as the toolbar, and as the list's columns (or the sessions'
+     * panes) beside the column; never narrower than the resource. */
+    listColumns = budget->profileWidth + budget->roleWidth + budget->dataMinimum + budget->sessionsMinimum + ListFramePx(dialog, list);
+    budget->minimum.cx = max(budget->toolbarTotal, max(listColumns, budget->profilesPane + budget->gap + treePane) + budget->sideGap + budget->column) +
+                         2 * budget->margin;
     budget->minimum.cx = max(budget->minimum.cx, MulDiv(MAIN_RESOURCE_WIDTH_DIPS, (int)dpi, 96));
-    /* As tall as the side bar's stacked actions, Set as default and its note. */
-    budget->noteHeight = NoteHeightMaximum(GetDlgItem(dialog, IDC_NOTE), kMainNote, NOTE_SAMPLE_NAME, budget->sidebar);
-    budget->minimumBody = max(budget->minimumBody, budget->headerHeight + (int)MAIN_STACKED_ACTIONS * budget->buttonHeight +
-                              ((int)MAIN_STACKED_ACTIONS - 1) * budget->gap + (int)ARRAYSIZE(kMainActionGroups) * groupGap +
-                              MulDiv(SIDEBAR_DEFAULT_GAP_DIPS + SIDEBAR_NOTE_GAP_DIPS, (int)dpi, 96) + budget->buttonHeight + budget->noteHeight);
-    budget->headerRow = max(budget->buttonHeight, max(archivedHeight, searchHeight));
-    budget->minimum.cy = budget->margin + budget->headerRow + budget->sideGap + budget->minimumBody + budget->margin;
+    /* As tall as the column in either view: the view's button, the actions
+     * and the note, or the details; above the foot. */
+    budget->noteHeight = NoteHeightMaximum(GetDlgItem(dialog, IDC_NOTE), kMainNote, NOTE_SAMPLE_NAME, budget->column);
+    budget->footHeight = MainFootHeight(dialog, budget);
+    profilesColumn = budget->buttonHeight + budget->groupGap + (int)ARRAYSIZE(kMainColumn) * budget->buttonHeight +
+                     ((int)ARRAYSIZE(kMainColumn) - 1) * budget->gap + MulDiv(COLUMN_NOTE_GAP_DIPS, (int)dpi, 96) + budget->noteHeight;
+    sessionsColumn = budget->buttonHeight + budget->gap + DETAILS_MINIMUM_ROWS * budget->buttonHeight;
+    budget->minimumBody = max(budget->minimumBody, max(profilesColumn, sessionsColumn) + budget->groupGap + budget->footHeight);
+    budget->minimum.cy = budget->gap + budget->buttonHeight + budget->sideGap + budget->minimumBody + budget->margin;
     budget->minimum.cy = max(budget->minimum.cy, MulDiv(MAIN_RESOURCE_HEIGHT_DIPS, (int)dpi, 96));
     budget->measuring = FALSE;
 }
@@ -4828,8 +5116,11 @@ BOOL Theme_MainMinimum(HWND dialog, SIZE *client)
 /* Where the main window's bands go in its current client area. */
 typedef struct MainArea {
     int left, right;              /* the content's edges inside the margins */
-    int rowWidth;                 /* right - left */
-    int bodyTop, bodyBottom;      /* the list, or the sessions' panes */
+    int toolbarTop;               /* under the menu bar */
+    int bodyTop, bodyBottom;      /* the list, or the sessions' panes, and the column */
+    int bodyRight;                /* where the list, or the sessions' panes, end */
+    int columnLeft;               /* the column's left edge; it ends at `right` */
+    int footTop;                  /* the column's foot, down to bodyBottom */
 } MainArea;
 
 static BOOL Shown(HWND dialog, int id)
@@ -4837,81 +5128,109 @@ static BOOL Shown(HWND dialog, int id)
     return (GetWindowLongW(GetDlgItem(dialog, id), GWL_STYLE) & WS_VISIBLE) != 0;
 }
 
-/* The header: the menus on the left; on the right, above the side bar, the
- * view's button, then leftwards Update while it shows, the version and the
- * status action while it shows; between them the status, or the progress of
- * a sync in its place, their text level with the buttons' captions. */
-static void PlaceMainHeader(MainMoves *moves, const MainBudget *budget, const MainArea *area)
+/* How tall a label's current text is, wrapped at `width`: at least a line. */
+static int LabelTextHeight(HWND label, int width)
 {
-    HWND dialog = moves->dialog, status = GetDlgItem(dialog, IDC_STATUS), version = GetDlgItem(dialog, IDC_VERSION);
-    int gap = budget->gap, x = area->left, right = area->right - budget->sidebar, i;
-    int statusTop = budget->margin + TextLineOffset(status, NULL, budget->headerRow);
-    for (i = 0; i < (int)ARRAYSIZE(kMainMenus); i++) {
-        PlaceMainControl(moves, GetDlgItem(dialog, kMainMenus[i].id), x, budget->margin, budget->menuWidth[i], budget->headerRow);
-        x += budget->menuWidth[i] + gap;
-    }
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_SESSIONS), right, budget->margin, budget->sidebar, budget->headerRow);
-    right -= budget->sideGap;
-    if (Shown(dialog, IDC_UPDATE)) {
-        right -= budget->updateWidth;
-        PlaceMainControl(moves, GetDlgItem(dialog, IDC_UPDATE), right, budget->margin, budget->updateWidth, budget->headerRow);
-        right -= gap;
-    }
-    PlaceMainControl(moves, version, right - budget->versionWidth, budget->margin + TextLineOffset(version, NULL, budget->headerRow),
-                     budget->versionWidth, budget->margin + budget->headerRow - (budget->margin + TextLineOffset(version, NULL, budget->headerRow)));
-    right -= budget->versionWidth + gap;
-    if (Shown(dialog, IDC_STATUS_ACTION)) {
-        right -= budget->statusActionWidth;
-        PlaceMainControl(moves, GetDlgItem(dialog, IDC_STATUS_ACTION), right, budget->margin, budget->statusActionWidth, budget->headerRow);
-        right -= gap;
-    }
-    PlaceMainControl(moves, status, x, statusTop, right - x, budget->margin + budget->headerRow - statusTop);
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_PROGRESS), x, budget->margin, right - x, budget->headerRow);
+    WCHAR text[512];
+    RECT measured = { 0, 0, max(1, width), 0 };
+    TEXTMETRICW metrics;
+    HDC dc = GetDC(label);
+    HGDIOBJ old;
+    int line = 0;
+    if (!dc) return 0;
+    old = SelectObject(dc, (HFONT)SendMessageW(label, WM_GETFONT, 0, 0));
+    GetWindowTextW(label, text, ARRAYSIZE(text));
+    if (GetTextMetricsW(dc, &metrics)) line = metrics.tmHeight;
+    if (text[0]) DrawTextW(dc, text, -1, &measured, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | Localize_ReadingFlags());
+    SelectObject(dc, old);
+    ReleaseDC(label, dc);
+    return max(line, (int)measured.bottom) + LABEL_SLACK_PX;
 }
 
-/* The profile list and its side bar of actions, in groups (Set as default and
- * its note at the bottom of the minimum body). */
+/* The toolbar, its groups apart. */
+static void PlaceMainToolbar(MainMoves *moves, const MainBudget *budget, const MainArea *area)
+{
+    int x = area->left, i, group;
+    for (i = 0; i < (int)ARRAYSIZE(kMainToolbar); i++) {
+        for (group = 0; group < (int)ARRAYSIZE(kMainToolbarGroups); group++)
+            if (kMainToolbarGroups[group] == i) x += budget->groupGap;
+        PlaceMainControl(moves, GetDlgItem(moves->dialog, kMainToolbar[i].id), x, area->toolbarTop, budget->toolbarWidth[i], budget->buttonHeight);
+        x += budget->toolbarWidth[i] + budget->gap;
+    }
+}
+
+/* The column's foot, from the bottom up: Update while it shows, the
+ * version, the status action while it shows, the status (the progress of a
+ * sync over it, its bottom on the status's). Returns its top. */
+static int PlaceMainFoot(MainMoves *moves, const MainBudget *budget, const MainArea *area)
+{
+    HWND dialog = moves->dialog, status = GetDlgItem(dialog, IDC_STATUS), version = GetDlgItem(dialog, IDC_VERSION);
+    int width = area->right - area->columnLeft, y = area->bodyBottom, height, statusBottom;
+    if (Shown(dialog, IDC_UPDATE)) {
+        y -= budget->buttonHeight;
+        PlaceMainControl(moves, GetDlgItem(dialog, IDC_UPDATE), area->columnLeft, y, width, budget->buttonHeight);
+        y -= budget->gap;
+    }
+    height = LabelTextHeight(version, width);
+    y -= height;
+    PlaceMainControl(moves, version, area->columnLeft, y, width, height);
+    y -= budget->gap;
+    if (Shown(dialog, IDC_STATUS_ACTION)) {
+        y -= budget->buttonHeight;
+        PlaceMainControl(moves, GetDlgItem(dialog, IDC_STATUS_ACTION), area->columnLeft, y, width, budget->buttonHeight);
+        y -= budget->gap;
+    }
+    statusBottom = y;
+    height = LabelTextHeight(status, width);
+    y -= height;
+    PlaceMainControl(moves, status, area->columnLeft, y, width, height);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_PROGRESS), area->columnLeft, statusBottom - budget->buttonHeight, width, budget->buttonHeight);
+    return min(y, statusBottom - budget->buttonHeight);
+}
+
+/* The profile list, and the column's actions under the view's button, the
+ * note below them. */
 static void PlaceProfilesView(MainMoves *moves, const MainBudget *budget, const MainArea *area)
 {
     HWND dialog = moves->dialog;
-    int sidebarLeft = area->right - budget->sidebar, noteTop = area->bodyTop + budget->minimumBody - budget->noteHeight, i, group;
-    int groupGap = MulDiv(SIDEBAR_GROUP_GAP_DIPS, (int)budget->dpi, 96), top = area->bodyTop + budget->headerHeight;
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_LIST), area->left, area->bodyTop, area->rowWidth - budget->sidebar - budget->sideGap,
-                     area->bodyBottom - area->bodyTop);
-    for (i = 0; i < (int)MAIN_STACKED_ACTIONS; i++) {
-        for (group = 0; group < (int)ARRAYSIZE(kMainActionGroups); group++)
-            if (kMainActionGroups[group] == i) top += groupGap;
-        PlaceMainControl(moves, GetDlgItem(dialog, kMainActions[i].id), sidebarLeft, top, budget->sidebar, budget->buttonHeight);
+    int width = area->right - area->columnLeft, top = area->bodyTop + budget->buttonHeight + budget->groupGap, i;
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_LIST), area->left, area->bodyTop, area->bodyRight - area->left, area->bodyBottom - area->bodyTop);
+    for (i = 0; i < (int)ARRAYSIZE(kMainColumn); i++) {
+        PlaceMainControl(moves, GetDlgItem(dialog, kMainColumn[i].id), area->columnLeft, top, width, budget->buttonHeight);
         top += budget->buttonHeight + budget->gap;
     }
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_NOTE), sidebarLeft, noteTop, budget->sidebar, budget->noteHeight);
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_DEFAULT), sidebarLeft,
-                     noteTop - MulDiv(SIDEBAR_NOTE_GAP_DIPS, (int)budget->dpi, 96) - budget->buttonHeight, budget->sidebar, budget->buttonHeight);
+    top += MulDiv(COLUMN_NOTE_GAP_DIPS, (int)budget->dpi, 96) - budget->gap;
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_NOTE), area->columnLeft, top, width, budget->noteHeight);
 }
 
-/* The sessions: profiles, tree and details down to the margin; above the
- * tree, the search box and "Show archived", as wide as its caption in the
- * current language. */
+/* The sessions: profiles and tree down to the margin, the search box and
+ * "Show archived" (as wide as its caption in the current language) above
+ * the tree; the details in the column, between the view's button and the
+ * foot. */
 static void PlaceSessionsView(MainMoves *moves, const MainBudget *budget, const MainArea *area)
 {
     HWND dialog = moves->dialog, archived = GetDlgItem(dialog, IDC_S_ARCHIVED);
     SIZE ideal;
-    int gap = budget->gap, bottom = area->bodyBottom, detailsLeft = area->right - budget->detailsPane;
-    int treeLeft = area->left + budget->profilesPane + gap, treeRight = detailsLeft - gap;
+    int gap = budget->gap, bottom = area->bodyBottom, detailsTop = area->bodyTop + budget->buttonHeight + gap;
+    int treeLeft = area->left + budget->profilesPane + gap, treeRight = area->bodyRight;
     int archivedRight = treeRight - MulDiv(ARCHIVED_INSET_DIPS, (int)budget->dpi, 96);
     int archivedWidth = Theme_CheckBoxSize(archived, &ideal) && ideal.cx > 0 ? ideal.cx : budget->archivedWidth;
     PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_PROFILES), area->left, area->bodyTop, budget->profilesPane, bottom - area->bodyTop);
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_DETAILS), detailsLeft, area->bodyTop, budget->detailsPane, bottom - area->bodyTop);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_DETAILS), area->columnLeft, detailsTop, area->right - area->columnLeft,
+                     max(budget->buttonHeight, area->footTop - budget->groupGap - detailsTop));
     PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_SEARCH), treeLeft, area->bodyTop, archivedRight - archivedWidth - gap - treeLeft,
-                     budget->headerRow);
-    PlaceMainControl(moves, archived, archivedRight - archivedWidth, area->bodyTop, archivedWidth, budget->headerRow);
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_TREE), treeLeft, area->bodyTop + budget->headerRow + gap, treeRight - treeLeft,
-                     bottom - area->bodyTop - budget->headerRow - gap);
+                     budget->searchRow);
+    PlaceMainControl(moves, archived, archivedRight - archivedWidth, area->bodyTop, archivedWidth, budget->searchRow);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_TREE), treeLeft, area->bodyTop + budget->searchRow + gap, treeRight - treeLeft,
+                     bottom - area->bodyTop - budget->searchRow - gap);
 }
 
-static void PlaceMain(MainMoves *moves, const MainBudget *budget, const MainArea *area)
+static void PlaceMain(MainMoves *moves, const MainBudget *budget, MainArea *area)
 {
-    PlaceMainHeader(moves, budget, area);
+    PlaceMainToolbar(moves, budget, area);
+    PlaceMainControl(moves, GetDlgItem(moves->dialog, IDC_SESSIONS), area->columnLeft, area->bodyTop, area->right - area->columnLeft,
+                     budget->buttonHeight);
+    area->footTop = PlaceMainFoot(moves, budget, area);
     PlaceProfilesView(moves, budget, area);
     PlaceSessionsView(moves, budget, area);
 }
@@ -4927,9 +5246,12 @@ void Theme_LayoutMain(HWND dialog)
     width = min(client.right, max(budget->minimum.cx, MulDiv(THEME_MAIN_READING_WIDTH_DIPS, (int)budget->dpi, 96)));
     area.left = (client.right - width) / 2 + budget->margin;
     area.right = (client.right - width) / 2 + width - budget->margin;
-    area.rowWidth = area.right - area.left;
-    area.bodyTop = budget->margin + budget->headerRow + budget->sideGap;
+    area.columnLeft = area.right - budget->column;
+    area.bodyRight = area.columnLeft - budget->sideGap;
+    area.toolbarTop = budget->gap;
+    area.bodyTop = area.toolbarTop + budget->buttonHeight + budget->sideGap;
     area.bodyBottom = client.bottom - budget->margin;
+    area.footTop = area.bodyBottom;
     moves.dialog = dialog;
     moves.lost = FALSE;
     moves.batch = BeginDeferWindowPos(MAIN_PLACED_CONTROLS);
@@ -4942,7 +5264,7 @@ void Theme_LayoutMain(HWND dialog)
     }
 }
 
-/* The progress of a sync, in the header: a bar `done` of `total` full (none
+/* The progress of a sync, in the column's foot: a bar `done` of `total` full (none
  * while the total is not known), `text` over it. */
 void Theme_DrawProgress(HWND owner, HDC dc, const RECT *rc, int done, int total, const WCHAR *text)
 {
@@ -5363,9 +5685,13 @@ static BOOL CALLBACK ThemeChild(HWND child, LPARAM lp)
     return TRUE;
 }
 
+static BOOL IsMainDialog(HWND dialog);
+static void ApplyMainGlyphs(HWND dialog);
+
 void Theme_Apply(HWND dialog)
 {
     ApplyDialogFont(dialog);
+    if (IsMainDialog(dialog)) ApplyMainGlyphs(dialog);
     SetPropW(dialog, THEME_PROP, (HANDLE)(INT_PTR)(g_dark ? THEMED_DARK : THEMED_LIGHT));
     if (g_allowDarkModeForWindow) g_allowDarkModeForWindow(dialog, g_dark);
     ApplyTitleBarMode(dialog);

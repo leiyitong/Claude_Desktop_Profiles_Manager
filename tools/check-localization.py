@@ -64,8 +64,8 @@ COMMAND_FAMILIES = [
 # TR() calls whose argument is no literal, by file: the variable or the
 # function giving the key (an entry followed by "(" matches any call of it).
 NONLITERAL_CALLS = {
-    "gui.c": ["error", "g_ColorNames[i]", "title", "Theme_MainCaption", "Theme_ProfileRole", "Theme_MainVersion", "Theme_MainNote",
-              "Theme_SessionsFolderState"],
+    "gui.c": ["error", "g_ColorNames[i]", "title", "Theme_MainCaption", "Theme_ProfileRole", "Theme_MainVersion", "Theme_MainStatus",
+              "Theme_MainNote", "Theme_SessionsFolderState"],
     "sessions.c": ["Theme_SessionsCaption"],
     "localize.c": ["key"],
     "profiles.c": ["invalid"],
@@ -84,22 +84,26 @@ TRANSLATED_THROUGH_VARIABLES = {
     "gui.c": ["A profile folder with this name already exists."],
     "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "S&ync sessions", "Rep&air", "Set as de&fault",
                 "&Program", "&Sessions", "S&hortcuts", "Help", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
-                "Pin to &taskbar", "Pinned", "Add to Start &menu", "Remove from Start &menu", "Sessions &view  >", "<  &Back",
-                "&Get Claude", "Set up l&inks", "&Update",
+                "Pin to &taskbar", "Pinned", "Add to Start &menu", "Remove from Start &menu", "Sessions &view", "&Back",
+                "&Get Claude", "Fix claude:// &links", "&Update",
                 "Profile", "Role", "Data folder", "Sessions", "This profile", "Not signed in", "No sessions yet", "Link broken",
                 "Claude icon, default", "Claude icon", "Default",
                 "Version %s", "Version %s is available", "Downloading version %s\u2026", "Installing the new version\u2026",
+                "Claude Desktop %s\nclaude:// links are not set up yet",
+                "Claude Desktop %s\nclaude:// links are routed correctly",
                 "The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \u201c%s\u201d.",
                 "Actions", "Delete session everywhere\u2026"],
 }
 
 # Controls shown at the same time: no two of them may share an access key.
 # Close goes by Esc and has none (Windows' rule for OK, Cancel and Close).
-STATUS_ACTIONS = ["&Get Claude", "Set up l&inks"]
+STATUS_ACTIONS = ["&Get Claude"]
+# The main window's menu bar and toolbar, shown in both views.
+MENU_BAR = ["&Sessions", "&Program", "S&hortcuts"]
+TOOLBAR = ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "Set as de&fault"]
 ACCESS_KEY_GROUPS = {
-    "profiles view": ["&Program", "&Sessions", "S&hortcuts", "Sessions &view  >", "&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026",
-                      "&Delete\u2026", "S&ync sessions", "Rep&air", "Set as de&fault", "&Update"] + STATUS_ACTIONS,
-    "sessions view": ["&Program", "&Sessions", "S&hortcuts", "<  &Back", "Show &archived", "&Update"] + STATUS_ACTIONS,
+    "profiles view": MENU_BAR + TOOLBAR + ["Sessions &view", "S&ync sessions", "Rep&air", "Fix claude:// &links", "&Update"] + STATUS_ACTIONS,
+    "sessions view": MENU_BAR + TOOLBAR + ["&Back", "Show &archived", "&Update"] + STATUS_ACTIONS,
     "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "Sess&ions:", "Open at &Windows sign-in",
                        "Copy &settings from \u201c%s\u201d", "&Open it now to sign in"],
     "Actions menu of a profile without the session": ["&Share with\u2026", "&Copy to\u2026"],
@@ -108,12 +112,12 @@ ACCESS_KEY_GROUPS = {
     "session menu": ["&Open in %s", "Open i&n", "S&hare with", "&Copy to", "&Rename\u2026\tF2", "S&tar",
                      "Uns&tar", "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s", "&Show folder",
                      "&Delete session everywhere\u2026"],
-    "profile list menu": ["&Open", "&Quit", "&Restart", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "S&hortcuts", "&Sessions",
-                          "&Back up\u2026", "Restore from bac&kup\u2026"],
+    "profile list menu": ["&Open", "&Quit", "&Restart", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "S&ync sessions",
+                          "&Keep sessions the same as", "&Stop keeping sessions the same", "&Back up\u2026", "Restore from back&up\u2026"],
     "sessions menu": ["S&ync sessions", "Merge &all sessions\u2026", "&Copy all sessions to\u2026", "&Move all sessions to\u2026",
                       "&Keep sessions the same as", "&Stop keeping sessions the same", "U&nlink sessions folder\u2026", "E&xport sessions\u2026",
                       "&Import sessions\u2026", "Reco&ver sessions\u2026", "Recently de&leted\u2026", "&Back up .claude\u2026"],
-    "program menu": ["&Language", "Set up l&inks\u2026", "Rep&air", "&Uninstall\u2026", "E&xit"],
+    "program menu": ["&Language", "Rep&air", "&Uninstall\u2026", "E&xit"],
     "shortcuts menu of a profile": ["Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar",
                                     "Pinned", "Add to Start &menu", "Remove from Start &menu"],
     "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "S&tar", "Uns&tar", "Re&move\u2026%s",
@@ -130,7 +134,6 @@ ALTERNATIVES = [
     [{"&Keep in %s"}, {"&Rename\u2026", "&Rename\u2026\tF2", "S&tar", "Uns&tar",
                        "Re&move from %s\u2026%s", "Re&move\u2026%s"}],
     [{"Add to Start &menu"}, {"Remove from Start &menu"}],
-    [{"&Get Claude"}, {"Set up l&inks"}],
 ]
 RESOURCE_STATEMENT = re.compile(r'\s*(PUSHBUTTON|DEFPUSHBUTTON|PUSHBOX|LTEXT|RTEXT|CTEXT|GROUPBOX|CHECKBOX|AUTOCHECKBOX|'
                                 r'RADIOBUTTON|AUTORADIOBUTTON|STATE3|AUTO3STATE|CONTROL|CAPTION)\s+')
