@@ -19,6 +19,10 @@
 #define IDD_PURGE         109
 #define IDD_SYNC_ITEMS    110
 #define IDD_CONFLICTS     111
+#define IDD_SYNC_SETUP    112
+#define IDD_BACKUP_HUB    113
+#define IDD_PREVIEW       114
+#define IDD_SETTINGS      115
 
 /* main window; the ids of the commands its menus give are the buttons' they stand for */
 #define IDC_STATUS         1000
@@ -33,28 +37,23 @@
 #define IDC_SC_DESKTOP     1010   /* the shortcuts menu */
 #define IDC_SC_SAVEAS      1011
 #define IDC_SC_PIN         1012
-#define IDC_UNINSTALL      1013   /* the program menu */
 #define IDC_UPDATE         1015
 #define IDC_SC_START       1016
 #define IDC_SESSIONS       1017
-#define IDC_MERGE          1019   /* the sessions menu */
+#define IDC_MERGE          1019   /* the list's menu */
 #define IDC_STOP           1021
-#define IDC_RESTORE        1022
-#define IDC_PURGE          1023
-#define IDC_BACKUP_CODE    1024   /* Back up .claude, in the column */
-#define IDC_MENU_APP       1025
-#define IDC_MENU_SESSIONS  1026
-#define IDC_MENU_SHORTCUTS 1027
 #define IDC_RESTART        1028
 #define IDC_SYNC           1029
 #define IDC_REPAIR         1030
 #define IDC_VERSION        1031
 #define IDC_PROGRESS       1032
-#define IDC_COPY_ALL       1033   /* the sessions menu */
+#define IDC_COPY_ALL       1033   /* the list's menu */
 #define IDC_MOVE_ALL       1034
-#define IDC_SAME_STOP      1036   /* the sessions menu */
-#define IDC_SYNC_ITEMS     1037
-#define IDC_MENU_HELP      1038   /* Help: its questions (IDC_HELP is a cursor's id) */
+#define IDC_BACKUP         1038   /* Backup & Restore, in the column */
+#define IDC_SHORTCUTS      1039   /* the column's menus */
+#define IDC_LANGUAGE       1040
+#define IDC_SYNC_NOW       1041   /* the list's menu */
+#define IDC_SETTINGS       1042   /* the gear at the toolbar's right end */
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -64,9 +63,10 @@
 #define IDC_S_DETAILS     1404
 #define IDC_S_PARTS       1405
 
-/* session title dialog */
+/* session edit dialog */
 #define IDC_T_LABEL       1500
 #define IDC_T_TITLE       1501
+#define IDC_T_STAR        1502
 
 /* profile dialog */
 #define IDC_P_NAME        1100
@@ -123,11 +123,36 @@
 #define IDC_C_BACKUP      2002
 #define IDC_C_NOTE        2003
 #define IDC_C_RESTORE     2004
+#define IDC_C_SHOW_LABEL  2005
+#define IDC_C_PROFILE     2006
+#define IDC_C_ALL         2007
 
 /* what profiles keep the same */
 #define IDC_I_TEXT        2100
 #define IDC_I_LIST        2101
 #define IDC_I_NOTE        2102
+
+/* what a profile syncs, and with which */
+#define IDC_Z_TEXT        2300
+#define IDC_Z_LIST        2301
+#define IDC_Z_ITEMS_LABEL 2302
+#define IDC_Z_ITEMS       2303
+#define IDC_Z_NOTE        2304
+#define IDC_Z_SYNC_NOW    2305
+
+/* Backup & Restore: each button the command it stands for */
+#define IDC_H_PROFILE     2400
+#define IDC_H_SESSIONS    2401
+#define IDC_H_CODE_LABEL  2402
+#define IDC_H_BACKUP      2403
+#define IDC_H_RESTORE     2404
+#define IDC_H_EXPORT      2405
+#define IDC_H_IMPORT      2406
+#define IDC_H_RECOVER     2407
+#define IDC_H_PURGE       2408
+#define IDC_H_CODE        2409
+#define IDC_H_NOTE        2410
+#define IDC_H_WEEKLY      2411   /* not a command: it sets SETTING_WEEKLY_BACKUP */
 
 /* conflicts of a sync, settled */
 #define IDC_X_TEXT        2200
@@ -135,6 +160,20 @@
 #define IDC_X_LABEL       2202
 #define IDC_X_PROFILE     2203
 #define IDC_X_NOTE        2204
+#define IDC_X_ICON        2205
+
+/* a session's conversation, previewed */
+#define IDC_V_TITLE       2500
+#define IDC_V_TEXT        2501
+
+/* settings, and help */
+#define IDC_G_VAULT       2600
+#define IDC_G_DAYS_LABEL  2601
+#define IDC_G_DAYS        2602
+#define IDC_G_DAYS_UNIT   2603
+#define IDC_G_HELP        2604
+#define IDC_G_QUESTIONS   2605
+#define IDC_G_ANSWER      2606
 
 /* message box */
 #define IDC_M_ICON        1300

@@ -51,6 +51,8 @@
 #define MAIN_BUDGET_PROP  L"ClaudeDesktopProfilesManager.MainBudget"
 #define SHELL_PROP        L"ClaudeDesktopProfilesManager.Dialog"
 #define STRONG_PROP       L"ClaudeDesktopProfilesManager.Strong"          /* the semibold font a control shows its text in */
+#define HEADINGS_PROP     L"ClaudeDesktopProfilesManager.Headings"        /* a list's semibold font for its heading rows */
+#define HEADINGS_BASE_PROP L"ClaudeDesktopProfilesManager.HeadingsBase"   /* the font it was made from */
 #define TIP_PROP          L"ClaudeDesktopProfilesManager.CellTip"
 #define TABLE_STATE_PROP  L"ClaudeDesktopProfilesManager.TableState"
 #define HOT_PROP          L"ClaudeDesktopProfilesManager.Hot"             /* an edit or drop-down list under the mouse */
@@ -607,6 +609,37 @@ void Theme_SetStrong(HWND control)
     if (old) DeleteObject(old);
 }
 
+void Theme_SetHeadingRows(HWND list)
+{
+    HFONT font = (HFONT)SendMessageW(list, WM_GETFONT, 0, 0), strong = StrongOf(font), old = (HFONT)GetPropW(list, HEADINGS_PROP);
+    if (!strong) return;
+    SetPropW(list, HEADINGS_PROP, strong);
+    SetPropW(list, HEADINGS_BASE_PROP, font);
+    if (old) DeleteObject(old);
+}
+
+/* Row `index` of a list with heading rows, when it is one (nothing in its
+ * other columns): the semibold font it is written in, made again when the
+ * list's font changed (a new scale). NULL for any other row. */
+static HFONT HeadingFontOf(HWND list, int index, HFONT font)
+{
+    HFONT strong = (HFONT)GetPropW(list, HEADINGS_PROP), made;
+    int column, columns = Header_GetItemCount(ListView_GetHeader(list));
+    if (!strong) return NULL;
+    for (column = 1; column < columns; column++) {
+        WCHAR text[2];
+        ListView_GetItemText(list, index, column, text, ARRAYSIZE(text));
+        if (text[0]) return NULL;
+    }
+    if ((HFONT)GetPropW(list, HEADINGS_BASE_PROP) != font && (made = StrongOf(font)) != NULL) {
+        SetPropW(list, HEADINGS_PROP, made);
+        SetPropW(list, HEADINGS_BASE_PROP, font);
+        DeleteObject(strong);
+        strong = made;
+    }
+    return strong;
+}
+
 void Theme_FreeFonts(ThemeFonts *fonts)
 {
     int i;
@@ -761,6 +794,15 @@ static void DrawLabel(HDC dc, const WCHAR *text, HFONT font, RECT *rc, UINT form
     SelectObject(dc, old);
 }
 
+/* One character of the icon font: DrawText reads a string to its end. */
+static void DrawGlyph(HDC dc, WCHAR glyph, HFONT font, RECT *rc, UINT format)
+{
+    WCHAR text[2];
+    text[0] = glyph;
+    text[1] = 0;
+    DrawLabel(dc, text, font, rc, format);
+}
+
 /* A push button (see ButtonFace). `owner` gives the scale and the theme;
  * `format` is DrawText's. */
 void Theme_DrawButton(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state, UINT format)
@@ -799,6 +841,61 @@ static HFONT CreateGlyphFont(int pixels)
     return NULL;
 }
 
+HIMAGELIST Theme_GlyphImages(HWND owner, const WCHAR *glyphs, const ThemeTint *tints, int count)
+{
+    UINT dpi = GetDpiForWindow(owner);
+    int size = GetSystemMetricsForDpi(SM_CXSMICON, dpi ? dpi : 96), i, x, y;
+    HIMAGELIST images = ImageList_Create(size, size, ILC_COLOR32, count, 0);
+    HFONT font = images ? CreateGlyphFont(size * 7 / 8) : NULL;
+    HDC dc = font ? CreateCompatibleDC(NULL) : NULL;
+    if (!dc) {
+        if (font) DeleteObject(font);
+        return images;
+    }
+    for (i = 0; i < count; i++) {
+        BITMAPINFO info;
+        DWORD *pixels = NULL;
+        HBITMAP bitmap;
+        HGDIOBJ oldBitmap, oldFont;
+        RECT cell = { 0, 0, size, size };
+        COLORREF color = tints[i] == THEME_TINT_NONE ? (g_highContrast ? GetSysColor(COLOR_WINDOWTEXT) : g_palette.color[THEME_MUTED])
+                                                     : Theme_TintColor(tints[i]);
+        WCHAR text[2] = { glyphs[i], 0 };
+        ZeroMemory(&info, sizeof info);
+        info.bmiHeader.biSize = sizeof info.bmiHeader;
+        info.bmiHeader.biWidth = size;
+        info.bmiHeader.biHeight = -size;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        if ((bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, (void **)&pixels, NULL, 0)) == NULL || !pixels) {
+            if (bitmap) DeleteObject(bitmap);
+            continue;
+        }
+        oldBitmap = SelectObject(dc, bitmap);
+        oldFont = SelectObject(dc, font);
+        /* White on black: the glyph's coverage, which becomes the tint's alpha. */
+        ZeroMemory(pixels, (size_t)size * size * sizeof *pixels);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        DrawTextW(dc, text, 1, &cell, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+        GdiFlush();
+        for (y = 0; y < size; y++)
+            for (x = 0; x < size; x++) {
+                DWORD p = pixels[y * size + x];
+                DWORD alpha = max(max((p >> 16) & 0xFF, (p >> 8) & 0xFF), p & 0xFF);
+                pixels[y * size + x] = (alpha << 24) | ((GetRValue(color) * alpha / 255) << 16) | ((GetGValue(color) * alpha / 255) << 8) |
+                                       (GetBValue(color) * alpha / 255);
+            }
+        SelectObject(dc, oldFont);
+        SelectObject(dc, oldBitmap);
+        ImageList_Add(images, bitmap, NULL);
+        DeleteObject(bitmap);
+    }
+    DeleteDC(dc);
+    DeleteObject(font);
+    return images;
+}
+
 /* The icon font for captions in `textFont`: a sixth larger than its text,
  * as Windows' own command bars show them. One is kept, for the last size. */
 static HFONT GlyphFont(HFONT textFont)
@@ -815,6 +912,29 @@ static HFONT GlyphFont(HFONT textFont)
         cachedPixels = pixels;
     }
     return cached;
+}
+
+int Theme_InlineGlyphWidth(HDC dc, WCHAR glyph, HFONT textFont)
+{
+    HFONT font = GlyphFont(textFont);
+    SIZE size = { 0, 0 };
+    HGDIOBJ old;
+    if (!font) return 0;
+    old = SelectObject(dc, font);
+    GetTextExtentPoint32W(dc, &glyph, 1, &size);
+    SelectObject(dc, old);
+    return size.cx;
+}
+
+void Theme_DrawInlineGlyph(HDC dc, const RECT *rc, WCHAR glyph, HFONT textFont, COLORREF color)
+{
+    HFONT font = GlyphFont(textFont);
+    RECT box = *rc;
+    COLORREF old;
+    if (!font) return;
+    old = SetTextColor(dc, color);
+    DrawGlyph(dc, glyph, font, &box, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    SetTextColor(dc, old);
 }
 
 /* Each tint, light and dark: Windows 11's own status and accent colors, the
@@ -855,6 +975,52 @@ static ThemeTint TintOf(HWND button)
     return (ThemeTint)(((UINT_PTR)GetPropW(button, GLYPH_PROP) >> 16) & 0xFF);
 }
 
+#define GLYPH_ICON_ONLY 0x1000000u   /* with the icon: the button shows it alone, its caption in a tip */
+#define ICON_TIP_PROP   L"ClaudeDesktopProfilesManager.IconTip"   /* the tooltip window of such a button */
+
+BOOL Theme_IsIconButton(HWND button)
+{
+    return ((UINT_PTR)GetPropW(button, GLYPH_PROP) & GLYPH_ICON_ONLY) != 0;
+}
+
+/* A button that shows its icon alone: its caption (access key and all, for
+ * the keyboard and screen readers) shows in a tip under the mouse, in the
+ * current language and mode. */
+static void SetIconOnly(HWND button)
+{
+    WCHAR caption[128], tipText[128];
+    HWND tooltipWindow = (HWND)GetPropW(button, ICON_TIP_PROP);
+    TOOLINFOW tool;
+    size_t from, to = 0;
+    SetPropW(button, GLYPH_PROP, (HANDLE)((UINT_PTR)GetPropW(button, GLYPH_PROP) | GLYPH_ICON_ONLY));
+    GetWindowTextW(button, caption, ARRAYSIZE(caption));
+    for (from = 0; caption[from] && to + 1 < ARRAYSIZE(tipText); from++) {
+        if (caption[from] == L'&' && caption[from + 1] != L'&') continue;   /* "(&H)" keeps its parentheses: dropped below */
+        tipText[to++] = caption[from];
+    }
+    tipText[to] = 0;
+    if (to >= 3 && tipText[to - 1] == L')' && tipText[to - 3] == L'(') tipText[to - 3] = 0;
+    ZeroMemory(&tool, sizeof tool);
+    tool.cbSize = sizeof tool;
+    tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    tool.hwnd = GetParent(button);
+    tool.uId = (UINT_PTR)button;
+    tool.lpszText = tipText;
+    if (!tooltipWindow) {
+        tooltipWindow = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, 0, 0, 0, 0,
+                                        GetParent(button), NULL, g_hInst, NULL);
+        if (!tooltipWindow) return;
+        if (!SendMessageW(tooltipWindow, TTM_ADDTOOLW, 0, (LPARAM)&tool) || !SetPropW(button, ICON_TIP_PROP, tooltipWindow)) {
+            DestroyWindow(tooltipWindow);
+            return;
+        }
+    }
+    SendMessageW(tooltipWindow, TTM_UPDATETIPTEXTW, 0, (LPARAM)&tool);
+    if (g_allowDarkModeForWindow) g_allowDarkModeForWindow(tooltipWindow, g_dark);
+    SetWindowTheme(tooltipWindow, g_dark ? L"DarkMode_Explorer" : NULL, NULL);
+    SendMessageW(tooltipWindow, WM_SETFONT, SendMessageW(button, WM_GETFONT, 0, 0), FALSE);
+}
+
 /* What a button's icon adds to its caption's width: the icon and the gap
  * after it; 0 without an icon or an icon font. */
 static int GlyphWidth(HWND button, HFONT textFont, WCHAR glyph)
@@ -888,6 +1054,12 @@ static void DrawGlyphButton(HWND button, HDC dc, const RECT *rc, const WCHAR *te
         return;
     }
     ButtonFace(button, dc, rc, state);
+    if (Theme_IsIconButton(button)) {
+        icon = *rc;
+        if (!(state & THEME_BUTTON_DISABLED) && !(g_dark && (state & THEME_BUTTON_PRESSED))) SetTextColor(dc, Theme_TintColor(tint));
+        DrawGlyph(dc, glyph, glyphFont, &icon, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        return;
+    }
     old = SelectObject(dc, font);
     DrawTextW(dc, text, -1, &measured, DT_CALCRECT | DT_SINGLELINE | (format & (DT_HIDEPREFIX | DT_NOPREFIX)) | Localize_ReadingFlags());
     SelectObject(dc, glyphFont);
@@ -897,7 +1069,7 @@ static void DrawGlyphButton(HWND button, HDC dc, const RECT *rc, const WCHAR *te
     SetRect(&icon, left, rc->top, left + glyphSize.cx, rc->bottom);
     caption = GetTextColor(dc);
     if (!(state & THEME_BUTTON_DISABLED) && !(g_dark && (state & THEME_BUTTON_PRESSED))) SetTextColor(dc, Theme_TintColor(tint));
-    DrawLabel(dc, &glyph, glyphFont, &icon, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    DrawGlyph(dc, glyph, glyphFont, &icon, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     SetTextColor(dc, caption);
     label.left = icon.right + gap;
     DrawLabel(dc, text, font, &label, (format & ~(UINT)(DT_CENTER | DT_RIGHT)) | DT_LEFT | DT_END_ELLIPSIS);
@@ -1089,6 +1261,362 @@ UINT Theme_TrackDropDown(HWND owner, HMENU menu, const RECT *screenBox)
         if (PtInRect(screenBox, point)) PeekMessageW(&message, message.hwnd, kPresses[i], kPresses[i], PM_REMOVE);
     }
     return command;
+}
+
+/* ------------------------------------------------------------- own menus */
+
+/* A menu the program draws itself (the manager's Shortcuts and Language):
+ * the rows of its lists on the field's color in a thin frame a quarter of
+ * the way from the field's color to the text's (the separator's gray is the
+ * field's own, and a light theme's is white), a check
+ * before the words of the item chosen, the item under the mouse or the
+ * keyboard pale blue, a grayed one muted. */
+#define MENU_CLASS            L"ClaudeDesktopProfilesManager.Menu"
+#define MENU_ITEMS_MAX        32
+#define MENU_PADDING_DIPS     4        /* around the rows, inside the frame */
+#define MENU_ROW_PADDING_DIPS 6        /* above and below a row's words */
+#define MENU_CHECK_DIPS       28       /* the column of checks, before the words */
+#define MENU_END_DIPS         20       /* after the longest words */
+#define MENU_SEPARATOR_DIPS   9        /* a separator's height, its line in the middle */
+#define MENU_GAP_DIPS         2        /* between the button and the menu */
+#define MENU_CHECK_GLYPH      0xE73E   /* CheckMark, of Windows' icon font */
+
+typedef struct MenuItem {
+    UINT  id;
+    WCHAR text[128];
+    BOOL  separator, grayed, checked;
+    RECT  rc;   /* in the menu's client area */
+} MenuItem;
+
+typedef struct OwnMenu {
+    HWND     owner, window;
+    HFONT    font;
+    MenuItem items[MENU_ITEMS_MAX];
+    int      count, hot;
+    BOOL     keyboard;   /* opened or moved through with the keyboard: its access keys shown */
+    BOOL     done;
+    UINT     chosen;
+} OwnMenu;
+
+/* The strings, separators, checks and grayed items of `source`; a submenu is left out. */
+static void ReadOwnMenu(OwnMenu *menu, HMENU source)
+{
+    int i, count = GetMenuItemCount(source);
+    for (i = 0; i < count && menu->count < MENU_ITEMS_MAX; i++) {
+        MenuItem *item = &menu->items[menu->count];
+        MENUITEMINFOW info;
+        ZeroMemory(&info, sizeof info);
+        info.cbSize = sizeof info;
+        info.fMask = MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_STRING | MIIM_SUBMENU;
+        info.dwTypeData = item->text;
+        info.cch = ARRAYSIZE(item->text);
+        ZeroMemory(item, sizeof *item);
+        if (!GetMenuItemInfoW(source, (UINT)i, TRUE, &info) || info.hSubMenu) continue;
+        item->id = info.wID;
+        item->separator = (info.fType & MFT_SEPARATOR) != 0;
+        item->grayed = (info.fState & MFS_GRAYED) != 0;
+        item->checked = (info.fState & MFS_CHECKED) != 0;
+        menu->count++;
+    }
+}
+
+static BOOL MenuItemChoosable(const OwnMenu *menu, int i)
+{
+    return i >= 0 && i < menu->count && !menu->items[i].separator && !menu->items[i].grayed;
+}
+
+/* The item the keyboard reaches from `from` going `step` (1 down, -1 up),
+ * round the ends; from -1, the first one that way. */
+static int NextMenuItem(const OwnMenu *menu, int from, int step)
+{
+    int i, at = from;
+    for (i = 0; i < menu->count; i++) {
+        at = at < 0 ? (step > 0 ? 0 : menu->count - 1) : (at + step + menu->count) % menu->count;
+        if (MenuItemChoosable(menu, at)) return at;
+    }
+    return from;
+}
+
+static int MenuItemAt(const OwnMenu *menu, POINT point)
+{
+    int i;
+    for (i = 0; i < menu->count; i++)
+        if (!menu->items[i].separator && PtInRect(&menu->items[i].rc, point)) return i;
+    return -1;
+}
+
+/* The letter after an item's ampersand, upper case; 0 for none. */
+static WCHAR MenuAccessKey(const WCHAR *text)
+{
+    const WCHAR *at;
+    for (at = text; (at = wcschr(at, L'&')) != NULL; at += 2)
+        if (at[1] != L'&') return at[1] ? (WCHAR)(UINT_PTR)CharUpperW((LPWSTR)(UINT_PTR)at[1]) : 0;
+    return 0;
+}
+
+static void SetMenuHot(OwnMenu *menu, int hot)
+{
+    if (hot == menu->hot) return;
+    if (menu->hot >= 0) InvalidateRect(menu->window, &menu->items[menu->hot].rc, FALSE);
+    menu->hot = hot;
+    if (hot >= 0) InvalidateRect(menu->window, &menu->items[hot].rc, FALSE);
+}
+
+static void EndOwnMenu(OwnMenu *menu, UINT chosen)
+{
+    if (menu->done) return;
+    menu->chosen = chosen;
+    menu->done = TRUE;
+}
+
+/* The keyboard, as in Windows' menus: arrows, Home and End move, Return
+ * chooses (nothing when no item is lit), Escape, Alt and F10 close, an
+ * access key chooses its item (or moves among several with it). */
+static void OwnMenuKey(OwnMenu *menu, const MSG *msg)
+{
+    if (msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN) {
+        BOOL shown = menu->keyboard;
+        menu->keyboard = TRUE;
+        if (!shown) InvalidateRect(menu->window, NULL, FALSE);
+        switch (msg->wParam) {
+        case VK_DOWN:   SetMenuHot(menu, NextMenuItem(menu, menu->hot, 1)); break;
+        case VK_UP:     SetMenuHot(menu, NextMenuItem(menu, menu->hot, -1)); break;
+        case VK_HOME:   SetMenuHot(menu, NextMenuItem(menu, -1, 1)); break;
+        case VK_END:    SetMenuHot(menu, NextMenuItem(menu, -1, -1)); break;
+        case VK_RETURN: EndOwnMenu(menu, MenuItemChoosable(menu, menu->hot) ? menu->items[menu->hot].id : 0); break;
+        case VK_ESCAPE:
+        case VK_MENU:
+        case VK_F10:    EndOwnMenu(menu, 0); break;
+        }
+        return;
+    }
+    if (msg->message == WM_CHAR || msg->message == WM_SYSCHAR) {
+        WCHAR key = (WCHAR)(UINT_PTR)CharUpperW((LPWSTR)(UINT_PTR)(WCHAR)msg->wParam);
+        int i, at, matches = 0, next = -1;
+        for (i = 1; i <= menu->count; i++) {
+            at = (menu->hot + i + menu->count) % menu->count;
+            if (!MenuItemChoosable(menu, at) || MenuAccessKey(menu->items[at].text) != key) continue;
+            if (next < 0) next = at;
+            matches++;
+        }
+        if (matches == 1) EndOwnMenu(menu, menu->items[next].id);
+        else if (matches > 1) SetMenuHot(menu, next);
+    }
+}
+
+static void PaintOwnMenu(OwnMenu *menu, HDC target)
+{
+    ThemeBuffer buffer;
+    RECT client, frame;
+    HDC dc;
+    HFONT glyphFont = GlyphFont(menu->font);
+    int i, line = LineWidth(menu->window), check = ScaleForWindow(menu->window, MENU_CHECK_DIPS);
+    int end = ScaleForWindow(menu->window, MENU_END_DIPS);
+    COLORREF field = g_palette.color[THEME_FIELD], text = g_palette.color[THEME_TEXT];
+    COLORREF edge = g_highContrast ? GetSysColor(COLOR_WINDOWTEXT)
+                                   : RGB((3 * GetRValue(field) + GetRValue(text)) / 4, (3 * GetGValue(field) + GetGValue(text)) / 4,
+                                         (3 * GetBValue(field) + GetBValue(text)) / 4);
+    HBRUSH edgeBrush = CreateSolidBrush(edge);
+    GetClientRect(menu->window, &client);
+    dc = Theme_BufferBegin(&buffer, target, &client);
+    FillSolid(dc, &client, field);
+    frame = client;
+    for (i = 0; i < line && edgeBrush; i++) {
+        FrameRect(dc, &frame, edgeBrush);
+        InflateRect(&frame, -1, -1);
+    }
+    if (edgeBrush) DeleteObject(edgeBrush);
+    for (i = 0; i < menu->count; i++) {
+        const MenuItem *item = &menu->items[i];
+        RECT words = item->rc, mark = item->rc;
+        COLORREF color;
+        if (item->separator) {
+            RECT rule = item->rc;
+            rule.top += (rule.bottom - rule.top - line) / 2;
+            rule.bottom = rule.top + line;
+            InflateRect(&rule, -ScaleForWindow(menu->window, MENU_PADDING_DIPS), 0);
+            FillSolid(dc, &rule, g_palette.color[THEME_SEPARATOR]);
+            continue;
+        }
+        color = Theme_DrawRow(menu->window, dc, &item->rc, i == menu->hot && !item->grayed ? (g_highContrast ? THEME_ROW_SELECTED : THEME_ROW_HOT) : 0,
+                              g_palette.color[THEME_FIELD]);
+        if (item->grayed) color = g_highContrast ? GetSysColor(COLOR_GRAYTEXT) : g_palette.color[THEME_MUTED];
+        SetTextColor(dc, color);
+        mark.right = mark.left + check;
+        if (item->checked && glyphFont) {
+            WCHAR glyph = MENU_CHECK_GLYPH;
+            DrawGlyph(dc, glyph, glyphFont, &mark, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        }
+        words.left = mark.right;
+        words.right -= end / 2;
+        DrawLabel(dc, item->text, menu->font, &words, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | (menu->keyboard ? 0 : DT_HIDEPREFIX));
+    }
+    Theme_BufferEnd(&buffer);
+}
+
+static LRESULT CALLBACK OwnMenuProc(HWND window, UINT msg, WPARAM wp, LPARAM lp)
+{
+    OwnMenu *menu = (OwnMenu *)GetWindowLongPtrW(window, GWLP_USERDATA);
+    POINT point;
+    RECT client;
+    if (msg == WM_NCCREATE) {
+        SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)((const CREATESTRUCTW *)lp)->lpCreateParams);
+        return DefWindowProcW(window, msg, wp, lp);
+    }
+    if (!menu) return DefWindowProcW(window, msg, wp, lp);
+    point.x = (short)LOWORD(lp);
+    point.y = (short)HIWORD(lp);
+    GetClientRect(window, &client);
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_MOUSEMOVE:
+        /* Captured: the mouse anywhere comes here; outside, the lit item stays. */
+        if (PtInRect(&client, point)) {
+            int at = MenuItemAt(menu, point);
+            SetMenuHot(menu, MenuItemChoosable(menu, at) ? at : -1);
+        }
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDBLCLK:
+        /* A press outside closes the menu and goes no further: on its own button, it does not open it again. */
+        if (!PtInRect(&client, point)) EndOwnMenu(menu, 0);
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP: {
+        int at = PtInRect(&client, point) ? MenuItemAt(menu, point) : -1;
+        if (MenuItemChoosable(menu, at)) EndOwnMenu(menu, menu->items[at].id);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE:
+        EndOwnMenu(menu, 0);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT paint;
+        HDC dc = BeginPaint(window, &paint);
+        if (dc) PaintOwnMenu(menu, dc);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_PRINTCLIENT:
+        PaintOwnMenu(menu, (HDC)wp);
+        return 0;
+    }
+    return DefWindowProcW(window, msg, wp, lp);
+}
+
+/* The rows' places, and the menu's size: as wide as its longest words, and
+ * at least `minimumWidth`. */
+static SIZE MeasureOwnMenu(OwnMenu *menu, int minimumWidth)
+{
+    HWND scale = menu->owner;
+    HDC dc = GetDC(scale);
+    TEXTMETRICW metrics;
+    SIZE size = { 0, 0 };
+    int pad = ScaleForWindow(scale, MENU_PADDING_DIPS), row, widest = 0, y, i;
+    HGDIOBJ old;
+    if (!dc) return size;
+    old = SelectObject(dc, menu->font);
+    ZeroMemory(&metrics, sizeof metrics);
+    GetTextMetricsW(dc, &metrics);
+    row = metrics.tmHeight + 2 * ScaleForWindow(scale, MENU_ROW_PADDING_DIPS);
+    for (i = 0; i < menu->count; i++) {
+        RECT measured = { 0, 0, 0, 0 };
+        if (menu->items[i].separator) continue;
+        DrawTextW(dc, menu->items[i].text, -1, &measured, DT_CALCRECT | DT_SINGLELINE | Localize_ReadingFlags());
+        widest = max(widest, (int)measured.right);
+    }
+    SelectObject(dc, old);
+    ReleaseDC(scale, dc);
+    size.cx = max(minimumWidth, 2 * pad + ScaleForWindow(scale, MENU_CHECK_DIPS) + widest + ScaleForWindow(scale, MENU_END_DIPS));
+    for (y = pad, i = 0; i < menu->count; i++) {
+        SetRect(&menu->items[i].rc, pad, y, size.cx - pad, y + (menu->items[i].separator ? ScaleForWindow(scale, MENU_SEPARATOR_DIPS) : row));
+        y = menu->items[i].rc.bottom;
+    }
+    size.cy = y + pad;
+    return size;
+}
+
+UINT Theme_TrackMenu(HWND owner, HMENU source, const RECT *screenBox)
+{
+    static BOOL registered;
+    INPUT_MESSAGE_SOURCE input;
+    MONITORINFO monitor;
+    OwnMenu *menu;
+    SIZE size;
+    MSG msg;
+    UINT chosen;
+    int x, y, gap = ScaleForWindow(owner, MENU_GAP_DIPS);
+    if (!registered) {
+        WNDCLASSW wc;
+        ZeroMemory(&wc, sizeof wc);
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = OwnMenuProc;
+        wc.hInstance = g_hInst;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.lpszClassName = MENU_CLASS;
+        registered = RegisterClassW(&wc) != 0;
+        if (!registered) Util_Log(L"theme: the menu's class cannot be registered (error %lu)", GetLastError());
+    }
+    if (!registered || (menu = (OwnMenu *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *menu)) == NULL) return 0;
+    menu->owner = owner;
+    menu->hot = -1;
+    menu->font = (HFONT)SendMessageW(owner, WM_GETFONT, 0, 0);
+    if (!menu->font && GetParent(owner)) menu->font = (HFONT)SendMessageW(GetParent(owner), WM_GETFONT, 0, 0);
+    if (!menu->font) menu->font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    ReadOwnMenu(menu, source);
+    size = MeasureOwnMenu(menu, screenBox->right - screenBox->left);
+    if (!menu->count || size.cx <= 0) {
+        HeapFree(GetProcessHeap(), 0, menu);
+        return 0;
+    }
+    /* Below the button, from its left edge; above it where the screen ends below. */
+    ZeroMemory(&monitor, sizeof monitor);
+    monitor.cbSize = sizeof monitor;
+    GetMonitorInfoW(MonitorFromRect(screenBox, MONITOR_DEFAULTTONEAREST), &monitor);
+    x = min(screenBox->left, monitor.rcWork.right - size.cx);
+    x = max(x, monitor.rcWork.left);
+    y = screenBox->bottom + gap;
+    if (y + size.cy > monitor.rcWork.bottom) y = max(monitor.rcWork.top, screenBox->top - gap - size.cy);
+    menu->window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, MENU_CLASS, L"", WS_POPUP, x, y, size.cx, size.cy,
+                                   GetAncestor(owner, GA_ROOT), NULL, g_hInst, menu);
+    if (!menu->window) {
+        HeapFree(GetProcessHeap(), 0, menu);
+        return 0;
+    }
+    /* Opened from the keyboard: its first item lit and its access keys shown, as Windows' menus do. */
+    ZeroMemory(&input, sizeof input);
+    if (GetCurrentInputMessageSource(&input) && input.deviceType == IMDT_KEYBOARD) {
+        menu->keyboard = TRUE;
+        menu->hot = NextMenuItem(menu, -1, 1);
+    }
+    ShowWindow(menu->window, SW_SHOWNOACTIVATE);
+    UpdateWindow(menu->window);
+    SetCapture(menu->window);
+    /* Its own loop, as TrackPopupMenu's: the keyboard is the menu's while it is open. */
+    while (!menu->done && GetCapture() == menu->window) {
+        if (!GetMessageW(&msg, NULL, 0, 0)) {
+            PostQuitMessage((int)msg.wParam);
+            break;
+        }
+        if (msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST) {
+            OwnMenuKey(menu, &msg);
+            continue;
+        }
+        DispatchMessageW(&msg);
+    }
+    menu->done = TRUE;
+    if (GetCapture() == menu->window) ReleaseCapture();
+    DestroyWindow(menu->window);
+    chosen = menu->chosen;
+    HeapFree(GetProcessHeap(), 0, menu);
+    return chosen;
 }
 
 /* A dark push button (see Theme_DrawButton), with its focus rectangle. */
@@ -1865,6 +2393,7 @@ static BOOL PaintTableRow(HWND list, HDC dc, int index)
     HWND header = ListView_GetHeader(list);
     LONG windowExtendedStyle = GetWindowLongW(list, GWL_EXSTYLE);
     HGDIOBJ old;
+    HFONT font = (HFONT)SendMessageW(list, WM_GETFONT, 0, 0), headingFont;
     COLORREF textColor;
     UINT state = 0;
     int column, columns = Header_GetItemCount(header);
@@ -1874,7 +2403,8 @@ static BOOL PaintTableRow(HWND list, HDC dc, int index)
     if (ListView_GetItemState(list, index, LVIS_SELECTED)) state = THEME_ROW_SELECTED;
     else if (ListView_GetHotItem(list) == index) state = THEME_ROW_HOT;
     textColor = Theme_DrawRow(list, dc, &shape, state, g_palette.color[THEME_FIELD]);
-    old = SelectObject(dc, (HFONT)SendMessageW(list, WM_GETFONT, 0, 0));
+    headingFont = HeadingFontOf(list, index, font);
+    old = SelectObject(dc, headingFont ? headingFont : font);
     SetTextColor(dc, textColor);
     SetBkMode(dc, TRANSPARENT);
     item.mask = LVIF_IMAGE | LVIF_STATE;
@@ -3273,18 +3803,22 @@ static void FollowEdit(HWND edit, UINT msg, WPARAM wp, LPARAM lp, DWORD_PTR fram
 /* What the theme keeps on a control goes with it. */
 static LRESULT ForgetChild(HWND control, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id)
 {
-    HFONT strong = (HFONT)RemovePropW(control, STRONG_PROP);
+    HFONT strong = (HFONT)RemovePropW(control, STRONG_PROP), headings = (HFONT)RemovePropW(control, HEADINGS_PROP);
     ControlCorners *corners = (ControlCorners *)RemovePropW(control, CORNER_PROP);
+    HWND iconTip = (HWND)RemovePropW(control, ICON_TIP_PROP);
     LRESULT result;
+    if (iconTip && IsWindow(iconTip)) DestroyWindow(iconTip);
     RemovePropW(control, HOT_PROP);
     if ((INT_PTR)GetPropW(control, CHOICE_PROP) == CHOICE_TRACKING) EndMenu();
     RemovePropW(control, CHOICE_PROP);
     RemovePropW(control, BORDER_PROP);
     RemovePropW(control, EDIT_PAUSED_PROP);
     RemovePropW(control, EDIT_UPDATE_PROP);
+    RemovePropW(control, HEADINGS_BASE_PROP);
     RemoveWindowSubclass(control, ChildSubclass, id);
     result = DefSubclassProc(control, msg, wp, lp);
     if (strong) DeleteObject(strong);
+    if (headings) DeleteObject(headings);
     if (corners) ReleaseControlCorners(corners);
     return result;
 }
@@ -4076,118 +4610,13 @@ static void ForgetDialog(HWND dialog)
     if (font) DeleteObject(font);
 }
 
-/* ------------------------------------------------------------ menu bar */
-
-/* A window's menu bar stays light in dark mode: Windows has no dark class
- * for it. It asks its window to draw it first, through two messages it does
- * not document (the ones Windows' own dark apps and common editors answer),
- * with these structures. */
-#define WM_UAHDRAWMENU     0x0091
-#define WM_UAHDRAWMENUITEM 0x0092
-
-typedef struct UahMenu {
-    HMENU menu;
-    HDC   dc;
-    DWORD flags;
-} UahMenu;
-
-typedef struct UahMenuItem {
-    int   position;
-    DWORD metrics[8];        /* the item's sizes in the bar or in a menu */
-    DWORD popupMetrics[5];   /* a menu's column widths, and whether they change */
-} UahMenuItem;
-
-typedef struct UahDrawMenuItem {
-    DRAWITEMSTRUCT draw;
-    UahMenu        menu;
-    UahMenuItem    item;
-} UahDrawMenuItem;
-
-/* The menu bar, in window coordinates. */
-static BOOL MenuBarRect(HWND window, RECT *bar)
-{
-    MENUBARINFO info;
-    RECT frame;
-    ZeroMemory(&info, sizeof info);
-    info.cbSize = sizeof info;
-    if (!GetMenuBarInfo(window, OBJID_MENU, 0, &info) || !GetWindowRect(window, &frame)) return FALSE;
-    *bar = info.rcBar;
-    OffsetRect(bar, -frame.left, -frame.top);
-    return TRUE;
-}
-
-/* The bar on the window's face, each menu's name in the text color (muted
- * while the window is inactive or the menu disabled), the one under the
- * mouse on a button's fill and the open one on a disabled button's frame
- * color, as Explorer's dark menus. */
-static void DrawDarkMenuBar(HWND window, UINT msg, const void *data)
-{
-    if (msg == WM_UAHDRAWMENU) {
-        const UahMenu *menu = (const UahMenu *)data;
-        RECT bar;
-        if (MenuBarRect(window, &bar)) {
-            bar.top -= 1;   /* Windows' own line above it */
-            FillRect(menu->dc, &bar, g_brush[THEME_FACE]);
-        }
-    } else {
-        const UahDrawMenuItem *item = (const UahDrawMenuItem *)data;
-        WCHAR text[256];
-        MENUITEMINFOW info;
-        UINT state = item->draw.itemState, format = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
-        BOOL muted = (state & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED)) != 0;
-        COLORREF fill = (state & ODS_SELECTED) ? g_palette.buttonOff : (state & ODS_HOTLIGHT) ? g_palette.button : g_palette.color[THEME_FACE];
-        RECT rc = item->draw.rcItem;
-        HBRUSH brush = CreateSolidBrush(fill);
-        ZeroMemory(&info, sizeof info);
-        info.cbSize = sizeof info;
-        info.fMask = MIIM_STRING;
-        info.dwTypeData = text;
-        info.cch = ARRAYSIZE(text) - 1;
-        text[0] = 0;
-        GetMenuItemInfoW(item->menu.menu, (UINT)item->item.position, TRUE, &info);
-        if (state & ODS_NOACCEL) format |= DT_HIDEPREFIX;
-        if (brush) {
-            FillRect(item->menu.dc, &rc, brush);
-            DeleteObject(brush);
-        }
-        SetBkMode(item->menu.dc, TRANSPARENT);
-        SetTextColor(item->menu.dc, g_palette.color[muted ? THEME_MUTED : THEME_TEXT]);
-        DrawTextW(item->menu.dc, text, -1, &rc, format | Localize_ReadingFlags());
-    }
-}
-
-/* The light line Windows draws under the menu bar, over the client area's
- * top edge, painted over in the face color. */
-static void CoverMenuBarLine(HWND window)
-{
-    RECT client, frame;
-    HDC dc;
-    if (!GetClientRect(window, &client) || !GetWindowRect(window, &frame)) return;
-    MapWindowPoints(window, NULL, (POINT *)&client, 2);
-    OffsetRect(&client, -frame.left, -frame.top);
-    client.bottom = client.top;
-    client.top -= 1;
-    if ((dc = GetWindowDC(window)) == NULL) return;
-    FillRect(dc, &client, g_brush[THEME_FACE]);
-    ReleaseDC(window, dc);
-}
-
-/* Every themed dialog, whatever dialog it is: in dark mode its push buttons,
- * check boxes and menu bar are drawn here, and in both modes its list view
+/* Every themed dialog, whatever dialog it is: in dark mode its push buttons
+ * and check boxes are drawn here, and in both modes its list view
  * rows and its drop-down lists; it answers WM_GETFONT with the font
  * ApplyDialogFont made, and frees what the theme keeps on it. */
 static LRESULT CALLBACK DialogSubclass(HWND dialog, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
 {
     (void)ref;
-    if (g_dark && !g_highContrast && (msg == WM_UAHDRAWMENU || msg == WM_UAHDRAWMENUITEM) && lp && GetMenu(dialog)) {
-        DrawDarkMenuBar(dialog, msg, (const void *)lp);
-        return TRUE;
-    }
-    if (g_dark && !g_highContrast && (msg == WM_NCPAINT || msg == WM_NCACTIVATE) && GetMenu(dialog)) {
-        LRESULT result = DefSubclassProc(dialog, msg, wp, lp);
-        CoverMenuBarLine(dialog);
-        return result;
-    }
     if ((msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) || (msg == WM_ENABLE && !wp) ||
         (msg == WM_SHOWWINDOW && !wp) || msg == WM_CANCELMODE || msg == WM_ENTERMENULOOP || msg == WM_ENTERSIZEMOVE)
         EnumChildWindows(dialog, HideDialogTip, 0);
@@ -4478,7 +4907,9 @@ static SIZE MeasureEveryLanguage(HWND control, const WCHAR *const *keys, int key
     return largest;
 }
 
-static const WCHAR *const kProfileColumnTitles[] = { L"Profile", L"Role", L"Data folder", L"Sessions" };
+/* By column index; Status (the last index) shows second (Gui_LayoutProfileColumns). */
+static const WCHAR *const kProfileColumnTitles[] = { L"Profile", L"Role", L"Data folder", L"Sessions", L"Status" };
+static const WCHAR *const kProfileStates[] = { L"Running", L"Not running" };
 /* What the sessions folder column says besides a link's target (sessionlink.c). */
 static const WCHAR *const kSessionsFolderStates[] = { L"This profile", L"Not signed in", L"No sessions yet", L"Link broken" };
 /* The role column's values: the profile the regular Claude icon opens, the default one, or both. */
@@ -4487,6 +4918,11 @@ static const WCHAR *const kProfileRoles[] = { L"Claude icon, default", L"Claude 
 const WCHAR *Theme_ProfileColumnTitle(int column)
 {
     return column >= 0 && column < (int)ARRAYSIZE(kProfileColumnTitles) ? kProfileColumnTitles[column] : NULL;
+}
+
+const WCHAR *Theme_ProfileState(BOOL running)
+{
+    return kProfileStates[running ? 0 : 1];
 }
 
 const WCHAR *Theme_ProfileRole(BOOL stock, BOOL isDefault)
@@ -4695,10 +5131,10 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
 /* The manager window: what every control needs in every language and
  * script font is measured once per DPI and font (MeasureMain, a cached
  * MainBudget); a new size only places the controls (Theme_LayoutMain).
- * Under the menu bar (gui.c makes it), the toolbar acts on the profiles
- * selected; below it, the body: the list (or the sessions view's profiles
- * and tree) and, on its right, a column: the view's button on top, then the
- * profiles' other actions and the note (or the sessions' details), and at
+ * At the top, the toolbar acts on the profiles selected; below it, the
+ * body: the list (or the sessions view's profiles and tree) and, on its
+ * right, a column: the view's button on top, then the other actions (the
+ * last two open a menu) and the note (or the sessions' details), and at
  * its foot Claude Desktop's version and the state of claude:// links (or the
  * progress of a sync in their place), this program's version and Update. */
 #define MAIN_SIDE_GAP_DIPS            12
@@ -4707,7 +5143,6 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
 #define MAIN_GROUP_GAP_DIPS           12     /* between the toolbar's groups, and the column's */
 #define COLUMN_NOTE_GAP_DIPS          9      /* above the note */
 #define DETAILS_MINIMUM_ROWS          4      /* the sessions' details are at least as tall as this many buttons */
-#define DETAILS_PADDING_DIPS          12     /* around the caption of the details' button */
 #define ARCHIVED_INSET_DIPS           5      /* "Show archived" ends before the tree: room before the details */
 #define VERSION_SAMPLE                L"2026.12.31 23:59"   /* the longest version the label shows */
 #define CLAUDE_VERSION_SAMPLE         L"2.99999.99"         /* the longest Claude Desktop version the status shows */
@@ -4720,6 +5155,7 @@ typedef struct MainButton {
     const WCHAR *captions[2];
     WCHAR glyphs[2];
     ThemeTint tints[2];
+    BOOL iconOnly;   /* its icon alone, its caption in a tip */
 } MainButton;
 
 /* The toolbar, left to right, in groups: the profiles' Claude, the profiles,
@@ -4735,18 +5171,18 @@ static const MainButton kMainToolbar[] = {
     { IDC_DEFAULT, { L"Set as de&fault", NULL }, { 0xE735, 0 }, { THEME_TINT_GOLD, THEME_TINT_NONE } }
 };
 static const int kMainToolbarGroups[] = { 3, 6 };   /* the actions that start a group of their own */
-/* The column's actions on the profiles, below the view's button. */
-static const MainButton kMainColumn[] = {
-    { IDC_SYNC, { L"S&ync sessions", NULL }, { 0xE895, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE } },
-    { IDC_REPAIR, { L"Rep&air", NULL }, { 0xE90F, 0 }, { THEME_TINT_AMBER, THEME_TINT_NONE } },
-    { IDC_BACKUP_CODE, { L"&Back up .claude\x2026", NULL }, { 0xE74E, 0 }, { THEME_TINT_GREEN, THEME_TINT_NONE } }
+/* At the toolbar's right end, icons alone: the menus of shortcuts and languages, and the settings. */
+static const MainButton kMainToolIcons[] = {
+    { IDC_SHORTCUTS, { L"S&hortcuts", NULL }, { 0xE71B, 0 }, { THEME_TINT_TEAL, THEME_TINT_NONE }, TRUE },
+    { IDC_LANGUAGE, { L"&Language", NULL }, { 0xE774, 0 }, { THEME_TINT_PURPLE, THEME_TINT_NONE }, TRUE },
+    { IDC_SETTINGS, { L"Se&ttings", NULL }, { 0xE713, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE }, TRUE }
 };
-/* The menu bar's menus, left to right. */
-static const MainButton kMainMenus[] = {
-    { IDC_MENU_SESSIONS, { L"&Sessions", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
-    { IDC_MENU_APP, { L"&Program", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
-    { IDC_MENU_SHORTCUTS, { L"S&hortcuts", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } },
-    { IDC_MENU_HELP, { L"Help", NULL }, { 0, 0 }, { THEME_TINT_NONE, THEME_TINT_NONE } }   /* no access key: it would be one more shortcut */
+/* The column's actions, below the view's button: the profiles' sync and
+ * backups, and the repair. */
+static const MainButton kMainColumn[] = {
+    { IDC_SYNC, { L"S&ync settings\x2026", NULL }, { 0xE895, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE }, FALSE },
+    { IDC_BACKUP, { L"&Backup && Restore\x2026", NULL }, { 0xE74E, 0 }, { THEME_TINT_GREEN, THEME_TINT_NONE }, FALSE },
+    { IDC_REPAIR, { L"Rep&air", NULL }, { 0xE90F, 0 }, { THEME_TINT_AMBER, THEME_TINT_NONE }, FALSE }
 };
 /* The shortcuts menu's commands, each in the state its profile is in. */
 static const MainButton kMainShortcuts[] = {
@@ -4768,8 +5204,8 @@ static const MainButton *MainButtonOf(int id)
         if (kMainToolbar[i].id == id) return &kMainToolbar[i];
     for (i = 0; i < ARRAYSIZE(kMainColumn); i++)
         if (kMainColumn[i].id == id) return &kMainColumn[i];
-    for (i = 0; i < ARRAYSIZE(kMainMenus); i++)
-        if (kMainMenus[i].id == id) return &kMainMenus[i];
+    for (i = 0; i < ARRAYSIZE(kMainToolIcons); i++)
+        if (kMainToolIcons[i].id == id) return &kMainToolIcons[i];
     for (i = 0; i < ARRAYSIZE(kMainShortcuts); i++)
         if (kMainShortcuts[i].id == id) return &kMainShortcuts[i];
     for (i = 0; i < ARRAYSIZE(single); i++)
@@ -4787,8 +5223,11 @@ const WCHAR *Theme_MainCaption(int id, int state)
 void Theme_SetMainGlyph(HWND dialog, int id, int state)
 {
     const MainButton *button = MainButtonOf(id);
+    HWND control = GetDlgItem(dialog, id);
     int shown = state && button && button->glyphs[1] ? 1 : 0;
-    if (button) Theme_SetGlyph(GetDlgItem(dialog, id), button->glyphs[shown], button->tints[shown]);
+    if (!button || !control) return;
+    Theme_SetGlyph(control, button->glyphs[shown], button->tints[shown]);
+    if (button->iconOnly) SetIconOnly(control);
 }
 
 /* The toolbar's and the column's buttons get their icons; the view's
@@ -4798,6 +5237,7 @@ static void ApplyMainGlyphs(HWND dialog)
     size_t i;
     for (i = 0; i < ARRAYSIZE(kMainToolbar); i++) Theme_SetMainGlyph(dialog, kMainToolbar[i].id, 0);
     for (i = 0; i < ARRAYSIZE(kMainColumn); i++) Theme_SetMainGlyph(dialog, kMainColumn[i].id, 0);
+    for (i = 0; i < ARRAYSIZE(kMainToolIcons); i++) Theme_SetMainGlyph(dialog, kMainToolIcons[i].id, 0);
     if (!GlyphOf(GetDlgItem(dialog, IDC_SESSIONS))) Theme_SetMainGlyph(dialog, IDC_SESSIONS, 0);
 }
 
@@ -4818,8 +5258,6 @@ static const WCHAR *const kMainStatuses[MAIN_STATUSES] = {
 };
 /* The note under the column's actions; its argument: the profile the regular Claude icon opens. */
 static const WCHAR kMainNote[] = L"The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \x201C%s\x201D.";
-/* The sessions details' captions the main window's minimum keeps room for (SessionsCaption). */
-static const WCHAR *const kSessionsCaptions[SESSIONS_CAPTIONS] = { L"Actions", L"Delete session everywhere\x2026" };
 
 const WCHAR *Theme_MainVersion(MainVersion state)
 {
@@ -4836,11 +5274,6 @@ const WCHAR *Theme_MainNote(void)
     return kMainNote;
 }
 
-const WCHAR *Theme_SessionsCaption(SessionsCaption caption)
-{
-    return caption >= 0 && caption < SESSIONS_CAPTIONS ? kSessionsCaptions[caption] : kSessionsCaptions[SESSIONS_ACTIONS];
-}
-
 /* Main placement reads a cached union of every catalog and script font.
  * The cache owns scalar geometry, never a font or a monitor work area;
  * ForgetDialog frees it. */
@@ -4850,8 +5283,8 @@ typedef struct MainBudget {
     BOOL initialized, measuring;
     SIZE minimum;
     int margin, gap, sideGap, groupGap, column, buttonHeight, searchRow;
-    int toolbarWidth[ARRAYSIZE(kMainToolbar)], toolbarTotal;
-    int profileWidth, roleWidth, dataMinimum, sessionsMinimum, profilesPane, archivedWidth;
+    int toolbarWidth[ARRAYSIZE(kMainToolbar)], toolbarTotal;   /* with the icons at its end, square */
+    int profileWidth, roleWidth, dataMinimum, sessionsMinimum, stateWidth, profilesPane, archivedWidth;
     int noteHeight, footHeight, minimumBody;
 } MainBudget;
 
@@ -4937,8 +5370,8 @@ static ULONGLONG HashControlFont(ULONGLONG key, HWND control)
 
 static ULONGLONG MainFontKey(HWND dialog)
 {
-    static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_REPAIR,
-        IDC_SESSIONS, IDC_STATUS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_ARCHIVED, IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE };
+    static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_BACKUP,
+        IDC_REPAIR, IDC_SHORTCUTS, IDC_LANGUAGE, IDC_SETTINGS, IDC_SESSIONS, IDC_STATUS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_ARCHIVED, IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE };
     HWND list = MainViewContent(dialog, IDC_LIST);
     ULONGLONG key = Core_HashBytes(CORE_HASH_START, &g_dark, sizeof g_dark);
     size_t i;
@@ -4947,11 +5380,29 @@ static ULONGLONG MainFontKey(HWND dialog)
     return HashControlFont(key, ListView_GetHeader(list));
 }
 
-static BOOL CachedProfileWidths(HWND list, int *profile, int *role, int *dataMinimum, int *sessionsMinimum)
+static MainBudget *CurrentBudget(HWND list)
 {
     HWND dialog = GetAncestor(list, GA_ROOT);
     MainBudget *budget = (MainBudget *)GetPropW(dialog, MAIN_BUDGET_PROP);
-    if (!budget || budget->measuring || budget->dpi != GetDpiForWindow(list) || budget->fontKey != MainFontKey(dialog)) return FALSE;
+    return !budget || budget->measuring || budget->dpi != GetDpiForWindow(list) || budget->fontKey != MainFontKey(dialog) ? NULL : budget;
+}
+
+int Theme_ProfileStateWidth(HWND list)
+{
+    HWND header = ListView_GetHeader(list);
+    HWND titles = header && SendMessageW(header, WM_GETFONT, 0, 0) ? header : list;
+    const MainBudget *budget = CurrentBudget(list);
+    UINT format = DT_SINGLELINE | DT_NOPREFIX;
+    if (budget) return budget->stateWidth;
+    return max(MeasureEveryLanguage(titles, &kProfileColumnTitles[PROFILE_COLUMN_STATE], 1, NULL, format, 0, NULL).cx,
+               MeasureEveryLanguage(list, kProfileStates, ARRAYSIZE(kProfileStates), NULL, format, 0, NULL).cx) +
+           ScaleForWindow(list, PROFILE_COLUMN_PADDING_DIPS);
+}
+
+static BOOL CachedProfileWidths(HWND list, int *profile, int *role, int *dataMinimum, int *sessionsMinimum)
+{
+    const MainBudget *budget = CurrentBudget(list);
+    if (!budget) return FALSE;
     *profile = budget->profileWidth;
     *role = budget->roleWidth;
     *dataMinimum = budget->dataMinimum;
@@ -4992,6 +5443,8 @@ static void MeasureMainButtons(HWND dialog, const DialogBase *base, MainBudget *
         budget->column = max(budget->column, width);
         budget->buttonHeight = max(budget->buttonHeight, height);
     }
+    /* The icons alone, square, a group of their own. */
+    budget->toolbarTotal += budget->groupGap + (int)ARRAYSIZE(kMainToolIcons) * (budget->buttonHeight + budget->gap);
 }
 
 /* The sessions view's panes: the profiles' side bar as in the resource, the
@@ -5010,9 +5463,7 @@ static int MeasureSessionsPanes(HWND dialog, const DialogBase *base, MainBudget 
     LayoutSourceRect(dialog, base, GetDlgItem(dialog, IDC_S_PROFILES), dpi, &source);
     budget->profilesPane = source.right - source.left;
     LayoutSourceRect(dialog, base, details, dpi, &source);
-    budget->column = max(budget->column, max(source.right - source.left,
-        max(MainKeyWidth(details, kSessionsCaptions[SESSIONS_DELETE_EVERYWHERE], NULL) + MulDiv(DETAILS_PADDING_DIPS, (int)dpi, 96),
-            MainKeyWidth(details, kSessionsCaptions[SESSIONS_ACTIONS], NULL) + DropDownFrameWidth(details))));
+    budget->column = max(budget->column, source.right - source.left);
     LayoutSourceRect(dialog, base, search, dpi, &source);
     searchWidth = source.right - source.left;
     LayoutTextBudget(search, searchWidth, FALSE, &textWidth, &searchHeight, &tallestFont);
@@ -5054,13 +5505,15 @@ static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
     budget->groupGap = MulDiv(MAIN_GROUP_GAP_DIPS, (int)dpi, 96);
     budget->measuring = TRUE;
     Theme_ProfileColumnWidths(list, &budget->profileWidth, &budget->roleWidth, &budget->dataMinimum, &budget->sessionsMinimum);
+    budget->stateWidth = Theme_ProfileStateWidth(list);
     MeasureMainButtons(dialog, base, budget);
     treePane = MeasureSessionsPanes(dialog, base, budget);
     LayoutSourceRect(dialog, base, GetDlgItem(dialog, IDC_LIST), dpi, &source);
     budget->minimumBody = source.bottom - source.top;
     /* As wide as the toolbar, and as the list's columns (or the sessions'
      * panes) beside the column; never narrower than the resource. */
-    listColumns = budget->profileWidth + budget->roleWidth + budget->dataMinimum + budget->sessionsMinimum + ListFramePx(dialog, list);
+    listColumns = budget->profileWidth + budget->stateWidth + budget->roleWidth + budget->dataMinimum + budget->sessionsMinimum +
+                  ListFramePx(dialog, list);
     budget->minimum.cx = max(budget->toolbarTotal, max(listColumns, budget->profilesPane + budget->gap + treePane) + budget->sideGap + budget->column) +
                          2 * budget->margin;
     budget->minimum.cx = max(budget->minimum.cx, MulDiv(MAIN_RESOURCE_WIDTH_DIPS, (int)dpi, 96));
@@ -5116,7 +5569,7 @@ BOOL Theme_MainMinimum(HWND dialog, SIZE *client)
 /* Where the main window's bands go in its current client area. */
 typedef struct MainArea {
     int left, right;              /* the content's edges inside the margins */
-    int toolbarTop;               /* under the menu bar */
+    int toolbarTop;
     int bodyTop, bodyBottom;      /* the list, or the sessions' panes, and the column */
     int bodyRight;                /* where the list, or the sessions' panes, end */
     int columnLeft;               /* the column's left edge; it ends at `right` */
@@ -5156,6 +5609,12 @@ static void PlaceMainToolbar(MainMoves *moves, const MainBudget *budget, const M
             if (kMainToolbarGroups[group] == i) x += budget->groupGap;
         PlaceMainControl(moves, GetDlgItem(moves->dialog, kMainToolbar[i].id), x, area->toolbarTop, budget->toolbarWidth[i], budget->buttonHeight);
         x += budget->toolbarWidth[i] + budget->gap;
+    }
+    /* The icons alone at the right end, over the column. */
+    x = area->right - (int)ARRAYSIZE(kMainToolIcons) * budget->buttonHeight - ((int)ARRAYSIZE(kMainToolIcons) - 1) * budget->gap;
+    for (i = 0; i < (int)ARRAYSIZE(kMainToolIcons); i++) {
+        PlaceMainControl(moves, GetDlgItem(moves->dialog, kMainToolIcons[i].id), x, area->toolbarTop, budget->buttonHeight, budget->buttonHeight);
+        x += budget->buttonHeight + budget->gap;
     }
 }
 

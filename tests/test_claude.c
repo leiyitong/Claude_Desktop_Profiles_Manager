@@ -346,7 +346,7 @@ int wmain(void)
         { "a WSL session's entry has wslConfig (not listed)", "wslConfig" },
         { "a cloud session's entry has cloudSessionId or movedToCloud (not listed)", "movedToCloud" },
         { "... cloudSessionId", "cloudSessionId" },
-        /* Delete session everywhere removes what Claude's own delete removes (sessionedit.c). */
+        /* What Claude's own delete removes with a session: clean-up removes the same (sessionedit.c). */
         { "entries name the session's earlier transcripts: priorCliSessionIds", "priorCliSessionIds", "preClearCliSessionId" },
         { "... preClearCliSessionId and unarchivedCliSessionId", "unarchivedCliSessionId", "preClearCliSessionId" },
         { "Claude's delete leaves a deleted_<id> mark holding the time", "\"deleted_\";", "[SessionTombstones]" },

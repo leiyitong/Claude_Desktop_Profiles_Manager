@@ -463,6 +463,21 @@ int Core_SuggestTarget(int count, const ULONGLONG *signInTicks, ULONGLONG nowTic
     return suggested;
 }
 
+int Core_NotificationTarget(const BOOL *running, int count, int stock, int topmost, BOOL *ask)
+{
+    int i, others = 0, first = -1;
+    *ask = FALSE;
+    for (i = 0; i < count; i++) {
+        if (i == stock || !running[i]) continue;
+        if (first < 0) first = i;
+        others++;
+    }
+    if (others == 0) return -1;
+    if (others == 1) return first;
+    *ask = TRUE;
+    return topmost >= 0 && topmost < count && topmost != stock && running[topmost] ? topmost : first;
+}
+
 /* ---------------------------------------------------------------- shortcuts */
 
 static const WCHAR *NextToken(const WCHAR *p, WCHAR *token, size_t cch)
@@ -548,19 +563,6 @@ BOOL Core_PathUnder(const WCHAR *path, const WCHAR *dir)
     if (dirLength == 0 || wcslen(path) < dirLength || !EqualsI(path, (int)dirLength, dir, (int)dirLength)) return FALSE;
     return dir[dirLength - 1] == L'\\' || dir[dirLength - 1] == L'/' || path[dirLength] == 0 || path[dirLength] == L'\\' ||
            path[dirLength] == L'/';
-}
-
-/* `path` with its start written as `%variable%` when that start is the
- * variable's `value` (a whole folder, case-insensitive): FALSE, and `path`
- * as it is, when it is not. */
-BOOL Core_PathWithVariable(const WCHAR *path, const WCHAR *variable, const WCHAR *value, WCHAR *out, size_t cch)
-{
-    size_t valueLength = value ? Core_TrimmedPathLength(value) : 0;
-    if (path && variable && *variable && valueLength && Core_PathUnder(path, value) &&
-        SUCCEEDED(StringCchPrintfW(out, cch, L"%%%s%%%s", variable, path + valueLength)))
-        return TRUE;
-    if (FAILED(StringCchCopyW(out, cch, path ? path : L""))) out[0] = 0;
-    return FALSE;
 }
 
 /* Where Claude's package keeps what it writes to AppData for itself:
@@ -901,6 +903,126 @@ SessionEntryKind Core_SessionEntryKind(const char *json, size_t len)
         JsonIsSet(json, len, "movedToCloud"))
         return ENTRY_ELSEWHERE;
     return ENTRY_LOCAL;
+}
+
+/* ------------------------------------------------------------ transcripts */
+
+#define TRANSCRIPT_CUT L"\x2026"
+
+typedef struct TranscriptText {        /* what a transcript line shows, as it is put together */
+    WCHAR *out;
+    size_t cch, used;
+    BOOL   full;
+} TranscriptText;
+
+/* `text` added, each line break as CRLF (an edit control's), carriage
+ * returns of its own left out; what does not fit cut with an ellipsis. */
+static void TranscriptPut(TranscriptText *t, const WCHAR *text, size_t length)
+{
+    size_t i;
+    for (i = 0; i < length && !t->full; i++) {
+        size_t need = text[i] == L'\n' ? 2 : 1;
+        if (text[i] == L'\r') continue;
+        if (t->used + need + ARRAYSIZE(TRANSCRIPT_CUT) > t->cch) {
+            StringCchCopyW(t->out + t->used, t->cch - t->used, TRANSCRIPT_CUT);
+            t->used += ARRAYSIZE(TRANSCRIPT_CUT) - 1;
+            t->full = TRUE;
+            break;
+        }
+        if (text[i] == L'\n') t->out[t->used++] = L'\r';
+        t->out[t->used++] = text[i];
+        t->out[t->used] = 0;
+    }
+}
+
+/* A JSON string added, blanks around it left out; a block after another on a line of its own. */
+static void TranscriptPutString(TranscriptText *t, const char *raw, size_t len, const WCHAR *before)
+{
+    WCHAR *text;
+    size_t start = 0, end;
+    if (len < 2 || raw[0] != '"' || t->full) return;
+    if ((text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (len + 1) * sizeof(WCHAR))) == NULL) return;
+    if (Core_JsonString(raw, len, text, len + 1)) {
+        end = wcslen(text);
+        while (start < end && iswspace(text[start])) start++;
+        while (end > start && iswspace(text[end - 1])) end--;
+        if (end > start) {
+            if (t->used) TranscriptPut(t, L"\n", 1);
+            if (before) TranscriptPut(t, before, wcslen(before));
+            TranscriptPut(t, text + start, end - start);
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, text);
+}
+
+/* A tool call: "[name] what it works on", from the first of its inputs that names it. */
+static void TranscriptPutTool(TranscriptText *t, const char *block, size_t len)
+{
+    static const char *const kInputs[] = { "description", "command", "file_path", "path", "pattern", "url", "query", "prompt" };
+    WCHAR name[64], head[ARRAYSIZE(name) + 4];
+    const char *value, *input, *what;
+    size_t valueLength, inputLength, whatLength, i;
+    if (!Core_JsonMember(block, len, "name", &value, &valueLength) || !Core_JsonString(value, valueLength, name, ARRAYSIZE(name))) return;
+    StringCchPrintfW(head, ARRAYSIZE(head), L"[%s] ", name);
+    if (Core_JsonMember(block, len, "input", &input, &inputLength))
+        for (i = 0; i < ARRAYSIZE(kInputs); i++)
+            if (Core_JsonMember(input, inputLength, kInputs[i], &what, &whatLength) && whatLength > 2 && what[0] == '"') {
+                size_t before = t->used;
+                TranscriptPutString(t, what, whatLength, head);
+                if (t->used != before) return;
+            }
+    if (t->used) TranscriptPut(t, L"\n", 1);
+    TranscriptPut(t, head, wcslen(head) - 1);
+}
+
+/* One line of a Claude Code transcript (.jsonl) as the preview shows it:
+ * who speaks, and what: the text of the message, each tool call on a line
+ * of its own as "[name] what". Tool results, thinking, meta lines, side
+ * chains and the plumbing of commands (a user's text starting with a tag)
+ * show nothing. `out` is cut with an ellipsis past `cch`. */
+TranscriptRole Core_TranscriptLine(const char *line, size_t len, WCHAR *out, size_t cch)
+{
+    TranscriptText t;
+    WCHAR type[16];
+    const char *value, *message, *content;
+    size_t valueLength, messageLength, contentLength, i, end;
+    TranscriptRole role;
+    if (!out || cch < ARRAYSIZE(TRANSCRIPT_CUT) + 1) return TRANSCRIPT_NONE;
+    out[0] = 0;
+    if (!line || !Core_JsonMember(line, len, "type", &value, &valueLength) || !Core_JsonString(value, valueLength, type, ARRAYSIZE(type)))
+        return TRANSCRIPT_NONE;
+    if (wcscmp(type, L"user") == 0) role = TRANSCRIPT_USER;
+    else if (wcscmp(type, L"assistant") == 0) role = TRANSCRIPT_CLAUDE;
+    else return TRANSCRIPT_NONE;
+    if ((Core_JsonMember(line, len, "isMeta", &value, &valueLength) && Core_JsonTrue(value, valueLength)) ||
+        (Core_JsonMember(line, len, "isSidechain", &value, &valueLength) && Core_JsonTrue(value, valueLength)) ||
+        !Core_JsonMember(line, len, "message", &message, &messageLength) ||
+        !Core_JsonMember(message, messageLength, "content", &content, &contentLength))
+        return TRANSCRIPT_NONE;
+    ZeroMemory(&t, sizeof t);
+    t.out = out;
+    t.cch = cch;
+    if (content[0] == '"') {
+        if (role == TRANSCRIPT_USER && contentLength > 1 && content[1] == '<') return TRANSCRIPT_NONE;
+        TranscriptPutString(&t, content, contentLength, NULL);
+    } else if (content[0] == '[') {
+        i = SkipSpace(content, contentLength, 1);
+        while (i < contentLength && content[i] != ']' && !t.full) {
+            const char *block = content + i;
+            WCHAR kind[16];
+            if ((end = ValueEnd(content, contentLength, i)) == 0 || end == i) break;
+            if (Core_JsonMember(block, end - i, "type", &value, &valueLength) && Core_JsonString(value, valueLength, kind, ARRAYSIZE(kind))) {
+                if (wcscmp(kind, L"text") == 0 && Core_JsonMember(block, end - i, "text", &value, &valueLength)) {
+                    if (!(role == TRANSCRIPT_USER && valueLength > 1 && value[1] == '<')) TranscriptPutString(&t, value, valueLength, NULL);
+                } else if (wcscmp(kind, L"tool_use") == 0) {
+                    TranscriptPutTool(&t, block, end - i);
+                }
+            }
+            i = SkipSpace(content, contentLength, end);
+            if (i < contentLength && content[i] == ',') i = SkipSpace(content, contentLength, i + 1);
+        }
+    }
+    return t.used ? role : TRANSCRIPT_NONE;
 }
 
 /* ---------------------------------------------------------- session edits */
@@ -2646,4 +2768,456 @@ BOOL Core_WebStorageText(const BYTE *value, size_t length, WCHAR *out, size_t cc
     out[n] = 0;
     *outLength = n;
     return TRUE;
+}
+
+/* ------------------------------------------------------- three-way merge */
+
+/* Merging the values several profiles hold of one part against the value
+ * they shared at the last sync (Core_JsonMerge). An element changed by one
+ * goes to all; elements changed by several each their own way are merged
+ * deeper where they are objects or lists (by key, "id" or a first string),
+ * and lists of plain values as sets; what is left is a conflict at its
+ * path. */
+typedef struct MergeOut {
+    char  *data;
+    size_t len, cap;
+    BOOL   failed;
+} MergeOut;
+
+typedef struct MergeJob {
+    int                n;
+    const BOOL        *say;
+    const ULONGLONG   *written;
+    CoreMergeDecide    decide;
+    CoreMergeReport    report;
+    void              *context;
+    int                unresolved;
+    MergeOut           out;
+} MergeJob;
+
+typedef struct MergeNode {
+    const char *base;                        /* NULL: absent */
+    size_t      baseLen;
+    const char *value[MAX_PROFILES];         /* NULL: absent */
+    size_t      valueLen[MAX_PROFILES];
+    BOOL        changed[MAX_PROFILES];       /* the member's view counts and differs from the base */
+} MergeNode;
+
+static void MergePut(MergeOut *out, const char *text, size_t len)
+{
+    if (out->failed) return;
+    if (out->len + len + 1 > out->cap) {
+        size_t cap = out->cap ? out->cap : 256;
+        char *grown;
+        while (cap < out->len + len + 1) cap *= 2;
+        grown = out->data ? (char *)HeapReAlloc(GetProcessHeap(), 0, out->data, cap) : (char *)HeapAlloc(GetProcessHeap(), 0, cap);
+        if (!grown) {
+            out->failed = TRUE;
+            return;
+        }
+        out->data = grown;
+        out->cap = cap;
+    }
+    memcpy(out->data + out->len, text, len);
+    out->len += len;
+    out->data[out->len] = 0;
+}
+
+/* Two JSON texts the same but for spaces outside their strings. */
+static BOOL SameJson(const char *a, size_t aLen, const char *b, size_t bLen)
+{
+    size_t i = 0, j = 0;
+    BOOL inString = FALSE;
+    if (!a || !b) return a == b;
+    for (;;) {
+        if (!inString) {
+            while (i < aLen && IsJsonSpace(a[i])) i++;
+            while (j < bLen && IsJsonSpace(b[j])) j++;
+        }
+        if (i >= aLen || j >= bLen) return i >= aLen && j >= bLen;
+        if (a[i] != b[j]) return FALSE;
+        if (a[i] == '\\' && inString) {
+            if (i + 1 >= aLen || j + 1 >= bLen || a[i + 1] != b[j + 1]) return FALSE;
+            i += 2;
+            j += 2;
+            continue;
+        }
+        if (a[i] == '"') inString = !inString;
+        i++;
+        j++;
+    }
+}
+
+/* The next member of an object from `*i` (just after '{' or a comma): its
+ * key's raw text and its value's. FALSE at the object's end. */
+static BOOL MergeNextMember(const char *s, size_t len, size_t *i, const char **key, size_t *keyLen, const char **value, size_t *valueLen)
+{
+    size_t at = SkipSpace(s, len, *i), keyEnd, end;
+    if (at < len && s[at] == ',') at = SkipSpace(s, len, at + 1);
+    if (at >= len || s[at] != '"' || (keyEnd = StringEnd(s, len, at)) == 0) return FALSE;
+    *key = s + at + 1;
+    *keyLen = keyEnd - at - 2;
+    at = SkipSpace(s, len, keyEnd);
+    if (at >= len || s[at] != ':') return FALSE;
+    at = SkipSpace(s, len, at + 1);
+    if ((end = ValueEnd(s, len, at)) == 0 || end == at) return FALSE;
+    *value = s + at;
+    *valueLen = end - at;
+    *i = end;
+    return TRUE;
+}
+
+/* The next item of an array from `*i` (just after '[' or a comma). */
+static BOOL MergeNextItem(const char *s, size_t len, size_t *i, const char **value, size_t *valueLen)
+{
+    size_t at = SkipSpace(s, len, *i), end;
+    if (at < len && s[at] == ',') at = SkipSpace(s, len, at + 1);
+    if (at >= len || s[at] == ']' || (end = ValueEnd(s, len, at)) == 0 || end == at) return FALSE;
+    *value = s + at;
+    *valueLen = end - at;
+    *i = end;
+    return TRUE;
+}
+
+static char MergeKind(const char *s, size_t len)
+{
+    size_t at = SkipSpace(s, len, 0);
+    return at < len ? s[at] : 0;
+}
+
+static size_t MergeOpen(const char *s, size_t len)
+{
+    return SkipSpace(s, len, 0) + 1;   /* just after '{' or '[' */
+}
+
+/* How a list's items are told apart: by their "id", by their first string,
+ * or as plain values (a set). */
+typedef enum MergeScheme { SCHEME_NONE, SCHEME_ID, SCHEME_FIRST, SCHEME_PLAIN, SCHEME_MIXED } MergeScheme;
+
+/* The key of item `item` in `scheme`: the raw text inside the quotes of its id or first string. */
+static BOOL MergeItemKey(const char *item, size_t len, MergeScheme scheme, const char **key, size_t *keyLen)
+{
+    const char *value;
+    size_t valueLen, i;
+    if (scheme == SCHEME_ID) {
+        if (MergeKind(item, len) != '{') return FALSE;
+        i = MergeOpen(item, len);
+        while (MergeNextMember(item, len, &i, key, keyLen, &value, &valueLen))
+            if (*keyLen == 2 && memcmp(*key, "id", 2) == 0) {
+                if (MergeKind(value, valueLen) != '"' || valueLen < 2) return FALSE;
+                *key = value + 1;
+                *keyLen = valueLen - 2;
+                return TRUE;
+            }
+        return FALSE;
+    }
+    if (scheme == SCHEME_FIRST) {
+        if (MergeKind(item, len) != '[') return FALSE;
+        i = MergeOpen(item, len);
+        if (!MergeNextItem(item, len, &i, &value, &valueLen) || MergeKind(value, valueLen) != '"' || valueLen < 2) return FALSE;
+        *key = value + 1;
+        *keyLen = valueLen - 2;
+        return TRUE;
+    }
+    *key = item;
+    *keyLen = len;
+    return TRUE;
+}
+
+static MergeScheme MergeListScheme(const char *s, size_t len)
+{
+    MergeScheme scheme = SCHEME_NONE, one;
+    const char *item, *key;
+    size_t itemLen, keyLen, i = MergeOpen(s, len);
+    while (MergeNextItem(s, len, &i, &item, &itemLen)) {
+        char kind = MergeKind(item, itemLen);
+        if (kind == '{') one = MergeItemKey(item, itemLen, SCHEME_ID, &key, &keyLen) ? SCHEME_ID : SCHEME_MIXED;
+        else if (kind == '[') one = MergeItemKey(item, itemLen, SCHEME_FIRST, &key, &keyLen) ? SCHEME_FIRST : SCHEME_MIXED;
+        else one = SCHEME_PLAIN;
+        if (scheme == SCHEME_NONE) scheme = one;
+        else if (scheme != one) return SCHEME_MIXED;
+        if (scheme == SCHEME_MIXED) return SCHEME_MIXED;
+    }
+    return scheme;
+}
+
+/* The element of key `key` in the object or list `s` (`scheme`: how the
+ * list's items are told apart; SCHEME_NONE for an object). */
+static BOOL MergeFind(const char *s, size_t len, MergeScheme scheme, const char *key, size_t keyLen, const char **value, size_t *valueLen)
+{
+    const char *k;
+    size_t kLen, i;
+    if (!s) return FALSE;
+    i = MergeOpen(s, len);
+    if (scheme == SCHEME_NONE) {
+        while (MergeNextMember(s, len, &i, &k, &kLen, value, valueLen))
+            if (kLen == keyLen && memcmp(k, key, keyLen) == 0) return TRUE;
+        return FALSE;
+    }
+    while (MergeNextItem(s, len, &i, value, valueLen))
+        if (MergeItemKey(*value, *valueLen, scheme, &k, &kLen) &&
+            (scheme == SCHEME_PLAIN ? SameJson(k, kLen, key, keyLen) : kLen == keyLen && memcmp(k, key, keyLen) == 0))
+            return TRUE;
+    return FALSE;
+}
+
+/* The keys of the elements, each once, in the order of `order` first (the
+ * member that changed last), then of the base and the others. */
+typedef struct MergeKeys {
+    const char **key;
+    size_t      *keyLen;
+    int          count, capacity;
+} MergeKeys;
+
+static void MergeAddKeys(MergeKeys *keys, const char *s, size_t len, MergeScheme scheme)
+{
+    const char *key, *value;
+    size_t keyLen, valueLen, i;
+    int k;
+    if (!s) return;
+    i = MergeOpen(s, len);
+    for (;;) {
+        if (scheme == SCHEME_NONE) {
+            if (!MergeNextMember(s, len, &i, &key, &keyLen, &value, &valueLen)) break;
+        } else {
+            if (!MergeNextItem(s, len, &i, &value, &valueLen)) break;
+            if (!MergeItemKey(value, valueLen, scheme, &key, &keyLen)) continue;
+        }
+        for (k = 0; k < keys->count; k++)
+            if (scheme == SCHEME_PLAIN ? SameJson(keys->key[k], keys->keyLen[k], key, keyLen)
+                                       : keys->keyLen[k] == keyLen && memcmp(keys->key[k], key, keyLen) == 0)
+                break;
+        if (k < keys->count) continue;
+        if (keys->count == keys->capacity) {
+            int capacity = keys->capacity ? keys->capacity * 2 : 32;
+            const char **grownKey = (const char **)(keys->key ? HeapReAlloc(GetProcessHeap(), 0, (void *)keys->key, (size_t)capacity * sizeof *keys->key)
+                                                              : HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof *keys->key));
+            size_t *grownLen;
+            if (!grownKey) return;
+            keys->key = grownKey;
+            grownLen = (size_t *)(keys->keyLen ? HeapReAlloc(GetProcessHeap(), 0, keys->keyLen, (size_t)capacity * sizeof *keys->keyLen)
+                                               : HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof *keys->keyLen));
+            if (!grownLen) return;
+            keys->keyLen = grownLen;
+            keys->capacity = capacity;
+        }
+        keys->key[keys->count] = key;
+        keys->keyLen[keys->count++] = keyLen;
+    }
+}
+
+static void MergeFreeKeys(MergeKeys *keys)
+{
+    if (keys->key) HeapFree(GetProcessHeap(), 0, (void *)keys->key);
+    if (keys->keyLen) HeapFree(GetProcessHeap(), 0, keys->keyLen);
+}
+
+/* `path` with one more step: "/" and `key`, '~' and '/' written "~0" and "~1"; "#" before a list item's key. */
+static BOOL MergeStep(const char *path, const char *key, size_t keyLen, BOOL item, char *out, size_t cap)
+{
+    size_t n = strlen(path), i;
+    if (n + 3 > cap) return FALSE;
+    memcpy(out, path, n);
+    out[n++] = '/';
+    if (item) out[n++] = '#';
+    for (i = 0; i < keyLen; i++) {
+        if (n + 3 > cap) return FALSE;
+        if (key[i] == '~' || key[i] == '/') {
+            out[n++] = '~';
+            out[n++] = key[i] == '~' ? '0' : '1';
+        } else {
+            out[n++] = key[i];
+        }
+    }
+    out[n] = 0;
+    return TRUE;
+}
+
+/* The member of `changed` that changed last: the order and the default come from it. */
+static int MergeLatest(const MergeJob *job, const BOOL *changed)
+{
+    int m, latest = -1;
+    for (m = 0; m < job->n; m++)
+        if (changed[m] && (latest < 0 || job->written[m] > job->written[latest])) latest = m;
+    return latest;
+}
+
+static BOOL MergeValue(MergeJob *job, const MergeNode *node, const char *path, int depth);
+
+/* An object or a keyed list merged element by element; a set of plain values by membership. */
+static void MergeElements(MergeJob *job, const MergeNode *node, const char *path, int depth, MergeScheme scheme, BOOL list)
+{
+    MergeKeys keys;
+    int latest = MergeLatest(job, node->changed), m, k, written = 0;
+    char step[CORE_MERGE_PATH_CCH];
+    ZeroMemory(&keys, sizeof keys);
+    if (latest >= 0) MergeAddKeys(&keys, node->value[latest], node->valueLen[latest], scheme);
+    MergeAddKeys(&keys, node->base, node->baseLen, scheme);
+    for (m = 0; m < job->n; m++)
+        if (node->changed[m]) MergeAddKeys(&keys, node->value[m], node->valueLen[m], scheme);
+    MergePut(&job->out, list ? "[" : "{", 1);
+    for (k = 0; k < keys.count; k++) {
+        MergeNode child;
+        BOOL inBase, keep = FALSE;
+        size_t before = job->out.len;
+        ZeroMemory(&child, sizeof child);
+        inBase = MergeFind(node->base, node->baseLen, scheme, keys.key[k], keys.keyLen[k], &child.base, &child.baseLen);
+        if (!inBase) child.base = NULL;
+        for (m = 0; m < job->n; m++) {
+            if (!node->changed[m]) continue;
+            if (!MergeFind(node->value[m], node->valueLen[m], scheme, keys.key[k], keys.keyLen[k], &child.value[m], &child.valueLen[m]))
+                child.value[m] = NULL;
+            child.changed[m] = !SameJson(child.value[m], child.valueLen[m], child.base, child.baseLen);
+        }
+        if (scheme == SCHEME_PLAIN) {
+            /* A plain value: in the result when no member took it out, or one put it in. */
+            BOOL added = FALSE, removed = FALSE;
+            for (m = 0; m < job->n; m++) {
+                if (!child.changed[m]) continue;
+                if (child.value[m]) added = TRUE;
+                else removed = TRUE;
+            }
+            keep = inBase ? !removed : added;
+            if (keep) {
+                if (written++) MergePut(&job->out, ",", 1);
+                MergePut(&job->out, keys.key[k], keys.keyLen[k]);
+            }
+            continue;
+        }
+        if (written) MergePut(&job->out, ",", 1);
+        if (!list) {
+            MergePut(&job->out, "\"", 1);
+            MergePut(&job->out, keys.key[k], keys.keyLen[k]);
+            MergePut(&job->out, "\":", 2);
+        }
+        if (!MergeStep(path, keys.key[k], keys.keyLen[k], list, step, sizeof step)) {
+            job->out.failed = TRUE;
+            break;
+        }
+        /* An item told apart by its first string is a tuple: whole, never merged inside. */
+        if (MergeValue(job, &child, step, scheme == SCHEME_FIRST ? 0 : depth - 1)) written++;
+        else job->out.len = before;   /* gone from the result: its key and comma too */
+        if (!job->out.failed && job->out.data) job->out.data[job->out.len] = 0;
+    }
+    MergePut(&job->out, list ? "]" : "}", 1);
+    MergeFreeKeys(&keys);
+}
+
+/* The merged value of `node` appended to the output; FALSE when it is absent from the result. */
+static BOOL MergeValue(MergeJob *job, const MergeNode *node, const char *path, int depth)
+{
+    const char *one = NULL;
+    size_t oneLen = 0;
+    int m, ways = 0, latest = -1, chosen;
+    DWORD members = 0;
+    BOOL oneSet = FALSE, deeper = depth > 0;
+    char kind = 0;
+    MergeScheme scheme = SCHEME_NONE;
+    for (m = 0; m < job->n; m++) {
+        if (!node->changed[m]) continue;
+        members |= 1u << m;
+        if (!oneSet) {
+            one = node->value[m];
+            oneLen = node->valueLen[m];
+            oneSet = TRUE;
+            ways = 1;
+        } else if (ways == 1 && !SameJson(one, oneLen, node->value[m], node->valueLen[m])) {
+            ways = 2;
+        }
+    }
+    if (ways == 0) {
+        if (!node->base) return FALSE;
+        MergePut(&job->out, node->base, node->baseLen);
+        return TRUE;
+    }
+    if (ways == 1) {
+        if (!one) return FALSE;
+        MergePut(&job->out, one, oneLen);
+        return TRUE;
+    }
+    /* Changed several ways: deeper, where every one of them (and the base) is an object, or a list told apart the same way. */
+    for (m = 0; deeper && m < job->n; m++) {
+        char k;
+        if (!node->changed[m]) continue;
+        if (!node->value[m]) {
+            deeper = FALSE;   /* taken out by one, changed by another */
+            break;
+        }
+        k = MergeKind(node->value[m], node->valueLen[m]);
+        if ((k != '{' && k != '[') || (kind && k != kind)) deeper = FALSE;
+        kind = k;
+    }
+    if (deeper && node->base && MergeKind(node->base, node->baseLen) != kind) deeper = FALSE;
+    if (deeper && kind == '[') {
+        MergeScheme one2;
+        for (m = -1; deeper && m < job->n; m++) {
+            const char *s = m < 0 ? node->base : node->changed[m] ? node->value[m] : NULL;
+            size_t len = m < 0 ? node->baseLen : node->changed[m] ? node->valueLen[m] : 0;
+            if (!s) continue;
+            one2 = MergeListScheme(s, len);
+            if (one2 == SCHEME_MIXED) deeper = FALSE;
+            else if (one2 != SCHEME_NONE) {
+                if (scheme == SCHEME_NONE) scheme = one2;
+                else if (scheme != one2) deeper = FALSE;
+            }
+        }
+        if (scheme == SCHEME_NONE) scheme = SCHEME_PLAIN;
+    }
+    if (deeper) {
+        MergeElements(job, node, path, depth, kind == '[' ? scheme : SCHEME_NONE, kind == '[');
+        return TRUE;
+    }
+    /* A conflict at `path`: the person's choice, else the one changed last until then. */
+    latest = MergeLatest(job, node->changed);
+    chosen = job->decide ? job->decide(job->context, path, members) : -1;
+    if (chosen < 0 || chosen >= job->n || !(members & (1u << chosen))) {
+        if (job->report) job->report(job->context, path, members, latest, node->value, node->valueLen);
+        job->unresolved++;
+        chosen = latest;
+    }
+    if (!node->value[chosen]) return FALSE;
+    MergePut(&job->out, node->value[chosen], node->valueLen[chosen]);
+    return TRUE;
+}
+
+char *Core_JsonMerge(const char *base, size_t baseLen, const char *const *values, const size_t *lengths, const BOOL *say,
+                     const ULONGLONG *written, int n, int depth, CoreMergeDecide decide, CoreMergeReport report, void *context,
+                     size_t *outLen, int *unresolved)
+{
+    MergeJob job;
+    MergeNode node;
+    int m;
+    BOOL present;
+    *outLen = 0;
+    *unresolved = 0;
+    if (n < 1 || n > MAX_PROFILES) return NULL;
+    ZeroMemory(&job, sizeof job);
+    ZeroMemory(&node, sizeof node);
+    job.n = n;
+    job.say = say;
+    job.written = written;
+    job.decide = decide;
+    job.report = report;
+    job.context = context;
+    node.base = base;
+    node.baseLen = base ? baseLen : 0;
+    for (m = 0; m < n; m++) {
+        node.value[m] = values[m];
+        node.valueLen[m] = values[m] ? lengths[m] : 0;
+        node.changed[m] = say[m] && !SameJson(node.value[m], node.valueLen[m], node.base, node.baseLen);
+    }
+    present = MergeValue(&job, &node, "", depth);
+    *unresolved = job.unresolved;
+    if (job.out.failed) {
+        if (job.out.data) HeapFree(GetProcessHeap(), 0, job.out.data);
+        return NULL;
+    }
+    if (!present) {
+        if (job.out.data) HeapFree(GetProcessHeap(), 0, job.out.data);
+        if ((job.out.data = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 1)) == NULL) return NULL;
+        *outLen = 0;   /* absent: an empty text */
+        return job.out.data;
+    }
+    *outLen = job.out.len;
+    return job.out.data;
 }

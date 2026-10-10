@@ -252,6 +252,12 @@ BOOL         Core_LastQuit(const char *text, size_t len, SYSTEMTIME *when, BOOL 
  * default profile's (`defaultIndex`) or the first. `signInTicks` may be NULL. */
 int          Core_SuggestTarget(int count, const ULONGLONG *signInTicks, ULONGLONG nowTicks, ULONGLONG signInMaxAgeTicks,
                                 BOOL signInUrl, int lastUsed, int defaultIndex, RouteReason *reason);
+/* The default profile's Claude, started by a notification clicked in
+ * Windows' notification center (notifyguard.c): the profile the notification
+ * belongs to among the `count` of `running`, `stock` the default one. -1
+ * when no other runs (it is the default's); the only other one; else, with
+ * `*ask`, the one to suggest (`topmost` when it is another that runs). */
+int          Core_NotificationTarget(const BOOL *running, int count, int stock, int topmost, BOOL *ask);
 BOOL         Core_ArgsSelectProfile(const WCHAR *args, const WCHAR *folder);
 BOOL         Core_ArgsReferenceDir(const WCHAR *args, const WCHAR *dir);
 BOOL         Core_NamesClaudePackage(const WCHAR *text);
@@ -269,7 +275,6 @@ void         Core_ProfileAumid(const WCHAR *folder, WCHAR *out, size_t cch);
 void         Core_ShortcutFileName(const WCHAR *label, int copyNumber, WCHAR *out, size_t cch);
 ULONGLONG    Core_SystemTimeTicks(const SYSTEMTIME *st);
 BOOL         Core_PathUnder(const WCHAR *path, const WCHAR *dir);
-BOOL         Core_PathWithVariable(const WCHAR *path, const WCHAR *variable, const WCHAR *value, WCHAR *out, size_t cch);   /* "%APPDATA%\..." */
 BOOL         Core_ProfileFilePath(const Profile *p, const WCHAR *path, WCHAR *out, size_t cch);
 BOOL         Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *family, const WCHAR *area, const WCHAR *name,
                                    WCHAR *out, size_t cch);
@@ -285,6 +290,8 @@ BOOL         Core_JsonString(const char *raw, size_t len, WCHAR *out, size_t cch
 BOOL         Core_JsonNumber(const char *raw, size_t len, ULONGLONG *value);
 BOOL         Core_JsonTrue(const char *raw, size_t len);
 SessionEntryKind Core_SessionEntryKind(const char *json, size_t len);
+typedef enum TranscriptRole { TRANSCRIPT_NONE, TRANSCRIPT_USER, TRANSCRIPT_CLAUDE } TranscriptRole;
+TranscriptRole Core_TranscriptLine(const char *line, size_t len, WCHAR *out, size_t cch);   /* one line of a .jsonl, for the preview */
 BOOL         Core_JsonSetMember(const char *json, size_t len, const char *key, const char *raw, char *out, size_t cap, size_t *outLen);
 BOOL         Core_JsonQuote(const WCHAR *text, char *out, size_t cap);
 BOOL         Core_ProjectDirName(const WCHAR *cwd, WCHAR *out, size_t cch);
@@ -316,6 +323,22 @@ BOOL         Core_ScratchFolderName(const WCHAR *cwd, WCHAR *out, size_t cch);
 char        *Core_JsonSetNested(const char *json, size_t len, const char *const *keys, int depth, const char *raw, size_t *outLen);
 typedef size_t (*CoreStringMap)(void *context, const char *text, size_t length, char *out, size_t cap);
 char        *Core_JsonMapStrings(const char *json, size_t len, CoreStringMap map, void *context, size_t *outLen);
+/* Three-way merge of a part's value in `n` profiles (`values[m]` NULL: it
+ * has none) against `base` (NULL: none): what one changed goes to all; what
+ * several changed each their own way is merged deeper, `depth` levels at
+ * most, objects by member, lists by their items' "id" or first string, lists
+ * of plain values as sets; what is left is a conflict at its path (JSON
+ * pointer, a list item's step "#" and its key): `decide` gives the member
+ * whose version it takes (-1: none yet), else `report` hears of it and the
+ * member that changed last (`written`) stands in, counted in `*unresolved`.
+ * Only members with `say` count. A heap text (HeapFree it), empty when the
+ * value is absent from the result; NULL without memory. */
+#define CORE_MERGE_PATH_CCH 512
+typedef int  (*CoreMergeDecide)(void *context, const char *path, DWORD members);
+typedef void (*CoreMergeReport)(void *context, const char *path, DWORD members, int latest, const char *const *values, const size_t *lengths);
+char        *Core_JsonMerge(const char *base, size_t baseLen, const char *const *values, const size_t *lengths, const BOOL *say,
+                            const ULONGLONG *written, int n, int depth, CoreMergeDecide decide, CoreMergeReport report, void *context,
+                            size_t *outLen, int *unresolved);
 BOOL         Core_IsoTime(ULONGLONG ms, char *out, size_t cap);
 BOOL         Core_TranscriptBranches(const char *text, size_t len, ULONGLONG keepTime, ULONGLONG dropTime, ULONGLONG since,
                                      BOOL **excluded, int *lineCount);
@@ -390,6 +413,11 @@ BOOL      Util_SelfExe(WCHAR *out, size_t cch);
 BOOL      Util_InstallDir(WCHAR *out, size_t cch);     /* %LOCALAPPDATA%\Programs\Claude Desktop Profiles Manager */
 BOOL      Util_InstallExe(WCHAR *out, size_t cch);
 BOOL      Util_StateDir(WCHAR *out, size_t cch);       /* %LOCALAPPDATA%\Claude Desktop Profiles Manager */
+#define SETTING_VAULT_DAYS     L"VaultKeepDays"        /* days the vault keeps a list's versions; 0: all */
+#define SETTING_VAULT_DAYS_DEFAULT 30
+#define SETTING_WEEKLY_BACKUP  L"WeeklyClaudeBackup"   /* 1: .claude copied beside itself once a week */
+DWORD     Util_GetSetting(const WCHAR *name, DWORD fallback);
+BOOL      Util_SetSetting(const WCHAR *name, DWORD value);
 void      Util_SetStateDir(const WCHAR *dir);          /* tests: a private state folder */
 /* One sync at a time, across processes (the state folder's lock: a test has
  * its own). The thread that holds it takes it again; NULL after
@@ -763,11 +791,6 @@ void         SessionEdit_ApplyPendingFor(const WCHAR *folder);
 CopyResult   SessionEdit_CopyConversation(HWND owner, const SessionSet *set, int row, int target, WCHAR *newId, size_t idCch,
                                           WCHAR *error, size_t errorCch);
 BOOL         SessionEdit_RemoveCopy(const SessionSet *set, int row, int target, const WCHAR *copyId, WCHAR *left, size_t leftCch);
-BOOL         SessionEdit_CanDelete(const SessionSet *set, int row, WCHAR *error, size_t errorCch);
-BOOL         SessionEdit_RemovesWorkingFolder(const SessionSet *set, int row, WCHAR *physical, size_t cch);
-RemoveResult SessionEdit_DeleteEverywhere(HWND owner, const SessionSet *set, int row, WCHAR *error, size_t errorCch);
-BOOL         SessionEdit_ListFiles(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count,
-                                   WCHAR *error, size_t errorCch);
 BOOL         SessionEdit_ListConversation(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count,
                                           WCHAR *error, size_t errorCch);
 BOOL         SessionEdit_ListTranscriptFiles(const WCHAR *const *ids, int idCount, WCHAR (**paths)[LONG_PATH_CCH], int *count,
@@ -813,9 +836,10 @@ char        *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, s
  * whether it is made the same member by member (each session's own); FALSE
  * past the last. */
 typedef struct LayoutPart {
-    const char *name;
-    DWORD       item;
-    BOOL        byKey;
+    const char  *name;
+    const WCHAR *label;   /* as the person sees it (a catalog key), NULL for none */
+    DWORD        item;
+    BOOL         byKey;
 } LayoutPart;
 BOOL         SessionSync_LayoutPart(int index, LayoutPart *part);
 /* From now on, each change this thread makes in a profile calls `step` (a
@@ -868,15 +892,20 @@ int   SessionVault_NewGroup(const ProfileList *list);           /* the lowest gr
 DWORD SessionVault_GroupItems(const ProfileList *list, DWORD members);   /* what all of `members` keep the same (SYNC_ITEM_*) */
 /* A part of the sidebar two profiles of a group changed each their own way
  * since the last sync: it stays as each has it until the person chooses. */
+#define VAULT_SHOWN_CCH 160
 typedef struct VaultConflict {
-    char  part[64];      /* the layout's part (SessionSync_LayoutPart) */
-    DWORD item;          /* what it belongs to (SYNC_ITEM_*) */
-    DWORD members;       /* the profiles of the list that changed it, one bit each */
+    char      part[64];      /* the layout's part (SessionSync_LayoutPart) */
+    char      path[CORE_MERGE_PATH_CCH];   /* the element in it (Core_JsonMerge) */
+    DWORD     item;          /* what it belongs to (SYNC_ITEM_*) */
+    DWORD     members;       /* the profiles of the list that changed it each their own way, one bit each */
+    int       latest;        /* the one of them that changed it last, -1 not known */
+    WCHAR     label[VAULT_SHOWN_CCH];                      /* the element as shown */
+    WCHAR     shown[MAX_PROFILES][VAULT_SHOWN_CCH];        /* each member's version as shown, by profile */
 } VaultConflict;
 int   SessionVault_Conflicts(const ProfileList *list, int group, VaultConflict *out, int capacity);
-/* Every conflict of `item` in `group` settled for the version of profile
- * `profile` (an index of `list`); the next sync makes it. */
-BOOL  SessionVault_Decide(const ProfileList *list, int group, DWORD item, int profile);
+/* The person's choices: element `chosen[i]` takes the version of profile
+ * `profiles[i]` (an index of `list`); the next sync makes them. */
+BOOL  SessionVault_Decide(const ProfileList *list, int group, const VaultConflict *chosen, const int *profiles, int count);
 BOOL  SessionVault_GroupListName(int group, WCHAR *out, size_t cch);
 BOOL  SessionVault_ListName(const ProfileList *list, int index, WCHAR *out, size_t cch);
 /* `profiles`' list kept as `listName`; with `same`, each of them made to list
@@ -906,6 +935,7 @@ void  SessionVault_FreeIds(VaultIds *ids);
 BOOL  SessionVault_AddDeleted(const WCHAR *const *ids, int count);
 /* The keys of the sessions any version of any kept list names. */
 BOOL  SessionVault_EverListed(VaultIds *keys);
+BOOL  SessionVault_ListedIn(const ProfileList *list, int index, VaultIds *keys);   /* the keys profile `index`'s kept lists had */
 /* Deleted sessions (by key) put back in each profile whose kept list had them,
  * as that list last had them, at once where it is closed, else once it closes;
  * they leave the deleted ones. Returns how many came back, -1 on a failure. */
@@ -924,6 +954,7 @@ typedef struct PurgeItem {
     WCHAR     project[MAX_PATH];       /* its working folder, as the transcript names it */
     PurgeKind kind;                    /* deleted in Claude, or no list ever named it */
     BOOL      restorable;              /* a kept list had it (SessionVault_Undelete) */
+    DWORD     profiles;                /* the profiles whose kept lists had it, one bit each */
     ULONGLONG bytes, written;          /* written: ms since 1970 */
 } PurgeItem;
 
@@ -948,7 +979,7 @@ BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles);
 /* Every session of `sources` listed by the profiles chosen too; with `move`,
  * then taken out of `sources` (none of them keeping its sessions the same). */
 BOOL SyncUi_CopyAll(HWND owner, const ProfileList *profiles, DWORD sources, BOOL move);
-BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *rows, int rowCount, BOOL copy);
+BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *rows, int rowCount, BOOL copy, int to);   /* to: -1 to choose */
 BOOL SyncUi_Export(HWND owner, const SessionSet *set, int profile, const int *rows, int rowCount);
 BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen);
 BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen);
@@ -956,36 +987,29 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
 BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
 /* What `members` keep the same, chosen in a dialog (IDD_SYNC_ITEMS) from `*items`: FALSE when cancelled. */
 BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items);
+/* What a profile syncs, and with which, chosen in a dialog (IDD_SYNC_SETUP). */
+typedef struct SyncSetup {
+    int   profile;    /* the profile set up */
+    DWORD partners;   /* the profiles it syncs with */
+    DWORD items;      /* what they sync (SYNC_ITEM_*) */
+    BOOL  syncNow;    /* closed with Sync now */
+} SyncSetup;
+/* `setup->profile` given, the rest filled from its group and the choice made:
+ * FALSE when cancelled. */
+BOOL SyncUi_Setup(HWND owner, const ProfileList *profiles, SyncSetup *setup);
 /* The conflicts syncs left to the person (SessionVault_Conflicts), one
  * dialog per group (IDD_CONFLICTS): the profiles of the groups settled. */
 DWORD SyncUi_SettleConflicts(HWND owner, const ProfileList *profiles);
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles);
 BOOL SyncUi_BackUpCode(HWND owner);
-/* A change to data, said before it is made and asked: `question`, the
- * folders it changes (`folders`: lines made with SyncUi_AddLine and
- * SyncUi_AddSessionFolders), and, when `backedUp`, where what it replaces
- * goes first. TRUE to go on. */
-#define CONFIRM_CCH 8192
-BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, const WCHAR *folders, BOOL backedUp, const WCHAR *button);
-void SyncUi_AddLine(WCHAR *text, size_t cch, const WCHAR *line, BOOL indent);
-void SyncUi_ShortPath(const WCHAR *path, WCHAR *out, size_t cch);   /* with %LOCALAPPDATA%, %APPDATA% or %USERPROFILE% for its start */
-void SyncUi_AddPath(WCHAR *text, size_t cch, const WCHAR *path);   /* a path, short, on an indented line */
-/* The folders a change to the sessions of the profiles of `bits` writes in
- * each: the entries, the working folders of sessions without a folder, and
- * (`layout`) the sidebar's settings; with a heading. */
-void SyncUi_AddSessionFolders(WCHAR *text, size_t cch, const ProfileList *profiles, DWORD bits, BOOL layout);
-void SyncUi_AddTranscriptFolder(WCHAR *text, size_t cch, const WCHAR *heading);   /* Claude Code's conversations, under `heading` */
-/* Sessions of the profiles of `bits` written, asked first (SyncUi_Confirm):
- * their folders, the sidebar's settings when `layout`, Claude Code's
- * conversations when `transcripts`. */
-BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const ProfileList *profiles, DWORD bits, BOOL layout, BOOL transcripts,
-                            const WCHAR *button);
+/* A change to data, asked first in a sentence or two: `question`, and
+ * that what it replaces is backed up first when `backedUp`. TRUE to go on. */
+BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, BOOL backedUp, const WCHAR *button);
+BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const WCHAR *button);   /* sessions written: SyncUi_Confirm, backed up first */
 
-/* ---------------------------------------------------------------- help.c */
+/* ------------------------------------------------------------ settings.c */
 
-/* The questions someone new asks, under `button`; the answer picked shown. */
-void Help_FillMenu(HMENU menu);
-BOOL Help_Command(HWND owner, UINT command);
+void Settings_Show(HWND owner);   /* the vault's days, and help */
 
 /* ------------------------------------------------------------- sessions.c */
 
@@ -1113,6 +1137,10 @@ int      Theme_DropDownWidth(HWND owner, HFONT font, const WCHAR *text);   /* fi
 void     Theme_DropDownLabel(HWND owner, const RECT *box, RECT *label);   /* where Theme_DrawDropDown draws the label of `box` */
 BOOL     Theme_TableCellText(HWND list, int row, int column, RECT *text);   /* where a table cell's text is drawn; a wider text shows a tip */
 UINT     Theme_TrackDropDown(HWND owner, HMENU menu, const RECT *screenBox);
+/* `menu` drawn by the program itself below `screenBox` (a button, or a point
+ * for a context menu): its strings, separators, checks and grayed items, no
+ * submenus. The command chosen, 0 when dismissed. */
+UINT     Theme_TrackMenu(HWND owner, HMENU menu, const RECT *screenBox);
 void     Theme_SetStrong(HWND control);   /* its text semibold, at the dialog's scale */
 /* The color of a button's icon, by what the button does, in a shade for each mode. */
 typedef enum ThemeTint {
@@ -1121,6 +1149,14 @@ typedef enum ThemeTint {
     THEME_TINTS
 } ThemeTint;
 void     Theme_SetGlyph(HWND button, WCHAR glyph, ThemeTint tint);   /* an icon before a push button's caption: a character of Windows' icon font, 0 for none */
+BOOL     Theme_IsIconButton(HWND button);   /* it shows its icon alone, its caption in a tip */
+/* A character of Windows' icon font beside text in `textFont` (a row's mark):
+ * its width on `dc`, and drawn at the start of `rc`, vertically centered. */
+int      Theme_InlineGlyphWidth(HDC dc, WCHAR glyph, HFONT textFont);
+void     Theme_DrawInlineGlyph(HDC dc, const RECT *rc, WCHAR glyph, HFONT textFont, COLORREF color);
+/* An image list of `count` characters of Windows' icon font, each in its tint
+ * (THEME_TINT_NONE: muted), at the small icon size of `owner`'s monitor. */
+struct _IMAGELIST *Theme_GlyphImages(HWND owner, const WCHAR *glyphs, const ThemeTint *tints, int count);   /* an HIMAGELIST */
 COLORREF Theme_TintColor(ThemeTint tint);   /* in the current mode; the caption's color for none, and in a contrast theme */
 void     Theme_SetMainGlyph(HWND dialog, int id, int state);   /* the manager window's button `id` gets the icon of its caption in `state` */
 BOOL     Theme_CheckBoxSize(HWND control, SIZE *size);
@@ -1130,6 +1166,7 @@ HDC      Theme_BufferBegin(ThemeBuffer *buffer, HDC target, const RECT *rc);
 void     Theme_BufferEnd(ThemeBuffer *buffer);
 void     Theme_SetScrollRow(HWND control, int rowPx);   /* how far a wheel line scrolls, 0: one row of the control */
 int      Theme_ScrollTarget(HWND window, WPARAM request, int linePx);   /* the position a WM_VSCROLL asks of a window scrolled by the pixel */
+void     Theme_SetHeadingRows(HWND list);   /* a report list's rows with nothing after their first column are headings: semibold */
 HWND     Theme_SmoothView(HWND control);   /* a list or tree scrolled by the pixel; returns the view, which has its place */
 void     Theme_Follow(HWND dialog, UINT msg, WPARAM wp, LPARAM lp);
 void     Theme_Apply(HWND dialog);   /* what it keeps on the dialog goes with the dialog */
@@ -1145,6 +1182,9 @@ void     Theme_FitLastColumn(HWND list, int minimum);   /* the width the other c
  * other one), a profile column's title (NULL past the last), a row's role. */
 const WCHAR *Theme_MainCaption(int id, int state);
 const WCHAR *Theme_ProfileColumnTitle(int column);
+#define PROFILE_COLUMN_STATE 4   /* the profile list's Status column: its index, shown second */
+const WCHAR *Theme_ProfileState(BOOL running);   /* what the Status column says */
+int      Theme_ProfileStateWidth(HWND list);     /* the Status column's width: its title or its widest state, in any language */
 const WCHAR *Theme_ProfileRole(BOOL stock, BOOL isDefault);
 /* The version label's text in each state (its one %s: this build, the
  * release available, the one downloading), the status in each state (its
@@ -1153,12 +1193,10 @@ const WCHAR *Theme_ProfileRole(BOOL stock, BOOL isDefault);
  * captions, also measured with the window: catalog keys. */
 typedef enum MainVersion { MAIN_VERSION_BUILD, MAIN_VERSION_AVAILABLE, MAIN_VERSION_DOWNLOADING, MAIN_VERSION_INSTALLING, MAIN_VERSIONS } MainVersion;
 typedef enum MainStatus { MAIN_STATUS_NO_CLAUDE, MAIN_STATUS_NO_LINKS, MAIN_STATUS_ROUTED, MAIN_STATUSES } MainStatus;
-typedef enum SessionsCaption { SESSIONS_ACTIONS, SESSIONS_DELETE_EVERYWHERE, SESSIONS_CAPTIONS } SessionsCaption;
 const WCHAR *Theme_MainVersion(MainVersion state);
 const WCHAR *Theme_MainStatus(MainStatus state);
 void         Theme_DrawProgress(HWND owner, HDC dc, const RECT *rc, int done, int total, const WCHAR *text);   /* a sync's, in the column's foot */
 const WCHAR *Theme_MainNote(void);
-const WCHAR *Theme_SessionsCaption(SessionsCaption caption);
 BOOL     Theme_ColumnResizeIsManual(HWND list, int column);   /* the user sized it (a header divider dragged or double-clicked) */
 void     Theme_SetColumnWidth(HWND list, int column, int width);
 void     Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name);
@@ -1170,12 +1208,15 @@ INT_PTR  Ui_Dialog(HWND owner, int id, DLGPROC proc, LPARAM param);   /* every d
 /* ------------------------------------------------ router.c / main.c / gui.c */
 
 int     Router_Run(const WCHAR *rawUrl);
+int     Router_ChooseNotification(const ClaudePackage *pkg, const ProfileList *list, int suggested);   /* IDD_LINK for a notification; -1: none */
+void    NotifyGuard_Start(void);   /* in a watcher: notifications clicked in the notification center go to their profile */
 int     Launcher_Run(const WCHAR *folder);
 HRESULT Launcher_Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *url, DWORD *pid, BOOL *identity);
 HRESULT Launcher_OpenSynced(const ClaudePackage *pkg, const Profile *p, DWORD *pid, BOOL *identity);   /* sessions already made the same */
 typedef enum GuiStart { GUI_MANAGER, GUI_SET_UP_LINKS, GUI_UNINSTALL } GuiStart;
 int     Gui_Run(GuiStart start);
 BOOL    Gui_MainWindowGeometry(HWND dialog, UINT message, WPARAM wp, LPARAM lp);
+void    Gui_OrderProfileColumns(HWND list);   /* Status shown second */
 void    Gui_LayoutProfileColumns(HWND list);
 void    Gui_ShowSessions(HWND dialog, const ClaudePackage *package, BOOL showSessions, const WCHAR *folder);
 

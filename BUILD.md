@@ -76,7 +76,7 @@ src/app.h                     shared declarations, constants, registry paths
 src/core.c                    pure helpers (no I/O): names, links, launch arguments, log parsing, link suggestion,
                               JSON and session entries, queued session changes, hashes, scrolling math, versions,
                               LevelDB's formats (log, write batch, table, manifest, Snappy) and Local Storage's keys
-src/util.c                    known folders, registry, log file, long paths, file reading, process start, Recycle Bin
+src/util.c                    known folders, registry, settings, log file, long paths, file reading, process start, Recycle Bin
 src/localize.c                interface language selection, catalog lookup, reading direction (TR)
 src/localize.h                its declarations and TR()
 src/localize_catalog.inc      the embedded interface catalog: English and Simplified Chinese
@@ -94,9 +94,11 @@ src/handler.c                 claude:// registration and default-app check
 src/install.c                 install, repair, uninstall
 src/update.c                  new release check (GitHub API, WinHTTP) and one-click update
 src/router.c                  --launch (shortcuts) and --url (claude:// links, the dialog choosing their profile)
-src/gui.c                     manager window, its menus and dialogs, its open, quit, restart and sync jobs and their progress
+src/notifyguard.c             in each watcher: a notification clicked in the notification center goes to its profile
+src/gui.c                     manager window, its menus and dialogs, Backup & Restore, its open, quit, restart and sync jobs
+                              and their progress
 src/sessionstore.c            every profile's Claude Code sessions: entries, transcripts, projects, sessions in use (read only)
-src/sessionedit.c             session actions: open, copy, entry changes (made when an open profile closes), delete
+src/sessionedit.c             session actions: open, copy, entry changes (made when an open profile closes), what clean-up removes
 src/sessionsync.c             sessions sent between profiles: merge, several shared, copied or removed, the sidebar's
                               pins, groups and settings, archives exported and imported (made when an open profile
                               closes), backups
@@ -104,14 +106,13 @@ src/webstore.c                Claude's web storage (its Local Storage, a LevelDB
                               Claude is closed
 src/sessionvault.c            the session vault (every list of sessions kept, its versions, the sessions deleted) and the
                               groups of profiles whose sessions are kept the same (sessions without a folder moved to
-                              each one's own area, sessions continued apart kept as two); a version recovered into a profile;
-                              deleted sessions put back; old versions pruned
-src/sessionpurge.c            conversations no profile lists, restored or cleaned up; Claude Code's folder copied beside
-                              it, on demand and every week
+                              each one's own area, sessions continued apart kept as two); a version recovered into a profile
+src/sessionpurge.c            conversations no profile lists, cleaned up or restored; Claude Code's folder copied beside it,
+                              by hand or once a week
 src/sessionlink.c             session folders linked by earlier versions: read, and taken away
 src/syncui.c                  the dialog choosing the profiles that take part, and the summary of what was done; the
-                              recover and Recently deleted dialogs
-src/help.c                    the Help menu's questions and answers
+                              recover, clean-up, sync settings and sync conflicts dialogs
+src/settings.c                the Settings dialog: the session vault's days, and help
 src/sessions.c                the sessions view of the manager window: profiles, tree, details, menus, several sessions
 src/main.c                    command-line dispatch
 src/app.rc, src/resource.h    dialogs, version info, control ids
@@ -138,7 +139,7 @@ tools/check-localization.py   checks the catalog: keys used and translated, form
 
 - **Plain Win32 C** - MSVC with `/W4 /WX /sdl` and Control Flow Guard, Unicode (`...W`) APIs, `strsafe.h` for every string copy and format; no third-party code
 - **Static CRT** - `/MT` and system DLLs only (listed in `build.cmd`): the exe runs on a bare Windows 10 1809+
-- **Tests** - Pure logic goes in `src/core.c`, with a test in `tests/test_core.c`; the pin entry helpers are tested in `tests/test_pin.c`; `tests/test_theme.c`, linked with the program's manifest, compares what `src/theme.c` draws (rows and their three blues, separators and tree arrows, list headers, edits and their printing, drop-down buttons and their width, the color swatches of a drop-down list, buttons with icons, the dark menu bar, side bar colors, scroll bars at the edges and following the wheel, off-screen drawing) with what Windows draws, in the mode Windows is set to, and checks the views that scroll lists by the pixel (paging, keeping their place on refills and resizes, following only the keyboard and the program, the keys that scroll a tree, the wheel and what stops it, lists taller than a native control can scroll), push buttons, tooltips and info tips, the last column's width, the focus cue and secondary text, names never cut inside a character, and that every resource is freed after destruction; `tests/test_claude.c` looks up in the installed Claude Desktop each fact the program relies on (skipped where Claude is not installed, as on GitHub Actions), so a Claude update that changes one fails the build
+- **Tests** - Pure logic goes in `src/core.c`, with a test in `tests/test_core.c`; the pin entry helpers are tested in `tests/test_pin.c`; `tests/test_theme.c`, linked with the program's manifest, compares what `src/theme.c` draws (rows and their three blues, separators and tree arrows, list headers, edits and their printing, drop-down buttons and their width, the color swatches of a drop-down list, buttons with icons, the program's own menu and its keyboard, side bar colors, scroll bars at the edges and following the wheel, off-screen drawing) with what Windows draws, in the mode Windows is set to, and checks the views that scroll lists by the pixel (paging, keeping their place on refills and resizes, following only the keyboard and the program, the keys that scroll a tree, the wheel and what stops it, lists taller than a native control can scroll), push buttons, tooltips and info tips, the last column's width, the focus cue and secondary text, names never cut inside a character, and that every resource is freed after destruction; `tests/test_claude.c` looks up in the installed Claude Desktop each fact the program relies on (skipped where Claude is not installed, as on GitHub Actions), so a Claude update that changes one fails the build
 - **Manual checks** - Use a throwaway profile (`%APPDATA%\Claude-<test>`) and delete it afterwards; never test with the Claude windows in daily use
 - **Session fixtures** - `tests/test_sessions.c` runs through `build.cmd` without launching Claude. It covers real and virtualized Main storage, account selection, filesystem notifications, concurrent pending edits, unreadable queue files, complete deletion plans, scratch copies, settings-copy exclusions, and sessions merged, copied and moved, shared with a running profile, exported and imported, and groups of profiles kept the same (the sidebar's pins and groups, sessions without a folder, sessions continued apart). Its profiles, transcripts, log and queued changes stay in a unique temporary directory, which it removes afterwards; deletion plans do not send user files to the Recycle Bin.
 - **Platform fixtures** - `tests/test_platform.c` includes `update.c`, `install.c`, `taskbar.c`, `gui.c`, `router.c`, `util.c` and `profiles.c` with fixtures in place of their system calls. It checks the release check and the download against a fixture server (URLs, HTTPS, status, the `MZ` header and size limits); the download's verification (the signature checked on the opened file, its version read as data, a refused download deleted, `Update_Run` starting only a verified file, once); the atomic install (`<exe>.new` then a rename, retries, rollback, leftovers removed, an unsupported Windows refused first); the uninstall (the download, registry keys and state folder removed, linked profile folders never removed, running profiles refused); the wait for a profile's Claude (its process, the folder watch with its lock file then its window, quit and handover); the router's watchers and its link dialog (the profile suggested and the one chosen, a cancel, a dialog that cannot show); the manager's update messages; and the Recycle Bin results. It runs on private files, a faked WinHTTP, faked registry writes and recorded hooks, without stopping the user's watchers or launching an installation.

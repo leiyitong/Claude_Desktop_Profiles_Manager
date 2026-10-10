@@ -151,7 +151,7 @@ int SessionPurge_List(const ProfileList *profiles, PurgeItem **items, WCHAR *err
     VaultIds listed, deleted;
     ProfileList now = *profiles;
     ULONGLONG recent = NowMs() - PURGE_RECENT_HOURS * HOUR_MS;
-    int count = 0, capacity = 0, i;
+    int count = 0, capacity = 0, i, p;
     *items = NULL;
     error[0] = 0;
     if (!SessionStore_LoadProfiles(&set, profiles)) {
@@ -214,10 +214,14 @@ int SessionPurge_List(const ProfileList *profiles, PurgeItem **items, WCHAR *err
     if (count > 1) qsort(*items, (size_t)count, sizeof **items, CompareWritten);
     SessionVault_FreeIds(&listed);
     SessionVault_FreeIds(&deleted);
-    if (count > 0 && SessionVault_EverListed(&listed)) {
-        for (i = 0; i < count; i++) (*items)[i].restorable = SessionVault_HasId(&listed, (*items)[i].id);
-        SessionVault_FreeIds(&listed);
-    }
+    /* Which profiles had each: Restore puts it back there, and the list shows it by profile. */
+    for (p = 0; count > 0 && p < profiles->count; p++)
+        if (SessionVault_ListedIn(profiles, p, &listed)) {
+            for (i = 0; i < count; i++)
+                if (SessionVault_HasId(&listed, (*items)[i].id)) (*items)[i].profiles |= 1u << p;
+            SessionVault_FreeIds(&listed);
+        }
+    for (i = 0; i < count; i++) (*items)[i].restorable = (*items)[i].profiles != 0;
     SessionStore_Free(&set);
     Util_Log(L"conversations no list names: %d", count);
     return count;

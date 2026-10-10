@@ -524,8 +524,7 @@ static BOOL ConfirmDiscardingWaitingChanges(HWND owner, const ProfileList *list)
         const Profile *p = &list->items[i];
         if (!p->running || (SessionStore_LoadPending(p, &first, 1) == 0 && SessionSync_PendingCount(p) == 0)) continue;
         StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Session changes for \x201C%s\x201D are waiting for it to close, and uninstalling now discards them.\n\n"
-                            L"To keep them, choose Cancel, quit Claude for this profile (right-click its icon in the notification area and choose Quit), then uninstall."),
+                         TR(L"Changes for \x201C%s\x201D wait for it to close: uninstalling now discards them."),
                          p->name);
         if (!Ui_Ask(owner, IDI_WARNING, text, TR(L"Uninstall"), TR(L"Cancel"), TRUE)) return FALSE;
     }

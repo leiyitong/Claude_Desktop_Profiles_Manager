@@ -263,112 +263,20 @@ void SyncUi_ShowReport(HWND owner, const ProfileList *profiles, const SyncReport
 
 /* ----------------------------------------------------------- confirming */
 
-/* An indented line keeps its indent: no-break spaces, where a line never
- * breaks. */
-void SyncUi_AddLine(WCHAR *text, size_t cch, const WCHAR *line, BOOL indent)
+BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, BOOL backedUp, const WCHAR *button)
 {
-    if (indent) StringCchCatW(text, cch, L"\x00A0\x00A0\x00A0\x00A0");
-    StringCchCatW(text, cch, line);
-    StringCchCatW(text, cch, L"\n");
-}
-
-void SyncUi_ShortPath(const WCHAR *path, WCHAR *out, size_t cch)
-{
-    static const WCHAR *const kVariables[] = { L"LOCALAPPDATA", L"APPDATA", L"USERPROFILE" };
-    WCHAR value[MAX_PATH];
-    size_t i;
-    for (i = 0; i < ARRAYSIZE(kVariables); i++) {
-        DWORD length = GetEnvironmentVariableW(kVariables[i], value, ARRAYSIZE(value));
-        if (length && length < ARRAYSIZE(value) && Core_PathWithVariable(path, kVariables[i], value, out, cch)) return;
+    WCHAR text[2048];
+    StringCchCopyW(text, ARRAYSIZE(text), question);
+    if (backedUp) {
+        StringCchCatW(text, ARRAYSIZE(text), L"\n\n");
+        StringCchCatW(text, ARRAYSIZE(text), TR(L"What it replaces is backed up first."));
     }
-    if (FAILED(StringCchCopyW(out, cch, path))) out[0] = 0;
+    return Ui_Ask(owner, icon ? icon : IDI_QUESTION, text, button, TR(L"Cancel"), FALSE);
 }
 
-void SyncUi_AddPath(WCHAR *text, size_t cch, const WCHAR *path)
+BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const WCHAR *button)
 {
-    WCHAR shown[LONG_PATH_CCH];
-    SyncUi_ShortPath(path, shown, ARRAYSIZE(shown));
-    SyncUi_AddLine(text, cch, shown, TRUE);
-}
-
-/* Where profile `p`'s files are, outside Claude's package. */
-static const WCHAR *StorageOf(const Profile *p)
-{
-    return p->storageDir[0] ? p->storageDir : p->dataDir;
-}
-
-#define FOLDERS_PROFILES_SHOWN 8   /* profiles a question names the folders of before saying how many more */
-
-/* Each profile of `bits`: its name, its folder, then what in it changes. */
-void SyncUi_AddSessionFolders(WCHAR *text, size_t cch, const ProfileList *profiles, DWORD bits, BOOL layout)
-{
-    WCHAR line[128], items[256];
-    int p, listed = 0, more = 0;
-    SyncUi_AddLine(text, cch, TR(L"These folders change (an open profile's once it closes):"), FALSE);
-    StringCchCopyW(items, ARRAYSIZE(items), CLAUDE_ENTRIES_DIR);
-    StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
-    StringCchCatW(items, ARRAYSIZE(items), CLAUDE_SCRATCH_DIR);
-    if (layout) {
-        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
-        StringCchCatW(items, ARRAYSIZE(items), CLAUDE_DESKTOP_SETTINGS);
-        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
-        StringCchCatW(items, ARRAYSIZE(items), CLAUDE_WEB_STORAGE);
-        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
-        StringCchCatW(items, ARRAYSIZE(items), CLAUDE_APP_SETTINGS);
-        StringCchCatW(items, ARRAYSIZE(items), TR(L", "));
-        StringCchCatW(items, ARRAYSIZE(items), L"Preferences");
-    }
-    for (p = 0; p < profiles->count; p++) {
-        if (!(bits & (1u << p))) continue;
-        if (listed == FOLDERS_PROFILES_SHOWN) {
-            more++;
-            continue;
-        }
-        SyncUi_AddLine(text, cch, profiles->items[p].name, FALSE);
-        SyncUi_AddPath(text, cch, StorageOf(&profiles->items[p]));
-        SyncUi_AddLine(text, cch, items, TRUE);
-        listed++;
-    }
-    if (more && SUCCEEDED(StringCchPrintfW(line, ARRAYSIZE(line), TR(L"and %d more profiles"), more))) SyncUi_AddLine(text, cch, line, FALSE);
-}
-
-void SyncUi_AddTranscriptFolder(WCHAR *text, size_t cch, const WCHAR *heading)
-{
-    WCHAR projects[MAX_PATH];
-    if (!SessionStore_ProjectsDir(projects, ARRAYSIZE(projects))) return;
-    SyncUi_AddLine(text, cch, heading, FALSE);
-    SyncUi_AddPath(text, cch, projects);
-}
-
-BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, const WCHAR *folders, BOOL backedUp, const WCHAR *button)
-{
-    WCHAR *text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (CONFIRM_CCH + 1024) * sizeof(WCHAR)), state[MAX_PATH], backups[MAX_PATH];
-    BOOL ok;
-    if (!text) return FALSE;
-    StringCchCopyW(text, CONFIRM_CCH + 1024, question);
-    StringCchCatW(text, CONFIRM_CCH + 1024, L"\n\n");
-    StringCchCatW(text, CONFIRM_CCH + 1024, folders);
-    if (backedUp && Util_StateDir(state, ARRAYSIZE(state)) && SUCCEEDED(StringCchPrintfW(backups, ARRAYSIZE(backups), L"%s\\backups", state))) {
-        SyncUi_AddLine(text, CONFIRM_CCH + 1024, TR(L"What is replaced or removed is backed up first to:"), FALSE);
-        SyncUi_AddPath(text, CONFIRM_CCH + 1024, backups);
-    }
-    ok = Ui_Ask(owner, icon ? icon : IDI_QUESTION, text, button, TR(L"Cancel"), FALSE);
-    HeapFree(GetProcessHeap(), 0, text);
-    return ok;
-}
-
-BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const ProfileList *profiles, DWORD bits, BOOL layout, BOOL transcripts,
-                            const WCHAR *button)
-{
-    WCHAR *folders = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, CONFIRM_CCH * sizeof(WCHAR));
-    BOOL ok;
-    if (!folders) return FALSE;
-    folders[0] = 0;
-    SyncUi_AddSessionFolders(folders, CONFIRM_CCH, profiles, bits, layout);
-    if (transcripts) SyncUi_AddTranscriptFolder(folders, CONFIRM_CCH, TR(L"Claude Code's conversations, where a session gets a copy of its own:"));
-    ok = SyncUi_Confirm(owner, NULL, question, folders, TRUE, button);
-    HeapFree(GetProcessHeap(), 0, folders);
-    return ok;
+    return SyncUi_Confirm(owner, NULL, question, TRUE, button);
 }
 
 /* ------------------------------------------------------------- sessions */
@@ -413,7 +321,7 @@ BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles)
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
     NamesOf(profiles, dialog.chosen, names, ARRAYSIZE(names));
     StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Merge the sessions of %s?"), names);
-    if (!SyncUi_ConfirmSessions(owner, question, profiles, dialog.chosen, FALSE, FALSE, TR(L"Merge"))) return FALSE;
+    if (!SyncUi_ConfirmSessions(owner, question, TR(L"Merge"))) return FALSE;
     /* Read again: the dialog may have been open a while. */
     if (!LoadSessions(owner, profiles, &set)) return FALSE;
     ZeroMemory(&report, sizeof report);
@@ -460,12 +368,10 @@ BOOL SyncUi_CopyAll(HWND owner, const ProfileList *profiles, DWORD sources, BOOL
     NamesOf(profiles, dialog.chosen, targets, ARRAYSIZE(targets));
     if (move)
         StringCchPrintfW(question, ARRAYSIZE(question),
-                         TR(L"Move every session of %s to %s?\n\nOnce %s list them, they are taken out of %s, and Claude's marks that they were "
-                            L"deleted are left there, so that Claude does not take them in again."),
-                         names, targets, targets, names);
+                         TR(L"Move every session of %s to %s?\n\nThey are then taken out of %s."), names, targets, names);
     else
         StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Copy every session of %s to %s?"), names, targets);
-    if (!SyncUi_ConfirmSessions(owner, question, profiles, dialog.chosen | (move ? sources : 0), FALSE, FALSE, move ? TR(L"Move") : TR(L"Copy")))
+    if (!SyncUi_ConfirmSessions(owner, question, move ? TR(L"Move") : TR(L"Copy")))
         return FALSE;
     if (!LoadSessions(owner, profiles, &set)) return FALSE;
     rows = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)max(set.rowCount, 1) * sizeof *rows);
@@ -497,12 +403,16 @@ BOOL SyncUi_CopyAll(HWND owner, const ProfileList *profiles, DWORD sources, BOOL
     return TRUE;
 }
 
-BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *rows, int rowCount, BOOL copy)
+BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *rows, int rowCount, BOOL copy, int to)
 {
     SyncDialog dialog;
     SyncReport report;
     DWORD takers = SessionSync_Takers(set) & ~(from >= 0 ? 1u << from : 0);
     if (!rowCount) return FALSE;
+    if (to >= 0 && !(takers & (1u << to))) {
+        Ui_Message(owner, MB_ICONINFORMATION, TR(L"\x201C%s\x201D is not signed in to Claude yet: sign in there first."), set->profiles.items[to].name);
+        return FALSE;
+    }
     if (!takers) {
         Ui_Message(owner, MB_ICONINFORMATION, TR(L"This needs at least two profiles signed in to Claude: "
                                                  L"a profile keeps sessions only once it is signed in."));
@@ -514,7 +424,30 @@ BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *
     dialog.takers = takers;
     dialog.chosen = BitCount(takers) == 1 ? takers : 0;   /* one to choose: it is */
     dialog.sources = from >= 0 ? 1u << from : 0;
-    if (!ChooseProfiles(owner, &dialog)) return FALSE;
+    if (to >= 0) {
+        /* Pasted into one profile, or one picked in a menu: a question instead of the choice. */
+        WCHAR question[SESSION_TITLE_CCH + LABEL_CCH + 128];
+        const WCHAR *verb = copy ? TR(L"Copy") : TR(L"Share");
+        const SessionRow *row = &set->rows[rows[0]];
+        const SessionEntry *entry = from >= 0 && row->entry[from] >= 0 ? &set->entries[row->entry[from]] : NULL;
+        int p;
+        for (p = 0; !entry && p < set->profiles.count; p++)
+            if (row->entry[p] >= 0) entry = &set->entries[row->entry[p]];
+        const WCHAR *title = entry && entry->title[0] ? entry->title : row->key, *name = set->profiles.items[to].name;
+        if (rowCount == 1 && copy)
+            StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\nThe copy goes on separately."), title, name);
+        else if (rowCount == 1)
+            StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Share \x201C%s\x201D with \x201C%s\x201D?\n\nBoth go on with the same conversation."),
+                             title, name);
+        else if (copy)
+            StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Copy %d sessions to \x201C%s\x201D?\n\nThe copies go on separately."), rowCount, name);
+        else
+            StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Share %d sessions with \x201C%s\x201D?"), rowCount, name);
+        if (!Ui_Ask(owner, IDI_QUESTION, question, verb, TR(L"Cancel"), FALSE)) return FALSE;
+        dialog.chosen = 1u << to;
+    } else if (!ChooseProfiles(owner, &dialog)) {
+        return FALSE;
+    }
     ZeroMemory(&report, sizeof report);
     if (copy) {
         if (SessionSync_Copy(owner, set, from, rows, rowCount, dialog.chosen, &report) == COPY_CANCELLED && !report.added && !report.waiting)
@@ -653,7 +586,7 @@ BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
     NamesOf(profiles, dialog.chosen, names, ARRAYSIZE(names));
     StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Import the sessions of %s into %s?"), dialog.archive, names);
-    if (!SyncUi_ConfirmSessions(owner, question, profiles, dialog.chosen, FALSE, TRUE, TR(L"Import")) || !LoadSessions(owner, profiles, &set))
+    if (!SyncUi_ConfirmSessions(owner, question, TR(L"Import")) || !LoadSessions(owner, profiles, &set))
         return FALSE;
     ZeroMemory(&report, sizeof report);
     old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
@@ -807,10 +740,9 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
         return FALSE;
     }
     FormatWhen(dialog.versions[dialog.chosen].time, when, ARRAYSIZE(when));
-    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Write the list of sessions of %s back into \x201C%s\x201D?\n\nIt lists those sessions again; "
-                                                       L"the ones deleted by then get Claude's marks that they were deleted."),
+    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Recover the sessions of %s in \x201C%s\x201D?\n\nSessions deleted since stay deleted."),
                      when, p->name);
-    if (!SyncUi_ConfirmSessions(owner, question, profiles, 1u << dialog.profile, TRUE, FALSE, TR(L"Recover"))) {
+    if (!SyncUi_ConfirmSessions(owner, question, TR(L"Recover"))) {
         HeapFree(GetProcessHeap(), 0, dialog.versions);
         return FALSE;
     }
@@ -932,93 +864,93 @@ BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, 
     return TRUE;
 }
 
-/* ------------------------------------------------------ conflicts settled */
+/* ------------------------------------------------------- sync settings */
 
-typedef struct ConflictRow {
-    DWORD item;         /* SYNC_ITEM_* */
-    DWORD candidates;   /* the profiles that changed it each their own way */
-    int   chosen;       /* whose version is kept */
-} ConflictRow;
-
-typedef struct ConflictsDialog {
+typedef struct SetupDialog {
     const ProfileList *profiles;
-    const WCHAR       *text;
-    ConflictRow        rows[SYNC_ITEM_COUNT];
-    int                count;
-    int                row;   /* the one the drop-down is for */
-    HWND               list;
-    int                comboProfile[MAX_PROFILES];
-} ConflictsDialog;
+    SyncSetup         *setup;
+    HWND               partners, items;
+    int                rowProfile[MAX_PROFILES];
+    int                rowCount;
+    BOOL               filling;
+} SetupDialog;
 
-static const WCHAR *ItemLabel(DWORD item)
+/* What the rows checked say: what to sync only once it syncs with one at least, and OK with something to sync. */
+static void ReadSetup(HWND dialog, SetupDialog *state)
 {
     int row;
+    state->setup->partners = 0;
+    for (row = 0; row < state->rowCount; row++)
+        if (ListView_GetCheckState(state->partners, row)) state->setup->partners |= 1u << state->rowProfile[row];
+    state->setup->items = 0;
     for (row = 0; row < SYNC_ITEM_COUNT; row++)
-        if (kSyncItems[row].item == item) return TR(kSyncItems[row].label);
-    return L"";
+        if (ListView_GetCheckState(state->items, row)) state->setup->items |= kSyncItems[row].item;
+    EnableWindow(GetDlgItem(dialog, IDC_Z_ITEMS_LABEL), state->setup->partners != 0);
+    EnableWindow(state->items, state->setup->partners != 0);
+    EnableWindow(GetDlgItem(dialog, IDC_Z_SYNC_NOW), state->setup->partners && state->setup->items);
+    EnableWindow(GetDlgItem(dialog, IDOK), !state->setup->partners || state->setup->items);
 }
 
-static void ConflictRowText(const ConflictsDialog *state, int row, WCHAR *out, size_t cch)
+/* A list of rows with check boxes, in one column as wide as the list. */
+static void CheckRows(HWND list)
 {
-    StringCchPrintfW(out, cch, TR(L"%s \x00B7 kept: %s"), ItemLabel(state->rows[row].item), state->profiles->items[state->rows[row].chosen].name);
+    LVCOLUMNW column;
+    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    ZeroMemory(&column, sizeof column);
+    ListView_InsertColumn(list, 0, &column);   /* the view it scrolls in gives it the list's width */
 }
 
-/* The drop-down lists the profiles that changed the row's item, its choice selected. */
-static void FillConflictChoices(HWND dialog, ConflictsDialog *state)
+static void AddCheckRow(HWND list, int row, const WCHAR *text, BOOL checked)
 {
-    HWND combo = GetDlgItem(dialog, IDC_X_PROFILE);
-    const ConflictRow *row = &state->rows[state->row];
-    int p, n = 0;
-    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-    for (p = 0; p < state->profiles->count; p++) {
-        if (!(row->candidates & (1u << p))) continue;
-        SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)state->profiles->items[p].name);
-        if (p == row->chosen) SendMessageW(combo, CB_SETCURSEL, (WPARAM)n, 0);
-        state->comboProfile[n++] = p;
-    }
+    LVITEMW item;
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_TEXT;
+    item.iItem = row;
+    item.pszText = (LPWSTR)text;
+    ListView_InsertItem(list, &item);
+    ListView_SetCheckState(list, row, checked);
 }
 
-static INT_PTR CALLBACK ConflictsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+static INT_PTR CALLBACK SetupProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
-    ConflictsDialog *state = (ConflictsDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
-    WCHAR text[LABEL_CCH + 256];
+    SetupDialog *state = (SetupDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
     switch (message) {
     case WM_INITDIALOG: {
-        LVCOLUMNW column;
-        LVITEMW item;
-        int row;
-        state = (ConflictsDialog *)lp;
+        WCHAR text[LABEL_CCH + 64];
+        int p, row;
+        state = (SetupDialog *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
-        SetDlgItemTextW(dialog, IDC_X_TEXT, state->text);
-        state->list = GetDlgItem(dialog, IDC_X_LIST);
-        ListView_SetExtendedListViewStyle(state->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        ZeroMemory(&column, sizeof column);
-        ListView_InsertColumn(state->list, 0, &column);   /* the view it scrolls in gives it the list's width */
-        for (row = 0; row < state->count; row++) {
-            ConflictRowText(state, row, text, ARRAYSIZE(text));
-            ZeroMemory(&item, sizeof item);
-            item.mask = LVIF_TEXT;
-            item.iItem = row;
-            item.pszText = text;
-            ListView_InsertItem(state->list, &item);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"\x201C%s\x201D syncs with:"), state->profiles->items[state->setup->profile].name);
+        SetDlgItemTextW(dialog, IDC_Z_TEXT, text);
+        state->partners = GetDlgItem(dialog, IDC_Z_LIST);
+        state->items = GetDlgItem(dialog, IDC_Z_ITEMS);
+        CheckRows(state->partners);
+        CheckRows(state->items);
+        state->filling = TRUE;
+        for (p = 0; p < state->profiles->count; p++) {
+            if (p == state->setup->profile) continue;
+            state->rowProfile[state->rowCount] = p;
+            AddCheckRow(state->partners, state->rowCount, state->profiles->items[p].name, (state->setup->partners & (1u << p)) != 0);
+            state->rowCount++;
         }
-        ListView_SetItemState(state->list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-        FillConflictChoices(dialog, state);
-        Theme_SmoothView(state->list);
+        for (row = 0; row < SYNC_ITEM_COUNT; row++)
+            AddCheckRow(state->items, row, TR(kSyncItems[row].label), (state->setup->items & kSyncItems[row].item) != 0);
+        state->filling = FALSE;
+        Theme_SmoothView(state->partners);
+        Theme_SmoothView(state->items);
+        ReadSetup(dialog, state);
         return TRUE;
     }
 
     case WM_CTLCOLORSTATIC:
-        return Theme_CtlColor(message, wp, lp, IDC_X_NOTE);
+        return Theme_CtlColor(message, wp, lp, IDC_Z_NOTE);
 
     case WM_NOTIFY:
-        if (state && ((const NMHDR *)lp)->hwndFrom == state->list && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
+        if (state && (((const NMHDR *)lp)->hwndFrom == state->partners || ((const NMHDR *)lp)->hwndFrom == state->items) &&
+            ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
             const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
-            if ((change->uChanged & LVIF_STATE) && (change->uNewState & LVIS_SELECTED) && change->iItem >= 0 && change->iItem < state->count &&
-                change->iItem != state->row) {
-                state->row = change->iItem;
-                FillConflictChoices(dialog, state);
-            }
+            if (!state->filling && (change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK))
+                ReadSetup(dialog, state);
             return TRUE;
         }
         break;
@@ -1026,17 +958,11 @@ static INT_PTR CALLBACK ConflictsProc(HWND dialog, UINT message, WPARAM wp, LPAR
     case WM_COMMAND:
         if (!state) break;
         switch (LOWORD(wp)) {
-        case IDC_X_PROFILE:
-            if (HIWORD(wp) == CBN_SELCHANGE) {
-                LRESULT chosen = SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_GETCURSEL, 0, 0);
-                if (chosen >= 0 && chosen < BitCount(state->rows[state->row].candidates)) {
-                    state->rows[state->row].chosen = state->comboProfile[chosen];
-                    ConflictRowText(state, state->row, text, ARRAYSIZE(text));
-                    ListView_SetItemText(state->list, state->row, 0, text);
-                }
-            }
-            return TRUE;
         case IDOK:
+        case IDC_Z_SYNC_NOW:
+            ReadSetup(dialog, state);
+            if (state->setup->partners && !state->setup->items) return TRUE;
+            state->setup->syncNow = LOWORD(wp) == IDC_Z_SYNC_NOW;
             EndDialog(dialog, IDOK);
             return TRUE;
         case IDCANCEL:
@@ -1048,40 +974,358 @@ static INT_PTR CALLBACK ConflictsProc(HWND dialog, UINT message, WPARAM wp, LPAR
     return FALSE;
 }
 
+BOOL SyncUi_Setup(HWND owner, const ProfileList *profiles, SyncSetup *setup)
+{
+    SetupDialog dialog;
+    const Profile *p;
+    if (setup->profile < 0 || setup->profile >= profiles->count) return FALSE;
+    p = &profiles->items[setup->profile];
+    setup->partners = p->syncGroup ? SessionVault_Group(profiles, p->syncGroup) & ~(1u << setup->profile) : 0;
+    setup->items = setup->partners ? SessionVault_GroupItems(profiles, setup->partners | (1u << setup->profile)) : SYNC_ITEMS_DEFAULT;
+    setup->syncNow = FALSE;
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.profiles = profiles;
+    dialog.setup = setup;
+    return Ui_Dialog(owner, IDD_SYNC_SETUP, SetupProc, (LPARAM)&dialog) == IDOK;
+}
+
+/* ------------------------------------------------------ conflicts settled */
+
+/* The images of the conflicts' list: the choice, then what each row is. */
+enum {
+    IMAGE_CHOSEN, IMAGE_CANDIDATE, IMAGE_SESSION, IMAGE_GROUP, IMAGE_SECTION, IMAGE_PIN, IMAGE_SETTING, IMAGE_APPEARANCE,
+    IMAGE_LANGUAGE, IMAGE_MODEL, IMAGE_LAYOUT, IMAGE_PERMISSION, IMAGE_STAR, IMAGES
+};
+static const WCHAR kConflictGlyphs[IMAGES] = { 0xEC61, 0xEA3A, 0xE8BD, 0xE8B7, 0xE8FD, 0xE718, 0xE713, 0xE8D2, 0xE774, 0xE945, 0xE80A, 0xE72E, 0xE734 };
+static const ThemeTint kConflictTints[IMAGES] = {
+    THEME_TINT_GREEN, THEME_TINT_NONE, THEME_TINT_PURPLE, THEME_TINT_AMBER, THEME_TINT_TEAL, THEME_TINT_TEAL, THEME_TINT_BLUE, THEME_TINT_PURPLE,
+    THEME_TINT_PURPLE, THEME_TINT_GOLD, THEME_TINT_TEAL, THEME_TINT_RED, THEME_TINT_GOLD
+};
+
+/* Each kind of setting a conflict belongs to (SYNC_ITEM_*): its heading, its image. */
+static const struct { DWORD item; const WCHAR *heading; int image; } kConflictKinds[] = {
+    { SYNC_ITEM_SESSIONS, L"Sessions", IMAGE_SESSION },
+    { SYNC_ITEM_SIDEBAR, L"Sidebar", IMAGE_GROUP },
+    { SYNC_ITEM_DETAILS, L"Session details", IMAGE_LAYOUT },
+    { SYNC_ITEM_APPEARANCE, L"Appearance", IMAGE_APPEARANCE },
+    { SYNC_ITEM_LANGUAGE, L"Interface language", IMAGE_LANGUAGE },
+    { SYNC_ITEM_MODEL, L"Default model", IMAGE_MODEL },
+    { SYNC_ITEM_SETTINGS, L"Settings", IMAGE_SETTING },
+    { SYNC_ITEM_PERMISSIONS, L"Permissions", IMAGE_PERMISSION },
+};
+
+#define CONFLICTS_SHOWN 256   /* the elements the dialog lists at most */
+#define ROW_HEADING     (-1)  /* a row's lParam: a kind's heading */
+
+typedef struct ConflictsDialog {
+    const ProfileList *profiles;
+    VaultConflict     *conflicts;
+    int                count;
+    int               *chosen;            /* by conflict: the profile whose version it keeps */
+    int                columns[MAX_PROFILES];   /* the profile of each column after the first */
+    int                columnCount;
+    const WCHAR       *text;
+    HWND               list;
+    HICON              icon;
+} ConflictsDialog;
+
+/* The image a conflict's row shows: what its element is. */
+static int ConflictImage(const VaultConflict *conflict)
+{
+    size_t k;
+    if (strcmp(conflict->part, "groups") == 0) return strncmp(conflict->path, "/assignments", 12) == 0 ? IMAGE_SESSION : IMAGE_GROUP;
+    if (strcmp(conflict->part, "pills") == 0) return IMAGE_SESSION;
+    if (strcmp(conflict->part, "sections") == 0) return IMAGE_SECTION;
+    if (strcmp(conflict->part, "slice") == 0 || strcmp(conflict->part, "navPins") == 0) return IMAGE_PIN;
+    if (strncmp(conflict->part, "starred", 7) == 0) return IMAGE_STAR;
+    for (k = 0; k < ARRAYSIZE(kConflictKinds); k++)
+        if (kConflictKinds[k].item == conflict->item) return kConflictKinds[k].image;
+    return IMAGE_SETTING;
+}
+
+static int KindOf(const VaultConflict *conflict)
+{
+    int k;
+    for (k = 0; k < (int)ARRAYSIZE(kConflictKinds); k++)
+        if (kConflictKinds[k].item == conflict->item) return k;
+    return (int)ARRAYSIZE(kConflictKinds) - 1;
+}
+
+/* Each cell of conflict row `row` (the conflict `c`): the chosen version checked, the others ringed. */
+static void ShowChoice(const ConflictsDialog *state, int row, int c)
+{
+    int column;
+    for (column = 0; column < state->columnCount; column++) {
+        int p = state->columns[column];
+        LVITEMW item;
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_IMAGE;
+        item.iItem = row;
+        item.iSubItem = column + 1;
+        item.iImage = !(state->conflicts[c].members & (1u << p)) ? I_IMAGENONE : state->chosen[c] == p ? IMAGE_CHOSEN : IMAGE_CANDIDATE;
+        ListView_SetItem(state->list, &item);
+    }
+}
+
+static void ShowAllChoices(const ConflictsDialog *state)
+{
+    int row, rows = ListView_GetItemCount(state->list);
+    for (row = 0; row < rows; row++) {
+        LVITEMW item;
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_PARAM;
+        item.iItem = row;
+        if (ListView_GetItem(state->list, &item) && item.lParam != ROW_HEADING) ShowChoice(state, row, (int)item.lParam);
+    }
+}
+
+/* The columns across `width`: each profile's as wide as its longest version,
+ * the elements' the rest, at least two fifths (the versions then share the
+ * other three). */
+static void SizeConflictColumns(const ConflictsDialog *state, int width)
+{
+    int wanted[MAX_PROFILES], total = 0, i, row, rows = ListView_GetItemCount(state->list), dpi = GetDpiForWindow(state->list), first, least;
+    int image = GetSystemMetricsForDpi(SM_CXSMICON, dpi), room = MulDiv(20, dpi, 96);
+    if (!state->columnCount) return;
+    for (i = 0; i < state->columnCount; i++) {
+        wanted[i] = ListView_GetStringWidth(state->list, state->profiles->items[state->columns[i]].name) + room;
+        for (row = 0; row < rows; row++) {
+            WCHAR text[VAULT_SHOWN_CCH];
+            ListView_GetItemText(state->list, row, i + 1, text, ARRAYSIZE(text));
+            wanted[i] = max(wanted[i], ListView_GetStringWidth(state->list, text) + image + room);
+        }
+        total += wanted[i];
+    }
+    least = width * 2 / 5;
+    if (total > width - least) {
+        int shared = 0;
+        for (i = 0; i < state->columnCount; i++) shared += wanted[i] = MulDiv(wanted[i], width - least, total);
+        total = shared;
+    }
+    first = width - total;
+    ListView_SetColumnWidth(state->list, 0, first);
+    for (i = 0; i < state->columnCount; i++) ListView_SetColumnWidth(state->list, i + 1, wanted[i]);
+}
+
+/* The list: a heading per kind, then a row per conflict, a column per profile. */
+static void FillConflicts(HWND dialog, ConflictsDialog *state)
+{
+    LVCOLUMNW column;
+    LVITEMW item;
+    RECT client;
+    int k, c, i, row = 0, width, first;
+    state->list = GetDlgItem(dialog, IDC_X_LIST);
+    ListView_SetExtendedListViewStyle(state->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_SUBITEMIMAGES);
+    ListView_SetImageList(state->list, Theme_GlyphImages(state->list, kConflictGlyphs, kConflictTints, IMAGES), LVSIL_SMALL);
+    GetClientRect(state->list, &client);
+    width = client.right - GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(state->list));
+    first = state->columnCount ? width * 2 / 5 : width;
+    ZeroMemory(&column, sizeof column);
+    column.mask = LVCF_TEXT | LVCF_WIDTH;
+    column.pszText = (LPWSTR)TR(L"Changed");
+    column.cx = first;
+    ListView_InsertColumn(state->list, 0, &column);
+    for (i = 0; i < state->columnCount; i++) {
+        column.pszText = (LPWSTR)state->profiles->items[state->columns[i]].name;
+        column.cx = (width - first) / state->columnCount;
+        ListView_InsertColumn(state->list, i + 1, &column);
+    }
+    for (k = 0; k < (int)ARRAYSIZE(kConflictKinds); k++) {
+        BOOL headed = FALSE;
+        for (c = 0; c < state->count; c++) {
+            if (KindOf(&state->conflicts[c]) != k) continue;
+            if (!headed) {
+                ZeroMemory(&item, sizeof item);
+                item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
+                item.iItem = row++;
+                item.iImage = kConflictKinds[k].image;
+                item.lParam = ROW_HEADING;
+                item.pszText = (LPWSTR)TR(kConflictKinds[k].heading);
+                ListView_InsertItem(state->list, &item);
+                headed = TRUE;
+            }
+            ZeroMemory(&item, sizeof item);
+            item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM | LVIF_INDENT;
+            item.iItem = row;
+            item.iImage = ConflictImage(&state->conflicts[c]);
+            item.iIndent = 1;
+            item.lParam = c;
+            item.pszText = state->conflicts[c].label;
+            ListView_InsertItem(state->list, &item);
+            for (i = 0; i < state->columnCount; i++) {
+                int p = state->columns[i];
+                ListView_SetItemText(state->list, row, i + 1,
+                                     (state->conflicts[c].members & (1u << p)) ? state->conflicts[c].shown[p] : (LPWSTR)L"\x2014");
+            }
+            ShowChoice(state, row, c);
+            row++;
+        }
+    }
+    SizeConflictColumns(state, width);
+    Theme_SetHeadingRows(state->list);
+    Theme_SmoothView(state->list);
+    /* The first conflict selected: the arrows choose from the start. */
+    for (i = 0; i < row; i++) {
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_PARAM;
+        item.iItem = i;
+        if (ListView_GetItem(state->list, &item) && item.lParam != ROW_HEADING) {
+            ListView_SetItemState(state->list, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            break;
+        }
+    }
+}
+
+/* Row `row`'s conflict, -1 for a heading. */
+static int ConflictOfRow(const ConflictsDialog *state, int row)
+{
+    LVITEMW item;
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_PARAM;
+    item.iItem = row;
+    return row >= 0 && ListView_GetItem(state->list, &item) && item.lParam != ROW_HEADING ? (int)item.lParam : -1;
+}
+
+/* Conflict row `row` moved to the next version left or right (`step`). */
+static void StepChoice(ConflictsDialog *state, int row, int step)
+{
+    int c = ConflictOfRow(state, row), column, at = -1;
+    if (c < 0) return;
+    for (column = 0; column < state->columnCount; column++)
+        if (state->columns[column] == state->chosen[c]) at = column;
+    for (column = at + step; column >= 0 && column < state->columnCount; column += step)
+        if (state->conflicts[c].members & (1u << state->columns[column])) {
+            state->chosen[c] = state->columns[column];
+            ShowChoice(state, row, c);
+            return;
+        }
+}
+
+static INT_PTR CALLBACK ConflictsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    ConflictsDialog *state = (ConflictsDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    switch (message) {
+    case WM_INITDIALOG: {
+        int i;
+        state = (ConflictsDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetDlgItemTextW(dialog, IDC_X_TEXT, state->text);
+        if (SUCCEEDED(LoadIconWithScaleDown(NULL, IDI_INFORMATION, GetSystemMetricsForDpi(SM_CXICON, GetDpiForWindow(dialog)),
+                                            GetSystemMetricsForDpi(SM_CYICON, GetDpiForWindow(dialog)), &state->icon)))
+            SendDlgItemMessageW(dialog, IDC_X_ICON, STM_SETICON, (WPARAM)state->icon, 0);
+        Theme_SetGlyph(GetDlgItem(dialog, IDOK), 0xE73E, THEME_TINT_GREEN);
+        Theme_SetGlyph(GetDlgItem(dialog, IDCANCEL), 0xE823, THEME_TINT_NONE);
+        SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)TR(L"The latest of each"));
+        for (i = 0; i < state->columnCount; i++)
+            SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)state->profiles->items[state->columns[i]].name);
+        SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_SETCURSEL, 0, 0);
+        FillConflicts(dialog, state);
+        return TRUE;
+    }
+
+    case WM_CTLCOLORSTATIC:
+        return Theme_CtlColor(message, wp, lp, IDC_X_NOTE);
+
+    case WM_NOTIFY:
+        if (state && ((const NMHDR *)lp)->hwndFrom == state->list) {
+            const NMHDR *header = (const NMHDR *)lp;
+            if (header->code == NM_CLICK || header->code == NM_DBLCLK) {
+                /* A click on a profile's version keeps it. */
+                LVHITTESTINFO hit;
+                DWORD position = GetMessagePos();
+                int c;
+                ZeroMemory(&hit, sizeof hit);
+                hit.pt.x = (short)LOWORD(position);
+                hit.pt.y = (short)HIWORD(position);
+                ScreenToClient(state->list, &hit.pt);
+                if (ListView_SubItemHitTest(state->list, &hit) >= 0 && hit.iSubItem > 0 && hit.iSubItem <= state->columnCount &&
+                    (c = ConflictOfRow(state, hit.iItem)) >= 0 && (state->conflicts[c].members & (1u << state->columns[hit.iSubItem - 1]))) {
+                    state->chosen[c] = state->columns[hit.iSubItem - 1];
+                    ShowChoice(state, hit.iItem, c);
+                }
+                return TRUE;
+            }
+            if (header->code == LVN_KEYDOWN) {
+                WORD key = ((const NMLVKEYDOWN *)lp)->wVKey;
+                int row = ListView_GetNextItem(state->list, -1, LVNI_FOCUSED);
+                if (key == VK_LEFT || key == VK_RIGHT) {
+                    StepChoice(state, row, key == VK_LEFT ? -1 : 1);
+                    SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+                }
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_COMMAND:
+        if (!state) break;
+        switch (LOWORD(wp)) {
+        case IDC_X_PROFILE:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                /* Every element: the latest version of each, or the one of the profile chosen where it has one. */
+                LRESULT choice = SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_GETCURSEL, 0, 0);
+                int c;
+                for (c = 0; c < state->count; c++) {
+                    if (choice <= 0) state->chosen[c] = state->conflicts[c].latest;
+                    else if (choice - 1 < state->columnCount && (state->conflicts[c].members & (1u << state->columns[choice - 1])))
+                        state->chosen[c] = state->columns[choice - 1];
+                }
+                ShowAllChoices(state);
+            }
+            return TRUE;
+        case IDOK:
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        case IDCANCEL:
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+
+    case WM_DESTROY:
+        if (state && state->icon) DestroyIcon(state->icon);
+        break;
+    }
+    return FALSE;
+}
+
 /* Group `group`'s conflicts settled: FALSE when there were none, or the person left them for later. */
 static BOOL SettleGroup(HWND owner, const ProfileList *profiles, int group)
 {
     WCHAR names[NAMES_CCH], text[NAMES_CCH + 256];
-    VaultConflict conflicts[64];
     ConflictsDialog dialog;
-    DWORD changed = 0;
-    int count = SessionVault_Conflicts(profiles, group, conflicts, ARRAYSIZE(conflicts)), c, k, row, first = -1, stock;
-    BOOL ok = TRUE;
-    if (count <= 0) return FALSE;
+    DWORD members = 0;
+    int c, p, *chosen = NULL;
+    BOOL ok = FALSE;
     ZeroMemory(&dialog, sizeof dialog);
     dialog.profiles = profiles;
-    stock = Profiles_Find(profiles, profiles->defaultFolder);
-    for (k = 0; k < SYNC_ITEM_COUNT; k++) {
-        ConflictRow *r = &dialog.rows[dialog.count];
-        ZeroMemory(r, sizeof *r);
-        for (c = 0; c < count; c++)
-            if (conflicts[c].item == kSyncItems[k].item) r->candidates |= conflicts[c].members;
-        if (!r->candidates) continue;
-        r->item = kSyncItems[k].item;
-        /* At first, the default profile's where it changed it, else the first one's. */
-        for (first = 0; first < profiles->count && !(r->candidates & (1u << first)); first++) {}
-        r->chosen = stock >= 0 && (r->candidates & (1u << stock)) ? stock : first;
-        changed |= r->candidates;
-        dialog.count++;
+    if ((dialog.conflicts = (VaultConflict *)HeapAlloc(GetProcessHeap(), 0, CONFLICTS_SHOWN * sizeof *dialog.conflicts)) == NULL ||
+        (chosen = (int *)HeapAlloc(GetProcessHeap(), 0, CONFLICTS_SHOWN * sizeof *chosen)) == NULL ||
+        (dialog.count = SessionVault_Conflicts(profiles, group, dialog.conflicts, CONFLICTS_SHOWN)) <= 0)
+        goto done;
+    dialog.chosen = chosen;
+    for (c = 0; c < dialog.count; c++) {
+        members |= dialog.conflicts[c].members;
+        /* At first, the version of the one that changed it last. */
+        if (dialog.conflicts[c].latest < 0 || !(dialog.conflicts[c].members & (1u << dialog.conflicts[c].latest)))
+            for (p = 0; p < profiles->count; p++)
+                if (dialog.conflicts[c].members & (1u << p)) {
+                    dialog.conflicts[c].latest = p;
+                    break;
+                }
+        chosen[c] = dialog.conflicts[c].latest;
     }
-    if (!dialog.count) return FALSE;
-    NamesOf(profiles, changed, names, ARRAYSIZE(names));
-    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Since the last sync, %s changed these each their own way. Choose whose version to keep:"), names);
+    for (p = 0; p < profiles->count && dialog.columnCount < MAX_PROFILES; p++)
+        if (members & (1u << p)) dialog.columns[dialog.columnCount++] = p;
+    NamesOf(profiles, members, names, ARRAYSIZE(names));
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s changed these each their own way since the last sync. Choose the version to keep of each:"), names);
     dialog.text = text;
-    if (Ui_Dialog(owner, IDD_CONFLICTS, ConflictsProc, (LPARAM)&dialog) != IDOK) return FALSE;
-    for (row = 0; row < dialog.count; row++)
-        if (!SessionVault_Decide(profiles, group, dialog.rows[row].item, dialog.rows[row].chosen)) ok = FALSE;
+    if (Ui_Dialog(owner, IDD_CONFLICTS, ConflictsProc, (LPARAM)&dialog) != IDOK) goto done;
+    ok = SessionVault_Decide(profiles, group, dialog.conflicts, chosen, dialog.count);
     if (!ok) Ui_Message(owner, MB_ICONERROR, TR(L"The choice could not be saved: the profiles keep their own until the next sync asks again."));
+done:
+    if (dialog.conflicts) HeapFree(GetProcessHeap(), 0, dialog.conflicts);
+    if (chosen) HeapFree(GetProcessHeap(), 0, chosen);
     return ok;
 }
 
@@ -1131,7 +1375,7 @@ static BOOL CopyCodeFolder(HWND owner, BOOL ask)
         Ui_Message(owner, MB_ICONERROR, TR(L"The path is too long."));
         return FALSE;
     }
-    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Copy %s\nto %s?"), code, target);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Copy .claude to %s?"), wcsrchr(target, L'\\') ? wcsrchr(target, L'\\') + 1 : target);
     if (ask && !Ui_Ask(owner, IDI_QUESTION, text, TR(L"Copy"), TR(L"Cancel"), FALSE)) return FALSE;
     result = SessionPurge_BackUp(owner, target, &error);
     if (result == COPY_MADE) {
@@ -1148,69 +1392,118 @@ BOOL SyncUi_BackUpCode(HWND owner)
 }
 
 typedef struct PurgeDialog {
-    const PurgeItem *items;
-    int              count;
-    BOOL            *checked;
-    BOOL             backUp;
-    HWND             rows;           /* in the view it scrolls in, which has its id */
-    BOOL             filling;
+    const PurgeItem   *items;
+    const ProfileList *profiles;
+    int                count;
+    BOOL              *checked;        /* by item; only the rows shown can be checked */
+    BOOL               backUp;
+    int                shown;          /* PURGE_SHOW_ALL, PURGE_SHOW_UNLISTED, or a profile's index */
+    HWND               rows;           /* in the view it scrolls in, which has its id */
+    BOOL               filling;
 } PurgeDialog;
 
-/* Delete takes any conversation checked; Restore, one a kept list had. */
-static void ReadChecked(HWND dialog, PurgeDialog *state)
+#define PURGE_SHOW_ALL      (-1)
+#define PURGE_SHOW_UNLISTED (-2)       /* in no profile's kept list: made in a terminal, say */
+
+static BOOL PurgeShown(const PurgeDialog *state, const PurgeItem *item)
 {
-    int i, chosen = 0, restorable = 0;
-    for (i = 0; i < state->count; i++)
-        if ((state->checked[i] = ListView_GetCheckState(state->rows, i)) != FALSE) {
-            chosen++;
-            if (state->items[i].restorable) restorable++;
-        }
-    EnableWindow(GetDlgItem(dialog, IDOK), chosen > 0);
-    EnableWindow(GetDlgItem(dialog, IDC_C_RESTORE), restorable > 0);
+    if (state->shown == PURGE_SHOW_ALL) return TRUE;
+    if (state->shown == PURGE_SHOW_UNLISTED) return item->profiles == 0;
+    return (item->profiles & (1u << state->shown)) != 0;
 }
 
-/* A conversation's row: what it is, its title (its id without one), when it
- * was last written, its size. */
-static void PurgeRow(const PurgeItem *item, WCHAR *out, size_t cch)
+/* Delete takes any conversation checked; Restore, one a kept list had.
+ * Select all is checked while every row shown is. */
+static void ReadChecked(HWND dialog, PurgeDialog *state)
 {
-    WCHAR when[128];
+    int i, rows = ListView_GetItemCount(state->rows), chosen = 0, restorable = 0;
+    for (i = 0; i < rows; i++) {
+        LVITEMW item;
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_PARAM;
+        item.iItem = i;
+        if (!ListView_GetItem(state->rows, &item) || item.lParam < 0 || item.lParam >= state->count) continue;
+        if ((state->checked[item.lParam] = ListView_GetCheckState(state->rows, i)) != FALSE) {
+            chosen++;
+            if (state->items[item.lParam].restorable) restorable++;
+        }
+    }
+    EnableWindow(GetDlgItem(dialog, IDOK), chosen > 0);
+    EnableWindow(GetDlgItem(dialog, IDC_C_RESTORE), restorable > 0);
+    EnableWindow(GetDlgItem(dialog, IDC_C_ALL), rows > 0);
+    CheckDlgButton(dialog, IDC_C_ALL, rows > 0 && chosen == rows ? BST_CHECKED : BST_UNCHECKED);
+}
+
+/* A conversation's row: the profiles that had it (or in no list), its
+ * title (its id without one), when it was last written, its size. */
+static void PurgeRow(const PurgeDialog *state, const PurgeItem *item, WCHAR *out, size_t cch)
+{
+    WCHAR when[128], names[MAX_PROFILES * (LABEL_CCH + 2)];
+    int p;
+    names[0] = 0;
+    for (p = 0; p < state->profiles->count; p++)
+        if (item->profiles & (1u << p)) {
+            if (names[0]) StringCchCatW(names, ARRAYSIZE(names), TR(L", "));
+            StringCchCatW(names, ARRAYSIZE(names), state->profiles->items[p].name);
+        }
     FormatWhen(item->written, when, ARRAYSIZE(when));
-    StringCchPrintfW(out, cch, L"%s  \x00B7  %s  \x00B7  %s  \x00B7  %.1f MB", item->kind == PURGE_DELETED ? TR(L"Deleted in Claude") : TR(L"In no list"),
+    StringCchPrintfW(out, cch, L"%s  \x00B7  %s  \x00B7  %s  \x00B7  %.1f MB", names[0] ? names : TR(L"In no list"),
                      item->title[0] ? item->title : item->id, when, (double)item->bytes / (1024.0 * 1024.0));
+}
+
+/* The rows of what Show picks, none checked: what is acted on is what shows. */
+static void FillPurgeRows(HWND dialog, PurgeDialog *state)
+{
+    WCHAR text[SESSION_TITLE_CCH + MAX_PATH + MAX_PROFILES * (LABEL_CCH + 2)];
+    LVITEMW item;
+    int i, row = 0;
+    state->filling = TRUE;
+    SendMessageW(state->rows, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(state->rows);
+    for (i = 0; i < state->count; i++) {
+        state->checked[i] = FALSE;
+        if (!PurgeShown(state, &state->items[i])) continue;
+        PurgeRow(state, &state->items[i], text, ARRAYSIZE(text));
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT | LVIF_PARAM;
+        item.iItem = row++;
+        item.pszText = text;
+        item.lParam = i;
+        ListView_InsertItem(state->rows, &item);
+    }
+    SendMessageW(state->rows, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(state->rows, NULL, TRUE);
+    state->filling = FALSE;
+    ReadChecked(dialog, state);
 }
 
 static INT_PTR CALLBACK PurgeProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
     PurgeDialog *state = (PurgeDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
-    WCHAR text[SESSION_TITLE_CCH + MAX_PATH];
     LVCOLUMNW column;
-    LVITEMW item;
     int i;
     switch (message) {
-    case WM_INITDIALOG:
+    case WM_INITDIALOG: {
+        HWND show = GetDlgItem(dialog, IDC_C_PROFILE);
         state = (PurgeDialog *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
-        SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"These conversations are on this PC, but no profile lists them any more: deleted in Claude, or made in a "
-                                               L"terminal for example.\nRestore puts the ones checked back in the profiles that listed them. "
-                                               L"Delete removes them, so that nothing brings them back."));
+        SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"Conversations still on this PC that no profile shows any more."));
         CheckDlgButton(dialog, IDC_C_BACKUP, BST_CHECKED);
+        /* Show: every one, each profile's, those in no list; the item data is what PurgeDialog.shown takes. */
+        SendMessageW(show, CB_SETITEMDATA, (WPARAM)SendMessageW(show, CB_ADDSTRING, 0, (LPARAM)TR(L"All profiles")), (LPARAM)PURGE_SHOW_ALL);
+        for (i = 0; i < state->profiles->count; i++)
+            SendMessageW(show, CB_SETITEMDATA, (WPARAM)SendMessageW(show, CB_ADDSTRING, 0, (LPARAM)state->profiles->items[i].name), (LPARAM)i);
+        SendMessageW(show, CB_SETITEMDATA, (WPARAM)SendMessageW(show, CB_ADDSTRING, 0, (LPARAM)TR(L"In no list")), (LPARAM)PURGE_SHOW_UNLISTED);
+        SendMessageW(show, CB_SETCURSEL, 0, 0);
+        state->shown = PURGE_SHOW_ALL;
         state->rows = GetDlgItem(dialog, IDC_C_LIST);
         ListView_SetExtendedListViewStyle(state->rows, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
         ZeroMemory(&column, sizeof column);
         ListView_InsertColumn(state->rows, 0, &column);
-        state->filling = TRUE;
-        for (i = 0; i < state->count; i++) {
-            PurgeRow(&state->items[i], text, ARRAYSIZE(text));
-            ZeroMemory(&item, sizeof item);
-            item.mask = LVIF_TEXT;
-            item.iItem = i;
-            item.pszText = text;
-            ListView_InsertItem(state->rows, &item);   /* none checked: restoring and deleting are both choices */
-        }
-        state->filling = FALSE;
+        FillPurgeRows(dialog, state);
         Theme_SmoothView(state->rows);
-        ReadChecked(dialog, state);
         return TRUE;
+    }
 
     case WM_NOTIFY:
         if (state && ((const NMHDR *)lp)->hwndFrom == state->rows && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
@@ -1224,6 +1517,22 @@ static INT_PTR CALLBACK PurgeProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
     case WM_COMMAND:
         if (!state) break;
         switch (LOWORD(wp)) {
+        case IDC_C_PROFILE:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                LRESULT at = SendDlgItemMessageW(dialog, IDC_C_PROFILE, CB_GETCURSEL, 0, 0);
+                if (at != CB_ERR) state->shown = (int)SendDlgItemMessageW(dialog, IDC_C_PROFILE, CB_GETITEMDATA, (WPARAM)at, 0);
+                FillPurgeRows(dialog, state);
+            }
+            return TRUE;
+        case IDC_C_ALL:
+            if (HIWORD(wp) == BN_CLICKED) {
+                BOOL all = IsDlgButtonChecked(dialog, IDC_C_ALL) == BST_CHECKED;
+                state->filling = TRUE;
+                for (i = 0; i < ListView_GetItemCount(state->rows); i++) ListView_SetCheckState(state->rows, i, all);
+                state->filling = FALSE;
+                ReadChecked(dialog, state);
+            }
+            return TRUE;
         case IDOK:
         case IDC_C_RESTORE:
             ReadChecked(dialog, state);
@@ -1262,7 +1571,7 @@ static BOOL RestoreChosen(HWND owner, const ProfileList *profiles, const PurgeIt
     }
     StringCchPrintfW(first, ARRAYSIZE(first), TR(L"Conversations restored: %d"), restored);
     if (missing) {
-        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Not restored, as no kept list had them: %d"), missing);
+        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Not restored, in no list: %d"), missing);
         StringCchCatW(first, ARRAYSIZE(first), L"\n");
         StringCchCatW(first, ARRAYSIZE(first), line);
     }
@@ -1270,60 +1579,15 @@ static BOOL RestoreChosen(HWND owner, const ProfileList *profiles, const PurgeIt
     return restored > 0;
 }
 
-#define PURGE_FOLDERS_SHOWN 12   /* folders the clean-up names before saying how many more */
-
-/* The folders the files of the conversations chosen are in, each once, on
- * lines of `text`: PURGE_FOLDERS_SHOWN of them, then how many more. */
-static void AddPurgeFolders(WCHAR *text, size_t cch, const PurgeItem *items, const int *chosen, int n)
+/* The clean-up, asked first: how many conversations, and that .claude is
+ * copied first when that was chosen. */
+static BOOL ConfirmPurge(HWND owner, int n, BOOL backUp)
 {
-    const WCHAR **ids = (const WCHAR **)HeapAlloc(GetProcessHeap(), 0, (size_t)max(n, 1) * sizeof *ids);
-    WCHAR (*paths)[LONG_PATH_CCH] = NULL, (*folders)[LONG_PATH_CCH] = NULL, error[512], line[128];
-    int count = 0, folderCount = 0, i, j;
-    if (!ids) return;
-    for (i = 0; i < n; i++) ids[i] = items[chosen[i]].id;
-    if (SessionEdit_ListTranscriptFiles(ids, n, &paths, &count, error, ARRAYSIZE(error)) &&
-        (folders = (WCHAR (*)[LONG_PATH_CCH])HeapAlloc(GetProcessHeap(), 0, (size_t)max(count, 1) * sizeof *folders)) != NULL) {
-        for (i = 0; i < count; i++) {
-            WCHAR *slash;
-            if (FAILED(StringCchCopyW(folders[folderCount], LONG_PATH_CCH, paths[i])) || (slash = wcsrchr(folders[folderCount], L'\\')) == NULL)
-                continue;
-            *slash = 0;
-            for (j = 0; j < folderCount && !Core_PathEquals(folders[j], folders[folderCount]); j++) {}
-            if (j == folderCount) folderCount++;
-        }
-        for (i = 0; i < folderCount && i < PURGE_FOLDERS_SHOWN; i++) SyncUi_AddPath(text, cch, folders[i]);
-        if (folderCount > PURGE_FOLDERS_SHOWN && SUCCEEDED(StringCchPrintfW(line, ARRAYSIZE(line), TR(L"and %d more folders"),
-                                                                           folderCount - PURGE_FOLDERS_SHOWN)))
-            SyncUi_AddLine(text, cch, line, TRUE);
-    }
-    if (paths) HeapFree(GetProcessHeap(), 0, paths);
-    if (folders) HeapFree(GetProcessHeap(), 0, folders);
-    HeapFree(GetProcessHeap(), 0, (void *)ids);
-}
-
-/* The clean-up, asked first: how many conversations, the folders their
- * files go from, and where Claude Code's folder is copied first when that
- * was chosen. */
-static BOOL ConfirmPurge(HWND owner, const PurgeItem *items, const int *chosen, int n, BOOL backUp)
-{
-    WCHAR *folders = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, CONFIRM_CCH * sizeof(WCHAR)), question[256], code[MAX_PATH], copy[MAX_PATH],
-          line[2 * MAX_PATH], shown[MAX_PATH];
-    BOOL ok;
-    if (!folders) return FALSE;
-    folders[0] = 0;
-    SyncUi_AddLine(folders, CONFIRM_CCH, TR(L"Their files go to the Recycle Bin from these folders:"), FALSE);
-    AddPurgeFolders(folders, CONFIRM_CCH, items, chosen, n);
-    if (backUp && SessionPurge_CodeFolder(code, ARRAYSIZE(code)) && SessionPurge_BackupName(copy, ARRAYSIZE(copy))) {
-        SyncUi_ShortPath(code, shown, ARRAYSIZE(shown));
-        if (SUCCEEDED(StringCchPrintfW(line, ARRAYSIZE(line), TR(L"First, Claude Code's folder %s is copied to:"), shown))) {
-            SyncUi_AddLine(folders, CONFIRM_CCH, line, FALSE);
-            SyncUi_AddPath(folders, CONFIRM_CCH, copy);
-        }
-    }
-    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Move %d conversations to the Recycle Bin?"), n);
-    ok = SyncUi_Confirm(owner, IDI_WARNING, question, folders, FALSE, TR(L"Move to the Recycle Bin"));
-    HeapFree(GetProcessHeap(), 0, folders);
-    return ok;
+    WCHAR question[256];
+    StringCchPrintfW(question, ARRAYSIZE(question),
+                     backUp ? TR(L"Move %d conversations to the Recycle Bin?\n\n.claude is copied first.") : TR(L"Move %d conversations to the Recycle Bin?"),
+                     n);
+    return SyncUi_Confirm(owner, IDI_WARNING, question, FALSE, TR(L"Move to the Recycle Bin"));
 }
 
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
@@ -1349,6 +1613,7 @@ BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
     }
     ZeroMemory(&dialog, sizeof dialog);
     dialog.items = items;
+    dialog.profiles = profiles;
     dialog.count = count;
     dialog.checked = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *dialog.checked);
     chosen = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof *chosen);
@@ -1358,8 +1623,7 @@ BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
             if (dialog.checked[i]) chosen[n++] = i;
     if (action == IDC_C_RESTORE && n) {
         changed = RestoreChosen(owner, profiles, items, chosen, n);
-    } else if (action == IDOK && n && ConfirmPurge(owner, items, chosen, n, dialog.backUp) &&
-               (!dialog.backUp || CopyCodeFolder(owner, FALSE))) {
+    } else if (action == IDOK && n && ConfirmPurge(owner, n, dialog.backUp) && (!dialog.backUp || CopyCodeFolder(owner, FALSE))) {
         result = SessionPurge_Delete(owner, profiles, items, chosen, n, &deleted, error, ARRAYSIZE(error));
         if (result == REMOVE_DONE) Ui_Message(owner, MB_ICONINFORMATION, TR(L"Conversations moved to the Recycle Bin: %d"), deleted);
         else if (result == REMOVE_FAILED) Ui_Message(owner, MB_ICONWARNING, TR(L"The conversations could not be deleted. %s"), error);

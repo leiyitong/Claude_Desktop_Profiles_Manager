@@ -935,6 +935,38 @@ static const FilePart kFileParts[] = {
     { "spelling", CHROMIUM_PREFERENCES, { "spellcheck", "dictionaries", NULL }, 2, FALSE, SYNC_ITEM_APPEARANCE },
 };
 
+/* Each part as the person sees it, in a conflict (a catalog key). */
+static const struct { const char *part; const WCHAR *label; } kPartLabels[] = {
+    { "starred", L"Starred sessions" }, { "slice", L"Pinned sessions" }, { "starredGroups", L"Starred groups" },
+    { "order", L"Project order" }, { "statusFilter", L"Status filter" }, { "environments", L"Environment filter" },
+    { "showEmpty", L"Show empty groups" }, { "showPrStatus", L"Show PR status" }, { "projectsFilter", L"Projects shown" },
+    { "transcriptLinks", L"Links in previews" }, { "autoResume", L"Go on after a usage limit" },
+    { "folderModes", L"Folders' permission modes" }, { "modeAcks", L"Permission warnings confirmed" },
+    { "autoArchive", L"Archive when the PR closes" }, { "coworkWebSearch", L"Cowork web search" },
+    { "coworkBrowserTools", L"Cowork browser tools" }, { "coworkBrowser", L"Cowork's browser" },
+    { "coworkSchedules", L"Cowork scheduled tasks" }, { "codeSchedules", L"Code scheduled tasks" },
+    { "remoteExcluded", L"Remote Control: excluded folders" }, { "remotePinned", L"Remote Control: pinned folders" },
+    { "trustedFolders", L"Cowork's trusted folders" }, { "groups", L"Groups" }, { "sections", L"Sidebar sections" },
+    { "navPins", L"Edit sidebar" }, { "folded", L"Folded groups" }, { "groupBy", L"Group by" }, { "sortBy", L"Sort by" },
+    { "recentsType", L"Recents: type" }, { "recentsStatus", L"Recents: status" }, { "routines", L"Routines' place" },
+    { "sidebarWidth", L"Sidebar width" }, { "interfaceFont", L"Interface font" }, { "systemFont", L"System font" },
+    { "editor", L"Editor" }, { "zoom", L"Zoom" }, { "locale", L"Language" }, { "localeSource", L"Language source" },
+    { "defaultModel", L"Default model" }, { "coworkRecents", L"Cowork's recent folders" },
+    { "pills", L"Sessions' model and effort" }, { "unread", L"Unread marks" }, { "railSections", L"Session side bar" },
+    { "paneLayout", L"Side pane layout" }, { "paneSizes", L"Side pane sizes" }, { "transcriptMode", L"Transcript view" },
+    { "transcriptModeDefault", L"Transcript view by default" }, { "filesTree", L"Files tree" }, { "diffTree", L"Diff tree" },
+    { "appLocale", L"App language" }, { "controlsZoom", L"Controls' zoom" }, { "pageZoom", L"Page zoom" },
+    { "spelling", L"Spelling languages" },
+};
+
+static const WCHAR *PartLabel(const char *part)
+{
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kPartLabels); i++)
+        if (strcmp(kPartLabels[i].part, part) == 0) return kPartLabels[i].label;
+    return NULL;
+}
+
 BOOL SessionSync_LayoutPart(int index, LayoutPart *part)
 {
     ZeroMemory(part, sizeof *part);
@@ -942,22 +974,18 @@ BOOL SessionSync_LayoutPart(int index, LayoutPart *part)
     if (index < (int)ARRAYSIZE(kSettingParts)) {
         part->name = kSettingParts[index].part;
         part->item = kSettingParts[index].item;
-        return TRUE;
-    }
-    index -= (int)ARRAYSIZE(kSettingParts);
-    if (index < (int)ARRAYSIZE(kWebParts)) {
+    } else if ((index -= (int)ARRAYSIZE(kSettingParts)) < (int)ARRAYSIZE(kWebParts)) {
         part->name = kWebParts[index].part;
         part->item = kWebParts[index].item;
         part->byKey = kWebParts[index].byKey;
-        return TRUE;
-    }
-    index -= (int)ARRAYSIZE(kWebParts);
-    if (index < (int)ARRAYSIZE(kFileParts)) {
+    } else if ((index -= (int)ARRAYSIZE(kWebParts)) < (int)ARRAYSIZE(kFileParts)) {
         part->name = kFileParts[index].part;
         part->item = kFileParts[index].item;
-        return TRUE;
+    } else {
+        return FALSE;
     }
-    return FALSE;
+    part->label = PartLabel(part->name);
+    return TRUE;
 }
 
 /* The account and organization an entries folder is for (its last two

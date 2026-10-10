@@ -3488,6 +3488,7 @@ static INT_PTR FixtureUninstallDialog(HWND owner, int id, DLGPROC procedure, LPA
 #define Gui_Run TestedGui_Run
 #define Gui_ShowSessions TestedGui_ShowSessions
 #define Gui_LayoutProfileColumns TestedGui_LayoutProfileColumns
+#define Gui_OrderProfileColumns TestedGui_OrderProfileColumns
 #define Gui_MainWindowGeometry TestedGui_MainWindowGeometry
 #include "../src/gui.c"
 #undef Update_Run
@@ -3541,6 +3542,7 @@ static INT_PTR FixtureUninstallDialog(HWND owner, int id, DLGPROC procedure, LPA
 #undef Gui_Run
 #undef Gui_ShowSessions
 #undef Gui_LayoutProfileColumns
+#undef Gui_OrderProfileColumns
 #undef Gui_MainWindowGeometry
 
 static void ResetManagerRecords(void)
@@ -3851,6 +3853,7 @@ static INT_PTR FixtureRouteDialog(HWND owner, int id, DLGPROC proc, LPARAM param
 #define Util_Log FixtureRouteLog
 #define Ui_Dialog FixtureRouteDialog
 #define Router_Run TestedRouter_Run
+#define Router_ChooseNotification TestedRouter_ChooseNotification
 #define Launcher_Run TestedLauncher_Run
 #define Launcher_Open TestedLauncher_Open
 #define Launcher_OpenSynced TestedLauncher_OpenSynced
@@ -3874,6 +3877,7 @@ static INT_PTR FixtureRouteDialog(HWND owner, int id, DLGPROC proc, LPARAM param
 #undef Util_Log
 #undef Ui_Dialog
 #undef Router_Run
+#undef Router_ChooseNotification
 #undef Launcher_Run
 #undef Launcher_OpenSynced
 #undef Launcher_Open
@@ -4203,6 +4207,8 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #define Util_InstallExe TestedUtil_InstallExe
 #define Util_SetStateDir TestedUtil_SetStateDir
 #define Util_StateDir TestedUtil_StateDir
+#define Util_GetSetting TestedUtil_GetSetting
+#define Util_SetSetting TestedUtil_SetSetting
 #define Util_FileExists TestedUtil_FileExists
 #define Util_DirExists TestedUtil_DirExists
 #define Util_QueryPath TestedUtil_QueryPath
@@ -4256,6 +4262,8 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #undef Util_InstallExe
 #undef Util_SetStateDir
 #undef Util_StateDir
+#undef Util_GetSetting
+#undef Util_SetSetting
 #undef Util_FileExists
 #undef Util_DirExists
 #undef Util_QueryPath

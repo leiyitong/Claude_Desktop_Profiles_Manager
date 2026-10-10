@@ -8,7 +8,8 @@
  * that opened the browser; any other window logs "Google sign-in code does not
  * answer a sign-in this app started; ignoring". So for a sign-in link the
  * window whose main.log most recently says "[Auth] Using system browser for:"
- * is selected; for any other link, the Claude window used last.
+ * is selected; for any other link, the Claude window used last. The same
+ * dialog asks which profile a notification belongs to (notifyguard.c).
  */
 #include "app.h"
 #include "resource.h"
@@ -48,6 +49,7 @@ typedef struct LinkChoice {
     const ProfileList   *list;
     const WCHAR         *shown;     /* the link without its query or fragment */
     BOOL                 signIn;
+    BOOL                 notification;   /* the profile a notification belongs to, no link */
     int                  starter;   /* the profile whose window started the sign-in; -1: not known */
     int                  chosen;    /* selected at first, then the last row selected; once closed with OK, the profile chosen */
     HWND                 rows;      /* one per profile, in the list's order (in the view it scrolls in, which has its id) */
@@ -93,7 +95,10 @@ static INT_PTR CALLBACK LinkProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         WCHAR text[256 + LABEL_CCH];
         choice = (LinkChoice *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
-        if (!choice->signIn)
+        if (choice->notification) {
+            SetWindowTextW(dialog, TR(L"Open a Claude notification"));
+            StringCchCopyW(text, ARRAYSIZE(text), TR(L"Which profile is this notification from?"));
+        } else if (!choice->signIn)
             StringCchCopyW(text, ARRAYSIZE(text), TR(L"Which profile opens this link?"));
         else if (choice->starter >= 0)
             StringCchPrintfW(text, ARRAYSIZE(text), TR(L"This sign-in was started in \x201C%s\x201D: it finishes only there."),
@@ -172,6 +177,23 @@ static int ChooseProfile(const ClaudePackage *pkg, const ProfileList *list, int 
     choice.signIn = signIn;
     choice.starter = starter;
     choice.chosen = suggested;
+    result = Ui_Dialog(NULL, IDD_LINK, LinkProc, (LPARAM)&choice);
+    if (result == -1) return suggested;
+    return result == IDOK ? choice.chosen : -1;
+}
+
+int Router_ChooseNotification(const ClaudePackage *pkg, const ProfileList *list, int suggested)
+{
+    LinkChoice choice;
+    INT_PTR result;
+    ZeroMemory(&choice, sizeof choice);
+    choice.pkg = pkg;
+    choice.list = list;
+    choice.shown = L"";
+    choice.notification = TRUE;
+    choice.starter = -1;
+    choice.chosen = suggested;
+    Theme_Init();   /* the watcher that asks shows no window of its own otherwise */
     result = Ui_Dialog(NULL, IDD_LINK, LinkProc, (LPARAM)&choice);
     if (result == -1) return suggested;
     return result == IDOK ? choice.chosen : -1;

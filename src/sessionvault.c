@@ -10,7 +10,8 @@
  * vault\objects\<hash>.json; vault\deleted.txt names the sessions deleted,
  * which nothing here brings back unless the user undeletes them
  * (SessionVault_Undelete). A version is written only when the list changed;
- * the versions of the last VAULT_KEEP_DAYS days stay, and at least the
+ * the versions of the last days the settings say (SETTING_VAULT_DAYS, 0:
+ * every version) stay, and at least the
  * VAULT_KEEP_LEAST latest, and an entry no version names any more goes
  * (Prune), so the vault does not grow without end.
  *
@@ -59,13 +60,12 @@
 #define LAYOUT_KEY            L"layout"
 #define TRANSCRIPT_MAX_BYTES  (512u * 1024u * 1024u)   /* larger, a conversation is not forked: it stays one session */
 #define GUID_TEXT_CCH         39
-#define VAULT_KEEP_DAYS       30   /* a list's versions younger than that stay */
-#define VAULT_KEEP_LEAST      20   /* ... and at least its latest ones, however old */
-#define OBJECT_GRACE_MS       (24ULL * 3600ULL * 1000ULL)   /* an entry no version names yet may be one a keep is writing */
 #define CONFLICTS_DIR         L"conflicts"   /* per list: the layout's parts changed in two members each their own way */
 #define DECISIONS_DIR         L"decisions"   /* per list: whose each of those parts the person chose */
 #define LAYOUT_PARTS_MAX      96
 #define SEEN_MARK             L"-"           /* a member's seen line saying it has a record, whatever it holds */
+#define VAULT_KEEP_LEAST      20   /* ... and at least its latest ones, however old */
+#define OBJECT_GRACE_MS       (24ULL * 3600ULL * 1000ULL)   /* an entry no version names yet may be one a keep is writing */
 
 typedef struct VaultItem {          /* a session a version lists */
     WCHAR     key[SESSION_ID_CCH];
@@ -739,7 +739,7 @@ static BOOL NamedObjects(Hashes *named)
     return ok;
 }
 
-/* The list's versions older than VAULT_KEEP_DAYS days beyond its
+/* The list's versions older than the days the settings keep beyond its
  * VAULT_KEEP_LEAST latest removed, then the entries no version names any
  * more, unless written in the last day. */
 static void Prune(const WCHAR *listName)
@@ -752,8 +752,10 @@ static void Prune(const WCHAR *listName)
     Hashes named;
     HANDLE find;
     int count, i, removed = 0, objects = 0;
+    DWORD days = Util_GetSetting(SETTING_VAULT_DAYS, SETTING_VAULT_DAYS_DEFAULT);
+    if (!days || days > 36500) return;   /* every version kept */
     GetSystemTimeAsFileTime(&now);
-    ticks = (((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - (ULONGLONG)VAULT_KEEP_DAYS * 24 * 3600 * TICKS_PER_SECOND;
+    ticks = (((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - (ULONGLONG)days * 24 * 3600 * TICKS_PER_SECOND;
     now.dwLowDateTime = (DWORD)ticks;
     now.dwHighDateTime = (DWORD)(ticks >> 32);
     if (!FileTimeToSystemTime(&now, &limit)) return;
@@ -1187,20 +1189,65 @@ done:
  * an earlier transcript is no session of its own: it is neither deleted
  * (that would take the entry, which now holds the new one, from the other
  * profiles) nor given back; the new transcript's session brings the entry
- * to the others. A deletion the ledger holds for it is dropped. */
-static BOOL GoesOnAsAnother(const SessionSet *set, const WCHAR *key, DatedSet *ledger)
+ * to the others. The earlier ids every entry names are sorted once
+ * (EarlierIds), so that each session is looked up, not compared with every
+ * entry. */
+typedef struct EarlierId {
+    const WCHAR *id;
+    int          row;                   /* the row whose entry names it */
+} EarlierId;
+
+typedef struct EarlierIds {
+    EarlierId *items;
+    int        count;
+} EarlierIds;
+
+static int CompareIdsI(const WCHAR *a, const WCHAR *b)
 {
-    int r, m, e, i;
-    for (r = 0; r < set->rowCount; r++) {
-        if (Core_EqualsI(set->rows[r].key, key)) continue;
+    return CompareStringOrdinal(a, -1, b, -1, TRUE) - CSTR_EQUAL;
+}
+
+static int CompareEarlier(const void *a, const void *b)
+{
+    return CompareIdsI(((const EarlierId *)a)->id, ((const EarlierId *)b)->id);
+}
+
+/* The earlier transcripts the entries of `set` name, sorted; FALSE without memory. */
+static BOOL LoadEarlierIds(const SessionSet *set, EarlierIds *out)
+{
+    int r, m, e, i, count = 0;
+    ZeroMemory(out, sizeof *out);
+    for (r = 0; r < set->rowCount; r++)
+        for (m = 0; m < set->profiles.count; m++)
+            for (e = set->rows[r].entry[m]; e >= 0; e = set->entries[e].duplicate) count += set->entries[e].otherTranscriptCount;
+    if (!count) return TRUE;
+    if ((out->items = (EarlierId *)HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof *out->items)) == NULL) return FALSE;
+    for (r = 0; r < set->rowCount; r++)
         for (m = 0; m < set->profiles.count; m++)
             for (e = set->rows[r].entry[m]; e >= 0; e = set->entries[e].duplicate)
-                for (i = 0; i < set->entries[e].otherTranscriptCount; i++)
-                    if (Core_EqualsI(set->otherTranscriptIds[set->entries[e].firstOtherTranscript + i], key)) {
-                        RemoveDated(ledger, key);
-                        return TRUE;
-                    }
+                for (i = 0; i < set->entries[e].otherTranscriptCount && out->count < count; i++) {
+                    out->items[out->count].id = set->otherTranscriptIds[set->entries[e].firstOtherTranscript + i];
+                    out->items[out->count++].row = r;
+                }
+    qsort(out->items, (size_t)out->count, sizeof *out->items, CompareEarlier);
+    return TRUE;
+}
+
+/* Whether `key` is an earlier transcript of another session's entry; then
+ * a deletion the ledger holds for it is dropped. */
+static BOOL GoesOnAsAnother(const SessionSet *set, const EarlierIds *earlier, const WCHAR *key, DatedSet *ledger)
+{
+    int low = 0, high = earlier->count, i;
+    while (low < high) {                 /* the first one not below `key` */
+        int middle = low + (high - low) / 2;
+        if (CompareIdsI(earlier->items[middle].id, key) < 0) low = middle + 1;
+        else high = middle;
     }
+    for (i = low; i < earlier->count && CompareIdsI(earlier->items[i].id, key) == 0; i++)
+        if (!Core_EqualsI(set->rows[earlier->items[i].row].key, key)) {
+            RemoveDated(ledger, key);
+            return TRUE;
+        }
     return FALSE;
 }
 
@@ -1679,18 +1726,49 @@ DWORD SessionVault_GroupItems(const ProfileList *list, DWORD members)
 
 /* ------------------------------------------------------------- conflicts */
 
-/* The layout's parts two members changed each their own way, and whose
- * the person chose for each: one line per part, the part's name first. */
+/* The elements of the layout's parts several members changed each their own
+ * way (Core_JsonMerge), and whose version the person chose for each. A file
+ * per group: CHOICES_FORMAT, then a line per element: the part, the
+ * element's path, which of the members that follow changed it last, the
+ * element as shown, then each member's folder and its version as shown; a
+ * decision names one member, the one chosen. A file of an earlier format
+ * holds nothing: the next sync finds its conflicts again. */
+#define CHOICES_FORMAT L"elements 1"
+#define SHOWN_CCH      160   /* an element, or a version of it, as shown */
+
 typedef struct PartChoice {
-    char  part[64];
-    WCHAR folders[MAX_PROFILES][FOLDER_CCH];   /* conflicts: the members that changed it; decisions: the one chosen */
-    int   count;
+    char   part[64];
+    char   path[CORE_MERGE_PATH_CCH];
+    WCHAR  folders[MAX_PROFILES][FOLDER_CCH];   /* conflicts: the members that changed it; decisions: the one chosen */
+    WCHAR *shown[MAX_PROFILES];                 /* conflicts: each one's version as shown (heap) */
+    WCHAR *label;                               /* conflicts: the element as shown (heap) */
+    int    latest;                              /* conflicts: which of `folders` changed it last */
+    int    count;
 } PartChoice;
 
 typedef struct PartChoices {
     PartChoice *items;
     int         count, capacity;
 } PartChoices;
+
+static WCHAR *CopyText(const WCHAR *text)
+{
+    size_t length = wcslen(text) + 1;
+    WCHAR *copy = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, length * sizeof(WCHAR));
+    if (copy) memcpy(copy, text, length * sizeof(WCHAR));
+    return copy;
+}
+
+static void FreeChoices(PartChoices *choices)
+{
+    int c, i;
+    for (c = 0; c < choices->count; c++) {
+        Free(choices->items[c].label);
+        for (i = 0; i < choices->items[c].count; i++) Free(choices->items[c].shown[i]);
+    }
+    Free(choices->items);
+    ZeroMemory(choices, sizeof *choices);
+}
 
 static BOOL ChoicesPath(const WCHAR *dir, const WCHAR *listName, WCHAR *out, size_t cch)
 {
@@ -1701,23 +1779,36 @@ static BOOL ChoicesPath(const WCHAR *dir, const WCHAR *listName, WCHAR *out, siz
 
 static void LoadChoices(const WCHAR *dir, const WCHAR *listName, PartChoices *choices)
 {
-    WCHAR path[MAX_PATH], *text, *rest, *line, *fields[MAX_PROFILES + 1];
+    WCHAR path[MAX_PATH], *text, *rest, *line, *fields[4 + 2 * MAX_PROFILES];
+    BOOL current = FALSE;
     int n, i;
     ZeroMemory(choices, sizeof *choices);
     if (!ChoicesPath(dir, listName, path, ARRAYSIZE(path)) || (text = ReadText(path)) == NULL) return;
     rest = text;
     while ((line = NextLine(&rest)) != NULL) {
         PartChoice *grown, *choice;
-        if ((n = Fields(line, fields, ARRAYSIZE(fields))) < 2 ||
+        if (!current) {
+            if ((current = wcscmp(line, CHOICES_FORMAT) == 0) == FALSE) break;
+            continue;
+        }
+        if ((n = Fields(line, fields, ARRAYSIZE(fields))) < 6 ||
             (grown = (PartChoice *)Grow(choices->items, &choices->capacity, choices->count + 1, sizeof *grown)) == NULL)
             continue;
         choices->items = grown;
         choice = &choices->items[choices->count];
         ZeroMemory(choice, sizeof *choice);
-        if (WideCharToMultiByte(CP_UTF8, 0, fields[0], -1, choice->part, sizeof choice->part, NULL, NULL) <= 0) continue;
-        for (i = 1; i < n && choice->count < MAX_PROFILES; i++)
-            if (fields[i][0]) StringCchCopyW(choice->folders[choice->count++], FOLDER_CCH, fields[i]);
-        choices->count++;
+        if (WideCharToMultiByte(CP_UTF8, 0, fields[0], -1, choice->part, sizeof choice->part, NULL, NULL) <= 0 ||
+            WideCharToMultiByte(CP_UTF8, 0, fields[1], -1, choice->path, sizeof choice->path, NULL, NULL) <= 0)
+            continue;
+        choice->latest = _wtoi(fields[2]);
+        choice->label = CopyText(fields[3]);
+        for (i = 4; i + 1 < n && choice->count < MAX_PROFILES; i += 2) {
+            if (!fields[i][0]) continue;
+            StringCchCopyW(choice->folders[choice->count], FOLDER_CCH, fields[i]);
+            choice->shown[choice->count++] = CopyText(fields[i + 1]);
+        }
+        if (choice->count) choices->count++;
+        else Free(choice->label);
     }
     Free(text);
 }
@@ -1725,21 +1816,34 @@ static void LoadChoices(const WCHAR *dir, const WCHAR *listName, PartChoices *ch
 /* `choices` written for `listName`, or its file deleted when it holds none. */
 static BOOL SaveChoices(const WCHAR *dir, const WCHAR *listName, const PartChoices *choices)
 {
-    WCHAR path[MAX_PATH], folder[MAX_PATH], line[LINE_CCH], *text, *slash;
-    size_t cch = (size_t)(choices->count + 1) * (MAX_PROFILES + 1) * (FOLDER_CCH + 2);
+    WCHAR path[MAX_PATH], folder[MAX_PATH], wide[CORE_MERGE_PATH_CCH + 64], *text, *slash;
+    size_t cch = 64;
     int c, i;
     BOOL ok;
     if (!ChoicesPath(dir, listName, path, ARRAYSIZE(path))) return FALSE;
     if (!choices->count) return DeleteFileW(path) || GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+    for (c = 0; c < choices->count; c++) {
+        cch += 64 + CORE_MERGE_PATH_CCH + 16 + (choices->items[c].label ? wcslen(choices->items[c].label) : 0);
+        for (i = 0; i < choices->items[c].count; i++) cch += FOLDER_CCH + 2 + (choices->items[c].shown[i] ? wcslen(choices->items[c].shown[i]) : 0);
+    }
     StringCchCopyW(folder, ARRAYSIZE(folder), path);
     if ((slash = wcsrchr(folder, L'\\')) != NULL) *slash = 0;
     if (!Util_EnsureDir(folder) || (text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cch * sizeof(WCHAR))) == NULL) return FALSE;
+    StringCchCopyW(text, cch, CHOICES_FORMAT L"\n");
     for (c = 0; c < choices->count; c++) {
-        StringCchPrintfW(line, ARRAYSIZE(line), L"%S", choices->items[c].part);
-        StringCchCatW(text, cch, line);
-        for (i = 0; i < choices->items[c].count; i++) {
+        const PartChoice *choice = &choices->items[c];
+        if (MultiByteToWideChar(CP_UTF8, 0, choice->part, -1, wide, ARRAYSIZE(wide)) <= 0) continue;
+        StringCchCatW(text, cch, wide);
+        StringCchCatW(text, cch, L"\t");
+        if (MultiByteToWideChar(CP_UTF8, 0, choice->path, -1, wide, ARRAYSIZE(wide)) > 0) StringCchCatW(text, cch, wide);
+        StringCchPrintfW(wide, ARRAYSIZE(wide), L"\t%d\t", choice->latest);
+        StringCchCatW(text, cch, wide);
+        if (choice->label) StringCchCatW(text, cch, choice->label);
+        for (i = 0; i < choice->count; i++) {
             StringCchCatW(text, cch, L"\t");
-            StringCchCatW(text, cch, choices->items[c].folders[i]);
+            StringCchCatW(text, cch, choice->folders[i]);
+            StringCchCatW(text, cch, L"\t");
+            if (choice->shown[i]) StringCchCatW(text, cch, choice->shown[i]);
         }
         StringCchCatW(text, cch, L"\n");
     }
@@ -1748,12 +1852,234 @@ static BOOL SaveChoices(const WCHAR *dir, const WCHAR *listName, const PartChoic
     return ok;
 }
 
-static const PartChoice *FindChoice(const PartChoices *choices, const char *part)
+static const PartChoice *FindChoice(const PartChoices *choices, const char *part, const char *path)
 {
     int c;
     for (c = 0; c < choices->count; c++)
-        if (strcmp(choices->items[c].part, part) == 0) return &choices->items[c];
+        if (strcmp(choices->items[c].part, part) == 0 && strcmp(choices->items[c].path, path) == 0) return &choices->items[c];
     return NULL;
+}
+
+/* ----------------------------------------------------- elements as shown */
+
+/* Text the files of choices keep on one line: tabs and line ends become spaces. */
+static void OneLine(WCHAR *text)
+{
+    for (; *text; text++)
+        if (*text == L'\t' || *text == L'\n' || *text == L'\r') *text = L' ';
+}
+
+/* A version as shown: a string's text, On or Off, None, a number, else its JSON cut short. */
+static void ShowValue(const char *raw, size_t length, WCHAR *out, size_t cch)
+{
+    size_t start = 0;
+    while (start < length && (raw[start] == ' ' || raw[start] == '\n' || raw[start] == '\r' || raw[start] == '\t')) start++;
+    raw += start;
+    length -= start;
+    out[0] = 0;
+    if (length && raw[0] == '"' && Core_JsonString(raw, length, out, cch)) {
+    } else if (length == 4 && memcmp(raw, "true", 4) == 0) {
+        StringCchCopyW(out, cch, TR(L"On"));
+    } else if (length == 5 && memcmp(raw, "false", 5) == 0) {
+        StringCchCopyW(out, cch, TR(L"Off"));
+    } else if (length == 4 && memcmp(raw, "null", 4) == 0) {
+        StringCchCopyW(out, cch, TR(L"None"));
+    } else {
+        int written = MultiByteToWideChar(CP_UTF8, 0, raw, (int)min(length, (size_t)(cch - 2)), out, (int)cch - 2);
+        out[written > 0 ? written : 0] = 0;
+        if (length > cch - 2) StringCchCatW(out, cch, L"\x2026");
+    }
+    OneLine(out);
+}
+
+/* One step of an element's path, from `*at` (just after a "/"): its key
+ * with "~1" and "~0" read back, and whether it is a list item's ("#"). */
+static BOOL PathStep(const char **at, char *out, size_t cap, BOOL *item)
+{
+    const char *p = *at;
+    size_t n = 0;
+    if (!*p) return FALSE;
+    *item = *p == '#';
+    if (*item) p++;
+    while (*p && *p != '/' && n + 1 < cap) {
+        if (*p == '~' && (p[1] == '0' || p[1] == '1')) {
+            out[n++] = p[1] == '0' ? '~' : '/';
+            p += 2;
+        } else {
+            out[n++] = *p++;
+        }
+    }
+    out[n] = 0;
+    if (*p == '/') p++;
+    *at = p;
+    return TRUE;
+}
+
+/* The title a session shows (`ref`: "cli:<id>", maybe after "code:"). */
+static BOOL SessionTitleOf(const SessionSet *set, const char *ref, WCHAR *out, size_t cch)
+{
+    WCHAR key[SESSION_ID_CCH];
+    int row, m;
+    if (strncmp(ref, "code:", 5) == 0) ref += 5;
+    if (strncmp(ref, "cli:", 4) == 0) ref += 4;
+    if (MultiByteToWideChar(CP_UTF8, 0, ref, -1, key, ARRAYSIZE(key)) <= 0 || (row = SessionStore_FindRow(set, key)) < 0) return FALSE;
+    for (m = 0; m < set->profiles.count; m++) {
+        int entry = set->rows[row].entry[m];
+        if (entry >= 0 && set->entries[entry].title[0]) return SUCCEEDED(StringCchCopyW(out, cch, set->entries[entry].title));
+    }
+    return FALSE;
+}
+
+/* The name of group `id` in member `m`'s groups. */
+static BOOL GroupNameOf(const char *content, size_t length, const char *id, WCHAR *out, size_t cch)
+{
+    const char *groups, *list, *item, *value;
+    size_t groupsLength, listLength, itemLength, valueLength, i;
+    char quoted[160];
+    if (!content || !Core_JsonMember(content, length, "groups", &groups, &groupsLength) ||
+        !Core_JsonMember(groups, groupsLength, "groups", &list, &listLength) || FAILED(StringCchPrintfA(quoted, sizeof quoted, "\"%s\"", id)))
+        return FALSE;
+    for (i = 1; i < listLength; i++) {
+        /* Each {"id":...,"name":...} of the list. */
+        if (list[i] != '{') continue;
+        item = list + i;
+        itemLength = listLength - i;
+        if (Core_JsonMember(item, itemLength, "id", &value, &valueLength) && valueLength == strlen(quoted) &&
+            memcmp(value, quoted, valueLength) == 0 && Core_JsonMember(item, itemLength, "name", &value, &valueLength))
+            return Core_JsonString(value, valueLength, out, cch);
+    }
+    return FALSE;
+}
+
+typedef struct ElementContext {
+    const SessionSet  *set;
+    const LayoutPart  *part;
+    const PartChoices *decisions;
+    PartChoices       *conflicts;
+    char *const       *contents;
+    const size_t      *lengths;
+    const char        *base;   /* the layout of the last sync */
+    size_t             baseLength;
+} ElementContext;
+
+/* Element `path` of the part, and each member's version of it, as the person sees them. */
+static void ShowElement(const ElementContext *context, const char *path, int m, const char *value, size_t length, WCHAR *label, size_t labelCch,
+                        WCHAR *shown, size_t shownCch)
+{
+    char first[CORE_MERGE_PATH_CCH], second[CORE_MERGE_PATH_CCH], third[CORE_MERGE_PATH_CCH];
+    const char *at = *path == '/' ? path + 1 : path;
+    WCHAR name[SHOWN_CCH];
+    BOOL item1 = FALSE, item2 = FALSE, item3 = FALSE, has1, has2, has3;
+    const WCHAR *partLabel = context->part->label ? TR(context->part->label) : L"";
+    if (!partLabel[0] && MultiByteToWideChar(CP_UTF8, 0, context->part->name, -1, name, ARRAYSIZE(name)) > 0) partLabel = name;
+    has1 = PathStep(&at, first, sizeof first, &item1);
+    has2 = has1 && PathStep(&at, second, sizeof second, &item2);
+    has3 = has2 && PathStep(&at, third, sizeof third, &item3);
+    (void)item3;
+    if (value) ShowValue(value, length, shown, shownCch);
+    else StringCchCopyW(shown, shownCch, TR(L"Deleted"));
+    StringCchCopyW(label, labelCch, partLabel);
+    if (strcmp(context->part->name, "groups") == 0 && has2) {
+        WCHAR group[SHOWN_CCH], title[SHOWN_CCH];
+        if (strcmp(first, "groups") == 0 && item2) {
+            /* Named as it was at the last sync, which every version changed from. */
+            if (!GroupNameOf(context->base, context->baseLength, second, group, ARRAYSIZE(group)) &&
+                !GroupNameOf(context->contents[m], context->lengths[m], second, group, ARRAYSIZE(group))) {
+                int other;
+                group[0] = 0;
+                for (other = 0; !group[0] && other < context->set->profiles.count; other++)
+                    GroupNameOf(context->contents[other], context->lengths[other], second, group, ARRAYSIZE(group));
+                if (!group[0]) MultiByteToWideChar(CP_UTF8, 0, second, -1, group, ARRAYSIZE(group));
+            }
+            StringCchPrintfW(label, labelCch, has3 && strcmp(third, "name") == 0 ? TR(L"Name of group \x201C%s\x201D") : TR(L"Group \x201C%s\x201D"), group);
+            if (value && !has3) StringCchCopyW(shown, shownCch, group);
+        } else if (strcmp(first, "assignments") == 0) {
+            if (!SessionTitleOf(context->set, second, title, ARRAYSIZE(title))) StringCchCopyW(title, ARRAYSIZE(title), TR(L"a session"));
+            StringCchPrintfW(label, labelCch, TR(L"Group of \x201C%s\x201D"), title);
+            if (!value) {
+                StringCchCopyW(shown, shownCch, TR(L"No group"));
+            } else {
+                char id[160];
+                WCHAR raw[160];
+                if (Core_JsonString(value, length, raw, ARRAYSIZE(raw)) && WideCharToMultiByte(CP_UTF8, 0, raw, -1, id, sizeof id, NULL, NULL) > 0 &&
+                    GroupNameOf(context->contents[m], context->lengths[m], id, group, ARRAYSIZE(group)))
+                    StringCchCopyW(shown, shownCch, group);
+            }
+        }
+    } else if (strcmp(context->part->name, "pills") == 0 && has1 && item1) {
+        WCHAR title[SHOWN_CCH];
+        if (!SessionTitleOf(context->set, first, title, ARRAYSIZE(title))) StringCchCopyW(title, ARRAYSIZE(title), TR(L"a session"));
+        StringCchPrintfW(label, labelCch, TR(L"Model and effort of \x201C%s\x201D"), title);
+        if (value) {
+            /* ["cli:<id>","<model>","<effort>"]: the model and the effort. */
+            const char *p = value;
+            WCHAR model[64] = L"", effort[32] = L"";
+            int k = 0;
+            while ((p = strchr(p, '"')) != NULL && k < 6) {
+                const char *end = strchr(p + 1, '"');
+                if (!end) break;
+                if (k == 2) MultiByteToWideChar(CP_UTF8, 0, p + 1, (int)(end - p - 1), model, ARRAYSIZE(model) - 1);
+                if (k == 4) MultiByteToWideChar(CP_UTF8, 0, p + 1, (int)(end - p - 1), effort, ARRAYSIZE(effort) - 1);
+                p = end + 1;
+                k += 2;
+            }
+            StringCchPrintfW(shown, shownCch, effort[0] ? L"%s \x00B7 %s" : L"%s", model, effort);
+        }
+    } else if (has1) {
+        /* Any other element: the part and its path. */
+        WCHAR step[SHOWN_CCH];
+        if (MultiByteToWideChar(CP_UTF8, 0, path, -1, step, ARRAYSIZE(step)) > 0)
+            StringCchPrintfW(label, labelCch, L"%s \x00B7 %s", partLabel, step + (step[0] == L'/'));
+    }
+    OneLine(label);
+    OneLine(shown);
+}
+
+/* The person's choice for element `path` of the part: the member whose version it takes. */
+static int DecideElement(void *context, const char *path, DWORD members)
+{
+    const ElementContext *element = (const ElementContext *)context;
+    const PartChoice *decision = FindChoice(element->decisions, element->part->name, path);
+    int m;
+    (void)members;
+    if (!decision || !decision->count) return -1;
+    for (m = 0; m < element->set->profiles.count; m++)
+        if (Core_EqualsI(element->set->profiles.items[m].folder, decision->folders[0])) {
+            Util_Log(L"session vault: %S %S settled by the person: the one of %s", element->part->name, path, decision->folders[0]);
+            return m;
+        }
+    return -1;
+}
+
+/* Element `path` changed by `members` each their own way: left to the person. */
+static void ReportElement(void *context, const char *path, DWORD members, int latest, const char *const *values, const size_t *lengths)
+{
+    const ElementContext *element = (const ElementContext *)context;
+    PartChoice *grown = (PartChoice *)Grow(element->conflicts->items, &element->conflicts->capacity, element->conflicts->count + 1, sizeof *grown);
+    PartChoice *conflict;
+    WCHAR label[SHOWN_CCH], shown[SHOWN_CCH];
+    int m;
+    if (!grown) return;
+    element->conflicts->items = grown;
+    conflict = &grown[element->conflicts->count++];
+    ZeroMemory(conflict, sizeof *conflict);
+    StringCchCopyA(conflict->part, sizeof conflict->part, element->part->name);
+    StringCchCopyA(conflict->path, sizeof conflict->path, path);
+    label[0] = 0;
+    for (m = 0; m < element->set->profiles.count && conflict->count < MAX_PROFILES; m++) {
+        if (!(members & (1u << m))) continue;
+        ShowElement(element, path, m, values[m], values[m] ? lengths[m] : 0, label, ARRAYSIZE(label), shown, ARRAYSIZE(shown));
+        if (m == latest) conflict->latest = conflict->count;
+        StringCchCopyW(conflict->folders[conflict->count], FOLDER_CCH, element->set->profiles.items[m].folder);
+        conflict->shown[conflict->count++] = CopyText(shown);
+    }
+    conflict->label = CopyText(label);
+}
+
+/* How deep a part merges: its layout of panes is one whole, the rest element by element. */
+static int PartDepth(const char *part)
+{
+    return strcmp(part, "paneLayout") == 0 || strcmp(part, "paneSizes") == 0 ? 0 : 8;
 }
 
 /* The manager's window told that the person has conflicts to settle. */
@@ -1798,6 +2124,7 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
 {
     char *contents[MAX_PROFILES], *baseContent = NULL, *content, *kept = NULL, *layout;
     size_t lengths[MAX_PROFILES], used = 2, keptUsed = 2;
+    ElementContext element;
     ULONGLONG written[MAX_PROFILES], hashes[LAYOUT_PARTS_MAX], hash;
     LayoutPart part;
     DWORD baseLength = 0;
@@ -1820,11 +2147,11 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
         goto done;
     }
     for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part) && content && kept; p++) {
-        const char *value = NULL, *baseValue = NULL, *shown[MAX_PROFILES];
-        size_t valueLength = 0, baseValueLength = 0, shownLength[MAX_PROFILES];
-        ULONGLONG baseHash, current[MAX_PROFILES], first = 0;
-        int winner = -1, distinct = 0;
-        DWORD changed = 0;
+        const char *baseValue = NULL, *shown[MAX_PROFILES];
+        size_t valueLength = 0, baseValueLength = 0, shownLength[MAX_PROFILES], mergedLength = 0;
+        ULONGLONG baseHash, current[MAX_PROFILES];
+        char *mergedPart;
+        int unresolved = 0;
         if (!(part.item & items)) continue;
         settled[p] = TRUE;
         baseHash = PartOf(baseContent, baseLength, part.name, &baseValue, &baseValueLength);
@@ -1855,59 +2182,42 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
             for (m = 0; m < n; m++) seen[m][p] = current[m];
             continue;
         }
-        /* The members that changed it to something other than the base, and how many ways. */
-        for (m = 0; m < n; m++) {
-            if (!say[m] || current[m] == baseHash) continue;
-            changed |= 1u << m;
-            if (winner < 0) {
-                winner = m;
-                first = current[m];
-                distinct = 1;
-            } else if (current[m] != first && distinct == 1) {
-                distinct = 2;
-            }
+        /* Element by element: what one member changed goes to all, what several
+         * changed each their own way is the person's to settle; until then
+         * the part stays as each member has it, the base its value. */
+        element.set = set;
+        element.part = &part;
+        element.decisions = decisions;
+        element.conflicts = conflicts;
+        element.contents = contents;
+        element.lengths = lengths;
+        element.base = baseContent;
+        element.baseLength = baseLength;
+        for (m = 0; m < n; m++)
+            if (!members[m].taker || !current[m]) shown[m] = NULL;
+        mergedPart = Core_JsonMerge(baseHash ? baseValue : NULL, baseValueLength, shown, shownLength, say, written, n, PartDepth(part.name),
+                                DecideElement, ReportElement, &element, &mergedLength, &unresolved);
+        if (!mergedPart) {
+            ok = FALSE;
+            break;
         }
-        if (distinct > 1) {
-            const PartChoice *decision = FindChoice(decisions, part.name);
-            int chosen = -1;
-            for (m = 0; decision && decision->count && m < n; m++)
-                if (current[m] && Core_EqualsI(set->profiles.items[m].folder, decision->folders[0])) chosen = m;
-            if (chosen < 0) {
-                /* Left to the person: each member keeps its own, the base its value, the record its old reading. */
-                PartChoice *grown = (PartChoice *)Grow(conflicts->items, &conflicts->capacity, conflicts->count + 1, sizeof *grown);
-                if (grown) {
-                    PartChoice *conflict = &grown[conflicts->count++];
-                    conflicts->items = grown;
-                    ZeroMemory(conflict, sizeof *conflict);
-                    StringCchCopyA(conflict->part, sizeof conflict->part, part.name);
-                    for (m = 0; m < n; m++)
-                        if (changed & (1u << m)) StringCchCopyW(conflict->folders[conflict->count++], FOLDER_CCH, set->profiles.items[m].folder);
-                }
-                if (baseValue) kept = WithPart(kept, &keptUsed, part.name, baseValue, baseValueLength);
-                conflicted = TRUE;
-                settled[p] = FALSE;
-                continue;
-            }
-            winner = chosen;
-            Util_Log(L"session vault: %S settled by the person: the one of %s", part.name, set->profiles.items[chosen].folder);
+        if (unresolved) {
+            if (baseValue) kept = WithPart(kept, &keptUsed, part.name, baseValue, baseValueLength);
+            conflicted = TRUE;
+            settled[p] = FALSE;
+            Free(mergedPart);
+            continue;
         }
         for (m = 0; m < n; m++) seen[m][p] = current[m];
-        value = NULL;
-        if (winner >= 0) {
-            value = shown[winner];
-            valueLength = shownLength[winner];
-            hashes[p] = current[winner];
-        } else if (baseHash) {
-            value = baseValue;
-            valueLength = baseValueLength;
-            hashes[p] = baseHash;
+        if (mergedLength) {
+            hashes[p] = Core_HashBytes(CORE_HASH_START, mergedPart, mergedLength);
+            if (!hashes[p]) hashes[p] = 1;
+            content = WithPart(content, &used, part.name, mergedPart, mergedLength);
+            kept = WithPart(kept, &keptUsed, part.name, mergedPart, mergedLength);
         }
-        if (value) {
-            content = WithPart(content, &used, part.name, value, valueLength);
-            kept = WithPart(kept, &keptUsed, part.name, value, valueLength);
-        }
+        Free(mergedPart);
     }
-    if (!content || !kept) {
+    if (!ok || !content || !kept) {
         ok = FALSE;
         goto done;
     }
@@ -1942,7 +2252,7 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
              AddChange(changes, m, SYNC_LAYOUT, 0, LAYOUT_KEY, 0, 0, mapped, mappedLength);
     }
 done:
-    if (conflicted) Util_Log(L"session vault: %d part(s) of the sidebar changed in two profiles each their own way: left to the person", conflicts->count);
+    if (conflicted) Util_Log(L"session vault: %d element(s) of the layout changed in two profiles each their own way: left to the person", conflicts->count);
     Free(content);
     Free(kept);
     Free(baseContent);
@@ -2039,20 +2349,23 @@ static BOOL KeepLocked(const ProfileList *list, DWORD profiles, const WCHAR *lis
 
     if (sessions) {
         int *heal = FindHealed(&set);
+        EarlierIds earlier;
+        if (!LoadEarlierIds(&set, &earlier)) ok = FALSE;
         for (r = 0; r < set.rowCount && ok; r++) {
             const int *rowHeal = heal ? heal + (size_t)r * MAX_PROFILES : NULL;
             /* A row of entries that lost their session's id is no session of its own: the session's row heals them. */
-            if (!(heal && heal[((size_t)set.rowCount + r) * MAX_PROFILES]) && !GoesOnAsAnother(&set, set.rows[r].key, &ledger))
+            if (!(heal && heal[((size_t)set.rowCount + r) * MAX_PROFILES]) && !GoesOnAsAnother(&set, &earlier, set.rows[r].key, &ledger))
                 ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, rowHeal, &changes, &next);
             Step(progress, 1);
         }
         Free(heal);
         for (i = 0; i < base.count && ok; i++)
             if (SessionStore_FindRow(&set, base.items[i].key) < 0) {
-                if (!GoesOnAsAnother(&set, base.items[i].key, &ledger))
+                if (!GoesOnAsAnother(&set, &earlier, base.items[i].key, &ledger))
                     ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, NULL, &changes, &next);
                 Step(progress, 1);
             }
+        Free(earlier.items);
         if (ok) ok = ResolveIndex(&set, member, &base, same, &changes, &next);
     } else {
         /* Sessions not kept the same: the list stays as it was, to go on
@@ -2112,8 +2425,8 @@ static BOOL KeepLocked(const ProfileList *list, DWORD profiles, const WCHAR *lis
         Free(member[m].queued);
     }
     Free(ledger.items);
-    Free(decisions.items);
-    Free(conflicts.items);
+    FreeChoices(&decisions);
+    FreeChoices(&conflicts);
     Free(seen);
     FreeChanges(&changes);
     FreeList(&base);
@@ -2146,53 +2459,65 @@ int SessionVault_Conflicts(const ProfileList *list, int group, VaultConflict *ou
     if (!SessionVault_GroupListName(group, listName, ARRAYSIZE(listName))) return 0;
     LoadChoices(CONFLICTS_DIR, listName, &conflicts);
     for (c = 0; c < conflicts.count && count < capacity; c++) {
+        const PartChoice *choice = &conflicts.items[c];
         VaultConflict *conflict = &out[count];
         ZeroMemory(conflict, sizeof *conflict);
-        StringCchCopyA(conflict->part, sizeof conflict->part, conflicts.items[c].part);
+        conflict->latest = -1;
+        StringCchCopyA(conflict->part, sizeof conflict->part, choice->part);
+        StringCchCopyA(conflict->path, sizeof conflict->path, choice->path);
+        if (choice->label) StringCchCopyW(conflict->label, ARRAYSIZE(conflict->label), choice->label);
         for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++)
             if (strcmp(part.name, conflict->part) == 0) conflict->item = part.item;
-        for (i = 0; i < conflicts.items[c].count; i++)
-            if ((at = Profiles_Find(list, conflicts.items[c].folders[i])) >= 0) conflict->members |= 1u << at;
+        for (i = 0; i < choice->count; i++)
+            if ((at = Profiles_Find(list, choice->folders[i])) >= 0) {
+                conflict->members |= 1u << at;
+                if (choice->shown[i]) StringCchCopyW(conflict->shown[at], ARRAYSIZE(conflict->shown[at]), choice->shown[i]);
+                if (i == choice->latest) conflict->latest = at;
+            }
         if (conflict->item && conflict->members) count++;
     }
-    Free(conflicts.items);
+    FreeChoices(&conflicts);
     return count;
 }
 
-BOOL SessionVault_Decide(const ProfileList *list, int group, DWORD item, int profile)
+BOOL SessionVault_Decide(const ProfileList *list, int group, const VaultConflict *chosen, const int *profiles, int count)
 {
     WCHAR listName[FOLDER_CCH];
     PartChoices conflicts, decisions;
-    LayoutPart part;
     HANDLE lock;
-    int c, p, kept = 0;
+    int c, d, kept = 0, made = 0;
     BOOL ok;
-    if (profile < 0 || profile >= list->count || !SessionVault_GroupListName(group, listName, ARRAYSIZE(listName))) return FALSE;
+    if (!SessionVault_GroupListName(group, listName, ARRAYSIZE(listName))) return FALSE;
     /* Under the sync's lock: a sync reading the choices never misses one made meanwhile. */
     if ((lock = Util_SyncLock()) == NULL) return FALSE;
     LoadChoices(CONFLICTS_DIR, listName, &conflicts);
     LoadChoices(DECISIONS_DIR, listName, &decisions);
     for (c = 0; c < conflicts.count; c++) {
-        DWORD partItem = 0;
-        PartChoice *grown;
-        for (p = 0; p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++)
-            if (strcmp(part.name, conflicts.items[c].part) == 0) partItem = part.item;
-        if (!(partItem & item) ||
-            (grown = (PartChoice *)Grow(decisions.items, &decisions.capacity, decisions.count + 1, sizeof *grown)) == NULL) {
-            conflicts.items[kept++] = conflicts.items[c];
+        PartChoice *conflict = &conflicts.items[c], *grown;
+        for (d = 0; d < count; d++)
+            if (profiles[d] >= 0 && profiles[d] < list->count && strcmp(chosen[d].part, conflict->part) == 0 && strcmp(chosen[d].path, conflict->path) == 0)
+                break;
+        if (d == count || (grown = (PartChoice *)Grow(decisions.items, &decisions.capacity, decisions.count + 1, sizeof *grown)) == NULL) {
+            conflicts.items[kept++] = *conflict;
             continue;
         }
         decisions.items = grown;
         ZeroMemory(&decisions.items[decisions.count], sizeof decisions.items[0]);
-        StringCchCopyA(decisions.items[decisions.count].part, sizeof decisions.items[0].part, conflicts.items[c].part);
-        StringCchCopyW(decisions.items[decisions.count].folders[0], FOLDER_CCH, list->items[profile].folder);
+        StringCchCopyA(decisions.items[decisions.count].part, sizeof decisions.items[0].part, conflict->part);
+        StringCchCopyA(decisions.items[decisions.count].path, sizeof decisions.items[0].path, conflict->path);
+        StringCchCopyW(decisions.items[decisions.count].folders[0], FOLDER_CCH, list->items[profiles[d]].folder);
+        decisions.items[decisions.count].shown[0] = CopyText(L"");
         decisions.items[decisions.count++].count = 1;
+        /* Settled: what it showed goes with it. */
+        Free(conflict->label);
+        for (d = 0; d < conflict->count; d++) Free(conflict->shown[d]);
+        made++;
     }
     conflicts.count = kept;
     ok = SaveChoices(DECISIONS_DIR, listName, &decisions) && SaveChoices(CONFLICTS_DIR, listName, &conflicts);
-    if (ok) Util_Log(L"session vault: %s: the person chose the version of %s", listName, list->items[profile].folder);
-    Free(conflicts.items);
-    Free(decisions.items);
+    if (ok) Util_Log(L"session vault: %s: the person settled %d element(s)", listName, made);
+    FreeChoices(&conflicts);
+    FreeChoices(&decisions);
     Util_SyncUnlock(lock);
     return ok;
 }
@@ -2307,7 +2632,7 @@ void SessionVault_AfterClose(const WCHAR *folder)
     progress.report = TellManager;
     KeepFor(&list, i, &report, &progress);
     TellManager(NULL, 0, 0);
-    SessionPurge_WeeklyBackUp(&list);
+    if (Util_GetSetting(SETTING_WEEKLY_BACKUP, 0)) SessionPurge_WeeklyBackUp(&list);
 }
 
 /* ---------------------------------------------------------------- restoring */
@@ -2500,26 +2825,44 @@ BOOL SessionVault_AddDeleted(const WCHAR *const *ids, int count)
 
 /* ------------------------------------------------------------ undeleting */
 
+/* The keys every version of list `listName` names, added to `keys`. */
+static void AddListedKeys(const WCHAR *listName, VaultIds *keys)
+{
+    WCHAR (*names)[MAX_PATH];
+    int count, i, j;
+    names = VersionNames(listName, &count);
+    for (i = 0; i < count; i++) {
+        VaultList version;
+        if (!LoadVersion(listName, names[i], &version)) continue;
+        for (j = 0; j < version.count; j++) AddId(keys, version.items[j].key);
+        FreeList(&version);
+    }
+    Free(names);
+}
+
 BOOL SessionVault_EverListed(VaultIds *keys)
 {
-    WCHAR dir[MAX_PATH], (*names)[MAX_PATH];
+    WCHAR dir[MAX_PATH];
     WIN32_FIND_DATAW found;
     HANDLE find;
-    int count, i, j;
     ZeroMemory(keys, sizeof *keys);
     if (!VaultPath(LISTS_DIR, dir, ARRAYSIZE(dir)) || (find = Util_FindFiles(dir, L"*", &found, TRUE)) == INVALID_HANDLE_VALUE) return TRUE;
     do {
-        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == L'.') continue;
-        names = VersionNames(found.cFileName, &count);
-        for (i = 0; i < count; i++) {
-            VaultList version;
-            if (!LoadVersion(found.cFileName, names[i], &version)) continue;
-            for (j = 0; j < version.count; j++) AddId(keys, version.items[j].key);
-            FreeList(&version);
-        }
-        Free(names);
+        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && found.cFileName[0] != L'.') AddListedKeys(found.cFileName, keys);
     } while (FindNextFileW(find, &found));
     FindClose(find);
+    return TRUE;
+}
+
+/* The keys profile `index` had: in its list, and in the one it kept alone
+ * before it joined a group (where SessionVault_Undelete looks too). */
+BOOL SessionVault_ListedIn(const ProfileList *list, int index, VaultIds *keys)
+{
+    WCHAR listName[FOLDER_CCH];
+    ZeroMemory(keys, sizeof *keys);
+    if (!SessionVault_ListName(list, index, listName, ARRAYSIZE(listName))) return FALSE;
+    AddListedKeys(listName, keys);
+    if (list->items[index].syncGroup) AddListedKeys(list->items[index].folder, keys);
     return TRUE;
 }
 

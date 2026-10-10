@@ -660,3 +660,27 @@ BOOL Util_OpenUrl(const WCHAR *url)
     Util_Log(L"could not open %s (code %ld)", url, (long)result);
     return FALSE;
 }
+
+/* The program's settings (the Settings dialog), in settings.ini of the
+ * state folder: the watcher's process reads them too, and a test's private
+ * state folder has none, so it gets the defaults. */
+static BOOL SettingsPath(WCHAR *out, size_t cch)
+{
+    WCHAR dir[MAX_PATH];
+    return Util_StateDir(dir, ARRAYSIZE(dir)) && SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\settings.ini", dir));
+}
+
+DWORD Util_GetSetting(const WCHAR *name, DWORD fallback)
+{
+    WCHAR path[MAX_PATH];
+    if (!SettingsPath(path, ARRAYSIZE(path))) return fallback;
+    return (DWORD)GetPrivateProfileIntW(L"Settings", name, (INT)fallback, path);
+}
+
+BOOL Util_SetSetting(const WCHAR *name, DWORD value)
+{
+    WCHAR path[MAX_PATH], dir[MAX_PATH], text[16];
+    if (!Util_StateDir(dir, ARRAYSIZE(dir)) || !Util_EnsureDir(dir) || !SettingsPath(path, ARRAYSIZE(path))) return FALSE;
+    StringCchPrintfW(text, ARRAYSIZE(text), L"%lu", value);
+    return WritePrivateProfileStringW(L"Settings", name, text, path);
+}

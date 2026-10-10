@@ -336,6 +336,21 @@ static void TestRouting(void)
     int n;
     RouteReason why;
 
+    {
+        BOOL running[4] = { TRUE, FALSE, FALSE, FALSE }, ask = TRUE;
+        Check("notification: nothing but the default profile runs -> it stays",
+              Core_NotificationTarget(running, 4, 0, -1, &ask) == -1 && !ask);
+        running[2] = TRUE;
+        Check("notification: one other runs -> that one, no question", Core_NotificationTarget(running, 4, 0, 0, &ask) == 2 && !ask);
+        running[3] = TRUE;
+        Check("notification: several others run -> asked, the one used last suggested",
+              Core_NotificationTarget(running, 4, 0, 3, &ask) == 3 && ask);
+        Check("notification: the default profile used last is not suggested -> the first other",
+              Core_NotificationTarget(running, 4, 0, 0, &ask) == 2 && ask);
+        running[0] = FALSE;
+        Check("notification: the default profile itself counts for nothing",
+              Core_NotificationTarget(running, 4, 0, 1, &ask) == 2 && ask);
+    }
     n = Core_SuggestTarget(0, NULL, TimeOnTestDay(7, 3, 0), window, TRUE, -1, -1, &why);
     Check("nothing running -> the default profile, no window", n == -1 && why == ROUTE_NOTHING_RUNNING);
 
@@ -516,18 +531,6 @@ static void TestPathsAndTimes(void)
     Check("a drive root is inside itself", Core_PathUnder(L"C:\\", L"C:\\"));
     Check("a forward slash separates folders too", Core_PathUnder(L"C:\\a/b", L"C:\\a") && !Core_PathUnder(L"C:\\ab/c", L"C:\\a"));
     Check("a different drive is outside a root", !Core_PathUnder(L"D:\\a.lnk", L"C:\\"));
-    {
-        WCHAR shown[MAX_PATH];
-        Check("a path under a variable's folder is written with the variable",
-              Core_PathWithVariable(L"C:\\Users\\X\\AppData\\Roaming\\Claude-A\\x", L"APPDATA", L"c:\\users\\x\\appdata\\roaming\\", shown,
-                                    ARRAYSIZE(shown)) &&
-              wcscmp(shown, L"%APPDATA%\\Claude-A\\x") == 0);
-        Check("the variable's folder itself is the variable",
-              Core_PathWithVariable(L"C:\\Users\\X", L"USERPROFILE", L"C:\\Users\\X", shown, ARRAYSIZE(shown)) && wcscmp(shown, L"%USERPROFILE%") == 0);
-        Check("a sibling folder with the same start stays as it is",
-              !Core_PathWithVariable(L"C:\\Users\\X2\\a", L"USERPROFILE", L"C:\\Users\\X", shown, ARRAYSIZE(shown)) && wcscmp(shown, L"C:\\Users\\X2\\a") == 0);
-        Check("no value: the path as it is", !Core_PathWithVariable(L"C:\\a", L"APPDATA", L"", shown, ARRAYSIZE(shown)) && wcscmp(shown, L"C:\\a") == 0);
-    }
 
     ZeroMemory(&st, sizeof st);
     st.wYear = 2026; st.wMonth = 9; st.wDay = 27; st.wHour = 8; st.wMinute = 15; st.wSecond = 40; st.wMilliseconds = 500;
@@ -778,6 +781,36 @@ static BOOL ReplaceCut(const char *in, size_t cut, const CoreSwap *swaps, int co
     memcpy(buf + held, in + cut, len - cut);
     n += Core_ReplaceChunk(buf, held + len - cut, swaps, count, TRUE, out + n, &used);
     return n == strlen(expected) && memcmp(out, expected, n) == 0;
+}
+
+/* Transcript lines as the preview shows them. */
+static void TestTranscriptLines(void)
+{
+    WCHAR out[256], small[12];
+    static const char user[] = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"  Fix the build\\nplease \"}}";
+    static const char claude[] = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hm\"},"
+                                 "{\"type\":\"text\",\"text\":\"On it.\"},{\"type\":\"tool_use\",\"name\":\"Bash\","
+                                 "\"input\":{\"command\":\"build.cmd\",\"description\":\"Build it\"}},"
+                                 "{\"type\":\"tool_use\",\"name\":\"TodoWrite\",\"input\":{\"todos\":[]}}]}}";
+    static const char result[] = "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"ok\"}]}}";
+    static const char command[] = "{\"type\":\"user\",\"message\":{\"content\":\"<command-name>/clear</command-name>\"}}";
+    static const char meta[] = "{\"type\":\"user\",\"isMeta\":true,\"message\":{\"content\":\"Caveat\"}}";
+    static const char side[] = "{\"type\":\"assistant\",\"isSidechain\":true,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"x\"}]}}";
+    static const char summary[] = "{\"type\":\"summary\",\"summary\":\"A title\"}";
+    Check("transcript: a user's text, trimmed, its line break as CRLF",
+          Core_TranscriptLine(user, strlen(user), out, ARRAYSIZE(out)) == TRANSCRIPT_USER && wcscmp(out, L"Fix the build\r\nplease") == 0);
+    Check("transcript: Claude's text and tool calls, thinking left out",
+          Core_TranscriptLine(claude, strlen(claude), out, ARRAYSIZE(out)) == TRANSCRIPT_CLAUDE &&
+          wcscmp(out, L"On it.\r\n[Bash] Build it\r\n[TodoWrite]") == 0);
+    Check("transcript: a tool result shows nothing", Core_TranscriptLine(result, strlen(result), out, ARRAYSIZE(out)) == TRANSCRIPT_NONE);
+    Check("transcript: a command's plumbing shows nothing", Core_TranscriptLine(command, strlen(command), out, ARRAYSIZE(out)) == TRANSCRIPT_NONE);
+    Check("transcript: a meta line shows nothing", Core_TranscriptLine(meta, strlen(meta), out, ARRAYSIZE(out)) == TRANSCRIPT_NONE);
+    Check("transcript: a side chain shows nothing", Core_TranscriptLine(side, strlen(side), out, ARRAYSIZE(out)) == TRANSCRIPT_NONE);
+    Check("transcript: other lines show nothing", Core_TranscriptLine(summary, strlen(summary), out, ARRAYSIZE(out)) == TRANSCRIPT_NONE &&
+          Core_TranscriptLine("not json", 8, out, ARRAYSIZE(out)) == TRANSCRIPT_NONE);
+    Check("transcript: a long text is cut with an ellipsis",
+          Core_TranscriptLine(user, strlen(user), small, ARRAYSIZE(small)) == TRANSCRIPT_USER && wcslen(small) < ARRAYSIZE(small) &&
+          small[wcslen(small) - 1] == 0x2026 && wcsncmp(small, L"Fix the", 7) == 0);
 }
 
 static void TestSessionEdits(void)
@@ -1507,6 +1540,136 @@ static void SeeTable(void *context, ULONGLONG number, BOOL added)
     if (!added && seen->goneCount < 4) seen->gone[seen->goneCount++] = number;
 }
 
+/* ------------------------------------------------------ three-way merge */
+
+typedef struct MergeProbe {
+    char  paths[8][CORE_MERGE_PATH_CCH];
+    DWORD members[8];
+    int   latest[8], count;
+    const char *decidePath;   /* the one path the person decided, for member decideFor */
+    int   decideFor;
+} MergeProbe;
+
+static int ProbeDecide(void *context, const char *path, DWORD members)
+{
+    MergeProbe *probe = (MergeProbe *)context;
+    (void)members;
+    return probe->decidePath && strcmp(path, probe->decidePath) == 0 ? probe->decideFor : -1;
+}
+
+static void ProbeReport(void *context, const char *path, DWORD members, int latest, const char *const *values, const size_t *lengths)
+{
+    MergeProbe *probe = (MergeProbe *)context;
+    (void)values;
+    (void)lengths;
+    if (probe->count >= 8) return;
+    StringCchCopyA(probe->paths[probe->count], CORE_MERGE_PATH_CCH, path);
+    probe->members[probe->count] = members;
+    probe->latest[probe->count++] = latest;
+}
+
+/* `base` and two members' values merged (NULL: absent), the result compared with `expected` (NULL: absent). */
+static BOOL MergeTwo(const char *base, const char *a, const char *b, ULONGLONG writtenA, ULONGLONG writtenB, int depth, MergeProbe *probe,
+                     const char *expected, int unresolvedExpected)
+{
+    const char *values[2] = { a, b };
+    size_t lengths[2] = { a ? strlen(a) : 0, b ? strlen(b) : 0 }, outLen = 0;
+    BOOL say[2] = { TRUE, TRUE };
+    ULONGLONG written[2] = { writtenA, writtenB };
+    int unresolved = -1;
+    char *merged = Core_JsonMerge(base, base ? strlen(base) : 0, values, lengths, say, written, 2, depth, ProbeDecide, ProbeReport, probe,
+                                  &outLen, &unresolved);
+    BOOL ok = merged && unresolved == unresolvedExpected &&
+              (expected ? outLen == strlen(expected) && memcmp(merged, expected, outLen) == 0 : outLen == 0);
+    if (!ok) printf("        merged: %s (unresolved %d)\n", merged ? merged : "(null)", unresolved);
+    if (merged) HeapFree(GetProcessHeap(), 0, merged);
+    return ok;
+}
+
+static void TestJsonMerge(void)
+{
+    MergeProbe probe;
+    const char *groups = "{\"groups\":[{\"id\":\"g1\",\"name\":\"Work\"}],\"assignments\":{\"s1\":\"g1\"}}";
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: one profile changed it -> its value, no conflict",
+          MergeTwo(groups, "{\"groups\":[{\"id\":\"g1\",\"name\":\"Job\"}],\"assignments\":{\"s1\":\"g1\"}}", groups, 2, 1, 6, &probe,
+                   "{\"groups\":[{\"id\":\"g1\",\"name\":\"Job\"}],\"assignments\":{\"s1\":\"g1\"}}", 0) && probe.count == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: each added a group of its own -> both kept, no conflict",
+          MergeTwo(groups, "{\"groups\":[{\"id\":\"g1\",\"name\":\"Work\"},{\"id\":\"g2\",\"name\":\"A\"}],\"assignments\":{\"s1\":\"g1\"}}",
+                   "{\"groups\":[{\"id\":\"g1\",\"name\":\"Work\"},{\"id\":\"g3\",\"name\":\"B\"}],\"assignments\":{\"s1\":\"g1\",\"s2\":\"g3\"}}",
+                   1, 2, 6, &probe,
+                   "{\"groups\":[{\"id\":\"g1\",\"name\":\"Work\"},{\"id\":\"g3\",\"name\":\"B\"},{\"id\":\"g2\",\"name\":\"A\"}],"
+                   "\"assignments\":{\"s1\":\"g1\",\"s2\":\"g3\"}}", 0) && probe.count == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: the same group renamed two ways -> a conflict at its name, the later one standing in",
+          MergeTwo(groups, "{\"groups\":[{\"id\":\"g1\",\"name\":\"Job\"}],\"assignments\":{\"s1\":\"g1\"}}",
+                   "{\"groups\":[{\"id\":\"g1\",\"name\":\"Tasks\"}],\"assignments\":{\"s1\":\"g1\"}}", 1, 2, 6, &probe,
+                   "{\"groups\":[{\"id\":\"g1\",\"name\":\"Tasks\"}],\"assignments\":{\"s1\":\"g1\"}}", 1) &&
+          probe.count == 1 && strcmp(probe.paths[0], "/groups/#g1/name") == 0 && probe.members[0] == 0x3 && probe.latest[0] == 1);
+
+    ZeroMemory(&probe, sizeof probe);
+    probe.decidePath = "/groups/#g1/name";
+    probe.decideFor = 0;
+    Check("merge: the person's choice settles it",
+          MergeTwo(groups, "{\"groups\":[{\"id\":\"g1\",\"name\":\"Job\"}],\"assignments\":{\"s1\":\"g1\"}}",
+                   "{\"groups\":[{\"id\":\"g1\",\"name\":\"Tasks\"}],\"assignments\":{\"s1\":\"g1\"}}", 1, 2, 6, &probe,
+                   "{\"groups\":[{\"id\":\"g1\",\"name\":\"Job\"}],\"assignments\":{\"s1\":\"g1\"}}", 0) && probe.count == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: a list of plain values merges as a set (each one's additions, either one's removals)",
+          MergeTwo("[\"a\",\"b\"]", "[\"b\",\"c\"]", "[\"a\",\"b\",\"d\"]", 2, 1, 6, &probe, "[\"b\",\"c\",\"d\"]", 0) && probe.count == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: taken out by one, changed by the other -> a conflict at it",
+          MergeTwo("{\"x\":1,\"y\":1}", "{\"y\":1}", "{\"x\":2,\"y\":1}", 1, 2, 6, &probe, "{\"x\":2,\"y\":1}", 1) &&
+          probe.count == 1 && strcmp(probe.paths[0], "/x") == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: first sync, no base -> both groups kept, the session placed two ways a conflict",
+          MergeTwo(NULL, "{\"groups\":[{\"id\":\"a\",\"name\":\"A\"}],\"assignments\":{\"s1\":\"a\"}}",
+                   "{\"groups\":[{\"id\":\"b\",\"name\":\"B\"}],\"assignments\":{\"s1\":\"b\",\"s2\":\"b\"}}", 1, 2, 6, &probe,
+                   "{\"groups\":[{\"id\":\"b\",\"name\":\"B\"},{\"id\":\"a\",\"name\":\"A\"}],\"assignments\":{\"s1\":\"b\",\"s2\":\"b\"}}", 1) &&
+          probe.count == 1 && strcmp(probe.paths[0], "/assignments/s1") == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: with no depth, two changes are one conflict at the value itself",
+          MergeTwo("{\"root\":1}", "{\"root\":2}", "{\"root\":3}", 1, 2, 0, &probe, "{\"root\":3}", 1) &&
+          probe.count == 1 && strcmp(probe.paths[0], "") == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: a tuple told apart by its first string stays whole",
+          MergeTwo("[[\"s1\",\"opus\",\"high\"]]", "[[\"s1\",\"sonnet\",\"low\"]]", "[[\"s1\",\"opus\",\"max\"]]", 1, 2, 6, &probe,
+                   "[[\"s1\",\"opus\",\"max\"]]", 1) &&
+          probe.count == 1 && strcmp(probe.paths[0], "/#s1") == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: a key with / and ~ is escaped in the path",
+          MergeTwo("{\"a/b~c\":1}", "{\"a/b~c\":2}", "{\"a/b~c\":3}", 2, 1, 6, &probe, "{\"a/b~c\":2}", 1) &&
+          probe.count == 1 && strcmp(probe.paths[0], "/a~1b~0c") == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: the same value written with other spaces is no change",
+          MergeTwo("{\"a\": [1, 2]}", "{\"a\":[1,2]}", "{ \"a\" : [1,2] }", 1, 2, 6, &probe, "{\"a\": [1, 2]}", 0) && probe.count == 0);
+
+    ZeroMemory(&probe, sizeof probe);
+    Check("merge: taken out by both -> gone", MergeTwo("{\"x\":1}", NULL, NULL, 1, 2, 6, &probe, NULL, 0));
+    {
+        const char *values[2] = { "{\"x\":5}", "{\"x\":9}" };
+        size_t lengths[2] = { 7, 7 }, outLen = 0;
+        BOOL say[2] = { TRUE, FALSE };
+        ULONGLONG written[2] = { 1, 2 };
+        int unresolved = -1;
+        char *merged = Core_JsonMerge("{\"x\":1}", 7, values, lengths, say, written, 2, 6, NULL, NULL, NULL, &outLen, &unresolved);
+        Check("merge: a profile whose view does not count changes nothing",
+              merged && unresolved == 0 && outLen == 7 && memcmp(merged, "{\"x\":5}", 7) == 0);
+        if (merged) HeapFree(GetProcessHeap(), 0, merged);
+    }
+}
+
 static void TestLevelDb(void)
 {
     static const BYTE kSnappy[] = { 0x0C, 0x08, 'a', 'b', 'c', 0x15, 0x03 };
@@ -1637,8 +1800,10 @@ static void TestLevelDb(void)
 
 int wmain(void)
 {
+    TestJsonMerge();
     TestLevelDb();
     TestSessionEntries();
+    TestTranscriptLines();
     TestSessionEdits();
     TestSessionSync();
     TestMirror();

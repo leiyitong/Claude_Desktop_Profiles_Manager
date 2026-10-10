@@ -240,6 +240,8 @@ static void PopulateProfileTable(HWND table, const WCHAR *name)
     ListView_SetItemText(table, 0, 1, (WCHAR *)TR(Theme_ProfileRole(TRUE, TRUE)));
     ListView_SetItemText(table, 0, 2, L"%APPDATA%\\Claude");
     ListView_SetItemText(table, 0, 3, (WCHAR *)TR(Theme_SessionsFolderState(0)));
+    ListView_SetItemText(table, 0, PROFILE_COLUMN_STATE, (WCHAR *)TR(Theme_ProfileState(FALSE)));
+    Gui_OrderProfileColumns(table);
 }
 
 /* The uninstall dialog's profiles to keep, as gui.c makes them: check boxes in
@@ -391,35 +393,112 @@ static void SyncItemsCaptions(HWND dialog, const WCHAR *name)
     SetDlgItemTextW(dialog, IDC_I_TEXT, text);
 }
 
-/* The conflicts of a sync as syncui.c lists them: two rows, each with whose version is kept. */
+/* Sync settings as syncui.c fills them: two profiles to sync with, one checked, and every item. */
+static void SyncSetupCaptions(HWND dialog, const WCHAR *name, BOOL fill)
+{
+    static const WCHAR *const kPartners[] = { L"Work", L"Personal" };
+    WCHAR text[256];
+    LVCOLUMNW column;
+    LVITEMW item;
+    HWND lists[2];
+    int i, list;
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"\x201C%s\x201D syncs with:"), name);
+    SetDlgItemTextW(dialog, IDC_Z_TEXT, text);
+    if (!fill) return;
+    lists[0] = GetDlgItem(dialog, IDC_Z_LIST);
+    lists[1] = GetDlgItem(dialog, IDC_Z_ITEMS);
+    for (list = 0; list < 2; list++) {
+        ListView_SetExtendedListViewStyle(lists[list], LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        ZeroMemory(&column, sizeof column);
+        ListView_InsertColumn(lists[list], 0, &column);
+    }
+    for (i = 0; i < (int)ARRAYSIZE(kPartners); i++) {
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT;
+        item.iItem = i;
+        item.pszText = (LPWSTR)kPartners[i];
+        ListView_InsertItem(lists[0], &item);
+        ListView_SetCheckState(lists[0], i, i == 0);
+    }
+    Theme_SmoothView(lists[0]);
+    /* The items as the what-to-sync dialog lists them. */
+    {
+        HWND items = lists[1];
+        static const WCHAR *const kItems[] = { L"Sessions: new ones, titles, archived and deleted ones",
+                                               L"Sidebar: pins, groups, project order, filters",
+                                               L"Each session's model, effort, side pane, unread mark and cost",
+                                               L"Appearance: fonts, editor, zoom, spelling",
+                                               L"Interface language",
+                                               L"Default model",
+                                               L"Settings: auto-archive, Cowork, Remote Control, recent folders",
+                                               L"Permissions: folders' permission modes, Cowork's trusted folders" };
+        for (i = 0; i < (int)ARRAYSIZE(kItems); i++) {
+            ZeroMemory(&item, sizeof item);
+            item.mask = LVIF_TEXT;
+            item.iItem = i;
+            item.pszText = (LPWSTR)TR(kItems[i]);
+            ListView_InsertItem(items, &item);
+            ListView_SetCheckState(items, i, i != (int)ARRAYSIZE(kItems) - 1);
+        }
+        Theme_SmoothView(items);
+    }
+}
+
+/* Backup & Restore as gui.c fills it: the profile selected named, its headings semibold. */
+static void BackupHubCaptions(HWND dialog, const WCHAR *name, BOOL fill)
+{
+    static const int kHeadings[] = { IDC_H_PROFILE, IDC_H_SESSIONS, IDC_H_CODE_LABEL };
+    WCHAR text[256];
+    size_t i;
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Profile \x201C%s\x201D"), name);
+    SetDlgItemTextW(dialog, IDC_H_PROFILE, text);
+    if (!fill) return;
+    for (i = 0; i < ARRAYSIZE(kHeadings); i++) Theme_SetStrong(GetDlgItem(dialog, kHeadings[i]));
+}
+
+/* The conflicts of a sync as syncui.c lists them: a heading, two elements, a column per profile. */
 static void ConflictsCaptions(HWND dialog, const WCHAR *name, BOOL fill)
 {
-    static const WCHAR *const kItems[] = { L"Sidebar: pins, groups, project order, filters",
-                                           L"Settings: auto-archive, Cowork, Remote Control, recent folders" };
+    static const WCHAR *const kLabels[] = { L"Name of group \x201C%s\x201D", L"Group of \x201C%s\x201D" };
     HWND list = GetDlgItem(dialog, IDC_X_LIST);
     WCHAR text[512], names[LABEL_CCH * 2 + 32];
     LVCOLUMNW column;
     LVITEMW item;
     int i;
     StringCchPrintfW(names, ARRAYSIZE(names), L"%s%s%s", name, TR(L" and "), L"Personal");
-    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Since the last sync, %s changed these each their own way. Choose whose version to keep:"), names);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s changed these each their own way since the last sync. Choose the version to keep of each:"), names);
     SetDlgItemTextW(dialog, IDC_X_TEXT, text);
     if (!fill) return;
+    SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)TR(L"The latest of each"));
     SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)name);
     SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)L"Personal");
     SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_SETCURSEL, 0, 0);
-    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_SUBITEMIMAGES);
     ZeroMemory(&column, sizeof column);
+    column.mask = LVCF_TEXT | LVCF_WIDTH;
+    column.cx = 200;
+    column.pszText = (LPWSTR)TR(L"Changed");
     ListView_InsertColumn(list, 0, &column);
-    for (i = 0; i < (int)ARRAYSIZE(kItems); i++) {
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s \x00B7 kept: %s"), TR(kItems[i]), i ? L"Personal" : name);
+    column.cx = 120;
+    column.pszText = (LPWSTR)name;
+    ListView_InsertColumn(list, 1, &column);
+    column.pszText = (LPWSTR)L"Personal";
+    ListView_InsertColumn(list, 2, &column);
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_TEXT;
+    item.pszText = (LPWSTR)TR(L"Sidebar");
+    ListView_InsertItem(list, &item);
+    for (i = 0; i < (int)ARRAYSIZE(kLabels); i++) {
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(kLabels[i]), L"A private conversation");
         ZeroMemory(&item, sizeof item);
         item.mask = LVIF_TEXT;
-        item.iItem = i;
+        item.iItem = i + 1;
         item.pszText = text;
         ListView_InsertItem(list, &item);
+        ListView_SetItemText(list, i + 1, 1, (LPWSTR)L"Work");
+        ListView_SetItemText(list, i + 1, 2, (LPWSTR)L"Personal work");
     }
-    ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_SetItemState(list, 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     Theme_SmoothView(list);
 }
 
@@ -470,9 +549,7 @@ static void PurgeCaptions(HWND dialog, BOOL fill)
     LVCOLUMNW column;
     LVITEMW item;
     int i;
-    SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"These conversations are on this PC, but no profile lists them any more: deleted in Claude, or made in a "
-                                           L"terminal for example.\nRestore puts the ones checked back in the profiles that listed them. "
-                                           L"Delete removes them, so that nothing brings them back."));
+    SetDlgItemTextW(dialog, IDC_C_TEXT, TR(L"Conversations still on this PC that no profile shows any more."));
     if (!fill) return;
     CheckDlgButton(dialog, IDC_C_BACKUP, BST_CHECKED);
     ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
@@ -480,7 +557,7 @@ static void PurgeCaptions(HWND dialog, BOOL fill)
     ListView_InsertColumn(list, 0, &column);
     for (i = 0; i < 3; i++) {
         StringCchPrintfW(text, ARRAYSIZE(text), L"%s  \x00B7  Private conversation  \x00B7  2026-10-08  08:30  \x00B7  1.3 MB",
-                         i ? TR(L"In no list") : TR(L"Deleted in Claude"));
+                         i ? TR(L"In no list") : L"Private profile");
         ZeroMemory(&item, sizeof item);
         item.mask = LVIF_TEXT;
         item.iItem = i;
@@ -570,11 +647,30 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         SetDlgItemTextW(dialog, IDC_T_LABEL, text);
         SetDlgItemTextW(dialog, IDC_T_TITLE, L"A private mock session title that remains user data in every language");
         break;
+    case IDD_SETTINGS: {
+        HWND questions = GetDlgItem(dialog, IDC_G_QUESTIONS);
+        LVCOLUMNW column;
+        LVITEMW item;
+        Theme_SetStrong(GetDlgItem(dialog, IDC_G_VAULT));
+        Theme_SetStrong(GetDlgItem(dialog, IDC_G_HELP));
+        SetDlgItemTextW(dialog, IDC_G_DAYS, L"30");
+        ZeroMemory(&column, sizeof column);
+        ListView_InsertColumn(questions, 0, &column);
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT;
+        item.pszText = (LPWSTR)TR(L"What is this program for?");
+        ListView_InsertItem(questions, &item);
+        SetDlgItemTextW(dialog, IDC_G_ANSWER, TR(L"It runs several Claude accounts side by side, each in a window of its own: a profile, with its own "
+                                                 L"sign-in, settings and conversations. Claude itself is not changed."));
+        break;
+    }
+    case IDD_PREVIEW:
+        SetDlgItemTextW(dialog, IDC_V_TITLE, L"A private mock session title that remains user data in every language");
+        SetDlgItemTextW(dialog, IDC_V_TEXT, L"\x25B6  You\r\nPrivate user text\r\n\r\n\x25C6  Claude\r\nPrivate reply\r\n[Bash] Build it");
+        break;
     case IDD_MESSAGE:
         StringCchPrintfW(text, ARRAYSIZE(text),
-            TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\n%s gets its own copy of the conversation and of its working folder, "
-               L"under No folder in \x201C%s\x201D. The copy then goes on separately. %s, and its title there is set when %s closes."),
-            L"A private conversation", name, name, name, TR(L"Continue?"), name);
+            TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\nThe copy goes on separately."), L"A private conversation", name);
         SetDlgItemTextW(dialog, IDC_M_TEXT, text);
         SetDlgItemTextW(dialog, IDOK, TR(L"Copy"));
         break;
@@ -608,6 +704,12 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         break;
     case IDD_CONFLICTS:
         ConflictsCaptions(dialog, name, TRUE);
+        break;
+    case IDD_SYNC_SETUP:
+        SyncSetupCaptions(dialog, name, TRUE);
+        break;
+    case IDD_BACKUP_HUB:
+        BackupHubCaptions(dialog, name, TRUE);
         break;
     }
 }
@@ -655,17 +757,11 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         SyncItemsCaptions(dialog, L"Private profile");
     } else if (fixture->resource == IDD_CONFLICTS) {
         ConflictsCaptions(dialog, L"Private profile", FALSE);
+    } else if (fixture->resource == IDD_SYNC_SETUP) {
+        SyncSetupCaptions(dialog, L"Private profile", FALSE);
+    } else if (fixture->resource == IDD_BACKUP_HUB) {
+        BackupHubCaptions(dialog, L"Private profile", FALSE);
     }
-}
-
-/* The menu bar gui.c gives the window (MakeMenuBar): its three menus, named. */
-static void AddMockMenuBar(HWND dialog)
-{
-    static const int kMenus[] = { IDC_MENU_SESSIONS, IDC_MENU_APP, IDC_MENU_SHORTCUTS };
-    HMENU bar = CreateMenu();
-    size_t i;
-    for (i = 0; bar && i < ARRAYSIZE(kMenus); i++) AppendMenuW(bar, MF_POPUP, (UINT_PTR)CreatePopupMenu(), TR(Theme_MainCaption(kMenus[i], 0)));
-    if (bar && !SetMenu(dialog, bar)) DestroyMenu(bar);
 }
 
 /* What gui.c does to its window before theming it: the table's styles and
@@ -680,7 +776,6 @@ static void PrepareMainWindow(HWND dialog, LayoutFixture *fixture)
     if (fixture->realSessions) SessionsView_Init(dialog);
     fixture->treeViewport = Theme_SmoothView(fixture->tree);
     fixture->profilesViewport = Theme_SmoothView(GetDlgItem(dialog, IDC_S_PROFILES));
-    AddMockMenuBar(dialog);
     Theme_SetStrong(GetDlgItem(dialog, IDC_SESSIONS));
 }
 
@@ -696,7 +791,7 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_REPAIR, IDC_BACKUP_CODE, IDC_NOTE };
+    static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_BACKUP, IDC_REPAIR, IDC_NOTE };
     static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
     size_t i;
     for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
@@ -1074,7 +1169,7 @@ static void CheckNoteGeometry(HWND dialog, const LayoutFixture *fixture)
 {
     HWND note = GetDlgItem(dialog, IDC_NOTE);
     RECT client, table = RelativeRect(dialog, fixture->tableViewport), placed = RelativeRect(dialog, note);
-    RECT last = RelativeRect(dialog, GetDlgItem(dialog, IDC_BACKUP_CODE)), status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS));
+    RECT last = RelativeRect(dialog, GetDlgItem(dialog, IDC_REPAIR)), status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS));
     GetClientRect(dialog, &client);
     Check(fixture, note, "note stays beside the table and inside the dialog",
           placed.left >= table.right && placed.top >= 0 && placed.right <= client.right && placed.bottom <= client.bottom);
@@ -1151,6 +1246,14 @@ static void CheckText(const LayoutFixture *fixture, HWND control)
         } else {
             BOOL pushButton = button && (type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON);
             RECT area = pushButton ? PushButtonTextArea(control, &client) : client;
+            if (pushButton && Theme_IsIconButton(control)) {
+                /* Its icon alone, its caption in a tip: a square as tall as the font. */
+                Check(fixture, control, "an icon button is square and as tall as its script font",
+                      client.right == client.bottom && client.bottom >= metrics.tmHeight);
+                SelectObject(dc, previous);
+                ReleaseDC(control, dc);
+                return;
+            }
             measured.right = max(1, client.right);
             DrawTextW(dc, text, -1, &measured, DT_CALCRECT | (wrap ? DT_WORDBREAK : DT_SINGLELINE) |
                       ((label && (style & SS_NOPREFIX)) ? DT_NOPREFIX : 0) | flags);
@@ -1236,10 +1339,11 @@ static void CheckProfileTable(HWND dialog, const LayoutFixture *fixture)
     Check(fixture, table, "default Profile column is its fixed width at the window's DPI",
           first == MulDiv(THEME_PROFILE_COLUMN_DIPS, (int)GetDpiForWindow(table), 96));
     Check(fixture, table, "default Data column fits the data folder", third == dataMinimum);
+    Check(fixture, table, "default Status column fits its title and every state", ListView_GetColumnWidth(table, PROFILE_COLUMN_STATE) == Theme_ProfileStateWidth(table));
     Check(fixture, table, "default Sessions folder column consumes exactly the remaining client width",
-          ListView_GetColumnWidth(table, 3) == client.right - first - second - third);
+          ListView_GetColumnWidth(table, 3) == client.right - first - second - third - ListView_GetColumnWidth(table, PROFILE_COLUMN_STATE));
     Check(fixture, table, "default columns do not introduce a horizontal scroll bar", !(GetWindowLongW(table, GWL_STYLE) & WS_HSCROLL));
-    if (ListView_GetColumnWidth(table, 3) != client.right - first - second - third) {
+    if (ListView_GetColumnWidth(table, 3) != client.right - first - second - third - ListView_GetColumnWidth(table, PROFILE_COLUMN_STATE)) {
         RECT dialogClient;
         SIZE minimum = { 0, 0 };
         int sessionsMinimum = 0;
@@ -1284,28 +1388,6 @@ static void CheckHiddenProfileNote(HWND dialog, const LayoutFixture *fixture)
     Check(fixture, note, "hidden profile note leaves dialog and control geometry unchanged", unchanged);
     GetWindowTextW(note, text, ARRAYSIZE(text));
     Check(fixture, note, "hidden profile note receives its complete current localized caption", wcscmp(text, expected) == 0);
-}
-
-/* The details' widest captions fit their column: "Delete session
- * everywhere..." on its button as wide as the column (sessions.c), and the
- * Actions box with its arrow. */
-static void CheckSessionActionWidths(HWND dialog, const LayoutFixture *fixture)
-{
-    HWND details = GetDlgItem(dialog, IDC_S_DETAILS);
-    HFONT font = (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0);
-    RECT client, area, caption = { 0, 0, 0, 0 };
-    HDC dc = GetDC(details);
-    HGDIOBJ previous = SelectObject(dc, font);
-    int actionWidth;
-    GetClientRect(details, &client);
-    area = PushButtonTextArea(details, &client);
-    DrawTextW(dc, TR(Theme_SessionsCaption(SESSIONS_DELETE_EVERYWHERE)), -1, &caption, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX | Localize_ReadingFlags());
-    Check(fixture, details, "destructive action caption fits its button without ellipsis", caption.right <= area.right - area.left);
-    if (caption.right > area.right - area.left) printf("        available=%ld required=%ld\n", area.right - area.left, caption.right);
-    actionWidth = Theme_DropDownWidth(dialog, font, TR(Theme_SessionsCaption(SESSIONS_ACTIONS)));
-    Check(fixture, details, "an Actions box as wide as its caption fits its details column", actionWidth <= client.right);
-    SelectObject(dc, previous);
-    ReleaseDC(details, dc);
 }
 
 /* ------------------------------------------------------- live languages */
@@ -1567,7 +1649,7 @@ static void CheckReopenedModal(HWND owner, LayoutFixture *fixture, const LayoutS
 static void CheckLanguageRoundTrips(void)
 {
     static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
-                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS };
+                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS };
     static const WCHAR *const kVisited[] = { L"zh-CN" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"en");
@@ -1730,7 +1812,7 @@ static void CheckHiddenRows(void)
 static void CheckDialogs(void)
 {
     static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE,
-                                      IDD_SYNC_ITEMS, IDD_CONFLICTS };
+                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)
@@ -1808,9 +1890,7 @@ static void CheckMessageBoxes(void)
         check.single = variant == 0;
         Localize_SetLanguage(language, FALSE);
         StringCchPrintfW(text, ARRAYSIZE(text),
-            TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\n%s gets its own copy of the conversation and of its working folder, "
-               L"under No folder in \x201C%s\x201D. The copy then goes on separately. %s, and its title there is set when %s closes."),
-            L"A private conversation", L"Personal", L"Personal", L"Personal", TR(L"Continue?"), L"Personal");
+            TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\nThe copy goes on separately."), L"A private conversation", L"Personal");
         SetWindowSubclass(owner, CheckWaitingMessage, MESSAGE_OWNER_SUBCLASS, (DWORD_PTR)&check);
         Ui_Message(owner, check.single ? MB_OK | MB_ICONINFORMATION : MB_YESNO | MB_ICONQUESTION, L"%s", text);
         RemoveWindowSubclass(owner, CheckWaitingMessage, MESSAGE_OWNER_SUBCLASS);
@@ -1853,7 +1933,6 @@ static void CheckMainStates(void)
                 CheckNativeNote(dialog, &fixture);
                 CheckSecondFitKeepsFrame(dialog, &fixture);
             } else {
-                CheckSessionActionWidths(dialog, &fixture);
                 CheckHiddenProfileNote(dialog, &fixture);
             }
             for (links = 0; links < LINK_STATUSES; links++) for (version = 0; version < MAIN_VERSIONS; version++) {
@@ -2043,8 +2122,8 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
  * is on screen meanwhile: messages are handled between steps (PumpMessages). */
 static void CheckMainFrameMessages(void)
 {
-    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_REPAIR,
-                                    IDC_BACKUP_CODE };
+    static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_BACKUP,
+                                    IDC_REPAIR, IDC_SHORTCUTS, IDC_LANGUAGE, IDC_SETTINGS };
     LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];
@@ -2311,12 +2390,13 @@ static void CheckResponsiveMain(void)
             GetClientRect(fixture.table, &tableClient);
             Check(&fixture, fixture.table, "sessions folder column is the exact table remainder",
                   ListView_GetColumnWidth(fixture.table, 0) + ListView_GetColumnWidth(fixture.table, 1) +
-                  ListView_GetColumnWidth(fixture.table, 2) + ListView_GetColumnWidth(fixture.table, 3) == tableClient.right);
+                  ListView_GetColumnWidth(fixture.table, 2) + ListView_GetColumnWidth(fixture.table, 3) +
+                  ListView_GetColumnWidth(fixture.table, PROFILE_COLUMN_STATE) == tableClient.right);
             CheckGeometry(dialog, &fixture);
             if (!fixture.sessions) {
                 CheckNoteGeometry(dialog, &fixture);
                 CheckNativeNote(dialog, &fixture);
-            } else CheckSessionActionWidths(dialog, &fixture);
+            }
             for (version = 0; version < MAIN_VERSIONS; version++) {
                 fixture.version = (MainVersion)version;
                 MainCaptions(dialog, &fixture);
@@ -2661,59 +2741,6 @@ static void ReadPrivateTree(HWND tree, HTREEITEM item, PrivateTreeItem *items, i
     }
 }
 
-/* Whether hovering `x`, `y` of `control` changes what it draws there. */
-static BOOL LitUnderMouse(HWND control, int x, int y)
-{
-    HDC dc;
-    COLORREF before, after;
-    SendMessageW(control, WM_MOUSELEAVE, 0, 0);
-    UpdateWindow(control);
-    dc = GetDC(control);
-    before = GetPixel(dc, x, y);
-    ReleaseDC(control, dc);
-    SendMessageW(control, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
-    UpdateWindow(control);
-    dc = GetDC(control);
-    after = GetPixel(dc, x, y);
-    ReleaseDC(control, dc);
-    SendMessageW(control, WM_MOUSELEAVE, 0, 0);
-    UpdateWindow(control);
-    return before != CLR_INVALID && after != CLR_INVALID && before != after;
-}
-
-/* The first row of the details' scrolling part where the first profile's
- * Actions box, at its right end (`x`), lights up under the mouse: its place
- * follows the scale. -1 when none does. */
-static int ActionsRow(HWND parts, int x)
-{
-    RECT client;
-    int y, limit;
-    if (!GetClientRect(parts, &client)) return -1;
-    limit = min(client.bottom, MulDiv(120, (int)GetDpiForWindow(parts), 96));
-    for (y = 0; y < limit; y++)
-        if (LitUnderMouse(parts, x, y)) return y + 2 < client.bottom ? y + 2 : y;
-    return -1;
-}
-
-static void CheckDetailHover(HWND control, const LayoutFixture *fixture, int x, int y, const char *name)
-{
-    HDC dc;
-    COLORREF before, after;
-    SendMessageW(control, WM_MOUSELEAVE, 0, 0);
-    UpdateWindow(control);
-    dc = GetDC(control);
-    before = GetPixel(dc, x, y);
-    ReleaseDC(control, dc);
-    SendMessageW(control, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
-    UpdateWindow(control);
-    dc = GetDC(control);
-    after = GetPixel(dc, x, y);
-    ReleaseDC(control, dc);
-    Check(fixture, control, name, before != CLR_INVALID && after != CLR_INVALID && before != after);
-    SendMessageW(control, WM_MOUSELEAVE, 0, 0);
-    UpdateWindow(control);
-}
-
 /* Native resizes keep the populated tree: its items, expansion, selection
  * and scroll position; the details follow the new size. */
 static void CheckSessionsResize(SessionsFixture *sessions)
@@ -2741,7 +2768,7 @@ static void CheckSessionsResize(SessionsFixture *sessions)
     for (size = 0; size < (int)ARRAYSIZE(sizes); size++) {
         SCROLLINFO after = { sizeof after, SIF_ALL };
         HWND parts = GetDlgItem(details, IDC_S_PARTS);
-        RECT part, detail, inside;
+        RECT part, detail;
         ResizeMainFixture(dialog, fixture, sizes[size].cx, sizes[size].cy);
         for (i = 0; i < count; i++) {
             TVITEMW item = { 0 };
@@ -2760,15 +2787,7 @@ static void CheckSessionsResize(SessionsFixture *sessions)
         GetClientRect(details, &detail);
         Check(fixture, details, "selected session details render their bounded scrolling part",
               parts && (GetWindowLongW(parts, GWL_STYLE) & WS_VISIBLE) && part.left >= 0 && part.top > 0 &&
-              part.right <= detail.right && part.bottom < detail.bottom);
-        CheckDetailHover(details, fixture, 10, detail.bottom - 5, "resized bottom action hit region is current before its hover paint");
-        GetClientRect(parts, &inside);
-        {
-            int row = ActionsRow(parts, inside.right - 8);
-            Check(fixture, parts, "resized Actions menu hit region matches its native drawing", row >= 0);
-            if (row >= 0) CheckDetailHover(parts, fixture, inside.right - 8, row, "resized Actions menu hit region matches its native drawing");
-        }
-        CheckSessionActionWidths(dialog, fixture);
+              part.right <= detail.right && part.bottom <= detail.bottom);
     }
 }
 
@@ -2966,60 +2985,54 @@ static void CheckSessionsDoubleClick(SessionsFixture *sessions)
     PumpMessages();
 }
 
-/* Hovering `x` lights the Actions box under `inside` (the box lights whole). */
-static BOOL ActionsBoxLit(HWND parts, int x, POINT inside)
+/* `key` pressed with Ctrl held, sent to `control` (the thread's keyboard
+ * state says Ctrl, as GetKeyState reads it). */
+static void SendCtrlKey(HWND control, WPARAM key)
 {
-    COLORREF before, after;
-    HDC dc;
-    SendMessageW(parts, WM_MOUSELEAVE, 0, 0);
-    UpdateWindow(parts);
-    dc = GetDC(parts);
-    before = GetPixel(dc, inside.x, inside.y);
-    ReleaseDC(parts, dc);
-    SendMessageW(parts, WM_MOUSEMOVE, 0, MAKELPARAM(x, inside.y));
-    UpdateWindow(parts);
-    dc = GetDC(parts);
-    after = GetPixel(dc, inside.x, inside.y);
-    ReleaseDC(parts, dc);
-    SendMessageW(parts, WM_MOUSELEAVE, 0, 0);
-    UpdateWindow(parts);
-    return before != CLR_INVALID && after != CLR_INVALID && before != after;
+    BYTE state[256], held[256];
+    GetKeyboardState(state);
+    memcpy(held, state, sizeof held);
+    held[VK_CONTROL] |= 0x80;
+    held[VK_LCONTROL] |= 0x80;
+    SetKeyboardState(held);
+    SendMessageW(control, WM_KEYDOWN, key, 0);
+    SendMessageW(control, WM_KEYUP, key, 0xC0000001);
+    SetKeyboardState(state);
+    PumpMessages();
 }
 
-/* A profile's Actions box in the details is exactly a drop-down button for
- * its caption (Theme_DropDownWidth): its edges are where hovering stops
- * lighting it. */
-static void CheckSessionsActionsWidth(SessionsFixture *sessions)
+/* Ctrl+C on a folder's row takes its sessions; Ctrl+V in the side bar, on
+ * the other profile picked there, asks about them. */
+static void CheckSessionsCopyPaste(SessionsFixture *sessions)
 {
     LayoutFixture *fixture = &sessions->layout;
-    HWND dialog = sessions->dialog, parts = GetDlgItem(GetDlgItem(dialog, IDC_S_DETAILS), IDC_S_PARTS);
-    RECT client;
-    POINT inside;
-    int low, high, left, expected;
-    if (!parts || !GetClientRect(parts, &client)) {
-        Check(fixture, parts, "the details' scrolling part found", FALSE);
+    HWND dialog = sessions->dialog, tree = sessions->tree, list = GetWindow(fixture->profilesViewport, GW_CHILD);
+    FixtureRoots roots = ReadRoots(tree);
+    int prompts;
+    if (!roots.alpha || !list) {
+        Check(fixture, tree, "a folder's row to copy found", FALSE);
         return;
     }
-    inside.x = client.right - 8;
-    inside.y = ActionsRow(parts, inside.x);
-    if (inside.y < 0 || !ActionsBoxLit(parts, inside.x, inside)) {
-        Check(fixture, parts, "the details' Actions box lights up under the mouse", FALSE);
-        return;
-    }
-    for (low = 0, high = inside.x; low < high;) {
-        int middle = (low + high) / 2;
-        if (ActionsBoxLit(parts, middle, inside)) high = middle;
-        else low = middle + 1;
-    }
-    left = low;
-    for (low = inside.x, high = client.right; low + 1 < high;) {
-        int middle = (low + high) / 2;
-        if (ActionsBoxLit(parts, middle, inside)) low = middle;
-        else high = middle;
-    }
-    expected = Theme_DropDownWidth(dialog, (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0), TR(Theme_SessionsCaption(SESSIONS_ACTIONS)));
-    Check(fixture, parts, "the details' Actions box is as wide as a drop-down button for its caption", high - left == expected);
-    if (high - left != expected) printf("        box %d..%d, expected width %d\n", left, high, expected);
+    TreeView_SelectItem(tree, roots.alpha);
+    SetFocus(tree);
+    PumpMessages();
+    SendCtrlKey(tree, 'C');
+    SendMessageW(list, LB_SETCURSEL, 1, 0);
+    SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_S_PROFILES, LBN_SELCHANGE), (LPARAM)list);
+    PumpMessages();
+    SetFocus(list);
+    prompts = fixture->openPrompts;
+    fixture->promptText[0] = 0;
+    SendCtrlKey(list, 'V');
+    Check(fixture, list, "Ctrl+C on a folder, then Ctrl+V on another profile, asks about its sessions",
+          fixture->openPrompts > prompts && fixture->promptText[0]);
+    prompts = fixture->openPrompts;
+    SetFocus(tree);
+    SendCtrlKey(tree, 'V');
+    Check(fixture, tree, "Ctrl+V in the tree of the other profile asks about them too", fixture->openPrompts > prompts);
+    SendMessageW(list, LB_SETCURSEL, 0, 0);
+    SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_S_PROFILES, LBN_SELCHANGE), (LPARAM)list);
+    PumpMessages();
 }
 
 /* The side bar's list keeps the profiles' names (screen readers read them). */
@@ -3081,7 +3094,6 @@ static void CheckPopulatedSessions(void)
                   roots.starred && roots.alpha && roots.beta && roots.unknown && roots.unknown != roots.beta &&
                   TreeView_GetCount(sessions.tree) == wait.count);
             CheckSessionsResize(&sessions);
-            CheckSessionsActionsWidth(&sessions);
             if (language == 0) {
                 CheckSessionsProfileNames(&sessions);
                 CheckSessionsRefillKeepsState(&sessions);
@@ -3089,6 +3101,7 @@ static void CheckPopulatedSessions(void)
                 CheckSessionsWatcher(&sessions);
                 CheckSessionsUnderStream(&sessions);
                 CheckSessionsDoubleClick(&sessions);
+                CheckSessionsCopyPaste(&sessions);
                 CheckSessionsFocus(&sessions);
             }
         }

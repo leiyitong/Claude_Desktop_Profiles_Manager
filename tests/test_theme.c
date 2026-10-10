@@ -41,7 +41,7 @@
 enum {
     NATIVE_ROWS_SUBCLASS = 1, TREE_TIP_SUBCLASS, TIP_WINDOW_SUBCLASS, THEMED_COLORS_SUBCLASS, EDIT_PROBE_SUBCLASS,
     EDIT_PAUSE_SUBCLASS, CHOICE_PROBE_SUBCLASS, SCROLL_TRACE_SUBCLASS, TABLE_DESTROY_SUBCLASS,
-    PRINT_PROBE_SUBCLASS, SELECTION_COUNT_SUBCLASS, FRAME_SAMPLE_SUBCLASS, DRAG_WATCH_SUBCLASS
+    PRINT_PROBE_SUBCLASS, SELECTION_COUNT_SUBCLASS, FRAME_SAMPLE_SUBCLASS, DRAG_WATCH_SUBCLASS, MENU_PROBE_SUBCLASS
 };
 
 static int g_failures, g_checks;
@@ -4733,66 +4733,130 @@ static void TestGlyphButtons(void)
     DeleteObject(font);
 }
 
-/* A window's menu bar in dark mode: Windows draws it light, the theme draws
- * it on the window's face with its names in light text, and covers the
- * light line Windows draws under it. */
-static void TestDarkMenuBar(void)
+/* What the probe of the program's own menu saw of it, from inside its loop. */
+typedef struct MenuProbe {
+    RECT  box;                      /* the button it opens below */
+    BOOL  found, ownWindow, below, wideEnough, field, lit, framed;
+    BOOL  clickOutside;             /* then a press outside it */
+} MenuProbe;
+
+#define WM_MENU_PROBE (WM_APP + 40)
+
+static BOOL CALLBACK FindOwnMenu(HWND window, LPARAM found)
 {
-    HWND window;
-    HMENU bar, menus[2];
-    MENUBARINFO info;
-    RECT frame, area, client;
-    Canvas shown = { 0 };
-    COLORREF faceColor = Theme_Color(THEME_FACE);
-    int x, y, facePixels = 0, ink = 0, samples = 0, line = 0;
-    if (SkipInLight("the dark menu bar") || HighContrastOn()) return;
-    window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED, WC_STATICW, L"", WS_POPUP | WS_CAPTION | WS_CLIPCHILDREN,
-                             0, 0, 400, 160, NULL, NULL, GetModuleHandleW(NULL), NULL);
-    bar = CreateMenu();
-    menus[0] = CreatePopupMenu();
-    menus[1] = CreatePopupMenu();
-    if (!window || !bar || !menus[0] || !menus[1]) {
-        Check("dark menu bar: window and menus created", FALSE);
-        if (window) DestroyWindow(window);
+    WCHAR name[64];
+    GetClassNameW(window, name, ARRAYSIZE(name));
+    if (wcscmp(name, L"ClaudeDesktopProfilesManager.Menu") != 0 || !IsWindowVisible(window)) return TRUE;
+    *(HWND *)found = window;
+    return FALSE;
+}
+
+static LRESULT CALLBACK ProbeOwnMenu(HWND host, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR reference)
+{
+    MenuProbe *probe = (MenuProbe *)reference;
+    (void)id;
+    if (message == WM_MENU_PROBE) {
+        HWND popup = NULL;
+        RECT frame;
+        Canvas shown = { 0 };
+        int x, y, field = 0, lit = 0;
+        EnumThreadWindows(GetCurrentThreadId(), FindOwnMenu, (LPARAM)&popup);
+        probe->found = popup != NULL;
+        if (popup && GetWindowRect(popup, &frame)) {
+            WCHAR name[64];
+            GetClassNameW(popup, name, ARRAYSIZE(name));
+            probe->ownWindow = wcscmp(name, L"#32768") != 0;
+            probe->below = frame.top >= probe->box.bottom;
+            probe->wideEnough = frame.right - frame.left >= probe->box.right - probe->box.left;
+            if (CanvasOpen(&shown, frame.right - frame.left, frame.bottom - frame.top, RGB(1, 2, 3))) {
+                SendMessageW(popup, WM_PRINTCLIENT, (WPARAM)shown.dc, PRF_CLIENT);
+                for (y = 0; y < shown.height; y++) for (x = 0; x < shown.width; x++) {
+                    COLORREF color = PixelAt(&shown, x, y);
+                    if (color == Theme_Color(THEME_FIELD)) field++;
+                    if (color == Theme_Color(THEME_PALE_BLUE)) lit++;
+                }
+                probe->field = field > 0;
+                probe->lit = lit > 0 || HighContrastOn();
+                /* The frame a quarter of the way from the field to the text: visible on the field in either mode. */
+                {
+                    COLORREF fieldColor = Theme_Color(THEME_FIELD), text = Theme_Color(THEME_TEXT), corner = PixelAt(&shown, 0, 0);
+                    COLORREF edge = RGB((3 * GetRValue(fieldColor) + GetRValue(text)) / 4, (3 * GetGValue(fieldColor) + GetGValue(text)) / 4,
+                                        (3 * GetBValue(fieldColor) + GetBValue(text)) / 4);
+                    probe->framed = (corner == edge && corner != fieldColor) || HighContrastOn();
+                }
+            }
+            CanvasClose(&shown);
+            if (probe->clickOutside) PostMessageW(popup, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM((WORD)(SHORT)-5, (WORD)(SHORT)-5));
+        }
+        return 0;
+    }
+    return DefSubclassProc(host, message, wp, lp);
+}
+
+/* The program's own menu (Theme_TrackMenu, the manager's Shortcuts and
+ * Language): a window of its own below its button, as wide at least, on the
+ * field's color in a frame, the item the keyboard reached lit; arrows pass
+ * separators and grayed items, Return chooses, Escape and a press outside
+ * close it with nothing, an access key chooses its item. */
+static void TestOwnMenu(void)
+{
+    HWND host = ThemedHost(), button;
+    HFONT font = DialogFont();
+    HMENU menu = CreatePopupMenu();
+    MenuProbe probe;
+    UINT command;
+    button = host ? CreateWindowExW(0, WC_BUTTONW, L"Menu", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 10, 160, 30, host, NULL,
+                                    GetModuleHandleW(NULL), NULL) : NULL;
+    Check("own menu: a button and a menu made", button && menu);
+    if (!button || !menu) {
+        if (menu) DestroyMenu(menu);
+        DeleteObject(font);
         return;
     }
-    SetLayeredWindowAttributes(window, 0, 1, LWA_ALPHA);
-    AppendMenuW(bar, MF_POPUP, (UINT_PTR)menus[0], L"&Program");
-    AppendMenuW(bar, MF_POPUP, (UINT_PTR)menus[1], L"&Sessions");
-    SetMenu(window, bar);
-    Theme_Apply(window);
-    ShowWindow(window, SW_SHOWNOACTIVATE);
-    RedrawWindow(window, NULL, NULL, RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
-    PumpMessages();
-    ZeroMemory(&info, sizeof info);
-    info.cbSize = sizeof info;
-    if (GetMenuBarInfo(window, OBJID_MENU, 0, &info) && GetWindowRect(window, &frame) && GetClientRect(window, &client)) {
-        POINT origin = { 0, 0 };
-        area = info.rcBar;
-        OffsetRect(&area, -frame.left, -frame.top);
-        ClientToScreen(window, &origin);
-        area.bottom = origin.y - frame.top;   /* down to the client's top: the line under the bar too */
-        if (CanvasOpen(&shown, area.right - area.left, area.bottom - area.top, RGB(1, 2, 3)) &&
-            CopyFromWindow(window, TRUE, &area, &shown, 0, 0) && HasImage(&shown, "dark menu bar")) {
-            for (y = 0; y < shown.height; y++) for (x = 0; x < shown.width; x++) {
-                COLORREF color = PixelAt(&shown, x, y);
-                samples++;
-                if (color == faceColor) facePixels++;
-                else if (StandsOut(color, faceColor) && (GetRValue(color) + GetGValue(color) + GetBValue(color)) / 3 > 96) ink++;
-            }
-            for (x = 0; x < shown.width; x++)
-                if (PixelAt(&shown, x, shown.height - 1) == faceColor) line++;
-            Check("dark menu bar: the bar is the window's face", samples > 0 && facePixels * 10 >= samples * 7);
-            Check("dark menu bar: the menus' names are light text on it", ink > 0);
-            Check("dark menu bar: the line under it is the face too", line == shown.width);
-            if (facePixels * 10 < samples * 7 || !ink || line != shown.width)
-                printf("        face %d of %d pixels, ink %d, line %d of %d\n", facePixels, samples, ink, line, shown.width);
-        }
-    } else {
-        Check("dark menu bar: its place is known", FALSE);
+    SendMessageW(button, WM_SETFONT, (WPARAM)font, FALSE);
+    AppendMenuW(menu, MF_STRING, 1, L"&First");
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 2, L"&Grayed");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | MF_CHECKED, 3, L"&Third and longest of its items");
+    ShowWindow(host, SW_SHOWNOACTIVATE);
+    ZeroMemory(&probe, sizeof probe);
+    GetWindowRect(button, &probe.box);
+    SetWindowSubclass(host, ProbeOwnMenu, MENU_PROBE_SUBCLASS, (DWORD_PTR)&probe);
+
+    /* Posted first: its loop takes them in turn. */
+    PostMessageW(button, WM_KEYDOWN, VK_DOWN, 0);
+    PostMessageW(host, WM_MENU_PROBE, 0, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_DOWN, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_RETURN, 0);
+    command = Theme_TrackMenu(button, menu, &probe.box);
+    Check("own menu: a window of its own, not Windows' menu", probe.found && probe.ownWindow);
+    Check("own menu: below its button, at least as wide", probe.below && probe.wideEnough);
+    Check("own menu: on the field's color, in a frame, the item reached lit", probe.field && probe.framed && probe.lit);
+    Check("own menu: arrows pass separators and grayed items, Return chooses", command == 3);
+    {
+        HWND left = NULL;
+        EnumThreadWindows(GetCurrentThreadId(), FindOwnMenu, (LPARAM)&left);
+        Check("own menu: closed once chosen", left == NULL);
     }
-    CanvasClose(&shown);
-    DestroyWindow(window);   /* with its menu bar */
+
+    PostMessageW(button, WM_KEYDOWN, VK_ESCAPE, 0);
+    Check("own menu: Escape closes it with nothing", Theme_TrackMenu(button, menu, &probe.box) == 0);
+    PostMessageW(button, WM_KEYDOWN, VK_RETURN, 0);
+    Check("own menu: Return with no item lit chooses nothing", Theme_TrackMenu(button, menu, &probe.box) == 0);
+    PostMessageW(button, WM_CHAR, L'f', 0);
+    Check("own menu: an access key chooses its item", Theme_TrackMenu(button, menu, &probe.box) == 1);
+    PostMessageW(button, WM_CHAR, L'g', 0);
+    PostMessageW(button, WM_KEYDOWN, VK_ESCAPE, 0);
+    Check("own menu: a grayed item's access key chooses nothing", Theme_TrackMenu(button, menu, &probe.box) == 0);
+    probe.clickOutside = TRUE;
+    PostMessageW(host, WM_MENU_PROBE, 0, 0);
+    Check("own menu: a press outside closes it with nothing", Theme_TrackMenu(button, menu, &probe.box) == 0 && probe.found);
+
+    RemoveWindowSubclass(host, ProbeOwnMenu, MENU_PROBE_SUBCLASS);
+    DestroyMenu(menu);
+    DestroyWindow(button);
+    ShowWindow(host, SW_HIDE);
+    DeleteObject(font);
 }
 
 /* A window of every kind the theme serves, themed, drawn, then destroyed with
@@ -4862,6 +4926,66 @@ static void ThemedRound(void)
 /* Destroying a themed window and its controls frees what the theme made for
  * them: rounds of making, theming, drawing and destroying keep the process's
  * GDI and USER objects (the first rounds warm Windows' own caches). */
+/* An image's pixels drawn on black: the brightest one, and how many it covers. */
+static int DrawnImage(HIMAGELIST images, int index, int size, COLORREF *brightest)
+{
+    BITMAPINFO info;
+    DWORD *pixels = NULL, best = 0;
+    HDC dc = CreateCompatibleDC(NULL);
+    HBITMAP bitmap;
+    int i, covered = 0;
+    ZeroMemory(&info, sizeof info);
+    info.bmiHeader.biSize = sizeof info.bmiHeader;
+    info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    bitmap = dc ? CreateDIBSection(dc, &info, DIB_RGB_COLORS, (void **)&pixels, NULL, 0) : NULL;
+    *brightest = 0;
+    if (!bitmap || !pixels) {
+        if (bitmap) DeleteObject(bitmap);
+        if (dc) DeleteDC(dc);
+        return 0;
+    }
+    SelectObject(dc, bitmap);
+    ZeroMemory(pixels, (size_t)size * size * sizeof *pixels);
+    ImageList_Draw(images, index, dc, 0, 0, ILD_TRANSPARENT);
+    GdiFlush();
+    for (i = 0; i < size * size; i++) {
+        DWORD p = pixels[i] & 0xFFFFFF, sum = ((p >> 16) & 0xFF) + ((p >> 8) & 0xFF) + (p & 0xFF);
+        if (sum) covered++;
+        if (sum > ((best >> 16) & 0xFF) + ((best >> 8) & 0xFF) + (best & 0xFF)) best = p;
+    }
+    *brightest = RGB((best >> 16) & 0xFF, (best >> 8) & 0xFF, best & 0xFF);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    return covered;
+}
+
+/* The icons of a list (Theme_GlyphImages): one per character, at the small
+ * icon size, each in its tint where the glyph covers it fully. */
+static void TestGlyphImages(void)
+{
+    static const WCHAR glyphs[] = { 0xE73E, 0xE713 };
+    static const ThemeTint tints[] = { THEME_TINT_GREEN, THEME_TINT_NONE };
+    HWND host = ThemedHost();
+    HIMAGELIST images = host ? Theme_GlyphImages(host, glyphs, tints, 2) : NULL;
+    UINT dpi = host ? GetDpiForWindow(host) : 96;
+    int width = 0, height = 0, size = GetSystemMetricsForDpi(SM_CXSMICON, dpi ? dpi : 96);
+    COLORREF tint = Theme_TintColor(THEME_TINT_GREEN), drawn;
+    Check("glyph images: an image list made", images != NULL);
+    if (!images) return;
+    Check("glyph images: one image per character", ImageList_GetImageCount(images) == 2);
+    Check("glyph images: at the small icon size", ImageList_GetIconSize(images, &width, &height) && width == size && height == size);
+    Check("glyph images: the first glyph drawn in its tint",
+          DrawnImage(images, 0, size, &drawn) > 0 && abs((int)GetRValue(drawn) - (int)GetRValue(tint)) <= 24 &&
+          abs((int)GetGValue(drawn) - (int)GetGValue(tint)) <= 24 && abs((int)GetBValue(drawn) - (int)GetBValue(tint)) <= 24);
+    Check("glyph images: the second drawn too, muted (grey)",
+          DrawnImage(images, 1, size, &drawn) > 0 && abs((int)GetRValue(drawn) - (int)GetGValue(drawn)) <= 16 &&
+          abs((int)GetGValue(drawn) - (int)GetBValue(drawn)) <= 16);
+    ImageList_Destroy(images);
+}
+
 static void TestResourceLifetime(void)
 {
     DWORD gdi, user, gdiAfter, userAfter;
@@ -5164,7 +5288,8 @@ int wmain(void)
     TestLink();
     TestSidebarNoteCuts();
     TestBuffer();
-    TestDarkMenuBar();
+    TestOwnMenu();
+    TestGlyphImages();
     TestResourceLifetime();
     if (g_themedHost) DestroyWindow(g_themedHost);
     printf("Theme tests: %d checks, %d failure(s).\n", g_checks, g_failures);

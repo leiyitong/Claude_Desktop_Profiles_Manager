@@ -50,11 +50,14 @@ BEGIN
     PUSHBUTTON      L"&Edit\x2026", IDC_EDIT, 192, 6, 40, 15
     PUSHBUTTON      L"&Delete\x2026", IDC_DELETE, 236, 6, 40, 15
     PUSHBUTTON      "Set as de&fault", IDC_DEFAULT, 286, 6, 60, 15
+    PUSHBUTTON      "S&hortcuts", IDC_SHORTCUTS, 348, 6, 18, 15
+    PUSHBUTTON      "&Language", IDC_LANGUAGE, 370, 6, 18, 15
+    PUSHBUTTON      "Se&ttings", IDC_SETTINGS, 392, 6, 18, 15
     CONTROL         "", IDC_LIST, "SysListView32", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 28, 280, 246
     PUSHBUTTON      "Sessions &view", IDC_SESSIONS, 296, 28, 114, 15
-    PUSHBUTTON      "S&ync sessions", IDC_SYNC, 296, 51, 114, 15
-    PUSHBUTTON      "Rep&air", IDC_REPAIR, 296, 70, 114, 15
-    PUSHBUTTON      L"&Back up .claude\x2026", IDC_BACKUP_CODE, 296, 89, 114, 15
+    PUSHBUTTON      L"S&ync settings\x2026", IDC_SYNC, 296, 51, 114, 15
+    PUSHBUTTON      L"&Backup && Restore\x2026", IDC_BACKUP, 296, 70, 114, 15
+    PUSHBUTTON      "Rep&air", IDC_REPAIR, 296, 89, 114, 15
     LTEXT           "", IDC_NOTE, 296, 111, 114, 42, SS_NOPREFIX
     LTEXT           "", IDC_STATUS, 296, 186, 114, 20, SS_NOPREFIX
     CONTROL         "", IDC_PROGRESS, "Static", SS_OWNERDRAW | SS_NOPREFIX | NOT WS_VISIBLE, 296, 191, 114, 15
@@ -94,15 +97,42 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 158, 50, 15
 END
 
-IDD_TITLE DIALOGEX 0, 0, 268, 68
+IDD_TITLE DIALOGEX 0, 0, 268, 84
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Rename session"
+CAPTION "Edit session"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     LTEXT           "", IDC_T_LABEL, 10, 10, 248, 10, SS_NOPREFIX | SS_ENDELLIPSIS
     EDITTEXT        IDC_T_TITLE, 10, 23, 248, 14, ES_AUTOHSCROLL
-    DEFPUSHBUTTON   "Rename", IDOK, 154, 46, 50, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 208, 46, 50, 15
+    AUTOCHECKBOX    "S&tarred", IDC_T_STAR, 10, 44, 120, 10
+    DEFPUSHBUTTON   "Save", IDOK, 154, 62, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 208, 62, 50, 15
+END
+
+IDD_PREVIEW DIALOGEX 0, 0, 420, 280
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Session preview"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_V_TITLE, 10, 10, 400, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    EDITTEXT        IDC_V_TEXT, 10, 24, 400, 228, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "Close", IDCANCEL, 360, 258, 50, 15
+END
+
+IDD_SETTINGS DIALOGEX 0, 0, 320, 250
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Settings"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Session vault", IDC_G_VAULT, 10, 10, 300, 10
+    LTEXT           "&Keep versions for:", IDC_G_DAYS_LABEL, 10, 27, 80, 10
+    EDITTEXT        IDC_G_DAYS, 92, 24, 30, 14, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "days (0: keep them all)", IDC_G_DAYS_UNIT, 128, 27, 182, 10
+    LTEXT           "Help", IDC_G_HELP, 10, 50, 300, 10
+    CONTROL         "", IDC_G_QUESTIONS, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 64, 300, 84
+    EDITTEXT        IDC_G_ANSWER, 10, 154, 300, 66, ES_MULTILINE | ES_READONLY | WS_VSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 206, 228, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 260, 228, 50, 15
 END
 
 IDD_MESSAGE DIALOGEX 0, 0, 282, 70
@@ -168,18 +198,21 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 192, 50, 15
 END
 
-IDD_PURGE DIALOGEX 0, 0, 300, 236
+IDD_PURGE DIALOGEX 0, 0, 320, 250
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Recently deleted"
+CAPTION "Clean up sessions"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "", IDC_C_TEXT, 10, 10, 280, 40, SS_NOPREFIX
-    CONTROL         "", IDC_C_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 54, 280, 110
-    AUTOCHECKBOX    "&Back up .claude first", IDC_C_BACKUP, 10, 170, 280, 10
-    LTEXT           "They go to the Recycle Bin. A conversation in use, or new and in no list, is not shown.", IDC_C_NOTE, 10, 184, 280, 18
-    DEFPUSHBUTTON   "&Restore", IDC_C_RESTORE, 132, 214, 50, 15
-    PUSHBUTTON      "Delete", IDOK, 186, 214, 50, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 240, 214, 50, 15
+    LTEXT           "", IDC_C_TEXT, 10, 10, 300, 20, SS_NOPREFIX
+    LTEXT           "&Show:", IDC_C_SHOW_LABEL, 10, 37, 40, 10
+    COMBOBOX        IDC_C_PROFILE, 52, 34, 140, 120, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    AUTOCHECKBOX    "Select &all", IDC_C_ALL, 204, 36, 106, 10
+    CONTROL         "", IDC_C_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 54, 300, 120
+    AUTOCHECKBOX    "&Back up .claude first", IDC_C_BACKUP, 10, 180, 300, 10
+    LTEXT           "Restore puts them back in the profiles that had them. Delete moves them to the Recycle Bin.", IDC_C_NOTE, 10, 194, 300, 18
+    DEFPUSHBUTTON   "&Restore", IDC_C_RESTORE, 152, 228, 50, 15
+    PUSHBUTTON      "Delete", IDOK, 206, 228, 50, 15
+    PUSHBUTTON      "Close", IDCANCEL, 260, 228, 50, 15
 END
 
 IDD_SYNC_ITEMS DIALOGEX 0, 0, 268, 214
@@ -194,18 +227,54 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 192, 50, 15
 END
 
-IDD_CONFLICTS DIALOGEX 0, 0, 268, 214
+IDD_CONFLICTS DIALOGEX 0, 0, 420, 276
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Sync conflicts"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "", IDC_X_TEXT, 10, 10, 248, 30, SS_NOPREFIX
-    CONTROL         "", IDC_X_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 44, 248, 80
-    LTEXT           "&Keep the version of:", IDC_X_LABEL, 10, 133, 100, 10
-    COMBOBOX        IDC_X_PROFILE, 112, 130, 146, 120, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Every profile of the group then gets the version chosen; one open gets it once it closes. Until then, each keeps its own.", IDC_X_NOTE, 10, 150, 248, 30
-    DEFPUSHBUTTON   "Keep", IDOK, 154, 192, 50, 15
-    PUSHBUTTON      "Later", IDCANCEL, 208, 192, 50, 15
+    ICON            "", IDC_X_ICON, 10, 10, 21, 20, SS_ICON | SS_REALSIZEIMAGE
+    LTEXT           "", IDC_X_TEXT, 38, 10, 372, 22, SS_NOPREFIX
+    CONTROL         "", IDC_X_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 38, 400, 172
+    LTEXT           "&Use for all:", IDC_X_LABEL, 10, 219, 70, 10
+    COMBOBOX        IDC_X_PROFILE, 82, 216, 150, 120, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Click the version to keep, or press Left and Right. Until you apply, each profile keeps its own.", IDC_X_NOTE, 10, 236, 400, 10
+    DEFPUSHBUTTON   "Keep", IDOK, 306, 254, 50, 15
+    PUSHBUTTON      "Later", IDCANCEL, 360, 254, 50, 15
+END
+
+IDD_SYNC_SETUP DIALOGEX 0, 0, 268, 236
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Sync settings"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_Z_TEXT, 10, 10, 248, 10, SS_NOPREFIX
+    CONTROL         "", IDC_Z_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, 10, 24, 248, 60
+    LTEXT           "&What they sync:", IDC_Z_ITEMS_LABEL, 10, 90, 248, 10
+    CONTROL         "", IDC_Z_ITEMS, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, 10, 102, 248, 84
+    LTEXT           "Each sync goes both ways: what changed in one profile goes to the others. What two changed each their own way waits for you to choose.", IDC_Z_NOTE, 10, 190, 248, 20
+    PUSHBUTTON      "&Sync now", IDC_Z_SYNC_NOW, 10, 214, 60, 15
+    DEFPUSHBUTTON   "OK", IDOK, 154, 214, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 208, 214, 50, 15
+END
+
+IDD_BACKUP_HUB DIALOGEX 0, 0, 268, 196
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Backup & Restore"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_H_PROFILE, 10, 10, 248, 10, SS_NOPREFIX
+    PUSHBUTTON      L"&Back up\x2026", IDC_H_BACKUP, 10, 24, 121, 15
+    PUSHBUTTON      L"&Restore from backup\x2026", IDC_H_RESTORE, 137, 24, 121, 15
+    LTEXT           "Sessions", IDC_H_SESSIONS, 10, 48, 248, 10
+    PUSHBUTTON      L"E&xport sessions\x2026", IDC_H_EXPORT, 10, 62, 121, 15
+    PUSHBUTTON      L"&Import sessions\x2026", IDC_H_IMPORT, 137, 62, 121, 15
+    PUSHBUTTON      L"Reco&ver sessions\x2026", IDC_H_RECOVER, 10, 81, 121, 15
+    PUSHBUTTON      L"C&lean up sessions\x2026", IDC_H_PURGE, 137, 81, 121, 15
+    LTEXT           "Claude Code", IDC_H_CODE_LABEL, 10, 105, 248, 10
+    PUSHBUTTON      L"Back up .&claude\x2026", IDC_H_CODE, 10, 119, 121, 15
+    AUTOCHECKBOX    "Back up once a &week", IDC_H_WEEKLY, 137, 122, 121, 10
+    LTEXT           "Each backup asks what it keeps. What a restore or a recovery replaces is kept in a backup first.", IDC_H_NOTE, 10, 143, 248, 20
+    PUSHBUTTON      "Close", IDCANCEL, 208, 174, 50, 15
 END
 
 IDD_UNINSTALL DIALOGEX 0, 0, 292, 206

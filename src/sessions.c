@@ -3,17 +3,20 @@
  * sessions. On the left the profiles, with their badge and how many sessions
  * they list; in the middle the chosen profile's sessions as a tree, the
  * starred ones first, then by project (every row drawn here), or why it has
- * none; on the right the selected session: where it lives, then each
- * profile with what is going on there and an Actions box (open, rename,
- * star, remove, keep when its removal waits, or share and copy where it is
- * not listed), what is not listed, and Delete everywhere at the bottom. The
- * tree's context menu holds the entry's actions in the profile shown,
- * opening, sharing and copying in the others, the folder and Delete
- * everywhere; the other profiles' entries change from their Actions box.
+ * none, and below them, folded at first, the archived sessions by folder
+ * (Show archived); on the right the selected session: where it lives, then each
+ * profile with what is going on there (its menu, on a right-click, opens,
+ * renames, stars, removes, keeps when its removal waits, or shares and
+ * copies where it is not listed; a double-click opens it there) and what
+ * is not listed. The tree's context menu holds the entry's actions in the
+ * profile shown, opening, sharing and copying in the others, and the
+ * folder. Folders start
+ * folded; those the user opens stay open while the manager runs.
  * Several sessions are chosen together with Ctrl and Shift (click, or Shift
  * and the arrows) or Ctrl+A, and a folder's row or Starred stands for its
- * sessions: their menu shares, copies (syncui.c), exports, stars, removes or
- * deletes them all.
+ * sessions: their menu shares, copies (syncui.c), exports, stars or removes
+ * them all. Ctrl+C takes the sessions chosen, Ctrl+V copies them to
+ * the profile shown then.
  * What they do is in sessionedit.c; colors, fonts, rows, buttons and boxes
  * come from theme.c, as everywhere.
  *
@@ -36,24 +39,27 @@
 #include <string.h>
 #include <windowsx.h>
 
-#define MAX_COLLAPSED  128
+#define MAX_OPENED     128
 #define MAX_CHIPS      96
 #define NOTE_CCH       1024
 #define NAMES_CCH      (MAX_PROFILES * (LABEL_CCH + 16))
 #define WATCH_MAX      (2 * MAX_PROFILES + 1)
 #define NODE_STARRED   (-1)             /* tree lParam: >= 0 a row, else a folder (-2 - group) */
+#define NODE_ARCHIVED  ((LPARAM)-0x10000000)   /* the Archived part, below the folders; its folders: NODE_ARCHIVED - 1 - group */
 #define NODE_NONE      ((LPARAM)INT_MIN)   /* no row of the tree */
 #define STARRED_KEY    L"*starred"      /* folder keys that are no path start with '*' (GroupKey) */
+#define ARCHIVED_KEY   L"*archived"     /* the Archived part; its folders' keys: "*archived|" and theirs */
 #define IDM_ACTION     0x5000           /* menu commands: IDM_ACTION + action * MAX_PROFILES + profile */
 #define SLOW_LOAD_MS   1000             /* a snapshot read slower than this is logged even when nothing changed */
 #define READ_PACE_MS   500              /* the least time from a snapshot to the next one a notification asks for */
 #define PROFILE_ICON_DIPS      32       /* a profile's icon in the side bar */
 #define SPACING_DIPS           6        /* the padding of the side bar, the tree and the details (g_view.pad) */
 #define TREE_INDENT_DIPS       18       /* a tree level: a folder's arrow */
-#define FOLDER_ROW_LINE_TENTHS 19       /* a folder's row: 1.9 lines of text, at least a heading's line and the padding */
+#define FOLDER_ROW_LINE_TENTHS 19       /* a folder's row: 1.9 lines of text, at least a line and the padding */
 #define BADGE_LINE_QUARTERS    3        /* a profile's badge in the details: three quarters of a line of text */
 #define FIRST_PART_PAD_THIRDS  5        /* the first profile's part below the details' line: five thirds of the padding */
 #define UNIX_EPOCH_FILETIME    116444736000000000ULL   /* 1970-01-01 in FILETIME units (100 ns from 1601) */
+#define ARCHIVED_GLYPH         0xE7B8   /* Archive, of Windows' icon font: before an archived session's title */
 
 /* Tree rows are measured in units (the tree's item height): a session is
  * SESSION_UNITS high, a folder FOLDER_UNITS, plus GAP_UNITS of room above it
@@ -62,15 +68,18 @@
 #define FOLDER_UNITS   6
 #define GAP_UNITS      2
 
+#define PREVIEW_READ_MAX  (8u * 1024u * 1024u)   /* of a longer conversation, the preview shows the end */
+#define PREVIEW_LINE_CCH  4096                    /* what one message shows at most */
+#define PREVIEW_TEXT_CCH  (1024u * 1024u)         /* what the preview shows at most */
+
 typedef enum Action {
-    ACT_OPEN, ACT_RENAME, ACT_STAR, ACT_REMOVE, ACT_KEEP, ACT_SHARE, ACT_COPY, ACT_SHOW_FOLDER, ACT_DELETE_ALL,
-    ACT_MENU,                           /* a profile's Actions box: its menu */
+    ACT_OPEN, ACT_EDIT, ACT_STAR, ACT_REMOVE, ACT_KEEP, ACT_SHARE, ACT_COPY, ACT_SHOW_FOLDER, ACT_PREVIEW,
     ACTIONS
 } Action;
 
 /* What a menu of several sessions does to them all. */
 typedef enum BatchAction {
-    BATCH_NONE, BATCH_SHARE, BATCH_COPY, BATCH_EXPORT, BATCH_STAR, BATCH_REMOVE, BATCH_DELETE_ALL, BATCH_IMPORT
+    BATCH_NONE, BATCH_SHARE, BATCH_COPY, BATCH_EXPORT, BATCH_STAR, BATCH_REMOVE, BATCH_IMPORT, BATCH_TAKE, BATCH_PASTE
 } BatchAction;
 #define IDM_BATCH      0x5800           /* a menu of several sessions: IDM_BATCH + BatchAction */
 
@@ -159,26 +168,28 @@ typedef struct SessionsView {
     WCHAR         selectedFolder[MAX_PATH];   /* the selected session's folder for Explorer; "" when not on disk */
     int           sessionCount[MAX_PROFILES];   /* the sessions each profile lists, as the side bar counts them */
     int          *folderCount;          /* the sessions each folder of the tree shows, by group */
-    int           folderCountCapacity, starredCount;
+    int          *folderArchived;       /* those each folder under Archived shows */
+    int           folderCountCapacity, starredCount, archivedCount;
     WCHAR         folder[FOLDER_CCH];   /* the profile shown */
     HIMAGELIST    icons, badges;        /* profile icons for the list; badges for the details */
     int           iconSize, badgeSize, pad, indent, unit;
     ThemeFonts    fonts;
-    int           fontHeight[THEME_FONTS], fontAscent[THEME_FONTS], controlHeight, actionsWidth;
+    int           fontHeight[THEME_FONTS], fontAscent[THEME_FONTS], controlHeight;
     UINT          measuredDpi;
     HFONT         measuredFont;
     int           measuredLanguage;
     ULONGLONG     imageListHash;        /* what the icons and badges were made for */
     ChipSet       fixed, scrolled;      /* the controls of the details, and of their part that scrolls */
-    ChipRef       hot, pressed, open;   /* the control under the mouse, pressed, with its menu open */
+    ChipRef       hot, pressed;         /* the control under the mouse, pressed */
+    int           partTop[MAX_PROFILES], partBottom[MAX_PROFILES];   /* each profile's part, as last drawn (the part that scrolls) */
     TreeNodeKey   pressedSelection;     /* the selection when a control was pressed: its session is the one acted on */
     int           scroll;               /* how far the profiles' parts are scrolled, px */
     HANDLE        watchThread, watchStop;
     int           watchPaused;          /* SessionsView_PauseWatching calls not resumed yet: no watcher meanwhile */
     WatchPlan     watched;              /* what the watcher thread watches */
     WatchPlan     planned;              /* what the snapshot shown asks to watch */
-    WCHAR         collapsed[MAX_COLLAPSED][MAX_PATH];   /* folders the user folded, by GroupKey */
-    int           collapsedCount;
+    WCHAR         opened[MAX_OPENED][MAX_PATH];   /* folders the user opened, by GroupKey; the others start folded */
+    int           openedCount;
     /* Sessions chosen together (Ctrl, Shift, Ctrl+A), by key; while `several`
      * the tree shows them as selected instead of its own selection, which
      * keeps the keyboard's place. */
@@ -187,6 +198,10 @@ typedef struct SessionsView {
     WCHAR       (*marked)[SESSION_ID_CCH];
     int           markedCount, markedCapacity;
     TreeNodeKey   anchor;               /* where a Shift range starts */
+    /* The sessions Ctrl+C took, by key, and the profile they were taken in. */
+    WCHAR       (*taken)[SESSION_ID_CCH];
+    int           takenCount;
+    WCHAR         takenFrom[FOLDER_CCH];
     ULONGLONG     waitingChangesTried[MAX_PROFILES];   /* each profile's waiting changes as last tried in vain (WaitingChangesState) */
 } SessionsView;
 
@@ -388,9 +403,24 @@ static const WCHAR *StarredName(void)
     return TR(L"\x2605  Starred");
 }
 
+/* The group of a folder's node, in its folders or under Archived; -1 for
+ * any other node. */
 static int NodeGroup(LPARAM node)
 {
-    return node == NODE_STARRED ? -1 : (int)(-2 - node);
+    if (node >= 0 || node == NODE_STARRED || node == NODE_ARCHIVED || node == NODE_NONE) return -1;
+    return node < NODE_ARCHIVED ? (int)(NODE_ARCHIVED - 1 - node) : (int)(-2 - node);
+}
+
+static BOOL UnderArchived(LPARAM node)
+{
+    return node < NODE_ARCHIVED && node != NODE_NONE;
+}
+
+/* Archived in the profile shown: it shows under Archived only. */
+static BOOL RowArchived(const SessionRow *row, int profile)
+{
+    const SessionEntry *entry = EntryOf(row, profile);
+    return entry && entry->archived;
 }
 
 static int BitCount(DWORD bits)
@@ -481,15 +511,13 @@ static HFONT Font(ThemeFont role)
 }
 
 /* Each font's height and ascent, the details' control height (a button's)
- * and their Actions boxes' width: measured once for the window's scale and
- * language, read by every paint. */
+ * measured once for the window's scale and language, read by every paint. */
 static void MeasureFonts(void)
 {
     TEXTMETRICW metrics;
     HDC dc = GetDC(g_view.dlg);
     HGDIOBJ old;
     int role;
-    g_view.actionsWidth = Theme_DropDownWidth(g_view.dlg, DialogFont(), TR(Theme_SessionsCaption(SESSIONS_ACTIONS)));
     if (!dc) return;
     old = SelectObject(dc, DialogFont());
     for (role = 0; role < THEME_FONTS; role++) {
@@ -571,7 +599,7 @@ static void Measure(void)
     g_view.badgeSize = line * BADGE_LINE_QUARTERS / 4;
     SendMessageW(g_view.search, EM_SETCUEBANNER, TRUE, (LPARAM)TR(L"Search this profile's sessions"));
     SendMessageW(g_view.profiles, LB_SETITEMHEIGHT, 0, MAKELPARAM(max(g_view.iconSize, 2 * line) + 2 * g_view.pad, 0));
-    folderRow = max(line * FOLDER_ROW_LINE_TENTHS / 10, LineHeight(THEME_FONT_HEADING) + g_view.pad);
+    folderRow = max(line * FOLDER_ROW_LINE_TENTHS / 10, LineHeight(THEME_FONT_STRONG) + g_view.pad);
     g_view.unit = max(1, folderRow / FOLDER_UNITS);
     TreeView_SetItemHeight(g_view.tree, g_view.unit);
     TreeView_SetIndent(g_view.tree, MulDiv(TREE_INDENT_DIPS, (int)dpi, 96));
@@ -718,29 +746,28 @@ static void DrawProfile(const DRAWITEMSTRUCT *item)
 
 /* ------------------------------------------------------------------ tree */
 
-static BOOL WasCollapsed(const WCHAR *key)
+static BOOL WasOpened(const WCHAR *key)
 {
     int i;
-    for (i = 0; i < g_view.collapsedCount; i++)
-        if (Core_EqualsI(g_view.collapsed[i], key)) return TRUE;
+    for (i = 0; i < g_view.openedCount; i++)
+        if (Core_EqualsI(g_view.opened[i], key)) return TRUE;
     return FALSE;
 }
 
-static void SetCollapsed(const WCHAR *key, BOOL collapsed)
+static void SetOpened(const WCHAR *key, BOOL opened)
 {
     int i;
-    for (i = 0; i < g_view.collapsedCount; i++) {
-        if (!Core_EqualsI(g_view.collapsed[i], key)) continue;
-        if (!collapsed) {
-            g_view.collapsedCount--;
-            if (i < g_view.collapsedCount)
-                StringCchCopyW(g_view.collapsed[i], ARRAYSIZE(g_view.collapsed[i]), g_view.collapsed[g_view.collapsedCount]);
+    for (i = 0; i < g_view.openedCount; i++) {
+        if (!Core_EqualsI(g_view.opened[i], key)) continue;
+        if (!opened) {
+            g_view.openedCount--;
+            if (i < g_view.openedCount) StringCchCopyW(g_view.opened[i], ARRAYSIZE(g_view.opened[i]), g_view.opened[g_view.openedCount]);
         }
         return;
     }
-    if (collapsed && g_view.collapsedCount < MAX_COLLAPSED) {
-        StringCchCopyW(g_view.collapsed[g_view.collapsedCount], ARRAYSIZE(g_view.collapsed[g_view.collapsedCount]), key);
-        g_view.collapsedCount++;
+    if (opened && g_view.openedCount < MAX_OPENED) {
+        StringCchCopyW(g_view.opened[g_view.openedCount], ARRAYSIZE(g_view.opened[g_view.openedCount]), key);
+        g_view.openedCount++;
     }
 }
 
@@ -760,7 +787,13 @@ static void NodeKey(LPARAM node, BOOL inStarred, TreeNodeKey *out)
     out->folder = node < 0;
     out->inStarred = node >= 0 && inStarred;
     if (node == NODE_STARRED) StringCchCopyW(out->key, ARRAYSIZE(out->key), STARRED_KEY);
-    else if (node < 0 && node != NODE_NONE && NodeGroup(node) < g_view.set.groupCount) GroupKey(NodeGroup(node), out->key, ARRAYSIZE(out->key));
+    else if (node == NODE_ARCHIVED) StringCchCopyW(out->key, ARRAYSIZE(out->key), ARCHIVED_KEY);
+    else if (NodeGroup(node) >= 0 && NodeGroup(node) < g_view.set.groupCount) {
+        WCHAR group[MAX_PATH];
+        GroupKey(NodeGroup(node), group, ARRAYSIZE(group));
+        if (UnderArchived(node)) StringCchPrintfW(out->key, ARRAYSIZE(out->key), ARCHIVED_KEY L"|%s", group);
+        else StringCchCopyW(out->key, ARRAYSIZE(out->key), group);
+    }
     else if (node >= 0 && node < g_view.set.rowCount) StringCchCopyW(out->key, ARRAYSIZE(out->key), g_view.set.rows[node].key);
 }
 
@@ -827,12 +860,12 @@ static void PutBackOnTop(HTREEITEM item)
                      MAKEWPARAM(SB_THUMBPOSITION, (WORD)min(max(0, rc.top + g_view.topRowOffset), SHRT_MAX)), 0);
 }
 
-static HTREEITEM AddNode(HTREEITEM parent, const WCHAR *text, LPARAM param)
+static HTREEITEM InsertNode(HTREEITEM parent, HTREEITEM after, const WCHAR *text, LPARAM param)
 {
     TVINSERTSTRUCTW ins;
     ZeroMemory(&ins, sizeof ins);
     ins.hParent = parent;
-    ins.hInsertAfter = TVI_FIRST;
+    ins.hInsertAfter = after;
     ins.itemex.mask = TVIF_TEXT | TVIF_PARAM | TVIF_INTEGRAL;
     ins.itemex.pszText = (LPWSTR)text;
     ins.itemex.lParam = param;
@@ -840,12 +873,20 @@ static HTREEITEM AddNode(HTREEITEM parent, const WCHAR *text, LPARAM param)
     return TreeView_InsertItem(g_view.tree, &ins);
 }
 
-static void ExpandUnlessFolded(HTREEITEM folder)
+/* Prepended: the rows are added from the last. */
+static HTREEITEM AddNode(HTREEITEM parent, const WCHAR *text, LPARAM param)
+{
+    return InsertNode(parent, TVI_FIRST, text, param);
+}
+
+/* A folder the user opened, open again; while searching, every folder, so
+ * that what matches shows (not remembered: the search cleared, they fold). */
+static void ExpandIfOpened(HTREEITEM folder)
 {
     TreeNodeKey key;
     if (!folder) return;
     ItemKey(folder, &key);
-    if (!WasCollapsed(key.key)) TreeView_Expand(g_view.tree, folder, TVE_EXPAND);
+    if (g_view.filter[0] || WasOpened(key.key)) TreeView_Expand(g_view.tree, folder, TVE_EXPAND);
 }
 
 /* How many sessions each folder of the tree shows for profile `p`, and the
@@ -853,32 +894,44 @@ static void ExpandUnlessFolded(HTREEITEM folder)
 static void CountFolders(int p)
 {
     int r;
-    g_view.starredCount = 0;
+    g_view.starredCount = g_view.archivedCount = 0;
     if (g_view.set.groupCount > g_view.folderCountCapacity) {
         size_t bytes = (size_t)g_view.set.groupCount * sizeof(int);
         int *grown = (int *)(g_view.folderCount ? HeapReAlloc(GetProcessHeap(), 0, g_view.folderCount, bytes)
                                                 : HeapAlloc(GetProcessHeap(), 0, bytes));
-        if (grown) {
-            g_view.folderCount = grown;
-            g_view.folderCountCapacity = g_view.set.groupCount;
-        }
+        int *archived;
+        if (grown) g_view.folderCount = grown;
+        archived = (int *)(g_view.folderArchived ? HeapReAlloc(GetProcessHeap(), 0, g_view.folderArchived, bytes)
+                                                 : HeapAlloc(GetProcessHeap(), 0, bytes));
+        if (archived) g_view.folderArchived = archived;
+        if (grown && archived) g_view.folderCountCapacity = g_view.set.groupCount;
     }
     if (g_view.folderCount) ZeroMemory(g_view.folderCount, (size_t)g_view.folderCountCapacity * sizeof(int));
+    if (g_view.folderArchived) ZeroMemory(g_view.folderArchived, (size_t)g_view.folderCountCapacity * sizeof(int));
     if (p < 0) return;
     for (r = 0; r < g_view.set.rowCount; r++) {
         const SessionRow *row = &g_view.set.rows[r];
+        const SessionEntry *entry = EntryOf(row, p);
         if (!RowVisibleIn(row, p)) continue;
-        if (row->group < g_view.folderCountCapacity) g_view.folderCount[row->group]++;
-        if (StarredIn(EntryOf(row, p))) g_view.starredCount++;
+        if (entry->archived) {
+            g_view.archivedCount++;
+            if (row->group < g_view.folderCountCapacity) g_view.folderArchived[row->group]++;
+        } else {
+            if (row->group < g_view.folderCountCapacity) g_view.folderCount[row->group]++;
+            if (StarredIn(entry)) g_view.starredCount++;
+        }
     }
 }
 
-/* The sessions a folder node shows; NODE_STARRED: the starred ones. */
+/* The sessions a folder node shows; NODE_STARRED: the starred ones, not
+ * archived; NODE_ARCHIVED: the archived ones. */
 static int FolderCount(LPARAM node)
 {
     int group = NodeGroup(node);
     if (node == NODE_STARRED) return g_view.starredCount;
-    return group >= 0 && group < g_view.folderCountCapacity ? g_view.folderCount[group] : 0;
+    if (node == NODE_ARCHIVED) return g_view.archivedCount;
+    if (group < 0 || group >= g_view.folderCountCapacity) return 0;
+    return UnderArchived(node) ? g_view.folderArchived[group] : g_view.folderCount[group];
 }
 
 typedef struct RefillMatch {            /* what a refill finds again of the tree before */
@@ -943,7 +996,8 @@ static HTREEITEM FirstShownSession(void)
 /* The tree filled again for the shown profile. The row selected stays
  * selected (its session's other row when it is gone: unstarred, moved; the
  * session below it when its session is gone, else the one above it), else
- * the first session shown; folded folders stay folded. The view keeps its
+ * the first session shown, else the first folder; folders stay as the
+ * user left them (folded until opened). The view keeps its
  * place (RememberTopRow), else shows the selection: the search, the profile
  * or the archived sessions shown changed. */
 static void FillTree(void)
@@ -964,9 +1018,9 @@ static void FillTree(void)
          * siblings for every insertion into a large project. */
         for (r = g_view.set.rowCount - 1; r >= 0; r--) {
             const SessionRow *row = &g_view.set.rows[r];
-            if (!RowVisibleIn(row, p)) continue;
+            if (!RowVisibleIn(row, p) || RowArchived(row, p)) continue;
             if (row->group != group) {
-                ExpandUnlessFolded(folder);
+                ExpandIfOpened(folder);
                 group = row->group;
                 SessionStore_GroupName(&g_view.set, group, name, ARRAYSIZE(name));
                 folder = AddNode(TVI_ROOT, name, -2 - group);
@@ -975,17 +1029,39 @@ static void FillTree(void)
             item = AddNode(folder, ShownTitle(row, p), r);
             MatchNode(&match, item, r, FALSE);
         }
-        ExpandUnlessFolded(folder);
+        ExpandIfOpened(folder);
         if (g_view.starredCount) {
             folder = AddNode(TVI_ROOT, StarredName(), NODE_STARRED);
             MatchNode(&match, folder, NODE_STARRED, FALSE);
             for (r = g_view.set.rowCount - 1; r >= 0; r--) {
                 const SessionRow *row = &g_view.set.rows[r];
-                if (!RowVisibleIn(row, p) || !StarredIn(EntryOf(row, p))) continue;
+                if (!RowVisibleIn(row, p) || RowArchived(row, p) || !StarredIn(EntryOf(row, p))) continue;
                 item = AddNode(folder, ShownTitle(row, p), r);
                 MatchNode(&match, item, r, TRUE);
             }
-            ExpandUnlessFolded(folder);
+            ExpandIfOpened(folder);
+        }
+        /* Below, the archived sessions by folder: a folder can show above too. */
+        if (g_view.archivedCount) {
+            HTREEITEM archived = InsertNode(TVI_ROOT, TVI_LAST, TR(L"Archived"), NODE_ARCHIVED);
+            MatchNode(&match, archived, NODE_ARCHIVED, FALSE);
+            folder = NULL;
+            group = -1;
+            for (r = g_view.set.rowCount - 1; r >= 0; r--) {
+                const SessionRow *row = &g_view.set.rows[r];
+                if (!RowVisibleIn(row, p) || !RowArchived(row, p)) continue;
+                if (row->group != group) {
+                    ExpandIfOpened(folder);
+                    group = row->group;
+                    SessionStore_GroupName(&g_view.set, group, name, ARRAYSIZE(name));
+                    folder = AddNode(archived, name, NODE_ARCHIVED - 1 - group);
+                    MatchNode(&match, folder, NODE_ARCHIVED - 1 - group, FALSE);
+                }
+                item = AddNode(folder, ShownTitle(row, p), r);
+                MatchNode(&match, item, r, FALSE);
+            }
+            ExpandIfOpened(folder);
+            ExpandIfOpened(archived);
         }
         if (TreeView_GetRoot(g_view.tree)) {
             TVITEMEXW top;
@@ -998,13 +1074,14 @@ static void FillTree(void)
     }
     pick = match.selected ? match.selected : match.sameSession ? match.sameSession :
            match.neighbor[0] ? match.neighbor[0] : match.neighbor[1] ? match.neighbor[1] : FirstShownSession();
+    if (!pick) pick = TreeView_GetRoot(g_view.tree);
     ZeroMemory(&key, sizeof key);
     if (pick) {
         HTREEITEM parent = TreeView_GetParent(g_view.tree, pick);
         TreeView_SelectItem(g_view.tree, pick);   /* opens the folder it is in, if folded */
-        if (parent) {
+        if (parent && !g_view.filter[0]) {
             ItemKey(parent, &key);
-            SetCollapsed(key.key, FALSE);
+            SetOpened(key.key, TRUE);
         }
         ItemKey(pick, &key);
     }
@@ -1072,6 +1149,19 @@ static HTREEITEM FindShownSession(const WCHAR *key)
 
 static void MarkFolder(HTREEITEM folder, BOOL on);
 
+/* The row after `item` under folder row `folder`, at any depth (Archived
+ * holds folders), in the tree's order; NULL past its last. */
+static HTREEITEM NextUnder(HTREEITEM folder, HTREEITEM item)
+{
+    HTREEITEM next = TreeView_GetChild(g_view.tree, item);
+    if (next) return next;
+    while (item && item != folder) {
+        if ((next = TreeView_GetNextSibling(g_view.tree, item)) != NULL) return next;
+        item = TreeView_GetParent(g_view.tree, item);
+    }
+    return NULL;
+}
+
 /* Choosing starts from the selection: its session, or a folder's sessions, the first chosen. */
 static void StartMarks(void)
 {
@@ -1088,7 +1178,7 @@ static void StartMarks(void)
 static void MarkFolder(HTREEITEM folder, BOOL on)
 {
     HTREEITEM child;
-    for (child = TreeView_GetChild(g_view.tree, folder); child; child = TreeView_GetNextSibling(g_view.tree, child)) {
+    for (child = TreeView_GetChild(g_view.tree, folder); child; child = NextUnder(folder, child)) {
         LPARAM node = NodeParam(child);
         if (node >= 0 && node < g_view.set.rowCount) Mark(g_view.set.rows[node].key, on);
     }
@@ -1098,7 +1188,7 @@ static void MarkFolder(HTREEITEM folder, BOOL on)
 static BOOL FolderMarked(HTREEITEM folder)
 {
     HTREEITEM child;
-    for (child = TreeView_GetChild(g_view.tree, folder); child; child = TreeView_GetNextSibling(g_view.tree, child)) {
+    for (child = TreeView_GetChild(g_view.tree, folder); child; child = NextUnder(folder, child)) {
         LPARAM node = NodeParam(child);
         if (node >= 0 && node < g_view.set.rowCount && MarkIndex(g_view.set.rows[node].key) < 0) return FALSE;
     }
@@ -1183,6 +1273,8 @@ static void ChooseAllShown(void)
     RedrawDetails(FALSE);
 }
 
+static void CopyOrPaste(WPARAM key);
+
 static LRESULT CALLBACK TreeSubclass(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
 {
     (void)ref;
@@ -1216,9 +1308,13 @@ static LRESULT CALLBACK TreeSubclass(HWND window, UINT msg, WPARAM wp, LPARAM lp
             ChooseAllShown();
             return 0;
         }
+        if ((wp == 'C' || wp == 'V') && GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0) {
+            CopyOrPaste(wp);
+            return 0;
+        }
         break;
     case WM_CHAR:
-        if (wp == 1) return 0;   /* Ctrl+A's character: no search of the titles */
+        if (wp == 1 || wp == 3 || wp == 22) return 0;   /* Ctrl+A's, Ctrl+C's and Ctrl+V's characters: no search of the titles */
         break;
     case WM_NCDESTROY:
         RemoveWindowSubclass(window, TreeSubclass, id);
@@ -1227,8 +1323,20 @@ static LRESULT CALLBACK TreeSubclass(HWND window, UINT msg, WPARAM wp, LPARAM lp
     return DefSubclassProc(window, msg, wp, lp);
 }
 
+/* The archive mark before a row's title: Archived, its folders and its sessions. */
+static BOOL ArchivedIn(LPARAM node)
+{
+    if (node == NODE_ARCHIVED || UnderArchived(node)) return TRUE;
+    return node >= 0 && node < g_view.set.rowCount && RowArchived(&g_view.set.rows[node], ShownProfileIndex());
+}
+
+static int ArchivedMarkRoom(HDC dc)
+{
+    return Theme_InlineGlyphWidth(dc, ARCHIVED_GLYPH, Font(THEME_FONT_TEXT)) + g_view.pad / 2;
+}
+
 /* Drawing and tooltip measurement share the title's space, including the
- * folder count or a session's archived/waiting suffix. */
+ * folder count, the archive mark or a session's waiting suffix. */
 static RECT TreeTitleBounds(HDC dc, const RECT *row, int level, LPARAM node, WCHAR *tail, size_t cch)
 {
     RECT title = *row;
@@ -1240,17 +1348,28 @@ static RECT TreeTitleBounds(HDC dc, const RECT *row, int level, LPARAM node, WCH
         title.right -= TextWidth(dc, THEME_FONT_TEXT, tail) + g_view.pad;
     } else if (node < g_view.set.rowCount) {
         const SessionEntry *entry = EntryOf(&g_view.set.rows[node], ShownProfileIndex());
-        StringCchCopyW(tail, cch, entry && entry->pending ? TR(L"  \x00B7  waiting") :
-                                    entry && entry->archived ? TR(L"  \x00B7  archived") : L"");
+        StringCchCopyW(tail, cch, entry && entry->pending ? TR(L"  \x00B7  waiting") : L"");
         title.right -= TextWidth(dc, THEME_FONT_TEXT, tail);
     }
+    if (ArchivedIn(node)) title.left += ArchivedMarkRoom(dc);
     return title;
 }
 
-/* One row of the tree, in the theme's rows: folders in the heading font
- * with their count in gray, sessions in the text font; in gray a session
- * with no conversation on disk, archived, or with a change waiting. The
- * keyboard's row has the focus cue. */
+/* The archive mark, in the room TreeTitleBounds keeps before `title` on `row`. */
+static void DrawArchivedMark(HDC dc, const RECT *row, const RECT *title)
+{
+    RECT mark = *row;
+    mark.left = title->left - ArchivedMarkRoom(dc);
+    mark.right = title->left;
+    Theme_DrawInlineGlyph(dc, &mark, ARCHIVED_GLYPH, Font(THEME_FONT_TEXT), Theme_TintColor(THEME_TINT_AMBER));
+}
+
+/* One row of the tree, in the theme's rows: folders in the strong font (as
+ * large as the profile list's rows) with their count in gray, sessions in
+ * the text font; in gray a session with no conversation on disk, archived
+ * (its mark before it, as before a folder of archived sessions only), or
+ * with a change waiting. The keyboard's row has
+ * the focus cue. */
 static void DrawTreeItem(const NMTVCUSTOMDRAW *customDraw)
 {
     WCHAR tail[64], name[MAX_PATH];
@@ -1285,15 +1404,18 @@ static void DrawTreeItem(const NMTVCUSTOMDRAW *customDraw)
 
     if (node < 0) {
         if (node == NODE_STARRED) StringCchCopyW(name, ARRAYSIZE(name), StarredName());
+        else if (node == NODE_ARCHIVED) StringCchCopyW(name, ARRAYSIZE(name), TR(L"Archived"));
         else SessionStore_GroupName(&g_view.set, NodeGroup(node), name, ARRAYSIZE(name));
         Theme_DrawTreeGlyph(g_view.tree, dc, &cell, state, (itemState & TVIS_EXPANDED) != 0);
-        baseline = CenteredBaseline(&rc, THEME_FONT_HEADING);
-        left = TextAt(dc, THEME_FONT_HEADING, text, name, title.left, title.right, baseline);
+        if (ArchivedIn(node)) DrawArchivedMark(dc, &rc, &title);
+        baseline = CenteredBaseline(&rc, THEME_FONT_STRONG);
+        left = TextAt(dc, THEME_FONT_STRONG, text, name, title.left, title.right, baseline);
         TextAt(dc, THEME_FONT_TEXT, muted, tail, left + g_view.pad, right, baseline);
     } else if (node < g_view.set.rowCount) {
         const SessionRow *row = &g_view.set.rows[node];
         const SessionEntry *entry = EntryOf(row, p);
         baseline = CenteredBaseline(&rc, THEME_FONT_TEXT);
+        if (ArchivedIn(node)) DrawArchivedMark(dc, &rc, &title);
         left = TextAt(dc, THEME_FONT_TEXT, !row->transcript || (entry && (entry->archived || entry->pendingRemove)) ? muted : text,
                       ShownTitle(row, p), title.left, title.right, baseline);
         if (tail[0]) TextAt(dc, THEME_FONT_TEXT, muted, tail, left, right, baseline);
@@ -1371,7 +1493,7 @@ static LRESULT TreeCustomDraw(NMTVCUSTOMDRAW *customDraw)
             WCHAR tail[64];
             HTREEITEM parent;
             int level = 0;
-            SelectObject(customDraw->nmcd.hdc, Font(customDraw->nmcd.lItemlParam < 0 ? THEME_FONT_HEADING : THEME_FONT_TEXT));
+            SelectObject(customDraw->nmcd.hdc, Font(customDraw->nmcd.lItemlParam < 0 ? THEME_FONT_STRONG : THEME_FONT_TEXT));
             if (GetClientRect(g_view.tree, &row)) {
                 for (parent = TreeView_GetParent(g_view.tree, (HTREEITEM)customDraw->nmcd.dwItemSpec); parent;
                      parent = TreeView_GetParent(g_view.tree, parent)) level++;
@@ -1442,19 +1564,6 @@ static void NamesOf(DWORD bits, WCHAR *out, size_t cch)
     }
 }
 
-/* The place of an Actions box at the right end of `line`, in its middle: the
- * details' controls are as high as a button, and the boxes all as wide, down
- * the right edge (MeasureFonts). */
-static RECT ActionsBoxAt(const RECT *line)
-{
-    RECT box;
-    box.left = line->right - g_view.actionsWidth;
-    box.top = line->top + (line->bottom - line->top - g_view.controlHeight) / 2;
-    box.right = line->right;
-    box.bottom = box.top + g_view.controlHeight;
-    return box;
-}
-
 static ChipSet *ChipsOf(HWND window)
 {
     return window == g_view.parts ? &g_view.scrolled : &g_view.fixed;
@@ -1478,10 +1587,9 @@ static BOOL SameChip(const ChipRef *one, const ChipRef *other)
     return one->window == other->window && (!one->window || (one->action == other->action && one->profile == other->profile));
 }
 
-/* A control of the details drawn in `owner` at `rc`: a button, or
- * (ACT_MENU) the Actions box of `profile`, drawn pressed while its menu
- * shows; the folder's button (ACT_SHOW_FOLDER) shows its path on its left.
- * One scrolled out of `owner` is not there to click. */
+/* A button of the details drawn in `owner` at `rc`; the folder's button
+ * (ACT_SHOW_FOLDER) shows its path on its left. One scrolled out of `owner`
+ * is not there to click. */
 static void DrawChip(HWND owner, HDC dc, Action action, int profile, const WCHAR *text, const RECT *rc)
 {
     ChipSet *set = ChipsOf(owner);
@@ -1492,14 +1600,11 @@ static void DrawChip(HWND owner, HDC dc, Action action, int profile, const WCHAR
     if (i >= MAX_CHIPS || !IntersectRect(&set->chip[i].rc, rc, &client)) return;
     set->chip[i].action = action;
     set->chip[i].profile = profile;
-    if (IsChip(&g_view.open, owner, action, profile) ||
-        (IsChip(&g_view.hot, owner, action, profile) && IsChip(&g_view.pressed, owner, action, profile)))
+    if (IsChip(&g_view.hot, owner, action, profile) && IsChip(&g_view.pressed, owner, action, profile))
         state = THEME_BUTTON_PRESSED;
     else if (IsChip(&g_view.hot, owner, action, profile))
         state = THEME_BUTTON_HOT;
-    if (action == ACT_MENU) {
-        Theme_DrawDropDown(owner, dc, rc, text, DialogFont(), state);
-    } else if (action == ACT_SHOW_FOLDER) {
+    if (action == ACT_SHOW_FOLDER) {
         RECT label = *rc;
         InflateRect(&label, -g_view.pad - g_view.pad / 2, 0);
         Theme_DrawButton(owner, dc, rc, L"", DialogFont(), state, DT_SINGLELINE);
@@ -1522,9 +1627,9 @@ static int DrawSeparator(HDC dc, int left, int right, int y)
 
 /* One profile's part of the details. On its first line its badge, its name
  * (underlined for the profile shown, struck out where the session is not
- * listed), a star where it is starred, and its Actions box; below, its
- * title there when it is not the one the tree shows, what is going on there
- * and the changes waiting. */
+ * listed) and a star where it is starred; below, its title there when it is
+ * not the one the tree shows, what is going on there and the changes
+ * waiting. A right-click on it shows its menu (ProfileMenu). */
 static int DrawProfilePart(HDC dc, const SessionRow *row, int p, int left, int right, int y)
 {
     WCHAR text[512];
@@ -1533,14 +1638,13 @@ static int DrawProfilePart(HDC dc, const SessionRow *row, int p, int left, int r
     int shown = ShownProfileIndex();
     ThemeFont role = !entry ? THEME_FONT_ABSENT : p == shown ? THEME_FONT_CURRENT : THEME_FONT_STRONG;
     COLORREF color = Theme_Color(THEME_TEXT), muted = Theme_Color(THEME_MUTED);
-    RECT line = { left, y, right, y + max(g_view.controlHeight, LineHeight(THEME_FONT_STRONG)) }, box = ActionsBoxAt(&line);
+    RECT line = { left, y, right, y + max(g_view.controlHeight, LineHeight(THEME_FONT_STRONG)) };
     int inner = left + g_view.badgeSize + g_view.pad, star = StarredIn(entry) ? TextWidth(dc, THEME_FONT_TEXT, L" \x2605") : 0, baseline, end;
 
     if (g_view.badges) ImageList_Draw(g_view.badges, p, dc, left, line.top + (line.bottom - line.top - g_view.badgeSize) / 2, ILD_NORMAL);
     baseline = CenteredBaseline(&line, role);
-    end = TextAt(dc, role, entry ? color : muted, profile->name, inner, box.left - g_view.pad - star, baseline);
-    if (star) TextAt(dc, THEME_FONT_TEXT, color, L" \x2605", end, box.left - g_view.pad, baseline);
-    DrawChip(g_view.parts, dc, ACT_MENU, p, TR(Theme_SessionsCaption(SESSIONS_ACTIONS)), &box);
+    end = TextAt(dc, role, entry ? color : muted, profile->name, inner, right - star, baseline);
+    if (star) TextAt(dc, THEME_FONT_TEXT, color, L" \x2605", end, right, baseline);
     y = line.bottom;
     if (!entry) return y;
     if (p != shown && wcscmp(TitleIn(row, p), TitleIn(row, shown)) != 0)
@@ -1617,14 +1721,14 @@ static const WCHAR *SelectedFolder(void)
 /* The selected session's details that stay: from the tree's top (the
  * search box's row above stays empty), its folder's path (a button that
  * shows the folder), when it was last used, how big its conversation is, a
- * warning when it is open in two profiles at once; at the bottom, Delete
- * session everywhere. Between their two lines, the part that scrolls
- * (DrawParts) is placed. With no session selected: why, and the notes. */
+ * warning when it is open in two profiles at once. Below its line, down to
+ * the bottom, the part that scrolls (DrawParts) is placed. With no session
+ * selected: why, and the notes. */
 static void DrawDetails(const DRAWITEMSTRUCT *item)
 {
     WCHAR text[4096], date[64], time[32], names[NAMES_CCH];
     ThemeBuffer buffer;
-    RECT rc = item->rcItem, line, remove, tree = ChildRect(g_view.treeArea), self = ChildRect(g_view.details), was;
+    RECT rc = item->rcItem, line, tree = ChildRect(g_view.treeArea), self = ChildRect(g_view.details), was;
     int r = SelectedRow(), left = rc.left, right = rc.right, y = rc.top, top, bottom;
     const SessionRow *row = r >= 0 ? &g_view.set.rows[r] : NULL;
     HDC dc = Theme_BufferBegin(&buffer, item->hDC, &rc);
@@ -1678,13 +1782,10 @@ static void DrawDetails(const DRAWITEMSTRUCT *item)
         y = Paragraph(dc, THEME_FONT_STRONG, color, text, left, right, y + g_view.pad, 6);
     }
     top = DrawSeparator(dc, left, right, y) - g_view.pad;   /* under its line */
-    SetRect(&remove, left, rc.bottom - g_view.controlHeight, right, rc.bottom);
-    bottom = remove.top - g_view.pad - 1;                  /* over the bottom line */
-    DrawSeparator(dc, left, right, bottom - g_view.pad);
-    DrawChip(g_view.details, dc, ACT_DELETE_ALL, -1, TR(Theme_SessionsCaption(SESSIONS_DELETE_EVERYWHERE)), &remove);
+    bottom = rc.bottom;
     Theme_BufferEnd(&buffer);
 
-    /* The part that scrolls, between the two lines. */
+    /* The part that scrolls, under the line. */
     if (!g_view.parts || !GetWindowRect(g_view.parts, &was)) return;
     MapWindowPoints(NULL, g_view.details, (POINT *)&was, 2);
     if (was.left != left || was.top != top || was.right != right || was.bottom != max(top, bottom) || !IsWindowVisible(g_view.parts))
@@ -1692,7 +1793,7 @@ static void DrawDetails(const DRAWITEMSTRUCT *item)
 }
 
 /* Each profile's part of the selected session, then the notes: what scrolls
- * between the details' two lines. */
+ * under the details' line. */
 static void DrawParts(const DRAWITEMSTRUCT *item)
 {
     ThemeBuffer buffer;
@@ -1704,8 +1805,14 @@ static void DrawParts(const DRAWITEMSTRUCT *item)
     g_view.scrolled.count = 0;
     FillRect(dc, &rc, Theme_Brush(THEME_FACE));
     SetBkMode(dc, TRANSPARENT);
+    for (p = 0; p < MAX_PROFILES; p++) g_view.partTop[p] = g_view.partBottom[p] = 0;
     if (row)
-        for (p = 0; p < g_view.set.profiles.count; p++) y = DrawProfilePart(dc, row, p, left, right, p == 0 ? y : DrawSeparator(dc, left, right, y));
+        for (p = 0; p < g_view.set.profiles.count; p++) {
+            if (p) y = DrawSeparator(dc, left, right, y);
+            g_view.partTop[p] = y - rc.top;
+            y = DrawProfilePart(dc, row, p, left, right, y);
+            g_view.partBottom[p] = y - rc.top;
+        }
     y = DrawNotes(dc, left, right, y);
     Theme_BufferEnd(&buffer);
     if (!SetDetailsScroll(y - top + g_view.pad, rc.bottom - rc.top)) InvalidateRect(g_view.parts, NULL, FALSE);
@@ -1729,11 +1836,21 @@ static BOOL ChipAt(HWND window, POINT pt, ChipRef *found, RECT *rc)
 }
 
 static void RunAction(Action action, int p);
-static void ProfileMenu(int p, const RECT *box);
+static void ProfileMenu(int p, POINT pt);
+
+/* The profile whose part of the details is at `y` of the part that scrolls, -1 for none. */
+static int PartAt(int y)
+{
+    int p;
+    if (SelectedRow() < 0 || (g_view.several && g_view.markedCount >= 2)) return -1;
+    for (p = 0; p < g_view.set.profiles.count; p++)
+        if (y >= g_view.partTop[p] - g_view.pad && y < g_view.partBottom[p] + g_view.pad) return p;
+    return -1;
+}
 
 /* The controls of the details and of their part that scrolls: under the
- * mouse, pressed, clicked; an Actions box opens its menu as soon as it is
- * pressed, as a drop-down list does. The details also draw that part. */
+ * mouse, pressed, clicked; a profile's part, right-clicked (its menu) or
+ * double-clicked (opened there). The details also draw that part. */
 static LRESULT CALLBACK DetailsSubclass(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
 {
     POINT pt;
@@ -1770,15 +1887,34 @@ static LRESULT CALLBACK DetailsSubclass(HWND window, UINT msg, WPARAM wp, LPARAM
         pt.x = GET_X_LPARAM(lp);
         pt.y = GET_Y_LPARAM(lp);
         g_view.pressed.window = NULL;   /* a press anywhere ends any press before */
-        if (ChipAt(window, pt, &chip, &box) && chip.action == ACT_MENU) {
-            ProfileMenu(chip.profile, &box);
-        } else if (chip.window) {
+        if (ChipAt(window, pt, &chip, &box)) {
             g_view.pressed = chip;
             g_view.pressedSelection = g_view.selection;
             SetCapture(window);
+        } else if (msg == WM_LBUTTONDBLCLK && window == g_view.parts) {
+            int p = PartAt(pt.y), r = SelectedRow();
+            if (p >= 0 && r >= 0 && ListedAndKept(EntryOf(&g_view.set.rows[r], p))) RunAction(ACT_OPEN, p);
         }
         InvalidateRect(window, NULL, FALSE);
         return 0;
+    case WM_CONTEXTMENU:
+        if (window == g_view.parts) {
+            int p;
+            pt.x = GET_X_LPARAM(lp);
+            pt.y = GET_Y_LPARAM(lp);
+            if (lp == (LPARAM)-1) {
+                p = 0;
+                pt.x = pt.y = 0;
+                ClientToScreen(window, &pt);
+            } else {
+                POINT inside = pt;
+                ScreenToClient(window, &inside);
+                p = PartAt(inside.y);
+            }
+            if (p >= 0 && SelectedRow() >= 0) ProfileMenu(p, pt);
+            return 0;
+        }
+        break;
     case WM_LBUTTONUP:
         pt.x = GET_X_LPARAM(lp);
         pt.y = GET_Y_LPARAM(lp);
@@ -1814,9 +1950,10 @@ static LRESULT CALLBACK DetailsSubclass(HWND window, UINT msg, WPARAM wp, LPARAM
 
 /* --------------------------------------------------------------- actions */
 
-typedef struct TitleDialog {
+typedef struct TitleDialog {             /* the Edit session dialog: a session's title and star in one profile */
     const WCHAR *profile;
     WCHAR        title[SESSION_TITLE_CCH];
+    BOOL         starred;
 } TitleDialog;
 
 /* The title typed in the dialog, without the blanks around it: where it
@@ -1845,6 +1982,7 @@ static INT_PTR CALLBACK TitleProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp)
         SendDlgItemMessageW(dialog, IDC_T_TITLE, EM_LIMITTEXT, SESSION_TITLE_CCH - 1, 0);
         SetDlgItemTextW(dialog, IDC_T_TITLE, request->title);
         SendDlgItemMessageW(dialog, IDC_T_TITLE, EM_SETSEL, 0, -1);
+        CheckDlgButton(dialog, IDC_T_STAR, request->starred ? BST_CHECKED : BST_UNCHECKED);
         SetFocus(GetDlgItem(dialog, IDC_T_TITLE));
         return FALSE;
     case WM_COMMAND:
@@ -1854,18 +1992,13 @@ static INT_PTR CALLBACK TitleProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp)
             if (LOWORD(wp) == IDOK) {
                 if ((length = TypedTitle(dialog, typed, ARRAYSIZE(typed), &start)) == 0) return TRUE;
                 StringCchCopyNW(request->title, ARRAYSIZE(request->title), start, length);
+                request->starred = IsDlgButtonChecked(dialog, IDC_T_STAR) == BST_CHECKED;
             }
             EndDialog(dialog, LOWORD(wp));
         }
         return TRUE;
     }
     return FALSE;
-}
-
-/* "Work opens it now" with what happens first when it is closed. */
-static void OpensNow(int p, WCHAR *out, size_t cch)
-{
-    StringCchPrintfW(out, cch, ProfileAt(p)->running ? TR(L"%s opens it now") : TR(L"%s starts and opens it"), ProfileAt(p)->name);
 }
 
 static BOOL CanOpenConversation(const SessionRow *row, int target)
@@ -1913,121 +2046,22 @@ static void TellNotChanged(int p, const WCHAR *reason)
     else Ui_Message(g_view.dlg, MB_ICONERROR, TR(L"The session could not be changed in \x201C%s\x201D."), ProfileAt(p)->name);
 }
 
-/* The title session `key` keeps in `target` once Claude lists it there:
- * queued in `carried` (its key "" when none is: an untitled session, or a
- * failure the user is told about). */
-static void CarryTitle(int target, const WCHAR *key, const WCHAR *title, PendingEdit *carried)
-{
-    BOOL waiting;
-    ZeroMemory(carried, sizeof *carried);
-    if (!title[0]) return;
-    MakeEdit(carried, PENDING_TITLE, key, title);
-    if (SessionEdit_Change(g_view.dlg, ProfileAt(target), NULL, carried, &waiting, NULL, 0)) return;
-    carried->key[0] = 0;
-    Ui_Message(g_view.dlg, MB_ICONWARNING, TR(L"The session's title could not be set in \x201C%s\x201D."), ProfileAt(target)->name);
-}
-
-/* Session `key` opened in `target` with the title it carries; a title
- * carried for a session that did not open waits for nothing. FALSE, the
- * user told, when it did not open. */
-static BOOL OpenWithTitle(int target, const WCHAR *key, const WCHAR *title)
-{
-    PendingEdit carried;
-    CarryTitle(target, key, title, &carried);
-    if (OpenConversationIn(target, key)) return TRUE;
-    if (carried.key[0]) SessionEdit_Cancel(ProfileAt(target), &carried, 1);
-    return FALSE;
-}
-
-/* The end of the Share question when the session is open somewhere else:
- * shared with `target`, it opens there too, so in several profiles at once. */
-static void SharedOpenWarning(const SessionRow *row, int target, WCHAR *out, size_t cch)
-{
-    WCHAR names[NAMES_CCH];
-    DWORD open = row->live | (1u << target);
-    out[0] = 0;
-    if (BitCount(open) < 2) return;
-    NamesOf(open, names, ARRAYSIZE(names));
-    StringCchPrintfW(out, cch, BitCount(open) > 2
-                     ? TR(L"\n\nOnce shared, it is open in %s at once: go on in one of them only. "
-                          L"The others keep an older copy until the session is closed there.")
-                     : TR(L"\n\nOnce shared, it is open in %s at once: go on in one of them only. "
-                          L"The other one keeps an older copy until the session is closed there."),
-                     names);
-}
-
 static BOOL OpenSession(int r, int p)
 {
     return CanOpenConversation(&g_view.set.rows[r], -1) && OpenConversationIn(p, g_view.set.rows[r].key);
 }
 
-/* Share and Copy say when the session's title is set in `target`. An
- * untitled session carries none (CarryTitle): its question ends with how it
- * opens, and its format leaves out the last argument. */
+/* One session shared with or copied to `target` as several are
+ * (sessionsync.c): its entry goes whole, so it keeps its title, its star,
+ * whether it is archived and what else Claude keeps in it. */
 static BOOL ShareSession(int r, int target)
 {
-    const SessionRow *row = &g_view.set.rows[r];
-    const WCHAR *title = TitleIn(row, ShownProfileIndex()), *shown = ShownTitle(row, ShownProfileIndex());
-    const WCHAR *folder = wcsrchr(row->cwd, L'\\'), *name = ProfileAt(target)->name;
-    WCHAR text[4096], opens[256], warning[NOTE_CCH + NAMES_CCH];
-    if (!CanOpenConversation(row, target)) return FALSE;
-    OpensNow(target, opens, ARRAYSIZE(opens));
-    if (IsScratch(row))
-        StringCchPrintfW(text, ARRAYSIZE(text), title[0]
-                         ? TR(L"\x201C%s\x201D has no folder. Shared with \x201C%s\x201D, it shows there in a folder named %s, not under No folder, "
-                              L"and both profiles go on with the same conversation.\n\nFor a separate copy under No folder in \x201C%s\x201D, use Copy instead.\n\n"
-                              L"%s, and its title there is set when %s closes.")
-                         : TR(L"\x201C%s\x201D has no folder. Shared with \x201C%s\x201D, it shows there in a folder named %s, not under No folder, "
-                              L"and both profiles go on with the same conversation.\n\nFor a separate copy under No folder in \x201C%s\x201D, use Copy instead.\n\n"
-                              L"%s."),
-                         shown, name, folder ? folder + 1 : row->cwd, name, opens, name);
-    else
-        StringCchPrintfW(text, ARRAYSIZE(text), title[0]
-                         ? TR(L"Share \x201C%s\x201D with \x201C%s\x201D?\n\nBoth profiles then go on with the same conversation. "
-                              L"%s, and its title there is set when %s closes.")
-                         : TR(L"Share \x201C%s\x201D with \x201C%s\x201D?\n\nBoth profiles then go on with the same conversation. %s."),
-                         shown, name, opens, name);
-    SharedOpenWarning(row, target, warning, ARRAYSIZE(warning));
-    StringCchCatW(text, ARRAYSIZE(text), warning);
-    if (!Ui_Ask(g_view.dlg, IDI_QUESTION, text, TR(L"Share"), TR(L"Cancel"), FALSE)) return FALSE;
-    return OpenWithTitle(target, row->key, title);
+    return SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, ShownProfileIndex(), &r, 1, FALSE, target);
 }
 
-/* A copy that does not open is listed nowhere: what the copy made goes again. */
 static BOOL CopySession(int r, int target)
 {
-    const SessionRow *row = &g_view.set.rows[r];
-    const WCHAR *title = TitleIn(row, ShownProfileIndex()), *shown = ShownTitle(row, ShownProfileIndex()), *name = ProfileAt(target)->name;
-    WCHAR text[4096], opens[256], id[SESSION_ID_CCH], error[1024], left[LONG_PATH_CCH];
-    CopyResult copied;
-    if (!CanOpenConversation(row, target)) return FALSE;
-    if (IsScratch(row) && !g_view.set.source[target].scratchDir[0]) {
-        Ui_Message(g_view.dlg, MB_ICONINFORMATION, TR(L"\x201C%s\x201D has no Claude Code sessions yet: open its Code tab once, then copy again."),
-                   name);
-        return FALSE;
-    }
-    OpensNow(target, opens, ARRAYSIZE(opens));
-    if (IsScratch(row))
-        StringCchPrintfW(text, ARRAYSIZE(text), title[0]
-                         ? TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\n%s gets its own copy of the conversation and of its working folder, "
-                              L"under No folder in \x201C%s\x201D. The copy then goes on separately. %s, and its title there is set when %s closes.")
-                         : TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\n%s gets its own copy of the conversation and of its working folder, "
-                              L"under No folder in \x201C%s\x201D. The copy then goes on separately. %s."),
-                         shown, name, name, name, opens, name);
-    else
-        StringCchPrintfW(text, ARRAYSIZE(text), title[0]
-                         ? TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\n%s gets its own copy of the conversation, which then goes on separately. "
-                              L"%s, and its title there is set when %s closes.")
-                         : TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\n%s gets its own copy of the conversation, which then goes on separately. "
-                              L"%s."),
-                         shown, name, name, opens, name);
-    if (!Ui_Ask(g_view.dlg, IDI_QUESTION, text, TR(L"Copy"), TR(L"Cancel"), FALSE)) return FALSE;
-    copied = SessionEdit_CopyConversation(g_view.dlg, &g_view.set, r, target, id, ARRAYSIZE(id), error, ARRAYSIZE(error));
-    if (copied == COPY_FAILED) Ui_Message(g_view.dlg, MB_ICONERROR, TR(L"The session could not be copied. %s"), error);
-    if (copied != COPY_MADE) return FALSE;   /* cancelled in Windows' progress: nothing to say */
-    if (!OpenWithTitle(target, id, title) && !SessionEdit_RemoveCopy(&g_view.set, r, target, id, left, ARRAYSIZE(left)) && left[0])
-        Ui_Message(g_view.dlg, MB_ICONWARNING, TR(L"The copy could not be opened, and its files could not all be deleted: %s"), left);
-    return TRUE;
+    return SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, ShownProfileIndex(), &r, 1, TRUE, target);
 }
 
 /* A change to the entry of profile `p`, made now or when it closes; FALSE,
@@ -2044,41 +2078,36 @@ static BOOL ChangeEntry(int r, int p, PendingOp op, const WCHAR *value)
     return FALSE;
 }
 
-static BOOL RenameEntry(int r, int p)
+/* The title and the star of the session in profile `p`, edited together;
+ * only what changed is written. */
+static BOOL EditEntry(int r, int p)
 {
     TitleDialog request;
+    BOOL starred = StarredIn(EntryOf(&g_view.set.rows[r], p)), changed = FALSE;
     ZeroMemory(&request, sizeof request);
     request.profile = ProfileAt(p)->name;
+    request.starred = starred;
     StringCchCopyW(request.title, ARRAYSIZE(request.title), TitleIn(&g_view.set.rows[r], p));
     if (Ui_Dialog(g_view.dlg, IDD_TITLE, TitleProc, (LPARAM)&request) != IDOK) return FALSE;
     /* The same title written again would only mark it as chosen: Claude would stop naming the session. */
-    if (wcscmp(request.title, TitleIn(&g_view.set.rows[r], p)) == 0) return FALSE;
-    return ChangeEntry(r, p, PENDING_TITLE, request.title);
+    if (wcscmp(request.title, TitleIn(&g_view.set.rows[r], p)) != 0) {
+        if (!ChangeEntry(r, p, PENDING_TITLE, request.title)) return FALSE;
+        changed = TRUE;
+    }
+    if (request.starred != starred) changed = ChangeEntry(r, p, PENDING_STAR, request.starred ? L"1" : L"0") || changed;
+    return changed;
 }
 
 static BOOL RemoveEntry(int r, int p)
 {
     const SessionRow *row = &g_view.set.rows[r];
     const WCHAR *title = ShownTitle(row, p), *name = ProfileAt(p)->name;
-    WCHAR text[4096], names[NAMES_CCH];
-    DWORD keeping = ProfilesKeeping(row, p);
-    NamesOf(keeping, names, ARRAYSIZE(names));
-    if (ProfileAt(p)->running && keeping)
-        StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Remove \x201C%s\x201D from \x201C%s\x201D?\n\nIts entry there goes to the Recycle Bin when %s closes "
-                            L"(it keeps it until then). The conversation stays for %s."), title, name, name, names);
-    else if (ProfileAt(p)->running)
-        StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Remove \x201C%s\x201D from \x201C%s\x201D?\n\nIts entry there goes to the Recycle Bin when %s closes "
-                            L"(it keeps it until then). The conversation stays on disk: Delete session everywhere removes it too."), title, name, name);
-    else if (keeping)
-        StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Remove \x201C%s\x201D from \x201C%s\x201D?\n\nIts entry there goes to the Recycle Bin. The conversation stays for %s."),
-                         title, name, names);
+    WCHAR text[1024];
+    if (ProfileAt(p)->running)
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Remove \x201C%s\x201D from \x201C%s\x201D?\n\nIts entry goes to the Recycle Bin once %s closes."),
+                         title, name, name);
     else
-        StringCchPrintfW(text, ARRAYSIZE(text),
-                         TR(L"Remove \x201C%s\x201D from \x201C%s\x201D?\n\nIts entry there goes to the Recycle Bin. "
-                            L"The conversation stays on disk: Delete session everywhere removes it too."), title, name);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Remove \x201C%s\x201D from \x201C%s\x201D?\n\nIts entry goes to the Recycle Bin."), title, name);
     return Ui_Ask(g_view.dlg, IDI_QUESTION, text, TR(L"Remove"), TR(L"Cancel"), FALSE) && ChangeEntry(r, p, PENDING_REMOVE, L"");
 }
 
@@ -2106,40 +2135,102 @@ static BOOL KeepEntry(int r, int p)
     return kept;
 }
 
-/* Its conversation, its entries and, for a session without a folder, its
- * working folder to the Recycle Bin. Whatever runs it is said before the
- * question; SessionEdit checks again before anything goes. */
-static BOOL DeleteSessionEverywhere(int r)
+/* The conversation of transcript `path` as the preview shows it: who
+ * speaks, then what (Core_TranscriptLine), CRLF between lines. A heap block
+ * (HeapFree it); NULL when it cannot be read. */
+static WCHAR *PreviewText(const WCHAR *path, ULONGLONG bytes)
+{
+    DWORD length = 0;
+    char *content = Util_ReadFile(path, PREVIEW_READ_MAX, TRUE, &length), *line, *end = NULL;
+    WCHAR *text = NULL, *message = NULL;
+    TranscriptRole last = TRANSCRIPT_NONE;
+    size_t used;
+    if (!content) return NULL;
+    text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, PREVIEW_TEXT_CCH * sizeof(WCHAR));
+    message = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, PREVIEW_LINE_CCH * sizeof(WCHAR));
+    if (!text || !message) goto done;
+    text[0] = 0;
+    line = content;
+    if (bytes > PREVIEW_READ_MAX) {
+        /* Read from its middle: from the first whole line. */
+        if ((line = strchr(content, '\n')) == NULL) line = content + length;
+        else line++;
+        StringCchPrintfW(text, PREVIEW_TEXT_CCH, L"%s\r\n", TR(L"Only the end of this long conversation is shown."));
+    }
+    for (; *line; line = *end ? end + 1 : end) {
+        TranscriptRole role;
+        WCHAR head[64];
+        if ((end = strchr(line, '\n')) == NULL) end = line + strlen(line);
+        if ((role = Core_TranscriptLine(line, (size_t)(end - line), message, PREVIEW_LINE_CCH)) == TRANSCRIPT_NONE) continue;
+        if (role != last) {
+            StringCchPrintfW(head, ARRAYSIZE(head), L"%s%s  %s\r\n", text[0] ? L"\r\n\r\n" : L"",
+                             role == TRANSCRIPT_USER ? L"\x25B6" : L"\x25C6", role == TRANSCRIPT_USER ? TR(L"You") : L"Claude");
+            last = role;
+        } else {
+            StringCchCopyW(head, ARRAYSIZE(head), L"\r\n");
+        }
+        if (FAILED(StringCchCatW(text, PREVIEW_TEXT_CCH, head)) || FAILED(StringCchCatW(text, PREVIEW_TEXT_CCH, message))) {
+            used = wcslen(text);
+            if (used > 1) text[used - 1] = 0x2026;   /* full: cut */
+            break;
+        }
+    }
+    if (!text[0]) StringCchCopyW(text, PREVIEW_TEXT_CCH, TR(L"This conversation has nothing to show yet."));
+done:
+    if (message) HeapFree(GetProcessHeap(), 0, message);
+    if (content) HeapFree(GetProcessHeap(), 0, content);
+    if (text && !text[0]) {
+        HeapFree(GetProcessHeap(), 0, text);
+        text = NULL;
+    }
+    return text;
+}
+
+typedef struct PreviewDialog {
+    const WCHAR *title;
+    const WCHAR *text;
+} PreviewDialog;
+
+static INT_PTR CALLBACK PreviewProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp)
+{
+    const PreviewDialog *preview = (const PreviewDialog *)lp;
+    switch (msg) {
+    case WM_INITDIALOG:
+        SetDlgItemTextW(dialog, IDC_V_TITLE, preview->title);
+        SendDlgItemMessageW(dialog, IDC_V_TEXT, EM_SETLIMITTEXT, 0, 0);
+        SetDlgItemTextW(dialog, IDC_V_TEXT, preview->text);
+        SetFocus(GetDlgItem(dialog, IDC_V_TEXT));
+        SendDlgItemMessageW(dialog, IDC_V_TEXT, EM_SETSEL, 0, 0);
+        return FALSE;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) EndDialog(dialog, LOWORD(wp));
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* The conversation of session `r`, read only, in a window of its own. */
+static void PreviewSession(int r)
 {
     const SessionRow *row = &g_view.set.rows[r];
-    const WCHAR *question;
-    WCHAR text[4096], names[NAMES_CCH], error[LONG_PATH_CCH + NOTE_CCH], working[MAX_PATH];
-    DWORD listing = ProfilesListing(row);
-    RemoveResult result;
-    BOOL several = BitCount(listing) > 1, folder;
-    if (!SessionEdit_CanDelete(&g_view.set, r, error, ARRAYSIZE(error))) {
-        Ui_Message(g_view.dlg, MB_ICONINFORMATION, L"%s", error);
-        return FALSE;
+    PreviewDialog preview;
+    WCHAR *text;
+    HCURSOR old;
+    if (!row->transcript) {
+        Ui_Message(g_view.dlg, MB_ICONINFORMATION, TR(L"This session has no conversation on disk yet."));
+        return;
     }
-    folder = SessionEdit_RemovesWorkingFolder(&g_view.set, r, working, ARRAYSIZE(working));
-    NamesOf(listing, names, ARRAYSIZE(names));
-    if (row->transcript && folder)
-        question = several ? TR(L"Delete \x201C%s\x201D everywhere?\n\nIts conversation, its working folder and its entries in %s go to the Recycle Bin.")
-                           : TR(L"Delete \x201C%s\x201D everywhere?\n\nIts conversation, its working folder and its entry in %s go to the Recycle Bin.");
-    else if (row->transcript)
-        question = several ? TR(L"Delete \x201C%s\x201D everywhere?\n\nIts conversation and its entries in %s go to the Recycle Bin.")
-                           : TR(L"Delete \x201C%s\x201D everywhere?\n\nIts conversation and its entry in %s go to the Recycle Bin.");
-    else if (folder)
-        question = several ? TR(L"Delete \x201C%s\x201D everywhere?\n\nIts working folder and its entries in %s go to the Recycle Bin.")
-                           : TR(L"Delete \x201C%s\x201D everywhere?\n\nIts working folder and its entry in %s go to the Recycle Bin.");
-    else
-        question = several ? TR(L"Delete \x201C%s\x201D everywhere?\n\nIts entries in %s go to the Recycle Bin.")
-                           : TR(L"Delete \x201C%s\x201D everywhere?\n\nIts entry in %s goes to the Recycle Bin.");
-    StringCchPrintfW(text, ARRAYSIZE(text), question, ShownTitle(row, ShownProfileIndex()), names);
-    if (!Ui_Ask(g_view.dlg, IDI_WARNING, text, TR(L"Delete"), TR(L"Cancel"), TRUE)) return FALSE;
-    result = SessionEdit_DeleteEverywhere(g_view.dlg, &g_view.set, r, error, ARRAYSIZE(error));
-    if (result == REMOVE_FAILED) Ui_Message(g_view.dlg, MB_ICONWARNING, TR(L"The session could not be deleted. %s"), error);
-    return result != REMOVE_CANCELLED;
+    old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    text = PreviewText(row->transcriptPath, row->transcriptBytes);
+    SetCursor(old);
+    if (!text) {
+        Ui_Message(g_view.dlg, MB_ICONWARNING, TR(L"The conversation could not be read: %s"), row->transcriptPath);
+        return;
+    }
+    preview.title = ShownTitle(row, ShownProfileIndex());
+    preview.text = text;
+    Ui_Dialog(g_view.dlg, IDD_PREVIEW, PreviewProc, (LPARAM)&preview);
+    HeapFree(GetProcessHeap(), 0, text);
 }
 
 /* `folder` shown in Explorer; the user told when it cannot be. */
@@ -2174,7 +2265,7 @@ static void RunAction(Action action, int p)
     case ACT_OPEN:
         if (ListedAndKept(EntryOf(&g_view.set.rows[r], p))) OpenSession(r, p);
         break;
-    case ACT_RENAME:      changed = RenameEntry(r, p); break;
+    case ACT_EDIT:        changed = EditEntry(r, p); break;
     case ACT_STAR:        changed = ChangeEntry(r, p, PENDING_STAR, StarredIn(EntryOf(&g_view.set.rows[r], p)) ? L"0" : L"1"); break;
     case ACT_REMOVE:      changed = RemoveEntry(r, p); break;
     case ACT_KEEP:        changed = KeepEntry(r, p); break;
@@ -2183,7 +2274,7 @@ static void RunAction(Action action, int p)
     case ACT_SHOW_FOLDER:
         if (SelectedFolder()[0]) ShowFolder(SelectedFolder());
         break;
-    case ACT_DELETE_ALL:  changed = DeleteSessionEverywhere(r); break;
+    case ACT_PREVIEW:     PreviewSession(r); break;
     default: break;
     }
     g_view.actionDepth--;
@@ -2225,7 +2316,7 @@ static void AppendOpenItem(HMENU menu, int p, const WCHAR *name)
 }
 
 /* What can be done to the entry of session `row` in profile `p` (`name` as
- * a menu shows it): rename, star, remove (from that profile when others
+ * a menu shows it): edit, star, remove (from that profile when others
  * keep it), or keep it when its removal waits. `keys`: with the keys that do
  * it in the tree. */
 static void AppendEntryActions(HMENU menu, const SessionRow *row, int p, const WCHAR *name, BOOL keys)
@@ -2237,22 +2328,20 @@ static void AppendEntryActions(HMENU menu, const SessionRow *row, int p, const W
         AppendMenuW(menu, MF_STRING, MenuId(ACT_KEEP, p), text);
         return;
     }
-    AppendMenuW(menu, MF_STRING, MenuId(ACT_RENAME, p), keys ? TR(L"&Rename\x2026\tF2") : TR(L"&Rename\x2026"));
+    AppendMenuW(menu, MF_STRING, MenuId(ACT_EDIT, p), keys ? TR(L"&Edit\x2026\tF2") : TR(L"&Edit\x2026"));
     AppendMenuW(menu, MF_STRING, MenuId(ACT_STAR, p), StarredIn(entry) ? TR(L"Uns&tar") : TR(L"S&tar"));
     if (ProfilesKeeping(row, p)) StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Re&move from %s\x2026%s"), name, keys ? TR(L"\tDel") : L"");
     else StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Re&move\x2026%s"), keys ? TR(L"\tDel") : L"");
     AppendMenuW(menu, MF_STRING, MenuId(ACT_REMOVE, p), text);
 }
 
-/* The menu of the Actions box of profile `p` (`box`, in the part that
- * scrolls), under the box, which shows pressed meanwhile: open, rename,
- * star and remove where the session is listed (keep instead when its
- * removal waits), share and copy where it is not. */
-static void ProfileMenu(int p, const RECT *box)
+/* The menu of profile `p`'s part of the details, at `pt` (screen): open,
+ * edit, star and remove where the session is listed (keep instead when
+ * its removal waits), share and copy where it is not. */
+static void ProfileMenu(int p, POINT pt)
 {
     WCHAR name[LABEL_CCH * 2];
     int r = SelectedRow();
-    RECT screen = *box;
     const SessionEntry *entry;
     HMENU menu;
     UINT cmd;
@@ -2267,19 +2356,16 @@ static void ProfileMenu(int p, const RECT *box)
         if (ListedAndKept(entry)) AppendOpenItem(menu, p, name);
         AppendEntryActions(menu, &g_view.set.rows[r], p, name, FALSE);
     }
-    MapWindowPoints(g_view.parts, NULL, (POINT *)&screen, 2);
-    g_view.open.window = g_view.parts;
-    g_view.open.action = ACT_MENU;
-    g_view.open.profile = p;
-    RedrawWindow(g_view.parts, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-    cmd = Theme_TrackDropDown(g_view.dlg, menu, &screen);
+    cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | (Localize_IsRTL() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, g_view.dlg, NULL);
     DestroyMenu(menu);
-    g_view.open.window = g_view.hot.window = NULL;
+    g_view.hot.window = NULL;
     InvalidateRect(g_view.parts, NULL, FALSE);
     RunCommand(cmd);
     g_view.actionDepth--;
     TakeHeldSnapshot();
 }
+
+static void RunBatch(UINT cmd, const int *rows, int count);
 
 /* The selected session's actions, at `pt` (screen). A profile whose entry
  * waits for its removal is not one to open it in, nor to share it with. */
@@ -2302,6 +2388,7 @@ static void ShowMenu(POINT pt)
     entry = EntryOf(row, p);
     EscapeAmpersands(ProfileAt(p)->name, name, ARRAYSIZE(name));
     if (ListedAndKept(entry)) AppendOpenItem(menu, p, name);
+    AppendMenuW(menu, MF_STRING | (row->transcript ? 0 : MF_GRAYED), MenuId(ACT_PREVIEW, p), TR(L"Pre&view\tSpace"));
     for (otherProfile = 0; otherProfile < g_view.set.profiles.count; otherProfile++) {
         const SessionEntry *otherEntry = EntryOf(row, otherProfile);
         if (otherProfile == p) continue;
@@ -2318,17 +2405,19 @@ static void ShowMenu(POINT pt)
     AppendMenuW(menu, MF_POPUP | (openable ? 0 : MF_GRAYED), (UINT_PTR)openIn, TR(L"Open i&n"));
     AppendMenuW(menu, MF_POPUP | (unlisted ? 0 : MF_GRAYED), (UINT_PTR)shareWith, TR(L"S&hare with"));
     AppendMenuW(menu, MF_POPUP | (g_view.set.profiles.count > 1 ? 0 : MF_GRAYED), (UINT_PTR)copyTo, TR(L"&Copy to"));
+    AppendMenuW(menu, MF_STRING, IDM_BATCH + BATCH_TAKE, TR(L"Cop&y\tCtrl+C"));
+    AppendMenuW(menu, MF_STRING | (g_view.takenCount ? 0 : MF_GRAYED), IDM_BATCH + BATCH_PASTE, TR(L"&Paste\tCtrl+V"));
     if (entry) {
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendEntryActions(menu, row, p, name, TRUE);
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (SelectedFolder()[0] ? 0 : MF_GRAYED), MenuId(ACT_SHOW_FOLDER, p), TR(L"&Show folder"));
-    AppendMenuW(menu, MF_STRING, MenuId(ACT_DELETE_ALL, p), TR(L"&Delete session everywhere\x2026"));
     g_view.actionDepth++;
     cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | (Localize_IsRTL() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, g_view.dlg, NULL);
     DestroyMenu(menu);   /* its submenus with it */
-    RunCommand(cmd);
+    if (cmd >= IDM_BATCH) RunBatch(cmd, &r, 1);
+    else RunCommand(cmd);
     g_view.actionDepth--;
     TakeHeldSnapshot();
 }
@@ -2342,9 +2431,9 @@ static int *FolderRows(HTREEITEM folder, int *count)
     HTREEITEM child;
     int *rows, capacity = 0;
     *count = 0;
-    for (child = TreeView_GetChild(g_view.tree, folder); child; child = TreeView_GetNextSibling(g_view.tree, child)) capacity++;
+    for (child = TreeView_GetChild(g_view.tree, folder); child; child = NextUnder(folder, child)) capacity++;
     if (!capacity || (rows = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)capacity * sizeof *rows)) == NULL) return NULL;
-    for (child = TreeView_GetChild(g_view.tree, folder); child; child = TreeView_GetNextSibling(g_view.tree, child)) {
+    for (child = TreeView_GetChild(g_view.tree, folder); child; child = NextUnder(folder, child)) {
         LPARAM node = NodeParam(child);
         if (node >= 0 && node < g_view.set.rowCount) rows[(*count)++] = (int)node;
     }
@@ -2412,10 +2501,8 @@ static BOOL RemoveSeveral(const int *rows, int count)
         if (ListedAndKept(EntryOf(&g_view.set.rows[rows[i]], p))) return RemoveEntry(rows[i], p);
     StringCchPrintfW(text, ARRAYSIZE(text),
                      ProfileAt(p)->running
-                     ? TR(L"Remove %d sessions from \x201C%s\x201D?\n\nTheir entries there go to the Recycle Bin when it closes "
-                          L"(it keeps them until then). Their conversations stay on disk: Delete sessions everywhere removes them too.")
-                     : TR(L"Remove %d sessions from \x201C%s\x201D?\n\nTheir entries there go to the Recycle Bin. "
-                          L"Their conversations stay on disk: Delete sessions everywhere removes them too."),
+                     ? TR(L"Remove %d sessions from \x201C%s\x201D?\n\nTheir entries go to the Recycle Bin once it closes.")
+                     : TR(L"Remove %d sessions from \x201C%s\x201D?\n\nTheir entries go to the Recycle Bin."),
                      kept, ProfileAt(p)->name);
     if (!Ui_Ask(g_view.dlg, IDI_QUESTION, text, TR(L"Remove"), TR(L"Cancel"), FALSE)) return FALSE;
     for (i = 0; i < count; i++) {
@@ -2426,38 +2513,59 @@ static BOOL RemoveSeveral(const int *rows, int count)
     return changed > 0;
 }
 
-/* Delete session everywhere for each, after one question. Those it cannot
- * delete now (SessionEdit_CanDelete: open somewhere) are left, and said
- * once the others are gone. */
-static BOOL DeleteSeveralEverywhere(const int *rows, int count)
+/* Sessions `rows` of the profile shown taken (Ctrl+C): Ctrl+V copies them
+ * to the profile shown then. */
+static void TakeSessions(const int *rows, int count)
 {
-    WCHAR text[1024], error[LONG_PATH_CCH + NOTE_CCH], first[LONG_PATH_CCH + NOTE_CCH];
-    int i, deletable = 0, left = 0;
-    BOOL changed = FALSE;
-    if (count == 1) return DeleteSessionEverywhere(rows[0]);
-    first[0] = 0;
-    for (i = 0; i < count; i++)
-        if (SessionEdit_CanDelete(&g_view.set, rows[i], error, ARRAYSIZE(error))) deletable++;
-        else if (!first[0]) StringCchCopyW(first, ARRAYSIZE(first), error);
-    if (!deletable) {
-        Ui_Message(g_view.dlg, MB_ICONINFORMATION, L"%s", first);
+    WCHAR (*taken)[SESSION_ID_CCH];
+    int i, p = ShownProfileIndex();
+    if (p < 0 || count <= 0 || (taken = (WCHAR (*)[SESSION_ID_CCH])HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof *taken)) == NULL)
+        return;
+    for (i = 0; i < count; i++) StringCchCopyW(taken[i], SESSION_ID_CCH, g_view.set.rows[rows[i]].key);
+    if (g_view.taken) HeapFree(GetProcessHeap(), 0, g_view.taken);
+    g_view.taken = taken;
+    g_view.takenCount = count;
+    StringCchCopyW(g_view.takenFrom, ARRAYSIZE(g_view.takenFrom), ProfileAt(p)->folder);
+    Util_Log(L"sessions: %d taken in %s (Ctrl+C)", count, g_view.takenFrom);
+}
+
+/* What the keyboard acts on: the sessions chosen together, the selected
+ * folder's, or the selected session, as MarkedRows gives them. */
+static int *ChosenRows(int *count)
+{
+    HTREEITEM selected = TreeView_GetSelection(g_view.tree);
+    LPARAM node = NodeParam(selected);
+    int *rows;
+    *count = 0;
+    if (g_view.several && g_view.markedCount >= 2) return MarkedRows(count);
+    if (node >= 0 && node < g_view.set.rowCount) {
+        if ((rows = (int *)HeapAlloc(GetProcessHeap(), 0, sizeof *rows)) == NULL) return NULL;
+        rows[0] = (int)node;
+        *count = 1;
+        return rows;
+    }
+    return selected && node != NODE_NONE ? FolderRows(selected, count) : NULL;
+}
+
+/* Ctrl+V: the sessions taken that the profile shown does not keep yet,
+ * copied there (syncui.c asks first). */
+static BOOL PasteSessions(void)
+{
+    int *rows, i, r, count = 0, p = ShownProfileIndex();
+    BOOL changed;
+    if (p < 0 || !g_view.takenCount || (rows = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)g_view.takenCount * sizeof *rows)) == NULL)
+        return FALSE;
+    for (i = 0; i < g_view.takenCount; i++)
+        if ((r = SessionStore_FindRow(&g_view.set, g_view.taken[i])) >= 0 && !ListedAndKept(EntryOf(&g_view.set.rows[r], p))) rows[count++] = r;
+    Util_Log(L"sessions: Ctrl+V in %s: %d of the %d taken in %s not there yet", ProfileAt(p)->folder, count, g_view.takenCount, g_view.takenFrom);
+    if (!count) {
+        HeapFree(GetProcessHeap(), 0, rows);
+        Ui_Message(g_view.dlg, MB_ICONINFORMATION, TR(L"\x201C%s\x201D already has these sessions."), ProfileAt(p)->name);
         return FALSE;
     }
-    StringCchPrintfW(text, ARRAYSIZE(text),
-                     TR(L"Delete %d sessions everywhere?\n\nTheir conversations, their entries in every profile and the working folders "
-                        L"of those without a folder go to the Recycle Bin."), deletable);
-    if (!Ui_Ask(g_view.dlg, IDI_WARNING, text, TR(L"Delete"), TR(L"Cancel"), TRUE)) return FALSE;
-    first[0] = 0;
-    for (i = 0; i < count; i++) {
-        RemoveResult result = REMOVE_FAILED;
-        if (SessionEdit_CanDelete(&g_view.set, rows[i], error, ARRAYSIZE(error)))
-            result = SessionEdit_DeleteEverywhere(g_view.dlg, &g_view.set, rows[i], error, ARRAYSIZE(error));
-        if (result == REMOVE_CANCELLED) break;   /* in Windows' question: the rest stays too */
-        if (result == REMOVE_DONE) changed = TRUE;
-        else if (!left++) StringCchCopyW(first, ARRAYSIZE(first), error);
-    }
-    if (left) Ui_Message(g_view.dlg, MB_ICONWARNING, TR(L"Sessions that could not be deleted: %d. %s"), left, first);
-    return changed || left;
+    changed = SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, Profiles_Find(&g_view.set.profiles, g_view.takenFrom), rows, count, TRUE, p);
+    HeapFree(GetProcessHeap(), 0, rows);
+    return changed;
 }
 
 /* A menu's choice for sessions `rows` of the profile shown, run; what it
@@ -2469,13 +2577,14 @@ static void RunBatch(UINT cmd, const int *rows, int count)
     if (p < 0) return;
     g_view.actionDepth++;
     switch (cmd) {
-    case IDM_BATCH + BATCH_SHARE:      changed = SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, p, rows, count, FALSE); break;
-    case IDM_BATCH + BATCH_COPY:       changed = SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, p, rows, count, TRUE); break;
+    case IDM_BATCH + BATCH_SHARE:      changed = SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, p, rows, count, FALSE, -1); break;
+    case IDM_BATCH + BATCH_COPY:       changed = SyncUi_ShareOrCopy(g_view.dlg, &g_view.set, p, rows, count, TRUE, -1); break;
     case IDM_BATCH + BATCH_EXPORT:     SyncUi_Export(g_view.dlg, &g_view.set, p, rows, count); break;
     case IDM_BATCH + BATCH_STAR:       changed = StarSeveral(rows, count); break;
     case IDM_BATCH + BATCH_REMOVE:     changed = RemoveSeveral(rows, count); break;
-    case IDM_BATCH + BATCH_DELETE_ALL: changed = DeleteSeveralEverywhere(rows, count); break;
     case IDM_BATCH + BATCH_IMPORT:     changed = SyncUi_Import(g_view.dlg, &g_view.set.profiles, 1u << p); break;
+    case IDM_BATCH + BATCH_TAKE:       TakeSessions(rows, count); break;
+    case IDM_BATCH + BATCH_PASTE:      changed = PasteSessions(); break;
     default: break;
     }
     g_view.actionDepth--;
@@ -2499,8 +2608,8 @@ static UINT TrackMenu(HMENU menu, POINT pt)
 
 /* What can be done to sessions `rows` together, at `pt` (screen): share
  * them with other profiles or copy them there (a dialog chooses which),
- * export them, star or remove them in the profile shown, delete them
- * everywhere. `keys`: the sessions chosen, which the Del key removes. */
+ * export them, star or remove them in the profile shown. `keys`: the
+ * sessions chosen, which the Del key removes. */
 static void BatchMenu(POINT pt, const int *rows, int count, BOOL keys)
 {
     WCHAR text[64];
@@ -2513,12 +2622,12 @@ static void BatchMenu(POINT pt, const int *rows, int count, BOOL keys)
     AppendMenuW(menu, MF_STRING | others, IDM_BATCH + BATCH_SHARE, TR(L"&Share with\x2026"));
     AppendMenuW(menu, MF_STRING | others, IDM_BATCH + BATCH_COPY, TR(L"&Copy to\x2026"));
     AppendMenuW(menu, MF_STRING, IDM_BATCH + BATCH_EXPORT, TR(L"E&xport sessions\x2026"));
+    AppendMenuW(menu, MF_STRING, IDM_BATCH + BATCH_TAKE, TR(L"Cop&y\tCtrl+C"));
+    AppendMenuW(menu, MF_STRING | (g_view.takenCount ? 0 : MF_GRAYED), IDM_BATCH + BATCH_PASTE, TR(L"&Paste\tCtrl+V"));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (kept ? 0 : MF_GRAYED), IDM_BATCH + BATCH_STAR, kept && allStarred ? TR(L"Uns&tar") : TR(L"S&tar"));
     StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Re&move\x2026%s"), keys ? TR(L"\tDel") : L"");
     AppendMenuW(menu, MF_STRING | (kept ? 0 : MF_GRAYED), IDM_BATCH + BATCH_REMOVE, text);
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, IDM_BATCH + BATCH_DELETE_ALL, TR(L"&Delete sessions everywhere\x2026"));
     g_view.actionDepth++;   /* `rows` name the snapshot shown: it stays while the menu is open */
     cmd = TrackMenu(menu, pt);
     DestroyMenu(menu);
@@ -2539,12 +2648,49 @@ static void AreaMenu(POINT pt)
     rows = ShownRows(&count);
     AppendMenuW(menu, MF_STRING | (count ? 0 : MF_GRAYED), IDM_BATCH + BATCH_EXPORT, TR(L"E&xport sessions\x2026"));
     AppendMenuW(menu, MF_STRING, IDM_BATCH + BATCH_IMPORT, TR(L"&Import sessions\x2026"));
+    AppendMenuW(menu, MF_STRING | (g_view.takenCount ? 0 : MF_GRAYED), IDM_BATCH + BATCH_PASTE, TR(L"&Paste\tCtrl+V"));
     cmd = TrackMenu(menu, pt);
     DestroyMenu(menu);
     RunBatch(cmd, rows, count);
     if (rows) HeapFree(GetProcessHeap(), 0, rows);
     g_view.actionDepth--;
     TakeHeldSnapshot();
+}
+
+/* Ctrl+C: the sessions the keyboard acts on taken; Ctrl+V: those taken
+ * copied to the profile shown. */
+static void CopyOrPaste(WPARAM key)
+{
+    int *rows = NULL, count = 0;
+    if (!g_view.shown) return;
+    g_view.actionDepth++;   /* the rows name the snapshot shown */
+    if (key == 'C') rows = ChosenRows(&count);
+    if (key == 'V' || rows) RunBatch(IDM_BATCH + (key == 'C' ? BATCH_TAKE : BATCH_PASTE), rows, count);
+    if (rows) HeapFree(GetProcessHeap(), 0, rows);
+    g_view.actionDepth--;
+    TakeHeldSnapshot();
+}
+
+/* The side bar's list: Ctrl+V there pastes into the profile it shows, the
+ * one just picked after Ctrl+C in another. */
+static LRESULT CALLBACK ProfilesSubclass(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
+{
+    (void)ref;
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wp == 'V' && GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0) {
+            CopyOrPaste(wp);
+            return 0;
+        }
+        break;
+    case WM_CHAR:
+        if (wp == 22) return 0;   /* Ctrl+V's character: no search of the names */
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, ProfilesSubclass, id);
+        break;
+    }
+    return DefSubclassProc(window, msg, wp, lp);
 }
 
 /* --------------------------------------------------------------- watcher */
@@ -2993,6 +3139,7 @@ void SessionsView_Init(HWND dlg)
     SetWindowSubclass(g_view.details, DetailsSubclass, 1, 0);
     if (g_view.parts) SetWindowSubclass(g_view.parts, DetailsSubclass, 1, 0);
     SetWindowSubclass(g_view.tree, TreeSubclass, 1, 0);
+    SetWindowSubclass(g_view.profiles, ProfilesSubclass, 1, 0);
     SendMessageW(g_view.search, EM_LIMITTEXT, ARRAYSIZE(g_view.filter) - 1, 0);
 }
 
@@ -3318,7 +3465,11 @@ BOOL SessionsView_Notify(const NMHDR *header, LRESULT *result)
             if (key->wVKey == VK_DELETE) RunOnMarks(IDM_BATCH + BATCH_REMOVE);
             return TRUE;
         }
-        if (ListedAndKept(entry) && key->wVKey == VK_F2) RunAction(ACT_RENAME, -1);
+        if (r >= 0 && key->wVKey == VK_SPACE) {
+            RunAction(ACT_PREVIEW, -1);
+            *result = 1;   /* not a letter of the tree's incremental search */
+        }
+        else if (ListedAndKept(entry) && key->wVKey == VK_F2) RunAction(ACT_EDIT, -1);
         else if (ListedAndKept(entry) && key->wVKey == VK_DELETE) RunAction(ACT_REMOVE, -1);
         return TRUE;
     }
@@ -3342,7 +3493,7 @@ BOOL SessionsView_Notify(const NMHDR *header, LRESULT *result)
         TreeNodeKey key;
         if (!g_view.filling && change->itemNew.lParam < 0 && (change->action == TVE_COLLAPSE || change->action == TVE_EXPAND)) {
             NodeKey(change->itemNew.lParam, FALSE, &key);
-            SetCollapsed(key.key, change->action == TVE_COLLAPSE);
+            SetOpened(key.key, change->action == TVE_EXPAND);
         }
         return TRUE;
     }
@@ -3358,7 +3509,7 @@ BOOL SessionsView_Notify(const NMHDR *header, LRESULT *result)
                 StringCchPrintfW(tip->pszText, (size_t)tip->cchTextMax, TR(L"%s\nLast used %s %s%s"), title, date, time, noConversation);
             else
                 StringCchPrintfW(tip->pszText, (size_t)tip->cchTextMax, L"%s%s", title, noConversation);
-        } else if (tip->lParam < NODE_STARRED && tip->lParam != NODE_NONE && NodeGroup(tip->lParam) < g_view.set.groupCount) {
+        } else if (NodeGroup(tip->lParam) >= 0 && NodeGroup(tip->lParam) < g_view.set.groupCount) {
             int group = NodeGroup(tip->lParam);
             if (g_view.set.groups[group].path[0]) StringCchCopyW(tip->pszText, (size_t)tip->cchTextMax, g_view.set.groups[group].path);
             else SessionStore_GroupName(&g_view.set, group, tip->pszText, (size_t)tip->cchTextMax);
@@ -3392,7 +3543,9 @@ void SessionsView_Destroy(void)
     if (g_view.icons) ImageList_Destroy(g_view.icons);
     if (g_view.badges) ImageList_Destroy(g_view.badges);
     if (g_view.folderCount) HeapFree(GetProcessHeap(), 0, g_view.folderCount);
+    if (g_view.folderArchived) HeapFree(GetProcessHeap(), 0, g_view.folderArchived);
     if (g_view.marked) HeapFree(GetProcessHeap(), 0, g_view.marked);
+    if (g_view.taken) HeapFree(GetProcessHeap(), 0, g_view.taken);
     ZeroMemory(&g_view, sizeof g_view);
     InterlockedExchange(&g_reloadMessagePending, 0);
 }

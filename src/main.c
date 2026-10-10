@@ -69,6 +69,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR cmdLine, int s
         /* Each time the profile's Claude closes, the session changes that
          * waited for it are made, and its list of sessions kept (made the
          * same in the profiles that keep the same sessions). */
+        NotifyGuard_Start();
         rc = Taskbar_WatchRun(argument, argc >= 4 ? (DWORD)wcstoul(argv[3], NULL, 10) : 0, SessionVault_AfterClose);
     } else if (command[0] == L'-') {
         /* Not a request for the window: never open it for an unknown switch or one without its folder. */

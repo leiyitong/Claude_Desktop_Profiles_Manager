@@ -31,8 +31,8 @@ APP_NAME = "Claude Desktop Profiles Manager"
 FORMAT = re.compile(r'%%|%(?:[-+ #0]*)(?:\*|\d+)?(?:\.(?:\*|\d+))?(?:I64|ll|l|h|z|w)?[diuoxXfFeEgGaAcCsSpn]')
 FORBIDDEN_CONVERSIONS = ("a", "A", "n")
 # Names that are no format: their single percent signs are literal.
-PLAIN_NAMES = ["%LOCALAPPDATA%", "%APPDATA%", "%USERPROFILE%"]
-FIXED_TERMS = ["claude://", "%APPDATA%", "%LOCALAPPDATA%", "%USERPROFILE%", "*.lnk", "<a href=", "</a>",
+PLAIN_NAMES = ["%LOCALAPPDATA%", "%APPDATA%"]
+FIXED_TERMS = ["claude://", "%APPDATA%", "%LOCALAPPDATA%", "*.lnk", "<a href=", "</a>",
                APP_NAME, "Claude Desktop", "Claude Code", "Claude", "Cowork", "Anthropic", "Windows"]
 MARKUP = re.compile(r'<a href="[^"]*">|</a>')
 ELLIPSIS = "\u2026"
@@ -45,37 +45,36 @@ OWN_PUNCTUATION = {"zh-CN": "?;,!:"}
 
 # Commands that show in several places, in the same words.
 COMMAND_FAMILIES = [
-    ["Rename", "&Rename\u2026", "&Rename\u2026\tF2"],
+    ["&Edit\u2026", "&Edit\u2026\tF2"],
     ["&Copy to", "&Copy to\u2026"],
     ["S&hare with", "&Share with\u2026"],
-    ["Delete session everywhere\u2026", "&Delete session everywhere\u2026"],
     ["Remove", "Re&move\u2026%s"],
     ["Delete", "&Delete\u2026"],
-    ["Uninstall", "&Uninstall\u2026"],
     ["Restart", "&Restart"],
     ["Repair", "Rep&air"],
     ["Merge all sessions", "Merge &all sessions\u2026"],
     ["Export sessions", "E&xport sessions\u2026"],
     ["Import sessions", "&Import sessions\u2026"],
     ["Recover sessions", "Reco&ver sessions\u2026"],
-    ["Recently deleted", "Recently de&leted\u2026"],
+    ["Clean up sessions", "C&lean up sessions\u2026"],
 ]
 
 # TR() calls whose argument is no literal, by file: the variable or the
 # function giving the key (an entry followed by "(" matches any call of it).
 NONLITERAL_CALLS = {
-    "gui.c": ["error", "g_ColorNames[i]", "title", "Theme_MainCaption", "Theme_ProfileRole", "Theme_MainVersion", "Theme_MainStatus",
+    "gui.c": ["error", "g_ColorNames[i]", "title", "Theme_MainCaption", "Theme_ProfileRole", "Theme_ProfileState", "Theme_MainVersion", "Theme_MainStatus",
               "Theme_MainNote", "Theme_SessionsFolderState"],
-    "sessions.c": ["Theme_SessionsCaption"],
     "localize.c": ["key"],
     "profiles.c": ["invalid"],
-    "syncui.c": ["kSyncItems[row].label"],
+    "syncui.c": ["kSyncItems[row].label", "kConflictKinds[k].heading"],
+    "sessionvault.c": ["context->part->label"],
 }
 # Keys the code translates through a variable, by the source file that spells
 # them: the color names (g_ColorNames), the main window's captions, column
 # titles and roles (theme.c measures them, gui.c shows them) and the name
 # errors of Core_ValidateNewName and Core_ValidateLabel.
 TRANSLATED_THROUGH_VARIABLES = {
+    "sessionsync.c": ["Starred sessions", "Pinned sessions", "Starred groups", "Project order", "Status filter", "Environment filter", "Show empty groups", "Show PR status", "Projects shown", "Links in previews", "Go on after a usage limit", "Folders' permission modes", "Permission warnings confirmed", "Archive when the PR closes", "Cowork web search", "Cowork browser tools", "Cowork's browser", "Cowork scheduled tasks", "Code scheduled tasks", "Remote Control: excluded folders", "Remote Control: pinned folders", "Cowork's trusted folders", "Groups", "Sidebar sections", "Edit sidebar", "Folded groups", "Group by", "Sort by", "Recents: type", "Recents: status", "Routines' place", "Sidebar width", "Interface font", "System font", "Editor", "Zoom", "Language", "Language source", "Default model", "Cowork's recent folders", "Sessions' model and effort", "Unread marks", "Session side bar", "Side pane layout", "Side pane sizes", "Transcript view", "Transcript view by default", "Files tree", "Diff tree", "App language", "Controls' zoom", "Page zoom", "Spelling languages"],
     "icons.c": ["Blue", "Green", "Orange", "Pink", "Purple", "Red", "Slate", "Teal", "Amber", "Gold", "Lime", "Forest", "Sky",
                 "Indigo", "Fuchsia", "Crimson", "Brown", "Navy", "Plum", "Graphite"],
     "core.c": ["Claude uses this name itself. Pick another one.", "Enter a name.", "Name too long.",
@@ -83,58 +82,60 @@ TRANSLATED_THROUGH_VARIABLES = {
                "Use 32 characters or fewer.", "Use 48 characters or fewer.",
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
     "gui.c": ["A profile folder with this name already exists."],
-    "syncui.c": ["Sessions: new ones, titles, archived and deleted ones", "Sidebar: pins, groups, project order, filters", "Each session's model, effort, side pane, unread mark and cost", "Appearance: fonts, editor, zoom, spelling", "Interface language", "Default model", "Settings: auto-archive, Cowork, Remote Control, recent folders", "Permissions: folders' permission modes, Cowork's trusted folders"],
-    "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "S&ync sessions", "Rep&air", "Set as de&fault",
-                "&Program", "&Sessions", "S&hortcuts", "Help", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
+    "syncui.c": ["Sessions: new ones, titles, archived and deleted ones", "Sidebar: pins, groups, project order, filters", "Each session's model, effort, side pane, unread mark and cost", "Appearance: fonts, editor, zoom, spelling", "Interface language", "Default model", "Settings: auto-archive, Cowork, Remote Control, recent folders", "Permissions: folders' permission modes, Cowork's trusted folders", "Sessions", "Sidebar", "Session details", "Appearance", "Interface language", "Default model", "Settings", "Permissions"],
+    "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "&Delete\u2026", "S&ync settings\u2026", "&Backup && Restore\u2026",
+                "Rep&air", "Set as de&fault", "S&hortcuts", "&Language", "Se&ttings", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
                 "Pin to &taskbar", "Pinned", "Add to Start &menu", "Remove from Start &menu", "Sessions &view", "&Back",
-                "&Get Claude", "&Back up .claude\u2026", "&Update",
-                "Profile", "Role", "Data folder", "Sessions", "This profile", "Not signed in", "No sessions yet", "Link broken",
+                "&Get Claude", "&Update",
+                "Profile", "Role", "Data folder", "Sessions", "Status", "Running", "Not running", "This profile", "Not signed in", "No sessions yet", "Link broken",
                 "Claude icon, default", "Claude icon", "Default",
                 "Version %s", "Version %s is available", "Downloading version %s\u2026", "Installing the new version\u2026",
                 "Claude Desktop %s\nclaude:// links are not set up yet",
                 "Claude Desktop %s\nclaude:// links are routed correctly",
-                "The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \u201c%s\u201d.",
-                "Actions", "Delete session everywhere\u2026"],
+                "The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \u201c%s\u201d."],
 }
 
 # Controls shown at the same time: no two of them may share an access key.
 # Close goes by Esc and has none (Windows' rule for OK, Cancel and Close).
 STATUS_ACTIONS = ["&Get Claude"]
-# The main window's menu bar and toolbar, shown in both views.
-MENU_BAR = ["&Sessions", "&Program", "S&hortcuts"]
-TOOLBAR = ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "Set as de&fault"]
+# The main window's toolbar, its icons alone included, shown in both views.
+TOOLBAR = ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "S&hortcuts", "&Language", "Se&ttings"]
 ACCESS_KEY_GROUPS = {
-    "profiles view": MENU_BAR + TOOLBAR + ["Sessions &view", "S&ync sessions", "Rep&air", "&Back up .claude\u2026", "&Update"] + STATUS_ACTIONS,
-    "sessions view": MENU_BAR + TOOLBAR + ["&Back", "Show &archived", "&Update"] + STATUS_ACTIONS,
+    "profiles view": TOOLBAR + ["Sessions &view", "S&ync settings\u2026", "&Backup && Restore\u2026", "Rep&air", "&Update"] + STATUS_ACTIONS,
+    "sessions view": TOOLBAR + ["&Back", "Show &archived", "&Update"] + STATUS_ACTIONS,
     "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "S&ync:", "Wha&t to sync\u2026",
                        "Open at &Windows sign-in",
                        "Copy &settings from \u201c%s\u201d", "&Open it now to sign in"],
-    "Actions menu of a profile without the session": ["&Share with\u2026", "&Copy to\u2026"],
-    "Actions menu of a profile with the session": ["&Open in %s", "&Rename\u2026", "S&tar", "Uns&tar",
+    "menu of a profile without the session": ["&Share with\u2026", "&Copy to\u2026"],
+    "menu of a profile with the session": ["&Open in %s", "&Edit\u2026", "S&tar", "Uns&tar",
                                                    "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s"],
-    "session menu": ["&Open in %s", "Open i&n", "S&hare with", "&Copy to", "&Rename\u2026\tF2", "S&tar",
+    "session menu": ["&Open in %s", "Pre&view\tSpace", "Open i&n", "S&hare with", "&Copy to", "&Edit\u2026\tF2", "S&tar",
                      "Uns&tar", "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s", "&Show folder",
-                     "&Delete session everywhere\u2026"],
-    "profile list menu": ["&Open", "&Quit", "&Restart", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "S&ync sessions",
-                          "Sync &with", "Wha&t to sync\u2026", "Sto&p syncing", "&Back up\u2026", "Restore from back&up\u2026"],
-    "sessions menu": ["S&ync sessions", "Merge &all sessions\u2026", "&Copy all sessions to\u2026", "&Move all sessions to\u2026",
-                      "Sync &with", "Wha&t to sync\u2026", "Sto&p syncing", "U&nlink sessions folder\u2026", "E&xport sessions\u2026",
-                      "&Import sessions\u2026", "Reco&ver sessions\u2026", "Recently de&leted\u2026"],
-    "program menu": ["&Language", "Rep&air", "&Uninstall\u2026", "E&xit"],
+                     "Cop&y\tCtrl+C", "&Paste\tCtrl+V"],
+    "profile list menu": ["&Open", "&Quit", "&Restart", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "&Sync now",
+                          "S&ync settings\u2026", "Merge &all sessions\u2026", "&Copy all sessions to\u2026", "&Move all sessions to\u2026",
+                          "U&nlink sessions folder\u2026", "&Back up\u2026", "Restore from back&up\u2026"],
+    "sync settings dialog": ["&What they sync:", "&Sync now"],
+    "backup and restore dialog": ["&Back up\u2026", "&Restore from backup\u2026", "E&xport sessions\u2026", "&Import sessions\u2026",
+                                  "Reco&ver sessions\u2026", "C&lean up sessions\u2026", "Back up .&claude\u2026",
+                                  "Back up once a &week"],
+    "conflicts dialog": ["&Use for all:"],
+    "session edit dialog": ["S&tarred"],
     "shortcuts menu of a profile": ["Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar",
                                     "Pinned", "Add to Start &menu", "Remove from Start &menu"],
-    "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "S&tar", "Uns&tar", "Re&move\u2026%s",
-                                 "&Delete sessions everywhere\u2026"],
-    "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026"],
+    "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "Cop&y\tCtrl+C", "&Paste\tCtrl+V",
+                                 "S&tar", "Uns&tar", "Re&move\u2026%s"],
+    "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026", "&Paste\tCtrl+V"],
     "sessions dialog": ["&To these profiles:"],
     "recover dialog": ["&Profile:", "&Version:"],
-    "clean-up dialog": ["&Back up .claude first", "&Restore"],
+    "clean-up dialog": ["&Show:", "Select &all", "&Back up .claude first", "&Restore"],
+    "settings dialog": ["&Keep versions for:"],
 }
 # Choices made in the same place: a key of one choice never shows with a key of another.
 ALTERNATIVES = [
     [{"S&tar"}, {"Uns&tar"}],
     [{"Re&move from %s\u2026%s"}, {"Re&move\u2026%s"}],
-    [{"&Keep in %s"}, {"&Rename\u2026", "&Rename\u2026\tF2", "S&tar", "Uns&tar",
+    [{"&Keep in %s"}, {"&Edit\u2026", "&Edit\u2026\tF2", "S&tar", "Uns&tar",
                        "Re&move from %s\u2026%s", "Re&move\u2026%s"}],
     [{"Add to Start &menu"}, {"Remove from Start &menu"}],
 ]
@@ -151,11 +152,16 @@ def expression(value):
     return "".join(decode(m[1]) if m[1] is not None else APP_NAME for m in TOKEN.finditer(value))
 
 def access_key(text):
+    """The letter after an ampersand; "&&" is an ampersand shown, and one
+    before a space (a caption's "Backup & Restore") marks nothing."""
     i = 0
     while True:
         i = text.find("&", i)
         if i < 0 or i + 1 >= len(text):
             return None
+        if text[i + 1] == " ":
+            i += 1
+            continue
         if text[i + 1] != "&":
             return text[i + 1].upper()
         i += 2
