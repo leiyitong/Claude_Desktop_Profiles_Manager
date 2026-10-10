@@ -2994,6 +2994,40 @@ static void TestKeptGroups(const WCHAR *projects)
     ZeroMemory(&report, sizeof report);
     Check("kept forks: kept again, no other fork", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.forked == 0);
 
+    /* A conversation that ran out of room goes on in the same entry with a new transcript, naming the earlier ones: they
+     * are no deletion, and the other profile gets the entry with the new transcript, each time, from either profile. */
+    {
+        static const WCHAR *const goesOn[3] = { L"cdcdcdcd-0000-4000-8000-000000000011", L"cdcdcdcd-0000-4000-8000-000000000012",
+                                                L"cdcdcdcd-0000-4000-8000-000000000013" };
+        char json[1024], priors[256];
+        WCHAR file[MAX_PATH], cli[SESSION_ID_CCH];
+        int step, in;
+        ready = WriteKeptEntry(entries[0], goesOn[0], "Long one", L"C:\\Fixture", AtSecond(20));
+        ZeroMemory(&report, sizeof report);
+        Check("kept continued: fixtures kept", ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && EntryThere(entries[1], goesOn[0]));
+        priors[0] = 0;
+        for (step = 1; step < 3; step++) {
+            in = step - 1;   /* it goes on in A, then in B */
+            StringCchPrintfA(json, sizeof json, "%s\"%ls\"", priors[0] ? "," : "", goesOn[step - 1]);
+            StringCchCatA(priors, sizeof priors, json);
+            StringCchPrintfA(json, sizeof json,
+                "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"priorCliSessionIds\":[%s],\"cwd\":\"C:\\\\Fixture\","
+                "\"originCwd\":\"C:\\\\Fixture\",\"title\":\"Long one\",\"lastActivityAt\":%I64u}", goesOn[0], goesOn[step], priors, AtSecond(20 + step));
+            Sleep(30);
+            ready = EntryPath(entries[in], goesOn[0], file, ARRAYSIZE(file)) && Save(file, json) &&
+                    EntryPath(entries[1 - in], goesOn[0], file, ARRAYSIZE(file));
+            ZeroMemory(&report, sizeof report);
+            Check(step == 1 ? "kept continued: gone on in one, the other gets the entry with the new transcript"
+                            : "kept continued: gone on again in the other, the first gets it in turn",
+                  ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && report.removed == 0 &&
+                  ReadString(file, "cliSessionId", cli, ARRAYSIZE(cli)) && wcscmp(cli, goesOn[step]) == 0);
+        }
+        ZeroMemory(&report, sizeof report);
+        Check("kept continued: kept again, both keep the entry, nothing removed",
+              SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 && report.removed == 0 &&
+              EntryThere(entries[0], goesOn[0]) && EntryThere(entries[1], goesOn[0]));
+    }
+
     /* A profile new to the group takes its layout: what it showed before, newer as it is, changes none. */
     Sleep(30);
     StringCchPrintfA(layout, sizeof layout, "{\"preferences\":{\"epitaxyPrefs\":{\"code-sessions-status-filter.%ls\":\"archived\"}}}", accounts[2]);

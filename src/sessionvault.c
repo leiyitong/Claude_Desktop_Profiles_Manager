@@ -1181,6 +1181,29 @@ done:
 
 /* ------------------------------------------------------ one session */
 
+/* A conversation that ran out of room, or was cleared, goes on in the same
+ * entry with a new transcript: Claude names the earlier ones in it
+ * (priorCliSessionIds, preClearCliSessionId, unarchivedCliSessionId). Such
+ * an earlier transcript is no session of its own: it is neither deleted
+ * (that would take the entry, which now holds the new one, from the other
+ * profiles) nor given back; the new transcript's session brings the entry
+ * to the others. A deletion the ledger holds for it is dropped. */
+static BOOL GoesOnAsAnother(const SessionSet *set, const WCHAR *key, DatedSet *ledger)
+{
+    int r, m, e, i;
+    for (r = 0; r < set->rowCount; r++) {
+        if (Core_EqualsI(set->rows[r].key, key)) continue;
+        for (m = 0; m < set->profiles.count; m++)
+            for (e = set->rows[r].entry[m]; e >= 0; e = set->entries[e].duplicate)
+                for (i = 0; i < set->entries[e].otherTranscriptCount; i++)
+                    if (Core_EqualsI(set->otherTranscriptIds[set->entries[e].firstOtherTranscript + i], key)) {
+                        RemoveDated(ledger, key);
+                        return TRUE;
+                    }
+    }
+    return FALSE;
+}
+
 /* One session made the same in every member: `row` of `set` (-1: listed by
  * none, only by the base, as `key`). */
 static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, const Member *members, const VaultList *base,
@@ -2019,14 +2042,15 @@ static BOOL KeepLocked(const ProfileList *list, DWORD profiles, const WCHAR *lis
         for (r = 0; r < set.rowCount && ok; r++) {
             const int *rowHeal = heal ? heal + (size_t)r * MAX_PROFILES : NULL;
             /* A row of entries that lost their session's id is no session of its own: the session's row heals them. */
-            if (!(heal && heal[((size_t)set.rowCount + r) * MAX_PROFILES]))
+            if (!(heal && heal[((size_t)set.rowCount + r) * MAX_PROFILES]) && !GoesOnAsAnother(&set, set.rows[r].key, &ledger))
                 ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, rowHeal, &changes, &next);
             Step(progress, 1);
         }
         Free(heal);
         for (i = 0; i < base.count && ok; i++)
             if (SessionStore_FindRow(&set, base.items[i].key) < 0) {
-                ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, NULL, &changes, &next);
+                if (!GoesOnAsAnother(&set, base.items[i].key, &ledger))
+                    ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, NULL, &changes, &next);
                 Step(progress, 1);
             }
         if (ok) ok = ResolveIndex(&set, member, &base, same, &changes, &next);

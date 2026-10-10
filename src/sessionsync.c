@@ -696,9 +696,25 @@ static BOOL WriteMark(const Profile *p, const WCHAR *dir, const WCHAR *id, ULONG
     return WriteFileAt(path, text, strlen(text), p, FALSE);
 }
 
+/* The entry's file names another transcript than `key` now: the
+ * conversation went on in it with a new one (or it was just replaced). */
+static BOOL HoldsAnother(const SessionEntry *entry, const WCHAR *key)
+{
+    WCHAR cli[SESSION_ID_CCH];
+    const char *value;
+    size_t valueLength;
+    DWORD size = 0;
+    char *json = Util_ReadFile(entry->file, CONTENT_MAX_BYTES, FALSE, &size);
+    BOOL another = json && Core_JsonMember(json, size, "cliSessionId", &value, &valueLength) &&
+                   Core_JsonString(value, valueLength, cli, ARRAYSIZE(cli)) && Core_IsUuid(cli) && !Core_EqualsI(cli, key);
+    Free(json);
+    return another;
+}
+
 /* A session taken away from `p`: its entries to the backup, unless it was
- * used there since; with SYNC_MARKED, Claude's marks that it was deleted
- * there written too, so that Claude does not take it in again. */
+ * used there since, or an entry goes on with another transcript; with
+ * SYNC_MARKED, Claude's marks that it was deleted there written too, so that
+ * Claude does not take it in again. */
 static OpResult ApplyRemove(const Profile *p, const SessionSet *entries, const WCHAR *dir, const SyncOp *op, SyncReport *report)
 {
     WCHAR ids[MAX_PROFILES][SESSION_ID_CCH];
@@ -708,6 +724,11 @@ static OpResult ApplyRemove(const Profile *p, const SessionSet *entries, const W
         Util_Log(L"session %s in %s: kept, used there since", op->key, p->folder);
         return OP_SKIPPED;
     }
+    for (i = entry; i >= 0; i = entries->entries[i].duplicate)
+        if (HoldsAnother(&entries->entries[i], op->key)) {
+            Util_Log(L"session %s in %s: kept, its entry goes on with another transcript", op->key, p->folder);
+            return OP_SKIPPED;
+        }
     for (; entry >= 0; entry = entries->entries[entry].duplicate) {
         if (SessionLink_Busy(p)) return OP_STOPPED;
         if (count < MAX_PROFILES) StringCchCopyW(ids[count++], SESSION_ID_CCH, entries->entries[entry].localId);
