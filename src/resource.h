@@ -23,6 +23,11 @@
 #define IDD_BACKUP_HUB    113
 #define IDD_PREVIEW       114
 #define IDD_SETTINGS      115
+#define IDD_ABOUT         116
+
+/* the changelogs, embedded (RCDATA): CHANGELOG.md and CHANGELOG.zh-CN.md */
+#define IDR_CHANGELOG_EN  200
+#define IDR_CHANGELOG_ZH  201
 
 /* main window; the ids of the commands its menus give are the buttons' they stand for */
 #define IDC_STATUS         1000
@@ -50,23 +55,21 @@
 #define IDC_COPY_ALL       1033   /* the list's menu */
 #define IDC_MOVE_ALL       1034
 #define IDC_BACKUP         1038   /* Backup & Restore, in the column */
-#define IDC_SHORTCUTS      1039   /* the column's menus */
-#define IDC_LANGUAGE       1040
+#define IDC_SHORTCUTS      1039   /* its menu, at the toolbar's end */
 #define IDC_SYNC_NOW       1041   /* the list's menu */
-#define IDC_SETTINGS       1042   /* the gear at the toolbar's right end */
+#define IDC_SETTINGS       1042   /* the gear at the toolbar's end */
+#define IDC_ABOUT          1043   /* About, right of it */
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
-#define IDC_S_ARCHIVED    1401
 #define IDC_S_PROFILES    1402
 #define IDC_S_TREE        1403
-#define IDC_S_DETAILS     1404
-#define IDC_S_PARTS       1405
+#define IDC_S_FIND        1406   /* the search options, beside the search box */
+#define IDC_S_FILTER      1407   /* the filter menu's button */
 
-/* session edit dialog */
+/* rename session dialog */
 #define IDC_T_LABEL       1500
 #define IDC_T_TITLE       1501
-#define IDC_T_STAR        1502
 
 /* profile dialog */
 #define IDC_P_NAME        1100
@@ -166,14 +169,20 @@
 #define IDC_V_TITLE       2500
 #define IDC_V_TEXT        2501
 
-/* settings, and help */
+/* settings: the language and the vault's days */
 #define IDC_G_VAULT       2600
 #define IDC_G_DAYS_LABEL  2601
 #define IDC_G_DAYS        2602
 #define IDC_G_DAYS_UNIT   2603
-#define IDC_G_HELP        2604
-#define IDC_G_QUESTIONS   2605
-#define IDC_G_ANSWER      2606
+#define IDC_G_LANGUAGE_LABEL 2607
+#define IDC_G_LANGUAGE    2608
+#define IDC_G_APPLY       2609
+
+/* About: the version, help and the changelog */
+#define IDC_W_TEXT        2700
+#define IDC_W_TOPICS      2701
+#define IDC_W_NAME        2702
+#define IDC_W_VERSION     2703
 
 /* message box */
 #define IDC_M_ICON        1300

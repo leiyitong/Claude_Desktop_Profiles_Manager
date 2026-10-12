@@ -12,6 +12,7 @@
 #include "resource.h"
 #include <commctrl.h>
 #include <shlobj.h>
+#include <windowsx.h>
 
 #define UNIX_EPOCH_TICKS      116444736000000000ULL
 #define TICKS_PER_MILLISECOND (TICKS_PER_SECOND / 1000)
@@ -763,32 +764,249 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
 
 /* ------------------------------------------------------- what to sync */
 
-/* Each row of the dialog: what it syncs (SYNC_ITEM_*), as the list shows it. */
-static const struct { DWORD item; const WCHAR *label; } kSyncItems[SYNC_ITEM_COUNT] = {
-    { SYNC_ITEM_SESSIONS, L"Sessions: new ones, titles, archived and deleted ones" },
-    { SYNC_ITEM_SIDEBAR, L"Sidebar: pins, groups, project order, filters" },
-    { SYNC_ITEM_DETAILS, L"Each session's model, effort, side pane, unread mark and cost" },
-    { SYNC_ITEM_APPEARANCE, L"Appearance: fonts, editor, zoom, spelling" },
-    { SYNC_ITEM_LANGUAGE, L"Interface language" },
-    { SYNC_ITEM_MODEL, L"Default model" },
-    { SYNC_ITEM_SETTINGS, L"Settings: auto-archive, Cowork, Remote Control, recent folders" },
-    { SYNC_ITEM_PERMISSIONS, L"Permissions: folders' permission modes, Cowork's trusted folders" },
+/* The images of what syncs, the conflicts' list and the what-to-sync list
+ * alike: a conflict's choice, then what each row is. */
+enum {
+    IMAGE_CHOSEN, IMAGE_CANDIDATE, IMAGE_SESSION, IMAGE_GROUP, IMAGE_SECTION, IMAGE_PIN, IMAGE_SETTING, IMAGE_APPEARANCE,
+    IMAGE_LANGUAGE, IMAGE_MODEL, IMAGE_LAYOUT, IMAGE_PERMISSION, IMAGE_STAR, IMAGES
 };
+static const WCHAR kSyncGlyphs[IMAGES] = { 0xEC61, 0xEA3A, 0xE8BD, 0xE8B7, 0xE8FD, 0xE718, 0xE713, 0xE8D2, 0xE774, 0xE945, 0xE80A, 0xE72E, 0xE734 };
+static const ThemeTint kSyncTints[IMAGES] = {
+    THEME_TINT_GREEN, THEME_TINT_NONE, THEME_TINT_PURPLE, THEME_TINT_AMBER, THEME_TINT_TEAL, THEME_TINT_TEAL, THEME_TINT_BLUE, THEME_TINT_PURPLE,
+    THEME_TINT_PURPLE, THEME_TINT_GOLD, THEME_TINT_TEAL, THEME_TINT_RED, THEME_TINT_GOLD
+};
+
+/* Each group of what syncs, in Core_SyncGroup's order (its SYNC_ITEM_* mask):
+ * its heading, its image, and its name as settings.ini keeps it opened. */
+static const struct { DWORD item; const WCHAR *heading; int image; const WCHAR *name; } kSyncKinds[SYNC_GROUP_COUNT] = {
+    { SYNC_ITEM_SESSIONS, L"Sessions", IMAGE_SESSION, L"sessions" },
+    { SYNC_ITEM_SIDEBAR, L"Sidebar", IMAGE_GROUP, L"sidebar" },
+    { SYNC_ITEM_DETAILS, L"Session details", IMAGE_LAYOUT, L"details" },
+    { SYNC_ITEM_APPEARANCE, L"Appearance", IMAGE_APPEARANCE, L"appearance" },
+    { SYNC_ITEM_LANGUAGE, L"Interface language", IMAGE_LANGUAGE, L"language" },
+    { SYNC_ITEM_MODEL, L"Default model", IMAGE_MODEL, L"model" },
+    { SYNC_ITEM_SETTINGS, L"Settings", IMAGE_SETTING, L"settings" },
+    { SYNC_ITEM_PERMISSIONS, L"Permissions", IMAGE_PERMISSION, L"permissions" },
+};
+#define ITEMS_OPENED_SECTION L"SyncItemsOpened"
+
+/* Each item under its group, as the person sees it; a group of one item is a heading alone. */
+static const struct { DWORD item; const WCHAR *label; int image; } kSyncItemRows[] = {
+    { SYNC_ITEM_SESSIONS_NEW, L"New sessions", IMAGE_SESSION },
+    { SYNC_ITEM_SESSIONS_TITLES, L"Titles", IMAGE_SESSION },
+    { SYNC_ITEM_SESSIONS_ARCHIVED, L"Archived or not", IMAGE_SESSION },
+    { SYNC_ITEM_SESSIONS_DELETED, L"Deleted sessions", IMAGE_SESSION },
+    { SYNC_ITEM_SIDEBAR_PINS, L"Stars and pins", IMAGE_STAR },
+    { SYNC_ITEM_SIDEBAR_GROUPS, L"Groups and sections", IMAGE_GROUP },
+    { SYNC_ITEM_SIDEBAR_ORDER, L"Project order", IMAGE_SECTION },
+    { SYNC_ITEM_SIDEBAR_FILTERS, L"Filters, grouping and sorting", IMAGE_SECTION },
+    { SYNC_ITEM_SIDEBAR_LAYOUT, L"Width and the place of Routines", IMAGE_LAYOUT },
+    { SYNC_ITEM_DETAILS_MODEL, L"Model and effort", IMAGE_SESSION },
+    { SYNC_ITEM_DETAILS_PANE, L"Side pane", IMAGE_LAYOUT },
+    { SYNC_ITEM_DETAILS_UNREAD, L"Unread marks", IMAGE_LAYOUT },
+    { SYNC_ITEM_DETAILS_COST, L"Cost", IMAGE_LAYOUT },
+    { SYNC_ITEM_APPEARANCE_FONTS, L"Fonts", IMAGE_APPEARANCE },
+    { SYNC_ITEM_APPEARANCE_EDITOR, L"Editor", IMAGE_APPEARANCE },
+    { SYNC_ITEM_APPEARANCE_ZOOM, L"Zoom", IMAGE_APPEARANCE },
+    { SYNC_ITEM_APPEARANCE_SPELLING, L"Spelling", IMAGE_APPEARANCE },
+    { SYNC_ITEM_SETTINGS_ARCHIVE, L"Archive when the PR closes", IMAGE_SETTING },
+    { SYNC_ITEM_SETTINGS_COWORK, L"Cowork", IMAGE_SETTING },
+    { SYNC_ITEM_SETTINGS_REMOTE, L"Remote Control", IMAGE_SETTING },
+    { SYNC_ITEM_SETTINGS_RECENTS, L"Cowork's recent folders", IMAGE_SETTING },
+    { SYNC_ITEM_SETTINGS_CODE, L"Code: scheduled tasks, links in previews, going on after a usage limit", IMAGE_SETTING },
+    { SYNC_ITEM_PERMISSIONS_MODES, L"Folders' permission modes", IMAGE_PERMISSION },
+    { SYNC_ITEM_PERMISSIONS_TRUSTED, L"Cowork's trusted folders", IMAGE_PERMISSION },
+};
+
+/* What to sync, as a list whose groups fold, with check boxes: what it
+ * shows comes from `items`; the groups start folded, but those the person
+ * opened before (settings.ini). A box the list checks itself (a click,
+ * Space) is undone, then turned over here (WM_ITEMS_BOX): a group's
+ * checks all of it, or none once it all is checked. */
+typedef struct ItemsList {
+    HWND  list;
+    DWORD items;                       /* what is checked */
+    BOOL  open[SYNC_GROUP_COUNT];
+    BOOL  filling;                     /* boxes set here, not clicked */
+} ItemsList;
+
+#define WM_ITEMS_BOX (WM_APP + 0x100)   /* a box clicked: wParam its row */
+
+static BOOL HasItems(int g)
+{
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kSyncItemRows); i++)
+        if (kSyncItemRows[i].item & Core_SyncGroup(g)) return TRUE;
+    return FALSE;
+}
+
+static DWORD RowMask(LPARAM param)
+{
+    return param < 0 ? Core_SyncGroup(THEME_HEADING_OF(param)) : (DWORD)param;
+}
+
+/* Each row's box as `items` says: a group's checked when all of it is, mixed when some. */
+static void ShowBoxes(ItemsList *rows)
+{
+    int row, count = ListView_GetItemCount(rows->list);
+    rows->filling = TRUE;
+    for (row = 0; row < count; row++) {
+        DWORD mask = RowMask(Theme_RowParam(rows->list, row)), chosen = rows->items & mask;
+        ListView_SetItemState(rows->list, row, INDEXTOSTATEIMAGEMASK(chosen == mask ? 2 : chosen ? 3 : 1), LVIS_STATEIMAGEMASK);
+    }
+    rows->filling = FALSE;
+}
+
+/* Group `g`'s items, below its heading at `row`. */
+static void InsertGroupItems(ItemsList *rows, int row, int g)
+{
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kSyncItemRows); i++)
+        if (kSyncItemRows[i].item & Core_SyncGroup(g))
+            Theme_InsertFoldingRow(rows->list, ++row, TR(kSyncItemRows[i].label), kSyncItemRows[i].image, (LPARAM)kSyncItemRows[i].item, 0);
+}
+
+/* Every row again: each group's heading, and its items when it is open. */
+static void InsertItemsRows(ItemsList *rows)
+{
+    int g, row;
+    rows->filling = TRUE;
+    ListView_DeleteAllItems(rows->list);
+    for (g = 0; g < SYNC_GROUP_COUNT; g++) {
+        int fold = !HasItems(g) ? THEME_FOLD_NONE : rows->open[g] ? THEME_FOLD_OPEN : THEME_FOLD_CLOSED;
+        row = ListView_GetItemCount(rows->list);
+        Theme_InsertFoldingRow(rows->list, row, TR(kSyncKinds[g].heading), kSyncKinds[g].image, THEME_HEADING_ROW(g), fold);
+        if (fold == THEME_FOLD_OPEN) InsertGroupItems(rows, row, g);
+    }
+    rows->filling = FALSE;
+    ShowBoxes(rows);
+}
+
+static void SetupItemsList(ItemsList *rows, HWND list, DWORD items)
+{
+    WCHAR opened[SYNC_GROUP_COUNT][MAX_PATH];
+    LVCOLUMNW column;
+    HIMAGELIST states;
+    int g, o, openedCount = Util_GetSettingList(ITEMS_OPENED_SECTION, opened, SYNC_GROUP_COUNT);
+    ZeroMemory(rows, sizeof *rows);
+    rows->list = list;
+    rows->items = items & SYNC_ITEMS_ALL;
+    for (g = 0; g < SYNC_GROUP_COUNT; g++)
+        for (o = 0; o < openedCount; o++)
+            if (Core_EqualsI(opened[o], kSyncKinds[g].name)) rows->open[g] = TRUE;
+    rows->filling = TRUE;
+    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    if ((states = ListView_GetImageList(list, LVSIL_STATE)) != NULL) ImageList_SetImageCount(states, 3);   /* the third: some of a group */
+    ListView_SetImageList(list, Theme_GlyphImages(list, kSyncGlyphs, kSyncTints, IMAGES), LVSIL_SMALL);
+    ZeroMemory(&column, sizeof column);
+    ListView_InsertColumn(list, 0, &column);   /* the view it scrolls in gives it the list's width */
+    Theme_SetFoldingRows(list);
+    rows->filling = FALSE;
+    InsertItemsRows(rows);
+}
+
+void SyncUi_FillItemsList(HWND list, DWORD items)
+{
+    static ItemsList shown;   /* a list alone, as the tests show it */
+    SetupItemsList(&shown, list, items);
+}
+
+/* The groups open, kept for the next time. */
+static void KeepOpenedGroups(const ItemsList *rows)
+{
+    WCHAR opened[SYNC_GROUP_COUNT][MAX_PATH];
+    int g, count = 0;
+    for (g = 0; g < SYNC_GROUP_COUNT; g++)
+        if (rows->open[g] && SUCCEEDED(StringCchCopyW(opened[count], ARRAYSIZE(opened[count]), kSyncKinds[g].name))) count++;
+    if (!Util_SetSettingList(ITEMS_OPENED_SECTION, (const WCHAR (*)[MAX_PATH])opened, count))
+        Util_Log(L"what to sync: the groups opened could not be kept (error %lu)", GetLastError());
+}
+
+/* Heading `row` opened or folded by the person. */
+static void FoldItemsGroup(ItemsList *rows, int row, BOOL open)
+{
+    int g = THEME_HEADING_OF(Theme_RowParam(rows->list, row));
+    if (g < 0 || g >= SYNC_GROUP_COUNT || !HasItems(g) || !rows->open[g] == !open) return;
+    rows->open[g] = open;
+    rows->filling = TRUE;
+    Theme_SetFold(rows->list, row, open ? THEME_FOLD_OPEN : THEME_FOLD_CLOSED);
+    if (open) InsertGroupItems(rows, row, g);
+    else Theme_DeleteFoldedRows(rows->list, row);
+    rows->filling = FALSE;
+    ShowBoxes(rows);
+    KeepOpenedGroups(rows);
+}
+
+/* Every group opened, or every one folded (Theme_FoldMenu), and kept so. */
+static void FoldAllItems(ItemsList *rows, BOOL open)
+{
+    int g;
+    for (g = 0; g < SYNC_GROUP_COUNT; g++) rows->open[g] = open && HasItems(g);
+    InsertItemsRows(rows);
+    if (ListView_GetItemCount(rows->list)) Theme_FocusRow(rows->list, 0);
+    KeepOpenedGroups(rows);
+}
+
+/* Row `row`'s box clicked, or Space on it. */
+static void ToggleItemsBox(ItemsList *rows, int row)
+{
+    DWORD mask;
+    if (row < 0 || row >= ListView_GetItemCount(rows->list)) return;
+    mask = RowMask(Theme_RowParam(rows->list, row));
+    rows->items = (rows->items & mask) == mask ? rows->items & ~mask : rows->items | mask;
+    ShowBoxes(rows);
+}
+
+/* What the list tells about its boxes and folds: TRUE when the dialog
+ * answers `result` (a box the list was checking itself, undone). */
+static BOOL ItemsListNotify(ItemsList *rows, HWND dialog, const NMHDR *header, LRESULT *result)
+{
+    *result = 0;
+    if (header->hwndFrom != rows->list) return FALSE;
+    if (header->code == LVN_ITEMCHANGING) {
+        const NMLISTVIEW *change = (const NMLISTVIEW *)header;
+        if (rows->filling || !(change->uChanged & LVIF_STATE) || !((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK)) return FALSE;
+        PostMessageW(dialog, WM_ITEMS_BOX, (WPARAM)change->iItem, 0);
+        *result = TRUE;
+        return TRUE;
+    }
+    if (header->code == NM_CLICK || header->code == NM_DBLCLK) {
+        /* The arrow folds or opens a group; so does a double-click on its heading. */
+        LVHITTESTINFO hit;
+        ZeroMemory(&hit, sizeof hit);
+        hit.pt = ((const NMITEMACTIVATE *)header)->ptAction;
+        if (ListView_SubItemHitTest(rows->list, &hit) >= 0 && Theme_RowParam(rows->list, hit.iItem) < 0 &&
+            (Theme_OnFoldArrow(rows->list, hit.iItem, hit.pt) || (header->code == NM_DBLCLK && !(hit.flags & LVHT_ONITEMSTATEICON)))) {
+            int g = THEME_HEADING_OF(Theme_RowParam(rows->list, hit.iItem));
+            if (g >= 0 && g < SYNC_GROUP_COUNT) FoldItemsGroup(rows, hit.iItem, !rows->open[g]);
+        }
+        return FALSE;
+    }
+    if (header->code == LVN_KEYDOWN) {
+        /* Right opens a group, Left folds it, or goes from an item up to its group. */
+        WORD key = ((const NMLVKEYDOWN *)header)->wVKey;
+        int row = ListView_GetNextItem(rows->list, -1, LVNI_FOCUSED);
+        if (row < 0 || (key != VK_LEFT && key != VK_RIGHT)) return FALSE;
+        if (Theme_RowParam(rows->list, row) < 0) {
+            FoldItemsGroup(rows, row, key == VK_RIGHT);
+        } else if (key == VK_LEFT) {
+            while (row > 0 && Theme_RowParam(rows->list, row) >= 0) row--;
+            Theme_FocusRow(rows->list, row);
+        }
+    }
+    return FALSE;
+}
 
 typedef struct ItemsDialog {
     const WCHAR *text;
     DWORD        items;
-    HWND         rows;
-    BOOL         filling;
+    ItemsList    rows;
 } ItemsDialog;
 
-/* What the rows checked say; OK only with one at least. */
+/* What the boxes checked say; OK only with one at least. */
 static void ReadItems(HWND dialog, ItemsDialog *state)
 {
-    int row;
-    state->items = 0;
-    for (row = 0; row < SYNC_ITEM_COUNT; row++)
-        if (ListView_GetCheckState(state->rows, row)) state->items |= kSyncItems[row].item;
+    state->items = state->rows.items;
     EnableWindow(GetDlgItem(dialog, IDOK), state->items != 0);
 }
 
@@ -796,40 +1014,38 @@ static INT_PTR CALLBACK ItemsProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
 {
     ItemsDialog *state = (ItemsDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
     switch (message) {
-    case WM_INITDIALOG: {
-        LVCOLUMNW column;
-        LVITEMW item;
-        int row;
+    case WM_INITDIALOG:
         state = (ItemsDialog *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
         SetDlgItemTextW(dialog, IDC_I_TEXT, state->text);
-        state->rows = GetDlgItem(dialog, IDC_I_LIST);
-        ListView_SetExtendedListViewStyle(state->rows, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        ZeroMemory(&column, sizeof column);
-        ListView_InsertColumn(state->rows, 0, &column);   /* the view it scrolls in gives it the list's width */
-        state->filling = TRUE;
-        for (row = 0; row < SYNC_ITEM_COUNT; row++) {
-            ZeroMemory(&item, sizeof item);
-            item.mask = LVIF_TEXT;
-            item.iItem = row;
-            item.pszText = (LPWSTR)TR(kSyncItems[row].label);
-            ListView_InsertItem(state->rows, &item);
-            ListView_SetCheckState(state->rows, row, (state->items & kSyncItems[row].item) != 0);
-        }
-        state->filling = FALSE;
-        Theme_SmoothView(state->rows);
+        SetupItemsList(&state->rows, GetDlgItem(dialog, IDC_I_LIST), state->items);
+        Theme_SmoothView(state->rows.list);
         ReadItems(dialog, state);
         return TRUE;
-    }
 
     case WM_CTLCOLORSTATIC:
         return Theme_CtlColor(message, wp, lp, IDC_I_NOTE);
 
-    case WM_NOTIFY:
-        if (state && ((const NMHDR *)lp)->hwndFrom == state->rows && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
-            const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
-            if (!state->filling && (change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK))
-                ReadItems(dialog, state);
+    case WM_NOTIFY: {
+        LRESULT result;
+        if (state && ItemsListNotify(&state->rows, dialog, (const NMHDR *)lp, &result)) {
+            SetWindowLongPtrW(dialog, DWLP_MSGRESULT, result);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_ITEMS_BOX:
+        if (state) {
+            ToggleItemsBox(&state->rows, (int)wp);
+            ReadItems(dialog, state);
+        }
+        return TRUE;
+
+    case WM_CONTEXTMENU:
+        if (state && ((HWND)wp == state->rows.list || (HWND)wp == GetParent(state->rows.list))) {
+            UINT cmd = Theme_FoldMenu(dialog, state->rows.list, (HWND)wp, lp);
+            if (cmd) FoldAllItems(&state->rows, cmd == THEME_FOLD_MENU_EXPAND);
             return TRUE;
         }
         break;
@@ -869,7 +1085,8 @@ BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, 
 typedef struct SetupDialog {
     const ProfileList *profiles;
     SyncSetup         *setup;
-    HWND               partners, items;
+    HWND               partners;
+    ItemsList          items;
     int                rowProfile[MAX_PROFILES];
     int                rowCount;
     BOOL               filling;
@@ -882,11 +1099,9 @@ static void ReadSetup(HWND dialog, SetupDialog *state)
     state->setup->partners = 0;
     for (row = 0; row < state->rowCount; row++)
         if (ListView_GetCheckState(state->partners, row)) state->setup->partners |= 1u << state->rowProfile[row];
-    state->setup->items = 0;
-    for (row = 0; row < SYNC_ITEM_COUNT; row++)
-        if (ListView_GetCheckState(state->items, row)) state->setup->items |= kSyncItems[row].item;
+    state->setup->items = state->items.items;
     EnableWindow(GetDlgItem(dialog, IDC_Z_ITEMS_LABEL), state->setup->partners != 0);
-    EnableWindow(state->items, state->setup->partners != 0);
+    EnableWindow(state->items.list, state->setup->partners != 0);
     EnableWindow(GetDlgItem(dialog, IDC_Z_SYNC_NOW), state->setup->partners && state->setup->items);
     EnableWindow(GetDlgItem(dialog, IDOK), !state->setup->partners || state->setup->items);
 }
@@ -917,15 +1132,13 @@ static INT_PTR CALLBACK SetupProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
     switch (message) {
     case WM_INITDIALOG: {
         WCHAR text[LABEL_CCH + 64];
-        int p, row;
+        int p;
         state = (SetupDialog *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
         StringCchPrintfW(text, ARRAYSIZE(text), TR(L"\x201C%s\x201D syncs with:"), state->profiles->items[state->setup->profile].name);
         SetDlgItemTextW(dialog, IDC_Z_TEXT, text);
         state->partners = GetDlgItem(dialog, IDC_Z_LIST);
-        state->items = GetDlgItem(dialog, IDC_Z_ITEMS);
         CheckRows(state->partners);
-        CheckRows(state->items);
         state->filling = TRUE;
         for (p = 0; p < state->profiles->count; p++) {
             if (p == state->setup->profile) continue;
@@ -933,11 +1146,10 @@ static INT_PTR CALLBACK SetupProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
             AddCheckRow(state->partners, state->rowCount, state->profiles->items[p].name, (state->setup->partners & (1u << p)) != 0);
             state->rowCount++;
         }
-        for (row = 0; row < SYNC_ITEM_COUNT; row++)
-            AddCheckRow(state->items, row, TR(kSyncItems[row].label), (state->setup->items & kSyncItems[row].item) != 0);
         state->filling = FALSE;
+        SetupItemsList(&state->items, GetDlgItem(dialog, IDC_Z_ITEMS), state->setup->items);
         Theme_SmoothView(state->partners);
-        Theme_SmoothView(state->items);
+        Theme_SmoothView(state->items.list);
         ReadSetup(dialog, state);
         return TRUE;
     }
@@ -945,12 +1157,32 @@ static INT_PTR CALLBACK SetupProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
     case WM_CTLCOLORSTATIC:
         return Theme_CtlColor(message, wp, lp, IDC_Z_NOTE);
 
-    case WM_NOTIFY:
-        if (state && (((const NMHDR *)lp)->hwndFrom == state->partners || ((const NMHDR *)lp)->hwndFrom == state->items) &&
-            ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
+    case WM_NOTIFY: {
+        LRESULT result;
+        if (state && ItemsListNotify(&state->items, dialog, (const NMHDR *)lp, &result)) {
+            SetWindowLongPtrW(dialog, DWLP_MSGRESULT, result);
+            return TRUE;
+        }
+        if (state && ((const NMHDR *)lp)->hwndFrom == state->partners && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
             const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
             if (!state->filling && (change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK))
                 ReadSetup(dialog, state);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_ITEMS_BOX:
+        if (state) {
+            ToggleItemsBox(&state->items, (int)wp);
+            ReadSetup(dialog, state);
+        }
+        return TRUE;
+
+    case WM_CONTEXTMENU:
+        if (state && ((HWND)wp == state->items.list || (HWND)wp == GetParent(state->items.list))) {
+            UINT cmd = Theme_FoldMenu(dialog, state->items.list, (HWND)wp, lp);
+            if (cmd) FoldAllItems(&state->items, cmd == THEME_FOLD_MENU_EXPAND);
             return TRUE;
         }
         break;
@@ -991,31 +1223,7 @@ BOOL SyncUi_Setup(HWND owner, const ProfileList *profiles, SyncSetup *setup)
 
 /* ------------------------------------------------------ conflicts settled */
 
-/* The images of the conflicts' list: the choice, then what each row is. */
-enum {
-    IMAGE_CHOSEN, IMAGE_CANDIDATE, IMAGE_SESSION, IMAGE_GROUP, IMAGE_SECTION, IMAGE_PIN, IMAGE_SETTING, IMAGE_APPEARANCE,
-    IMAGE_LANGUAGE, IMAGE_MODEL, IMAGE_LAYOUT, IMAGE_PERMISSION, IMAGE_STAR, IMAGES
-};
-static const WCHAR kConflictGlyphs[IMAGES] = { 0xEC61, 0xEA3A, 0xE8BD, 0xE8B7, 0xE8FD, 0xE718, 0xE713, 0xE8D2, 0xE774, 0xE945, 0xE80A, 0xE72E, 0xE734 };
-static const ThemeTint kConflictTints[IMAGES] = {
-    THEME_TINT_GREEN, THEME_TINT_NONE, THEME_TINT_PURPLE, THEME_TINT_AMBER, THEME_TINT_TEAL, THEME_TINT_TEAL, THEME_TINT_BLUE, THEME_TINT_PURPLE,
-    THEME_TINT_PURPLE, THEME_TINT_GOLD, THEME_TINT_TEAL, THEME_TINT_RED, THEME_TINT_GOLD
-};
-
-/* Each kind of setting a conflict belongs to (SYNC_ITEM_*): its heading, its image. */
-static const struct { DWORD item; const WCHAR *heading; int image; } kConflictKinds[] = {
-    { SYNC_ITEM_SESSIONS, L"Sessions", IMAGE_SESSION },
-    { SYNC_ITEM_SIDEBAR, L"Sidebar", IMAGE_GROUP },
-    { SYNC_ITEM_DETAILS, L"Session details", IMAGE_LAYOUT },
-    { SYNC_ITEM_APPEARANCE, L"Appearance", IMAGE_APPEARANCE },
-    { SYNC_ITEM_LANGUAGE, L"Interface language", IMAGE_LANGUAGE },
-    { SYNC_ITEM_MODEL, L"Default model", IMAGE_MODEL },
-    { SYNC_ITEM_SETTINGS, L"Settings", IMAGE_SETTING },
-    { SYNC_ITEM_PERMISSIONS, L"Permissions", IMAGE_PERMISSION },
-};
-
 #define CONFLICTS_SHOWN 256   /* the elements the dialog lists at most */
-#define ROW_HEADING     (-1)  /* a row's lParam: a kind's heading */
 
 typedef struct ConflictsDialog {
     const ProfileList *profiles;
@@ -1027,6 +1235,7 @@ typedef struct ConflictsDialog {
     const WCHAR       *text;
     HWND               list;
     HICON              icon;
+    BOOL               open[SYNC_GROUP_COUNT];   /* each kind's heading: open (at first) or folded */
 } ConflictsDialog;
 
 /* The image a conflict's row shows: what its element is. */
@@ -1038,17 +1247,17 @@ static int ConflictImage(const VaultConflict *conflict)
     if (strcmp(conflict->part, "sections") == 0) return IMAGE_SECTION;
     if (strcmp(conflict->part, "slice") == 0 || strcmp(conflict->part, "navPins") == 0) return IMAGE_PIN;
     if (strncmp(conflict->part, "starred", 7) == 0) return IMAGE_STAR;
-    for (k = 0; k < ARRAYSIZE(kConflictKinds); k++)
-        if (kConflictKinds[k].item == conflict->item) return kConflictKinds[k].image;
+    for (k = 0; k < ARRAYSIZE(kSyncKinds); k++)
+        if (kSyncKinds[k].item & conflict->item) return kSyncKinds[k].image;
     return IMAGE_SETTING;
 }
 
 static int KindOf(const VaultConflict *conflict)
 {
     int k;
-    for (k = 0; k < (int)ARRAYSIZE(kConflictKinds); k++)
-        if (kConflictKinds[k].item == conflict->item) return k;
-    return (int)ARRAYSIZE(kConflictKinds) - 1;
+    for (k = 0; k < (int)ARRAYSIZE(kSyncKinds); k++)
+        if (kSyncKinds[k].item & conflict->item) return k;
+    return (int)ARRAYSIZE(kSyncKinds) - 1;
 }
 
 /* Each cell of conflict row `row` (the conflict `c`): the chosen version checked, the others ringed. */
@@ -1075,7 +1284,7 @@ static void ShowAllChoices(const ConflictsDialog *state)
         ZeroMemory(&item, sizeof item);
         item.mask = LVIF_PARAM;
         item.iItem = row;
-        if (ListView_GetItem(state->list, &item) && item.lParam != ROW_HEADING) ShowChoice(state, row, (int)item.lParam);
+        if (ListView_GetItem(state->list, &item) && item.lParam >= 0) ShowChoice(state, row, (int)item.lParam);
     }
 }
 
@@ -1107,16 +1316,54 @@ static void SizeConflictColumns(const ConflictsDialog *state, int width)
     for (i = 0; i < state->columnCount; i++) ListView_SetColumnWidth(state->list, i + 1, wanted[i]);
 }
 
-/* The list: a heading per kind, then a row per conflict, a column per profile. */
+/* The rows of kind `k`'s conflicts, below its heading at `row`. */
+static void InsertConflictRows(ConflictsDialog *state, int row, int k)
+{
+    int c, i;
+    for (c = 0; c < state->count; c++) {
+        if (KindOf(&state->conflicts[c]) != k) continue;
+        Theme_InsertFoldingRow(state->list, ++row, state->conflicts[c].label, ConflictImage(&state->conflicts[c]), (LPARAM)c, 0);
+        for (i = 0; i < state->columnCount; i++) {
+            int p = state->columns[i];
+            ListView_SetItemText(state->list, row, i + 1,
+                                 (state->conflicts[c].members & (1u << p)) ? state->conflicts[c].shown[p] : (LPWSTR)L"\x2014");
+        }
+        ShowChoice(state, row, c);
+    }
+}
+
+static BOOL HasConflicts(const ConflictsDialog *state, int k)
+{
+    int c;
+    for (c = 0; c < state->count; c++)
+        if (KindOf(&state->conflicts[c]) == k) return TRUE;
+    return FALSE;
+}
+
+/* Every row again: a heading per kind of conflict, and its conflicts when it is open. */
+static void InsertConflictKinds(ConflictsDialog *state)
+{
+    int k, row;
+    ListView_DeleteAllItems(state->list);
+    for (k = 0; k < (int)ARRAYSIZE(kSyncKinds); k++) {
+        if (!HasConflicts(state, k)) continue;
+        row = ListView_GetItemCount(state->list);
+        Theme_InsertFoldingRow(state->list, row, TR(kSyncKinds[k].heading), kSyncKinds[k].image, THEME_HEADING_ROW(k),
+                         state->open[k] ? THEME_FOLD_OPEN : THEME_FOLD_CLOSED);
+        if (state->open[k]) InsertConflictRows(state, row, k);
+    }
+}
+
+/* The list: a heading per kind, open, its conflicts below, a column per profile. */
 static void FillConflicts(HWND dialog, ConflictsDialog *state)
 {
     LVCOLUMNW column;
     LVITEMW item;
     RECT client;
-    int k, c, i, row = 0, width, first;
+    int k, i, row, width, first;
     state->list = GetDlgItem(dialog, IDC_X_LIST);
     ListView_SetExtendedListViewStyle(state->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_SUBITEMIMAGES);
-    ListView_SetImageList(state->list, Theme_GlyphImages(state->list, kConflictGlyphs, kConflictTints, IMAGES), LVSIL_SMALL);
+    ListView_SetImageList(state->list, Theme_GlyphImages(state->list, kSyncGlyphs, kSyncTints, IMAGES), LVSIL_SMALL);
     GetClientRect(state->list, &client);
     width = client.right - GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(state->list));
     first = state->columnCount ? width * 2 / 5 : width;
@@ -1130,46 +1377,18 @@ static void FillConflicts(HWND dialog, ConflictsDialog *state)
         column.cx = (width - first) / state->columnCount;
         ListView_InsertColumn(state->list, i + 1, &column);
     }
-    for (k = 0; k < (int)ARRAYSIZE(kConflictKinds); k++) {
-        BOOL headed = FALSE;
-        for (c = 0; c < state->count; c++) {
-            if (KindOf(&state->conflicts[c]) != k) continue;
-            if (!headed) {
-                ZeroMemory(&item, sizeof item);
-                item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
-                item.iItem = row++;
-                item.iImage = kConflictKinds[k].image;
-                item.lParam = ROW_HEADING;
-                item.pszText = (LPWSTR)TR(kConflictKinds[k].heading);
-                ListView_InsertItem(state->list, &item);
-                headed = TRUE;
-            }
-            ZeroMemory(&item, sizeof item);
-            item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM | LVIF_INDENT;
-            item.iItem = row;
-            item.iImage = ConflictImage(&state->conflicts[c]);
-            item.iIndent = 1;
-            item.lParam = c;
-            item.pszText = state->conflicts[c].label;
-            ListView_InsertItem(state->list, &item);
-            for (i = 0; i < state->columnCount; i++) {
-                int p = state->columns[i];
-                ListView_SetItemText(state->list, row, i + 1,
-                                     (state->conflicts[c].members & (1u << p)) ? state->conflicts[c].shown[p] : (LPWSTR)L"\x2014");
-            }
-            ShowChoice(state, row, c);
-            row++;
-        }
-    }
+    Theme_SetFoldingRows(state->list);
+    for (k = 0; k < (int)ARRAYSIZE(kSyncKinds); k++) state->open[k] = HasConflicts(state, k);
+    InsertConflictKinds(state);
+    row = ListView_GetItemCount(state->list);
     SizeConflictColumns(state, width);
-    Theme_SetHeadingRows(state->list);
     Theme_SmoothView(state->list);
     /* The first conflict selected: the arrows choose from the start. */
     for (i = 0; i < row; i++) {
         ZeroMemory(&item, sizeof item);
         item.mask = LVIF_PARAM;
         item.iItem = i;
-        if (ListView_GetItem(state->list, &item) && item.lParam != ROW_HEADING) {
+        if (ListView_GetItem(state->list, &item) && item.lParam >= 0) {
             ListView_SetItemState(state->list, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
             break;
         }
@@ -1183,7 +1402,18 @@ static int ConflictOfRow(const ConflictsDialog *state, int row)
     ZeroMemory(&item, sizeof item);
     item.mask = LVIF_PARAM;
     item.iItem = row;
-    return row >= 0 && ListView_GetItem(state->list, &item) && item.lParam != ROW_HEADING ? (int)item.lParam : -1;
+    return row >= 0 && ListView_GetItem(state->list, &item) && item.lParam >= 0 ? (int)item.lParam : -1;
+}
+
+/* Kind heading `row` opened or folded by the person. */
+static void FoldConflictKind(ConflictsDialog *state, int row, BOOL open)
+{
+    int k = THEME_HEADING_OF(Theme_RowParam(state->list, row));
+    if (k < 0 || k >= SYNC_GROUP_COUNT || !state->open[k] == !open) return;
+    state->open[k] = open;
+    Theme_SetFold(state->list, row, open ? THEME_FOLD_OPEN : THEME_FOLD_CLOSED);
+    if (open) InsertConflictRows(state, row, k);
+    else Theme_DeleteFoldedRows(state->list, row);
 }
 
 /* Conflict row `row` moved to the next version left or right (`step`). */
@@ -1226,19 +1456,33 @@ static INT_PTR CALLBACK ConflictsProc(HWND dialog, UINT message, WPARAM wp, LPAR
     case WM_CTLCOLORSTATIC:
         return Theme_CtlColor(message, wp, lp, IDC_X_NOTE);
 
+    case WM_CONTEXTMENU:
+        if (state && state->list && ((HWND)wp == state->list || (HWND)wp == GetParent(state->list))) {
+            UINT cmd = Theme_FoldMenu(dialog, state->list, (HWND)wp, lp);
+            int k;
+            if (cmd) {
+                for (k = 0; k < (int)ARRAYSIZE(kSyncKinds); k++) state->open[k] = cmd == THEME_FOLD_MENU_EXPAND && HasConflicts(state, k);
+                InsertConflictKinds(state);
+                if (ListView_GetItemCount(state->list)) Theme_FocusRow(state->list, 0);
+            }
+            return TRUE;
+        }
+        break;
+
     case WM_NOTIFY:
         if (state && ((const NMHDR *)lp)->hwndFrom == state->list) {
             const NMHDR *header = (const NMHDR *)lp;
             if (header->code == NM_CLICK || header->code == NM_DBLCLK) {
-                /* A click on a profile's version keeps it. */
+                /* A kind's arrow folds or opens it, as a double-click on its heading; a click on a profile's version keeps it. */
                 LVHITTESTINFO hit;
-                DWORD position = GetMessagePos();
                 int c;
                 ZeroMemory(&hit, sizeof hit);
-                hit.pt.x = (short)LOWORD(position);
-                hit.pt.y = (short)HIWORD(position);
-                ScreenToClient(state->list, &hit.pt);
-                if (ListView_SubItemHitTest(state->list, &hit) >= 0 && hit.iSubItem > 0 && hit.iSubItem <= state->columnCount &&
+                hit.pt = ((const NMITEMACTIVATE *)lp)->ptAction;   /* where the list was clicked, in its client */
+                if (ListView_SubItemHitTest(state->list, &hit) >= 0 && Theme_RowParam(state->list, hit.iItem) < 0 &&
+                    (Theme_OnFoldArrow(state->list, hit.iItem, hit.pt) || header->code == NM_DBLCLK)) {
+                    int k = THEME_HEADING_OF(Theme_RowParam(state->list, hit.iItem));
+                    if (k >= 0 && k < SYNC_GROUP_COUNT) FoldConflictKind(state, hit.iItem, !state->open[k]);
+                } else if (hit.iItem >= 0 && hit.iSubItem > 0 && hit.iSubItem <= state->columnCount &&
                     (c = ConflictOfRow(state, hit.iItem)) >= 0 && (state->conflicts[c].members & (1u << state->columns[hit.iSubItem - 1]))) {
                     state->chosen[c] = state->columns[hit.iSubItem - 1];
                     ShowChoice(state, hit.iItem, c);
@@ -1248,8 +1492,10 @@ static INT_PTR CALLBACK ConflictsProc(HWND dialog, UINT message, WPARAM wp, LPAR
             if (header->code == LVN_KEYDOWN) {
                 WORD key = ((const NMLVKEYDOWN *)lp)->wVKey;
                 int row = ListView_GetNextItem(state->list, -1, LVNI_FOCUSED);
-                if (key == VK_LEFT || key == VK_RIGHT) {
-                    StepChoice(state, row, key == VK_LEFT ? -1 : 1);
+                if ((key == VK_LEFT || key == VK_RIGHT) && row >= 0) {
+                    /* On a heading, the kind opens or folds; on a conflict, the next version left or right. */
+                    if (Theme_RowParam(state->list, row) < 0) FoldConflictKind(state, row, key == VK_RIGHT);
+                    else StepChoice(state, row, key == VK_LEFT ? -1 : 1);
                     SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
                 }
                 return TRUE;

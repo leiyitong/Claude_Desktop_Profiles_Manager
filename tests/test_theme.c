@@ -26,6 +26,16 @@
  */
 #include "../src/app.h"
 #include <commctrl.h>
+#include <commdlg.h>   /* FR_DOWN, for a rich edit's search */
+/* richedit.h declares nameless unions (C4201 at /W4) */
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4201)
+#endif
+#include <richedit.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #include <uxtheme.h>
 #include <vssym32.h>
 #include <stdio.h>
@@ -2105,6 +2115,76 @@ static BOOL BrightInk(const Canvas *canvas, RECT *ink)
     return ink->right > ink->left;
 }
 
+/* A rich edit (Theme_SetRichText): the field's color, Markdown in its font,
+ * a heading bold and larger than the text, code in the code font, in each
+ * mode the theme has; a new theme renders it again in its colors. */
+static void TestRichText(void)
+{
+    HWND host = ThemedHost(), rich;
+    CHARFORMAT2W format;
+    COLORREF field;
+    LONG heading, body;
+    WCHAR text[256] = L"";
+    FINDTEXTEXW find;
+    if (!Theme_RichTextReady()) {
+        Check("rich text: msftedit.dll loaded", FALSE);
+        return;
+    }
+    rich = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
+                           10, 10, 300, 200, host, NULL, GetModuleHandleW(NULL), NULL);
+    if (!rich) {
+        Check("rich text: created", FALSE);
+        return;
+    }
+    Theme_Apply(host);
+    Theme_SetRichText(rich, L"## Title\n\nBody with `code` and **bold**\n\n1. One");
+    field = (COLORREF)SendMessageW(rich, EM_SETBKGNDCOLOR, 0, RGB(1, 2, 3));
+    SendMessageW(rich, EM_SETBKGNDCOLOR, 0, (LPARAM)field);
+    Check("rich text: its field in the theme's field color", field == Theme_Color(THEME_FIELD));
+    Check("rich text: every script in the window's font, no font of the rich edit's own",
+          !(SendMessageW(rich, EM_GETLANGOPTIONS, 0, 0) & (IMF_AUTOFONT | IMF_DUALFONT)));
+    GetWindowTextW(rich, text, ARRAYSIZE(text));
+    Check("rich text: the Markdown's text, its markup gone, a numbered line kept", wcsncmp(text, L"Title", 5) == 0 &&
+          wcsstr(text, L"Body with code and bold") != NULL && wcsstr(text, L"1.\tOne") != NULL);
+    ZeroMemory(&format, sizeof format);
+    format.cbSize = sizeof format;
+    SendMessageW(rich, EM_SETSEL, 0, 1);
+    SendMessageW(rich, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&format);
+    heading = format.yHeight;
+    Check("rich text: a heading bold, in the text's color", (format.dwEffects & CFE_BOLD) && format.crTextColor == Theme_Color(THEME_TEXT));
+    ZeroMemory(&find, sizeof find);
+    find.chrg.cpMin = 0;
+    find.chrg.cpMax = -1;
+    find.lpstrText = L"Body";
+    if (SendMessageW(rich, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&find) >= 0) {
+        SendMessageW(rich, EM_SETSEL, find.chrgText.cpMin, find.chrgText.cpMax);
+        ZeroMemory(&format, sizeof format);
+        format.cbSize = sizeof format;
+        SendMessageW(rich, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&format);
+    }
+    body = format.yHeight;
+    Check("rich text: a heading larger than the text, the text plain", heading > body && body > 0 && !(format.dwEffects & CFE_BOLD));
+    find.lpstrText = L"code";
+    if (SendMessageW(rich, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&find) >= 0) {
+        SendMessageW(rich, EM_SETSEL, find.chrgText.cpMin, find.chrgText.cpMax);
+        ZeroMemory(&format, sizeof format);
+        format.cbSize = sizeof format;
+        SendMessageW(rich, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&format);
+    }
+    Check("rich text: code in the code font", wcscmp(format.szFaceName, L"Consolas") == 0);
+    if (SendMessageW(rich, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&find) >= 0) {
+        find.lpstrText = L"Body";
+        SendMessageW(rich, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&find);
+        SendMessageW(rich, EM_SETSEL, find.chrgText.cpMin, find.chrgText.cpMax);
+        ZeroMemory(&format, sizeof format);
+        format.cbSize = sizeof format;
+        SendMessageW(rich, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&format);
+    }
+    Check("rich text: the text in the interface's face", wcscmp(format.szFaceName, Localize_FontFace()) == 0);
+    DestroyWindow(rich);
+    ShowWindow(host, SW_HIDE);
+}
+
 static void TestEditInput(void)
 {
     static const struct { const WCHAR *text; const char *script; } kSamples[] = {
@@ -3918,6 +3998,101 @@ static BOOL RowInSight(HWND control, HWND view, int kind, int expectedIndex)
 /* Ctrl with an arrow, Page Up, Page Down, Home or End scrolls a tree's view
  * without moving its selection, as a tree that scrolls itself does; a list
  * keeps those keys (they move its focus, and its view follows). */
+#ifndef DM_POINTERHITTEST
+#define DM_POINTERHITTEST 0x0250
+#endif
+
+/* What reaches a control's own procedure: DM_POINTERHITTEST, counted. */
+static LRESULT CALLBACK PanProbe(HWND control, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
+{
+    if (msg == DM_POINTERHITTEST) (*(int *)ref)++;
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(control, PanProbe, id);
+    return DefSubclassProc(control, msg, wp, lp);
+}
+
+/* A precision touchpad's pan: a list in a view does not take it (it never
+ * scrolls itself there), so Windows sends the wheel the view scrolls by; a
+ * list that scrolls itself still takes it. */
+static void TestViewTouchpadPan(void)
+{
+    HWND host = ThemedHost(), viewed, alone;
+    int viewedSeen = 0, aloneSeen = 0;
+    viewed = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT, 10, 10, 200, 100, host, NULL, GetModuleHandleW(NULL), NULL);
+    alone = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT, 220, 10, 200, 100, host, NULL, GetModuleHandleW(NULL), NULL);
+    if (!viewed || !alone) {
+        Check("touchpad pan: lists created", FALSE);
+        if (viewed) DestroyWindow(viewed);
+        if (alone) DestroyWindow(alone);
+        return;
+    }
+    SetWindowSubclass(viewed, PanProbe, 1, (DWORD_PTR)&viewedSeen);
+    SetWindowSubclass(alone, PanProbe, 1, (DWORD_PTR)&aloneSeen);
+    Theme_SmoothView(viewed);
+    Theme_Apply(host);
+    SendMessageW(viewed, DM_POINTERHITTEST, 0, 0);
+    SendMessageW(alone, DM_POINTERHITTEST, 0, 0);
+    Check("touchpad pan: a list in a view does not take a touchpad's pan", viewedSeen == 0);
+    Check("touchpad pan: a list that scrolls itself still does", aloneSeen == 1);
+    DestroyWindow(GetParent(viewed));
+    DestroyWindow(alone);
+}
+
+/* A precision touchpad sends a notch in many wheel messages, down to a delta
+ * of 1, each less than a px: in a view they add up to the notch's lines. */
+static void TestViewTouchpadSteps(void)
+{
+    HWND host = ThemedHost();
+    ViewedControls viewed;
+    UINT lines;
+    int kind, i;
+    if (!WheelScrollsLines(&lines, "touchpad steps")) return;
+    if (!CreateViewedControls(host, 100, &viewed)) {
+        Check("touchpad steps: controls created", FALSE);
+        return;
+    }
+    for (kind = 0; kind < 3; kind++) {
+        char name[160];
+        FrameSample sample = { 0 };
+        BOOL reached;
+        sample.view = viewed.views[kind];
+        sample.target = (int)lines * RowHeight(viewed.controls[kind], kind);
+        for (i = 0; i < WHEEL_DELTA; i++) SendMessageW(viewed.controls[kind], WM_MOUSEWHEEL, MAKEWPARAM(0, -1), 0);
+        reached = PumpUntil(ViewReached, &sample, ANIMATION_TIMEOUT_MS);
+        StringCchPrintfA(name, ARRAYSIZE(name), "touchpad steps: %d wheel messages of 1 scroll %s in a view a notch's lines", WHEEL_DELTA, kViewedNames[kind]);
+        Check(name, sample.target > 0 && reached);
+        if (!reached) printf("        at %d px, a notch is %d\n", ViewPosition(sample.view), sample.target);
+    }
+    ShowWindow(host, SW_HIDE);
+    DestroyViewedControls(&viewed);
+}
+
+/* A touchpad's driver may scroll by lines the control under the pointer
+ * (WM_VSCROLL with no scroll bar of its own): in a view, the view scrolls. */
+static void TestViewLineScroll(void)
+{
+    HWND host = ThemedHost();
+    ViewedControls viewed;
+    int c;
+    if (!CreateViewedControls(host, 100, &viewed)) {
+        Check("view line scroll: controls created", FALSE);
+        return;
+    }
+    for (c = 0; c < 3; c++) {
+        char name[160];
+        int before = ViewPosition(viewed.views[c]);
+        SendMessageW(viewed.controls[c], WM_VSCROLL, SB_LINEDOWN, 0);
+        PumpMessages();
+        StringCchPrintfA(name, ARRAYSIZE(name), "view line scroll: a line down sent to %s scrolls its view", kViewedNames[c]);
+        Check(name, ViewPosition(viewed.views[c]) > before);
+        SendMessageW(viewed.controls[c], WM_VSCROLL, SB_TOP, 0);
+        PumpMessages();
+        StringCchPrintfA(name, ARRAYSIZE(name), "view line scroll: ... and to the top sent to %s, back", kViewedNames[c]);
+        Check(name, ViewPosition(viewed.views[c]) == 0);
+    }
+    ShowWindow(host, SW_HIDE);
+    DestroyViewedControls(&viewed);
+}
+
 static void TestViewKeys(void)
 {
     static const struct { UINT key; const char *name; } kKeys[] = {
@@ -4515,6 +4690,92 @@ static void TestTreeGlyph(void)
     DestroyWindow(tree);
 }
 
+/* A report list whose headings fold (Theme_SetFoldingRows): a closed and an
+ * open heading show the tree theme's arrow in the cell their indent leaves
+ * before their image, where Theme_FoldArrowRect says; a row below a
+ * heading, and a heading with nothing to fold, show none. */
+static void TestFoldingRows(void)
+{
+    static const struct { int fold, indent; BOOL arrow, open; const char *name; } kRows[] = {
+        { 0, 2, FALSE, FALSE, "a row first, out of the list's rounded corner" },
+        { THEME_FOLD_CLOSED, 1, TRUE, FALSE, "a folded heading" },
+        { THEME_FOLD_OPEN, 1, TRUE, TRUE, "an open heading" },
+        { 0, 2, FALSE, FALSE, "a row below it" },
+        { THEME_FOLD_NONE, 1, FALSE, FALSE, "a heading with nothing to fold" },
+    };
+    static const WCHAR glyphs[1] = { 0xE713 };
+    static const ThemeTint tints[1] = { THEME_TINT_BLUE };
+    HWND host = ThemedHost(), list;
+    Canvas painted = { 0 };
+    LVCOLUMNW column;
+    RECT client;
+    size_t i;
+    list = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_NOCOLUMNHEADER, 10, 10, 300, 200, host, NULL,
+                           GetModuleHandleW(NULL), NULL);
+    if (!list) {
+        Check("folding rows: list created", FALSE);
+        return;
+    }
+    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    ListView_SetImageList(list, Theme_GlyphImages(list, glyphs, tints, 1), LVSIL_SMALL);
+    ZeroMemory(&column, sizeof column);
+    column.mask = LVCF_WIDTH;
+    column.cx = 280;
+    ListView_InsertColumn(list, 0, &column);
+    for (i = 0; i < ARRAYSIZE(kRows); i++) {
+        LVITEMW item;
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_INDENT | LVIF_STATE;
+        item.iItem = (int)i;
+        item.pszText = (LPWSTR)L"Row";
+        item.iImage = 0;
+        item.iIndent = kRows[i].indent;
+        item.state = INDEXTOOVERLAYMASK(kRows[i].fold);
+        item.stateMask = LVIS_OVERLAYMASK;
+        ListView_InsertItem(list, &item);
+    }
+    Theme_SetFoldingRows(list);
+    ListView_SetItemState(list, -1, 0, LVIS_FOCUSED | LVIS_SELECTED);   /* no focus cue over the arrows */
+    Theme_Apply(host);
+    ShowWindow(host, SW_SHOWNOACTIVATE);
+    RedrawWindow(host, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    GetClientRect(list, &client);
+    if (CanvasOpen(&painted, client.right, client.bottom, RGB(1, 2, 3)) && CopyClient(list, &painted) && HasImage(&painted, "folding rows")) {
+        for (i = 0; i < ARRAYSIZE(kRows); i++) {
+            Canvas native = { 0 };
+            RECT arrow, icon, cell;
+            BOOL has = Theme_FoldArrowRect(list, (int)i, &arrow);
+            int x, y, differing = 0;
+            char name[160];
+            StringCchPrintfA(name, ARRAYSIZE(name), "folding rows: %s %s an arrow", kRows[i].name, kRows[i].arrow ? "has" : "has no");
+            Check(name, has == kRows[i].arrow);
+            if (!has || !kRows[i].arrow) continue;
+            ListView_GetItemRect(list, (int)i, &icon, LVIR_ICON);
+            StringCchPrintfA(name, ARRAYSIZE(name), "folding rows: %s's arrow is before its image", kRows[i].name);
+            Check(name, arrow.right <= icon.left && arrow.left >= 0 && arrow.right > arrow.left);
+            if (!CanvasOpen(&native, arrow.right - arrow.left, arrow.bottom - arrow.top, Theme_Color(THEME_FIELD))) continue;
+            SetRect(&cell, 0, 0, arrow.right - arrow.left, arrow.bottom - arrow.top);
+            Theme_DrawTreeGlyph(list, native.dc, &cell, 0, kRows[i].open);
+            for (y = 0; y < native.height; y++)
+                for (x = 0; x < native.width; x++)
+                    if (arrow.left + x >= painted.width || arrow.top + y >= painted.height ||
+                        PixelAt(&painted, arrow.left + x, arrow.top + y) != PixelAt(&native, x, y)) {
+                        if (!differing++ && arrow.left + x < painted.width && arrow.top + y < painted.height)
+                            printf("        first at %d,%d of %ldx%ld: #%06lX, expected #%06lX\n", x, y, arrow.right - arrow.left,
+                                   arrow.bottom - arrow.top, (unsigned long)PixelAt(&painted, arrow.left + x, arrow.top + y),
+                                   (unsigned long)PixelAt(&native, x, y));
+                    }
+            StringCchPrintfA(name, ARRAYSIZE(name), "folding rows: %s's arrow is the tree theme's own", kRows[i].name);
+            Check(name, differing == 0);
+            if (differing) printf("        %d of %d pixels differ\n", differing, native.width * native.height);
+            CanvasClose(&native);
+        }
+    }
+    CanvasClose(&painted);
+    DestroyWindow(list);
+    ShowWindow(host, SW_HIDE);
+}
+
 /* Theme_DrawFocusCue marks the keyboard's row after keyboard use only, with
  * a dotted outline inside the row; Theme_RowMuted, a row's secondary text,
  * reads on each row Theme_DrawRow draws. */
@@ -4963,10 +5224,12 @@ static int DrawnImage(HIMAGELIST images, int index, int size, COLORREF *brightes
 }
 
 /* The icons of a list (Theme_GlyphImages): one per character, at the small
- * icon size, each in its tint where the glyph covers it fully. */
+ * icon size, each in its tint where the glyph covers it fully. The first is
+ * a filled star: a thin glyph (a check mark) covers no pixel fully at 96 DPI,
+ * so its brightest pixel stays darker than the tint. */
 static void TestGlyphImages(void)
 {
-    static const WCHAR glyphs[] = { 0xE73E, 0xE713 };
+    static const WCHAR glyphs[] = { 0xE735, 0xE713 };
     static const ThemeTint tints[] = { THEME_TINT_GREEN, THEME_TINT_NONE };
     HWND host = ThemedHost();
     HIMAGELIST images = host ? Theme_GlyphImages(host, glyphs, tints, 2) : NULL;
@@ -5250,6 +5513,7 @@ int wmain(void)
     TestStatusTip();
     TestEdit();
     TestEditInput();
+    TestRichText();
     TestEditReentrantPause();
     TestEditPrinting();
     TestPushButtons();
@@ -5263,6 +5527,9 @@ int wmain(void)
     TestScrollBarColors();
     TestWheel();
     TestSmoothView();
+    TestViewLineScroll();
+    TestViewTouchpadPan();
+    TestViewTouchpadSteps();
     TestWideListInView();
     TestViewPaging();
     TestViewKeepsPlace();
@@ -5282,6 +5549,7 @@ int wmain(void)
     TestTipsUnderWheel();
     TestScrollTarget();
     TestTreeGlyph();
+    TestFoldingRows();
     TestFocusCueAndMutedText();
     TestSeparatorColor();
     TestSideBarColors();

@@ -519,10 +519,14 @@ static EntryOutcome AddEntry(SessionSet *set, int profile, const WCHAR *file, co
     MemberText(json, length, "title", entry.title, ARRAYSIZE(entry.title));
     MemberString(json, length, "titleSource", titleSource, ARRAYSIZE(titleSource));
     entry.userTitle = entry.title[0] && Core_EqualsI(titleSource, L"user");
+    entry.autoTitle = entry.title[0] && Core_EqualsI(titleSource, L"auto");
     entry.starred = MemberTrue(json, length, "isStarred");
     entry.archived = MemberTrue(json, length, "isArchived");
     entry.damaged = MemberTrue(json, length, "transcriptUnavailable");
     entry.lastActivity = MemberNumber(json, length, "lastActivityAt");
+    entry.created = MemberNumber(json, length, "createdAt");
+    entry.environment = Core_SessionEnvironment(json, length);
+    entry.pullRequest = Core_SessionPullRequest(json, length, &entry.pullRequestNumber);
     entry.pendingStar = -1;
     entry.duplicate = -1;
     MemberString(json, length, "cliSessionId", cliSessionId, ARRAYSIZE(cliSessionId));
@@ -813,7 +817,8 @@ static void LoadAllPending(SessionSet *set, HANDLE cancel)
             entry = &set->entries[found];
             entry->pending = TRUE;
             set->source[p].pending++;
-            if (edits[i].op == PENDING_TITLE) StringCchCopyW(entry->pendingTitle, ARRAYSIZE(entry->pendingTitle), edits[i].value);
+            if (edits[i].op == PENDING_TITLE || (edits[i].op == PENDING_TITLE_AUTO && edits[i].value[0]))
+                StringCchCopyW(entry->pendingTitle, ARRAYSIZE(entry->pendingTitle), edits[i].value);
             else if (edits[i].op == PENDING_STAR) entry->pendingStar = edits[i].value[0] == L'1';
             else entry->pendingRemove = TRUE;
         }

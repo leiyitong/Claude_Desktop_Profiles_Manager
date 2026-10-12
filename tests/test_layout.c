@@ -16,7 +16,11 @@
  *    transcripts: resizes, refills and language changes keep its rows, its
  *    selection (a starred row included), its folded folders and the row
  *    on top; its disk watcher; double-clicks;
- *  - the themed message box (Ui_Message), as the program shows it.
+ *  - the themed message box (Ui_Message), as the program shows it;
+ *  - the Settings dialog as the program shows it: each help question shows
+ *    its own answer, the language box offers Windows' language then each
+ *    of the program's, the one in use chosen, and a language applied with
+ *    Apply (enabled by a change only) is followed by the open dialog.
  * Built and run by build.cmd with the program's resources and manifest. Its
  * windows show briefly; the maximized one, the modal profile dialog and the
  * message boxes take the foreground. The log and the queued session changes
@@ -33,15 +37,14 @@
 
 /* The manager window's layout contract is theme.c's (THEME_MAIN_*, app.h);
  * these bounds are the tests' own, in DIPs. */
-#define SESSION_PROFILES_MAX_DIPS 200    /* the sessions' side bar stays narrow, */
-#define SESSION_DETAILS_MAX_DIPS  300    /* and so do the details */
+#define SESSION_PROFILES_MAX_DIPS 200    /* the sessions' side bar stays narrow */
 
 /* A session snapshot is read on another thread: generous for a loaded machine. */
 #define SNAPSHOT_TIMEOUT_MS 10000
 /* How long a write the watcher ignores is given to ask for a snapshot anyway. */
 #define IGNORED_WRITE_MS    1000
 
-enum { SCALED_FONT_SUBCLASS = 1, FRAME_PROBE_SUBCLASS, MESSAGE_OWNER_SUBCLASS };
+enum { SCALED_FONT_SUBCLASS = 1, FRAME_PROBE_SUBCLASS, MESSAGE_OWNER_SUBCLASS, SETTINGS_OWNER_SUBCLASS };
 enum { TRANSCRIPT_STREAM_TIMER = 1 };
 
 /* The first scale is the monitor's own: the checks made at it need it to fit. */
@@ -354,32 +357,11 @@ static void PopulateBackupParts(HWND dialog)
     Theme_SmoothView(list);
 }
 
-/* What to sync, as syncui.c lists it: every row, permissions left unchecked. */
+/* What to sync, as syncui.c shows it: the default, everything, its groups folded. */
 static void PopulateSyncItems(HWND dialog)
 {
-    static const WCHAR *const kItems[] = { L"Sessions: new ones, titles, archived and deleted ones",
-                                           L"Sidebar: pins, groups, project order, filters",
-                                           L"Each session's model, effort, side pane, unread mark and cost",
-                                           L"Appearance: fonts, editor, zoom, spelling",
-                                           L"Interface language",
-                                           L"Default model",
-                                           L"Settings: auto-archive, Cowork, Remote Control, recent folders",
-                                           L"Permissions: folders' permission modes, Cowork's trusted folders" };
     HWND list = GetDlgItem(dialog, IDC_I_LIST);
-    LVCOLUMNW column;
-    LVITEMW item;
-    int i;
-    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-    ZeroMemory(&column, sizeof column);
-    ListView_InsertColumn(list, 0, &column);
-    for (i = 0; i < (int)ARRAYSIZE(kItems); i++) {
-        ZeroMemory(&item, sizeof item);
-        item.mask = LVIF_TEXT;
-        item.iItem = i;
-        item.pszText = (LPWSTR)TR(kItems[i]);
-        ListView_InsertItem(list, &item);
-        ListView_SetCheckState(list, i, i != (int)ARRAYSIZE(kItems) - 1);
-    }
+    SyncUi_FillItemsList(list, SYNC_ITEMS_DEFAULT);
     Theme_SmoothView(list);
 }
 
@@ -401,17 +383,15 @@ static void SyncSetupCaptions(HWND dialog, const WCHAR *name, BOOL fill)
     LVCOLUMNW column;
     LVITEMW item;
     HWND lists[2];
-    int i, list;
+    int i;
     StringCchPrintfW(text, ARRAYSIZE(text), TR(L"\x201C%s\x201D syncs with:"), name);
     SetDlgItemTextW(dialog, IDC_Z_TEXT, text);
     if (!fill) return;
     lists[0] = GetDlgItem(dialog, IDC_Z_LIST);
     lists[1] = GetDlgItem(dialog, IDC_Z_ITEMS);
-    for (list = 0; list < 2; list++) {
-        ListView_SetExtendedListViewStyle(lists[list], LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        ZeroMemory(&column, sizeof column);
-        ListView_InsertColumn(lists[list], 0, &column);
-    }
+    ListView_SetExtendedListViewStyle(lists[0], LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    ZeroMemory(&column, sizeof column);
+    ListView_InsertColumn(lists[0], 0, &column);
     for (i = 0; i < (int)ARRAYSIZE(kPartners); i++) {
         ZeroMemory(&item, sizeof item);
         item.mask = LVIF_TEXT;
@@ -421,27 +401,9 @@ static void SyncSetupCaptions(HWND dialog, const WCHAR *name, BOOL fill)
         ListView_SetCheckState(lists[0], i, i == 0);
     }
     Theme_SmoothView(lists[0]);
-    /* The items as the what-to-sync dialog lists them. */
-    {
-        HWND items = lists[1];
-        static const WCHAR *const kItems[] = { L"Sessions: new ones, titles, archived and deleted ones",
-                                               L"Sidebar: pins, groups, project order, filters",
-                                               L"Each session's model, effort, side pane, unread mark and cost",
-                                               L"Appearance: fonts, editor, zoom, spelling",
-                                               L"Interface language",
-                                               L"Default model",
-                                               L"Settings: auto-archive, Cowork, Remote Control, recent folders",
-                                               L"Permissions: folders' permission modes, Cowork's trusted folders" };
-        for (i = 0; i < (int)ARRAYSIZE(kItems); i++) {
-            ZeroMemory(&item, sizeof item);
-            item.mask = LVIF_TEXT;
-            item.iItem = i;
-            item.pszText = (LPWSTR)TR(kItems[i]);
-            ListView_InsertItem(items, &item);
-            ListView_SetCheckState(items, i, i != (int)ARRAYSIZE(kItems) - 1);
-        }
-        Theme_SmoothView(items);
-    }
+    /* The items as the what-to-sync dialog shows them. */
+    SyncUi_FillItemsList(lists[1], SYNC_ITEMS_DEFAULT);
+    Theme_SmoothView(lists[1]);
 }
 
 /* Backup & Restore as gui.c fills it: the profile selected named, its headings semibold. */
@@ -593,11 +555,12 @@ static void MainCaptions(HWND dialog, const LayoutFixture *fixture)
                          L"2.16120.0");
         SetDlgItemTextW(dialog, IDC_STATUS, text);
     }
-    ShowWindow(statusAction, fixture->links == CLAUDE_MISSING ? SW_SHOW : SW_HIDE);   /* Get Claude; links are fixed from the column */
+    /* Get Claude; links are fixed from the column. The sessions view has no column. */
+    ShowWindow(statusAction, fixture->links == CLAUDE_MISSING && !fixture->sessions ? SW_SHOW : SW_HIDE);
     StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainVersion(fixture->version)),
-                     fixture->version == MAIN_VERSION_BUILD ? L"2026.12.31 23:59" : L"9.8.7");
+                     fixture->version == MAIN_VERSION_BUILD ? L"2026.12.31" : L"9.8.7");
     SetDlgItemTextW(dialog, IDC_VERSION, text);
-    ShowWindow(GetDlgItem(dialog, IDC_UPDATE), fixture->version != MAIN_VERSION_BUILD ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(dialog, IDC_UPDATE), fixture->version != MAIN_VERSION_BUILD && !fixture->sessions ? SW_SHOW : SW_HIDE);
 }
 
 /* The profile dialog's choices for its sessions, as gui.c fills them. */
@@ -648,20 +611,24 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         SetDlgItemTextW(dialog, IDC_T_TITLE, L"A private mock session title that remains user data in every language");
         break;
     case IDD_SETTINGS: {
-        HWND questions = GetDlgItem(dialog, IDC_G_QUESTIONS);
-        LVCOLUMNW column;
-        LVITEMW item;
+        HWND languages = GetDlgItem(dialog, IDC_G_LANGUAGE);
+        int language;
+        Theme_SetStrong(GetDlgItem(dialog, IDC_G_LANGUAGE_LABEL));
         Theme_SetStrong(GetDlgItem(dialog, IDC_G_VAULT));
-        Theme_SetStrong(GetDlgItem(dialog, IDC_G_HELP));
+        for (language = -1; language < Localize_LanguageCount(); language++)
+            SendMessageW(languages, CB_ADDSTRING, 0, (LPARAM)Localize_LanguageName(language));
+        SendMessageW(languages, CB_SETCURSEL, 0, 0);
         SetDlgItemTextW(dialog, IDC_G_DAYS, L"30");
-        ZeroMemory(&column, sizeof column);
-        ListView_InsertColumn(questions, 0, &column);
-        ZeroMemory(&item, sizeof item);
-        item.mask = LVIF_TEXT;
-        item.pszText = (LPWSTR)TR(L"What is this program for?");
-        ListView_InsertItem(questions, &item);
-        SetDlgItemTextW(dialog, IDC_G_ANSWER, TR(L"It runs several Claude accounts side by side, each in a window of its own: a profile, with its own "
-                                                 L"sign-in, settings and conversations. Claude itself is not changed."));
+        break;
+    }
+    case IDD_ABOUT: {
+        HWND topics = GetDlgItem(dialog, IDC_W_TOPICS);
+        WCHAR chosen[CHANGELOG_NAME_CCH] = L"";
+        About_Fill(dialog);
+        ListView_GetItemText(topics, ListView_GetNextItem(topics, -1, LVNI_FOCUSED), 0, chosen, ARRAYSIZE(chosen));
+        Check(fixture, NULL, "About opens on this version, the embedded changelog's newest", wcscmp(chosen, L"v" APP_VERSION_DATE_W) == 0);
+        Check(fixture, NULL, "About shows what the newest version changed", GetWindowTextLengthW(GetDlgItem(dialog, IDC_W_TEXT)) > 0);
+        Theme_SmoothView(topics);
         break;
     }
     case IDD_PREVIEW:
@@ -792,9 +759,11 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
 static void ShowMockSessions(HWND dialog)
 {
     static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_BACKUP, IDC_REPAIR, IDC_NOTE };
-    static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_TREE, IDC_S_DETAILS };
+    static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_FIND, IDC_S_FILTER, IDC_S_TREE };
+    static const int kFootControls[] = { IDC_STATUS, IDC_PROGRESS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE };   /* the view has no column */
     size_t i;
     for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
+    for (i = 0; i < ARRAYSIZE(kFootControls); i++) ShowWindow(GetDlgItem(dialog, kFootControls[i]), SW_HIDE);
     for (i = 0; i < ARRAYSIZE(kSessionControls); i++) ShowWindow(GetDlgItem(dialog, kSessionControls[i]), SW_SHOW);
     SetDlgItemTextW(dialog, IDC_SESSIONS, TR(Theme_MainCaption(IDC_SESSIONS, 1)));
     Theme_SetMainGlyph(dialog, IDC_SESSIONS, 1);
@@ -887,7 +856,6 @@ static INT_PTR CALLBACK FixtureProc(HWND dialog, UINT message, WPARAM wp, LPARAM
         if (Theme_MainMinimum(dialog, &minimum)) {
             Theme_LayoutMain(dialog);
             Gui_LayoutProfileColumns(fixture->table);
-            if (fixture->realSessions) SessionsView_Resize();
         }
     }
     if (message == WM_DESTROY) Localize_ForgetWindow(dialog);
@@ -1266,29 +1234,45 @@ static void CheckText(const LayoutFixture *fixture, HWND control)
     ReleaseDC(control, dc);
 }
 
-/* The toolbar in one row above the body, left to right; the column beside
- * the list (or the sessions' panes): the view's button level with the
- * body's top, the status above the version, the foot (the version, or
- * Update) on the body's bottom. */
+/* The toolbar in one row above the body, left to right, one gap between
+ * the buttons of a group and a wider one between groups, its icons the last
+ * group; the column beside the list (or the sessions' panes): the view's
+ * button level with the body's top, the status above the version, the foot
+ * (the version, or Update) on the body's bottom. */
 static void CheckMainBands(HWND dialog, const LayoutFixture *fixture)
 {
-    static const int kToolbar[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT };
+    static const int kToolbar[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SHORTCUTS, IDC_SETTINGS, IDC_ABOUT };
+    static const BOOL kStartsGroup[] = { FALSE, FALSE, FALSE, TRUE, FALSE, FALSE, TRUE, TRUE, FALSE, FALSE };
     HWND update = GetDlgItem(dialog, IDC_UPDATE);
     RECT first = RelativeRect(dialog, GetDlgItem(dialog, kToolbar[0])), view = RelativeRect(dialog, GetDlgItem(dialog, IDC_SESSIONS));
     RECT body = RelativeRect(dialog, fixture->sessions ? fixture->profilesViewport : fixture->tableViewport);
     RECT status = RelativeRect(dialog, GetDlgItem(dialog, IDC_STATUS)), version = RelativeRect(dialog, GetDlgItem(dialog, IDC_VERSION));
     RECT last = (GetWindowLongW(update, GWL_STYLE) & WS_VISIBLE) ? RelativeRect(dialog, update) : version;
-    BOOL row = TRUE, order = TRUE;
+    BOOL row = TRUE, order = TRUE, gaps = TRUE;
+    LONG within = -1, between = -1;
     size_t i;
     for (i = 1; i < ARRAYSIZE(kToolbar); i++) {
         RECT button = RelativeRect(dialog, GetDlgItem(dialog, kToolbar[i])), before = RelativeRect(dialog, GetDlgItem(dialog, kToolbar[i - 1]));
+        LONG *expected = kStartsGroup[i] ? &between : &within;
         row = row && button.top == first.top && button.bottom == first.bottom;
         order = order && button.left > before.right;
+        if (*expected < 0) *expected = button.left - before.right;
+        gaps = gaps && button.left - before.right == *expected;
     }
     Check(fixture, GetDlgItem(dialog, kToolbar[0]), "the toolbar's buttons share one row", row);
     Check(fixture, GetDlgItem(dialog, kToolbar[0]), "the toolbar's buttons go left to right, apart", order);
+    Check(fixture, GetDlgItem(dialog, IDC_SHORTCUTS), "the toolbar has one gap within its groups and a wider one between them, its icons included",
+          gaps && between > within);
     Check(fixture, GetDlgItem(dialog, kToolbar[0]), "the toolbar sits above the body, where the content starts",
           first.bottom < body.top && first.left == body.left);
+    if (fixture->sessions) {
+        RECT tree = RelativeRect(dialog, fixture->treeViewport);
+        Check(fixture, GetDlgItem(dialog, IDC_SESSIONS), "the view's button ends the search row, above the tree's right end",
+              view.top >= body.top && view.bottom <= tree.top && view.right == tree.right && view.left > body.right);
+        Check(fixture, GetDlgItem(dialog, IDC_STATUS), "the sessions view shows no column's foot",
+              !IsWindowVisible(GetDlgItem(dialog, IDC_STATUS)) && !IsWindowVisible(GetDlgItem(dialog, IDC_VERSION)) && !IsWindowVisible(update));
+        return;
+    }
     Check(fixture, GetDlgItem(dialog, IDC_SESSIONS), "the view's button tops the column, level with the body",
           view.top == body.top && view.left > body.right);
     Check(fixture, GetDlgItem(dialog, IDC_STATUS), "the status sits above the version, in the column",
@@ -1649,7 +1633,8 @@ static void CheckReopenedModal(HWND owner, LayoutFixture *fixture, const LayoutS
 static void CheckLanguageRoundTrips(void)
 {
     static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
-                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS };
+                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS,
+                                      IDD_ABOUT };
     static const WCHAR *const kVisited[] = { L"zh-CN" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"en");
@@ -1812,7 +1797,7 @@ static void CheckHiddenRows(void)
 static void CheckDialogs(void)
 {
     static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE,
-                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS };
+                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS, IDD_ABOUT };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)
@@ -1895,6 +1880,215 @@ static void CheckMessageBoxes(void)
         Ui_Message(owner, check.single ? MB_OK | MB_ICONINFORMATION : MB_YESNO | MB_ICONQUESTION, L"%s", text);
         RemoveWindowSubclass(owner, CheckWaitingMessage, MESSAGE_OWNER_SUBCLASS);
         Check(&check.fixture, NULL, "the message box waited for the user once, and was checked", check.checked == 1);
+    }
+    DestroyWindow(owner);
+}
+
+#define SETTINGS_ANSWERS_MAX 16
+#define SETTINGS_ANSWER_CCH  1024
+
+typedef struct SettingsCheck { LayoutFixture fixture; int chosen; HWND seen; int checked; } SettingsCheck;
+
+static int g_settingsApplied, g_settingsLanguage;
+
+/* `key` pressed alone: the thread's Ctrl, Shift and Alt are up meanwhile,
+ * whatever the real keyboard holds. */
+static void SendPlainKey(HWND control, WPARAM key)
+{
+    static const int kModifiers[] = { VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU, VK_LMENU, VK_RMENU };
+    BYTE state[256], plain[256];
+    size_t i;
+    GetKeyboardState(state);
+    memcpy(plain, state, sizeof plain);
+    for (i = 0; i < ARRAYSIZE(kModifiers); i++) plain[kModifiers[i]] &= (BYTE)~0x80;
+    SetKeyboardState(plain);
+    SendMessageW(control, WM_KEYDOWN, key, 0x00500001);
+    SendMessageW(control, WM_KEYUP, key, 0xC0500001);
+    SetKeyboardState(state);
+    PumpMessages();
+}
+
+/* What gui.c's DoLanguage does for Settings, for this process only. */
+static void ApplySettingsLanguage(int language)
+{
+    g_settingsApplied++;
+    g_settingsLanguage = language;
+    Localize_SetLanguage(language, FALSE);
+}
+
+/* Another language chosen in the Settings dialog and applied: Apply waits
+ * for the change, gives the language to the program, and waits again; the
+ * dialog speaks the new language, in its script's face, still laid out
+ * whole. */
+static void CheckSettingsApply(HWND dialog, SettingsCheck *check)
+{
+    HWND apply = GetDlgItem(dialog, IDC_G_APPLY), combo = GetDlgItem(dialog, IDC_G_LANGUAGE);
+    int target = Localize_EffectiveLanguage() == 0 ? 1 : 0;
+    WCHAR caption[64], heading[64];
+    FontState font;
+    Check(&check->fixture, apply, "Apply waits for a change", !IsWindowEnabled(apply));
+    SendMessageW(combo, CB_SETCURSEL, (WPARAM)(target + 1), 0);
+    SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_G_LANGUAGE, CBN_SELCHANGE), (LPARAM)combo);
+    Check(&check->fixture, apply, "another language chosen enables Apply", IsWindowEnabled(apply));
+    SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_G_APPLY, BN_CLICKED), (LPARAM)apply);
+    PumpMessages();
+    check->fixture.language = target;
+    GetWindowTextW(dialog, caption, ARRAYSIZE(caption));
+    GetDlgItemTextW(dialog, IDC_G_LANGUAGE_LABEL, heading, ARRAYSIZE(heading));
+    font = ReadFont(dialog, (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0));
+    Check(&check->fixture, apply, "Apply gives the language chosen to the program", g_settingsApplied == 1 && g_settingsLanguage == target);
+    Check(&check->fixture, NULL, "the settings dialog follows the language applied: caption, headings",
+          wcscmp(caption, TR(L"Settings")) == 0 && wcscmp(heading, TR(L"&Language")) == 0);
+    Check(&check->fixture, NULL, "the settings dialog's face covers the language applied",
+          font.available && wcscmp(font.logical.lfFaceName, Localize_FontFace()) == 0);
+    Check(&check->fixture, combo, "the language box shows the language applied", SendMessageW(combo, CB_GETCURSEL, 0, 0) == target + 1);
+    Check(&check->fixture, apply, "Apply waits again for a change once applied", !IsWindowEnabled(apply));
+    CheckGeometry(dialog, &check->fixture);
+}
+
+/* The Settings dialog's owner: once the dialog waits for the user, its
+ * language box is read; another language is chosen and applied, which the
+ * dialog follows, Apply waiting for a change before and after; then Cancel
+ * closes it. The vault's days stay as they are: nothing is written. */
+static LRESULT CALLBACK CheckWaitingSettings(HWND owner, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR reference)
+{
+    SettingsCheck *check = (SettingsCheck *)reference;
+    (void)id;
+    if (message == WM_ENTERIDLE && wp == MSGF_DIALOGBOX && (HWND)lp != check->seen) {
+        HWND dialog = (HWND)lp, combo = GetDlgItem(dialog, IDC_G_LANGUAGE);
+        WCHAR first[64];
+        check->seen = dialog;
+        check->checked++;
+        CheckGeometry(dialog, &check->fixture);
+        first[0] = 0;
+        SendMessageW(combo, CB_GETLBTEXT, 0, (LPARAM)first);
+        Check(&check->fixture, combo, "the language box offers Windows' language, then each of the program's",
+              SendMessageW(combo, CB_GETCOUNT, 0, 0) == Localize_LanguageCount() + 1 &&
+              SendMessageW(combo, CB_GETLBTEXTLEN, 0, 0) < (LRESULT)ARRAYSIZE(first) && wcscmp(first, Localize_LanguageName(-1)) == 0);
+        Check(&check->fixture, combo, "the language box shows the language in use", SendMessageW(combo, CB_GETCURSEL, 0, 0) == check->chosen + 1);
+        CheckSettingsApply(dialog, check);
+        PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
+    }
+    return DefSubclassProc(owner, message, wp, lp);
+}
+
+/* The About dialog's owner: once the dialog waits for the user, it shows
+ * this version, the changelog's newest, and what it changed; help's
+ * questions, walked with the keyboard from their heading, each show an
+ * answer of their own; the changelog's heading shows every version; then
+ * Close closes it. */
+static LRESULT CALLBACK CheckWaitingAbout(HWND owner, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR reference)
+{
+    static WCHAR answers[SETTINGS_ANSWERS_MAX][SETTINGS_ANSWER_CCH];
+    SettingsCheck *check = (SettingsCheck *)reference;
+    (void)id;
+    if (message == WM_ENTERIDLE && wp == MSGF_DIALOGBOX && (HWND)lp != check->seen) {
+        HWND dialog = (HWND)lp, list = GetWindow(GetDlgItem(dialog, IDC_W_TOPICS), GW_CHILD);
+        WCHAR chosen[CHANGELOG_NAME_CCH] = L"", version[64] = L"", expected[64];
+        int row, other, questions = 0;
+        BOOL own = list != NULL;
+        check->seen = dialog;
+        check->checked++;
+        CheckGeometry(dialog, &check->fixture);
+        if (list) ListView_GetItemText(list, ListView_GetNextItem(list, -1, LVNI_FOCUSED), 0, chosen, ARRAYSIZE(chosen));
+        GetDlgItemTextW(dialog, IDC_W_VERSION, version, ARRAYSIZE(version));
+        StringCchPrintfW(expected, ARRAYSIZE(expected), TR(L"Version %s"), APP_VERSION_DATE_W);
+        GetDlgItemTextW(dialog, IDC_W_TEXT, answers[0], SETTINGS_ANSWER_CCH);
+        Check(&check->fixture, list, "About shows this version, and opens on it in the changelog with what it changed",
+              wcscmp(version, expected) == 0 && wcscmp(chosen, L"v" APP_VERSION_DATE_W) == 0 &&
+              wcsncmp(answers[0], L"v" APP_VERSION_DATE_W, ARRAYSIZE(L"v" APP_VERSION_DATE_W) - 1) == 0 &&
+              (answers[0][ARRAYSIZE(L"v" APP_VERSION_DATE_W) - 1] == L'\r' || answers[0][ARRAYSIZE(L"v" APP_VERSION_DATE_W) - 1] == L'\n') &&
+              answers[0][ARRAYSIZE(L"v" APP_VERSION_DATE_W)]);
+        if (list) SendPlainKey(list, VK_HOME);
+        for (row = 1; own && row < ListView_GetItemCount(list) && Theme_RowParam(list, row) >= 0 && questions < SETTINGS_ANSWERS_MAX; row++, questions++) {
+            SendPlainKey(list, VK_DOWN);
+            GetDlgItemTextW(dialog, IDC_W_TEXT, answers[questions], SETTINGS_ANSWER_CCH);
+            own = ListView_GetNextItem(list, -1, LVNI_SELECTED) == row && answers[questions][0];
+            for (other = 0; own && other < questions; other++) own = wcscmp(answers[questions], answers[other]) != 0;
+        }
+        Check(&check->fixture, list, "each help question, reached with the keyboard, shows its own answer", own && questions > 1);
+        for (row = 0; list && row < ListView_GetItemCount(list); row++) {
+            WCHAR name[64] = L"";
+            ListView_GetItemText(list, row, 0, name, ARRAYSIZE(name));
+            if (wcscmp(name, TR(L"Changelog")) == 0) break;
+        }
+        if (list && row < ListView_GetItemCount(list)) {
+            int length;
+            WCHAR *whole;
+            Theme_FocusRow(list, row);
+            PumpMessages();
+            length = GetWindowTextLengthW(GetDlgItem(dialog, IDC_W_TEXT));
+            whole = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ((size_t)length + 1) * sizeof(WCHAR));
+            if (whole) GetDlgItemTextW(dialog, IDC_W_TEXT, whole, length + 1);
+            Check(&check->fixture, list, "the changelog's heading shows every version, the newest first",
+                  whole && wcsncmp(whole, L"v" APP_VERSION_DATE_W, ARRAYSIZE(L"v" APP_VERSION_DATE_W) - 1) == 0 &&
+                  (wcsstr(whole, L"\rv20") != NULL || wcsstr(whole, L"\nv20") != NULL));
+            if (whole) HeapFree(GetProcessHeap(), 0, whole);
+        } else {
+            Check(&check->fixture, list, "the changelog's heading is listed", FALSE);
+        }
+        PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
+    }
+    return DefSubclassProc(owner, message, wp, lp);
+}
+
+/* The Settings dialog as the program shows it (Settings_Show, at the
+ * monitor's scale), following Windows' language and in each of the program's. */
+static void CheckSettingsDialog(void)
+{
+    HWND owner;
+    int language;
+    if (!NativeScaleFits("the settings dialog")) return;
+    owner = CreateWindowExW(WS_EX_TOOLWINDOW, WC_STATICW, L"", WS_POPUP, 0, 0, 10, 10, NULL, NULL, g_hInst, NULL);
+    if (!owner) {
+        printf("  FAIL  settings dialog owner created\n");
+        g_checks++;
+        g_failures++;
+        return;
+    }
+    for (language = -1; language < Localize_LanguageCount(); language++) {
+        SettingsCheck check;
+        ZeroMemory(&check, sizeof check);
+        Localize_SetLanguage(language, FALSE);
+        check.fixture.resource = IDD_SETTINGS;
+        check.fixture.language = Localize_EffectiveLanguage();
+        check.fixture.fontScale = kFontScales[0];
+        check.chosen = language;
+        g_settingsApplied = 0;
+        SetWindowSubclass(owner, CheckWaitingSettings, SETTINGS_OWNER_SUBCLASS, (DWORD_PTR)&check);
+        Settings_Show(owner, ApplySettingsLanguage);
+        RemoveWindowSubclass(owner, CheckWaitingSettings, SETTINGS_OWNER_SUBCLASS);
+        Check(&check.fixture, NULL, "the settings dialog waited for the user once, and was checked", check.checked == 1);
+        Check(&check.fixture, NULL, "Cancel after Apply gives the program nothing more", g_settingsApplied == 1);
+    }
+    DestroyWindow(owner);
+}
+
+/* The About dialog as the program shows it (About_Show, at the monitor's
+ * scale), following Windows' language and in each of the program's. */
+static void CheckAboutDialog(void)
+{
+    HWND owner;
+    int language;
+    if (!NativeScaleFits("the About dialog")) return;
+    owner = CreateWindowExW(WS_EX_TOOLWINDOW, WC_STATICW, L"", WS_POPUP, 0, 0, 10, 10, NULL, NULL, g_hInst, NULL);
+    if (!owner) {
+        printf("  FAIL  About dialog owner created\n");
+        g_checks++;
+        g_failures++;
+        return;
+    }
+    for (language = -1; language < Localize_LanguageCount(); language++) {
+        SettingsCheck check;
+        ZeroMemory(&check, sizeof check);
+        Localize_SetLanguage(language, FALSE);
+        check.fixture.resource = IDD_ABOUT;
+        check.fixture.language = Localize_EffectiveLanguage();
+        check.fixture.fontScale = kFontScales[0];
+        SetWindowSubclass(owner, CheckWaitingAbout, SETTINGS_OWNER_SUBCLASS, (DWORD_PTR)&check);
+        About_Show(owner);
+        RemoveWindowSubclass(owner, CheckWaitingAbout, SETTINGS_OWNER_SUBCLASS);
+        Check(&check.fixture, NULL, "the About dialog waited for the user once, and was checked", check.checked == 1);
     }
     DestroyWindow(owner);
 }
@@ -2123,7 +2317,7 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
 static void CheckMainFrameMessages(void)
 {
     static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_BACKUP,
-                                    IDC_REPAIR, IDC_SHORTCUTS, IDC_LANGUAGE, IDC_SETTINGS };
+                                    IDC_REPAIR, IDC_SHORTCUTS, IDC_SETTINGS, IDC_ABOUT };
     LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];
@@ -2296,7 +2490,6 @@ static void CheckRealSessionsTransition(int language)
               !(GetWindowLongW(fixture.tableViewport, GWL_STYLE) & WS_VISIBLE));
         CheckGeometry(dialog, &fixture);
         Theme_FitDialog(dialog);
-        SessionsView_Resize();
         SessionsView_Relayout();
         CheckGeometry(dialog, &fixture);
         GetClientRect(dialog, &returned);
@@ -2357,7 +2550,7 @@ static void CheckResponsiveMain(void)
         role = ListView_GetColumnWidth(fixture.table, 1);
         dpi = (int)GetDpiForWindow(dialog);
         for (size = 0; size < (int)ARRAYSIZE(kSizes); size++) {
-            RECT before, after, table, group, note, setDefault, sessionProfiles, details, tree, tableClient;
+            RECT before, after, table, group, note, setDefault, sessionProfiles, tree, tableClient, search, find, filter, back;
             SIZE client = ClientWithin(dialog, minimum, kSizes[size][0], kSizes[size][1]);
 
             ResizeMainFixture(dialog, &fixture, client.cx, client.cy);
@@ -2372,8 +2565,11 @@ static void CheckResponsiveMain(void)
             note = RelativeRect(dialog, GetDlgItem(dialog, IDC_NOTE));
             setDefault = RelativeRect(dialog, GetDlgItem(dialog, IDC_DEFAULT));
             sessionProfiles = RelativeRect(dialog, fixture.profilesViewport);
-            details = RelativeRect(dialog, GetDlgItem(dialog, IDC_S_DETAILS));
             tree = RelativeRect(dialog, fixture.treeViewport);
+            search = RelativeRect(dialog, GetDlgItem(dialog, IDC_S_SEARCH));
+            find = RelativeRect(dialog, GetDlgItem(dialog, IDC_S_FIND));
+            filter = RelativeRect(dialog, GetDlgItem(dialog, IDC_S_FILTER));
+            back = RelativeRect(dialog, GetDlgItem(dialog, IDC_SESSIONS));
             Check(&fixture, fixture.tableViewport, "table starts where the content does", table.left == group.left);
             CheckReadingWidth(dialog, &fixture, minimum, "content fills the client within its margins up to its reading width, then stays centered");
             Check(&fixture, GetDlgItem(dialog, IDC_NOTE), "sidebar prose stays grouped with its actions on tall windows",
@@ -2381,10 +2577,13 @@ static void CheckResponsiveMain(void)
                   setDefault.top == initialDefault.top && setDefault.bottom - setDefault.top == initialDefault.bottom - initialDefault.top);
             Check(&fixture, fixture.profilesViewport, "session sidebar keeps its intrinsic width",
                   sessionProfiles.right - sessionProfiles.left <= MulDiv(SESSION_PROFILES_MAX_DIPS, dpi, 96));
-            Check(&fixture, GetDlgItem(dialog, IDC_S_DETAILS), "session details keep a bounded width",
-                  details.right - details.left <= MulDiv(SESSION_DETAILS_MAX_DIPS, dpi, 96));
-            Check(&fixture, fixture.treeViewport, "session tree takes the space between bounded side panes",
-                  tree.left > sessionProfiles.right && tree.right < details.left);
+            if (fixture.sessions) {
+                Check(&fixture, fixture.treeViewport, "the session tree takes the width beside the side bar, to the content's edge",
+                      tree.left > sessionProfiles.right && tree.right == back.right);
+                Check(&fixture, GetDlgItem(dialog, IDC_S_FILTER), "the search box, its options, the filter and the way back share one row above the tree",
+                      search.right < find.left && find.right < filter.left && filter.right < back.left && back.bottom <= tree.top &&
+                      find.right - find.left == find.bottom - find.top && filter.right - filter.left == filter.bottom - filter.top);
+            }
             Check(&fixture, fixture.table, "fixed table columns keep their widths at every window size",
                   ListView_GetColumnWidth(fixture.table, 0) == MulDiv(THEME_PROFILE_COLUMN_DIPS, dpi, 96) && ListView_GetColumnWidth(fixture.table, 1) == role);
             GetClientRect(fixture.table, &tableClient);
@@ -2742,11 +2941,11 @@ static void ReadPrivateTree(HWND tree, HTREEITEM item, PrivateTreeItem *items, i
 }
 
 /* Native resizes keep the populated tree: its items, expansion, selection
- * and scroll position; the details follow the new size. */
+ * and scroll position. */
 static void CheckSessionsResize(SessionsFixture *sessions)
 {
     LayoutFixture *fixture = &sessions->layout;
-    HWND dialog = sessions->dialog, tree = sessions->tree, details = GetDlgItem(dialog, IDC_S_DETAILS);
+    HWND dialog = sessions->dialog, tree = sessions->tree;
     PrivateTreeItem items[128];
     FixtureRoots roots = ReadRoots(tree);
     HTREEITEM selected;
@@ -2767,8 +2966,6 @@ static void CheckSessionsResize(SessionsFixture *sessions)
     Check(fixture, fixture->treeViewport, "private session tree has a genuine nonzero scroll position", scroll.nPos > 0);
     for (size = 0; size < (int)ARRAYSIZE(sizes); size++) {
         SCROLLINFO after = { sizeof after, SIF_ALL };
-        HWND parts = GetDlgItem(details, IDC_S_PARTS);
-        RECT part, detail;
         ResizeMainFixture(dialog, fixture, sizes[size].cx, sizes[size].cy);
         for (i = 0; i < count; i++) {
             TVITEMW item = { 0 };
@@ -2783,11 +2980,6 @@ static void CheckSessionsResize(SessionsFixture *sessions)
         Check(fixture, fixture->treeViewport, "resize retains the native scroll position while content still exceeds the page",
               after.nPos == scroll.nPos);
         CheckGeometry(dialog, fixture);
-        part = RelativeRect(details, parts);
-        GetClientRect(details, &detail);
-        Check(fixture, details, "selected session details render their bounded scrolling part",
-              parts && (GetWindowLongW(parts, GWL_STYLE) & WS_VISIBLE) && part.left >= 0 && part.top > 0 &&
-              part.right <= detail.right && part.bottom <= detail.bottom);
     }
 }
 
@@ -2824,7 +3016,6 @@ static void CheckSessionsRefillKeepsState(SessionsFixture *sessions)
             Localize_Window(dialog);
             Theme_Apply(dialog);
             Theme_FitDialog(dialog);
-            SessionsView_Resize();
             SessionsView_Relayout();
             PumpMessages();
         }
@@ -3130,6 +3321,7 @@ int wmain(void)
     }
     Util_SetStateDir(state);
     Theme_Init();
+    if (!Theme_RichTextReady()) printf("  FAIL  the rich edit (msftedit.dll) is loaded\n");
     if (!PrepareMainTemplate()) {
         printf("Layout test class could not be registered.\n");
         RemoveFixtureTree(state, state);
@@ -3138,6 +3330,8 @@ int wmain(void)
     MeasureScalesAgainstWorkArea();
     CheckDialogs();
     CheckMessageBoxes();
+    CheckSettingsDialog();
+    CheckAboutDialog();
     CheckHiddenRows();
     CheckMainStates();
     CheckProfileNotes();

@@ -176,11 +176,41 @@ static void JoinNames(DWORD bits, WCHAR *out, size_t cch);
 
 /* The status action and Update buttons take room only while they show: the
  * window is laid out again when one of them appears or goes. */
+/* The column's foot, and what of it shows in the profiles view: the
+ * sessions view has no column. */
+static const int kFootControls[] = { IDC_STATUS, IDC_PROGRESS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE };
+static BOOL g_footWanted[ARRAYSIZE(kFootControls)] = { TRUE, FALSE, FALSE, TRUE, FALSE };   /* as the resource has them */
+
+static int FootIndex(int id)
+{
+    int i;
+    for (i = 0; i < (int)ARRAYSIZE(kFootControls); i++)
+        if (kFootControls[i] == id) return i;
+    return -1;
+}
+
+/* A control of the foot shown or hidden: at once in the profiles view, else
+ * once that view shows again. */
+static void ShowInFoot(int id, BOOL shown)
+{
+    int i = FootIndex(id);
+    if (i >= 0) g_footWanted[i] = shown;
+    ShowWindow(GetDlgItem(g_manager.dlg, id), shown && !SessionsView_Shown() ? SW_SHOW : SW_HIDE);
+}
+
+/* The foot of `dialog` as the view shown has it. */
+static void ShowFoot(HWND dialog, BOOL profilesView)
+{
+    int i;
+    for (i = 0; i < (int)ARRAYSIZE(kFootControls); i++)
+        ShowWindow(GetDlgItem(dialog, kFootControls[i]), profilesView && g_footWanted[i] ? SW_SHOW : SW_HIDE);
+}
+
 static void ShowOptionalButton(int id, BOOL shown)
 {
-    HWND button = GetDlgItem(g_manager.dlg, id);
-    if (((GetWindowLongW(button, GWL_STYLE) & WS_VISIBLE) != 0) == shown) return;
-    ShowWindow(button, shown ? SW_SHOW : SW_HIDE);
+    int i = FootIndex(id);
+    if (i >= 0 && g_footWanted[i] == shown) return;
+    ShowInFoot(id, shown);
     LayoutMainControls();
 }
 
@@ -1261,8 +1291,8 @@ static void ShowProgress(int done, int total)
     g_manager.progressTotal = total;
     if (!g_manager.progressShown) {
         g_manager.progressShown = TRUE;
-        ShowWindow(GetDlgItem(g_manager.dlg, IDC_STATUS), SW_HIDE);
-        ShowWindow(bar, SW_SHOW);
+        ShowInFoot(IDC_STATUS, FALSE);
+        ShowInFoot(IDC_PROGRESS, TRUE);
     }
     InvalidateRect(bar, NULL, FALSE);
 }
@@ -1271,8 +1301,8 @@ static void HideProgress(void)
 {
     if (!g_manager.progressShown) return;
     g_manager.progressShown = FALSE;
-    ShowWindow(GetDlgItem(g_manager.dlg, IDC_PROGRESS), SW_HIDE);
-    ShowWindow(GetDlgItem(g_manager.dlg, IDC_STATUS), SW_SHOW);
+    ShowInFoot(IDC_PROGRESS, FALSE);
+    ShowInFoot(IDC_STATUS, TRUE);
 }
 
 static void DrawProgress(const DRAWITEMSTRUCT *item)
@@ -1849,7 +1879,6 @@ static void DoSessions(SessionsAction action)
 #define IDM_LIST_UNLINK     0x6008
 #define IDM_LIST_BACKUP     0x6009
 #define IDM_LIST_RESTORE    0x600A
-#define IDM_LANGUAGE        0x6020   /* + 1 + a language; itself: Windows' */
 
 /* TRUE (and says so) when the profile, or one sharing its session folder, runs: its sessions are in Claude's memory. */
 static BOOL LinkBusy(const Profile *p)
@@ -2044,15 +2073,9 @@ static void FillShortcutsMenu(HMENU menu, DWORD selected)
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDC_SC_START, TR(Theme_MainCaption(IDC_SC_START, one && g_manager.inStartMenu)));
 }
 
-static void DoLanguage(int choice);
-
 /* A menu's own commands: TRUE when `cmd` is one; the others are the buttons they stand for. */
 static BOOL MenuOwnCommand(UINT cmd)
 {
-    if (cmd >= IDM_LANGUAGE && cmd <= IDM_LANGUAGE + (UINT)Localize_LanguageCount()) {
-        DoLanguage(cmd == IDM_LANGUAGE ? -1 : (int)(cmd - IDM_LANGUAGE - 1));
-        return TRUE;
-    }
     switch (cmd) {
     case IDM_LIST_EXPORT: DoSessions(SESSIONS_EXPORT); return TRUE;
     case IDM_LIST_IMPORT: DoSessions(SESSIONS_IMPORT); return TRUE;
@@ -2097,23 +2120,6 @@ static void ShortcutsMenu(void)
     UpdateButtons();   /* the shortcuts' state of the profile selected */
     FillShortcutsMenu(menu, SelectedProfiles());
     cmd = ColumnMenu(IDC_SHORTCUTS, menu);
-    DestroyMenu(menu);
-    MenuCommand(cmd);
-}
-
-/* Windows' language, then each of the program's, the one in use checked. */
-static void LanguageMenu(void)
-{
-    HMENU menu = CreatePopupMenu();
-    UINT cmd;
-    int i;
-    if (!menu) return;
-    AppendMenuW(menu, MF_STRING | (Localize_CurrentLanguage() < 0 ? MF_CHECKED : 0), IDM_LANGUAGE, Localize_LanguageName(-1));
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    for (i = 0; i < Localize_LanguageCount(); i++)
-        AppendMenuW(menu, MF_STRING | (Localize_CurrentLanguage() == i ? MF_CHECKED : 0), (UINT_PTR)IDM_LANGUAGE + 1 + (UINT_PTR)i,
-                    Localize_LanguageName(i));
-    cmd = ColumnMenu(IDC_LANGUAGE, menu);
     DestroyMenu(menu);
     MenuCommand(cmd);
 }
@@ -2269,10 +2275,10 @@ void Gui_ShowSessions(HWND dialog, const ClaudePackage *package, BOOL showSessio
         FocusView(dialog, FALSE);
         SessionsView_Leave();
     }
+    ShowFoot(dialog, !showSessions);
     SetDlgItemTextW(dialog, IDC_SESSIONS, SessionsButtonCaption(showSessions));
     Theme_SetMainGlyph(dialog, IDC_SESSIONS, showSessions);
     Theme_LayoutMain(dialog);
-    SessionsView_Resize();
 }
 
 static void ToggleSessions(void)
@@ -2950,7 +2956,7 @@ static void DoUpdate(void)
     Update_Download(g_manager.dlg, WM_APP_DOWNLOADED);
 }
 
-/* This copy's version, the time it was built, in the header. */
+/* This copy's version, the day of its changes (the changelogs' heading of it), in the header. */
 static void ShowVersion(void)
 {
     WCHAR text[128];
@@ -2958,8 +2964,7 @@ static void ShowVersion(void)
         ShowUpdateProgress();
         return;
     }
-    if (!g_manager.build[0] && !Core_BuildStamp(__DATE__, __TIME__, g_manager.build, ARRAYSIZE(g_manager.build)))
-        StringCchCopyW(g_manager.build, ARRAYSIZE(g_manager.build), APP_VERSION_WSTR);
+    if (!g_manager.build[0]) StringCchCopyW(g_manager.build, ARRAYSIZE(g_manager.build), APP_VERSION_DATE_W);
     StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainVersion(MAIN_VERSION_BUILD)), g_manager.build);
     SetTextIfChanged(IDC_VERSION, text);
     ShowUpdate();
@@ -2978,14 +2983,15 @@ static void SetColumnTitles(void)
     }
 }
 
-/* The language chosen in the Language menu (-1: Windows'). */
+/* The language chosen in Settings (-1: Windows'). */
 static void DoLanguage(int choice)
 {
     int languageBefore = Localize_EffectiveLanguage();
     if (StateChangesBlocked()) return;
     FinishShellWork();   /* the previous language's, written in that language */
     if (!Localize_SetLanguage(choice, TRUE)) {
-        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The language preference could not be saved."));
+        /* Over Settings, which is open: a box owned by the window under it would enable that window on closing. */
+        Ui_Message(GetLastActivePopup(g_manager.dlg), MB_ICONWARNING, TR(L"The language preference could not be saved."));
         return;
     }
     Localize_Window(g_manager.dlg);
@@ -3088,7 +3094,6 @@ static void LayoutMainControls(void)
     g_manager.layingOut = TRUE;
     Theme_LayoutMain(g_manager.dlg);
     LayoutColumns();
-    SessionsView_Resize();
     g_manager.layingOut = FALSE;
 }
 
@@ -3099,7 +3104,6 @@ static void ReflowMain(void)
     g_manager.layoutReady = TRUE;
     LayoutColumns();
     UpdateNote();
-    SessionsView_Resize();
     SessionsView_Relayout();
 }
 
@@ -3207,6 +3211,10 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
 
     case WM_APP_SESSIONS_READY:
         SessionsView_Ready(!StateChangesBlocked());
+        return TRUE;
+
+    case WM_APP_SESSION_SEARCH:
+        SessionsView_SearchFound(wp, lp);
         return TRUE;
 
     case WM_APP_OUTSIDE: {
@@ -3319,8 +3327,8 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         case IDC_BACKUP:        DoBackupHub(); return TRUE;
         case IDC_REPAIR:        DoRepair(); return TRUE;
         case IDC_SHORTCUTS:     ShortcutsMenu(); return TRUE;
-        case IDC_LANGUAGE:      LanguageMenu(); return TRUE;
-        case IDC_SETTINGS:      Settings_Show(g_manager.dlg); return TRUE;
+        case IDC_SETTINGS:      Settings_Show(g_manager.dlg, DoLanguage); return TRUE;
+        case IDC_ABOUT:         About_Show(g_manager.dlg); return TRUE;
         case IDC_COPY_ALL:      DoSessions(SESSIONS_COPY_ALL); return TRUE;
         case IDC_MOVE_ALL:      DoSessions(SESSIONS_MOVE_ALL); return TRUE;
         case IDC_NEW:           DoNew(); return TRUE;
@@ -3443,6 +3451,15 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         /* The list, from the keyboard, or the view around it below its rows. */
         if (((HWND)wp == g_manager.list || (HWND)wp == GetDlgItem(dialog, IDC_LIST)) && !SessionsView_Shown()) {
             ListMenu(lp);
+            return TRUE;
+        }
+        /* The sessions view's profiles: the profile's menu, as the list's, once it shows. */
+        switch (SessionsView_ChooseProfileAt((HWND)wp, lp)) {
+        case 1:
+            SelectProfileRow(SessionsView_Profile());
+            ListMenu(lp);
+            return TRUE;
+        case 0:
             return TRUE;
         }
         if (SessionsView_ContextMenu((HWND)wp, lp)) return TRUE;

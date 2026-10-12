@@ -478,6 +478,17 @@ static void TestMisc(void)
     WCHAR a[64], b[64];
     Check("path equals ignores case and trailing slash", Core_PathEquals(L"C:\\Users\\X\\Claude\\", L"c:\\users\\x\\claude"));
     Check("path equals is not a prefix test", !Core_PathEquals(L"C:\\Users\\X\\Claude", L"C:\\Users\\X\\Claude-Work"));
+    {
+        const WCHAR *current = L"C:\\Users\\X\\AppData\\Local\\M\\icons\\04CA42D6-3F258D42.ico";
+        Check("a shortcut without an icon takes the profile's", Core_TakesCurrentIcon(L"", FALSE, current));
+        Check("a shortcut showing the current icon keeps it",
+              !Core_TakesCurrentIcon(L"c:\\users\\x\\appdata\\local\\m\\ICONS\\04ca42d6-3f258d42.ico", TRUE, current));
+        Check("a shortcut whose icon file is gone takes the profile's", Core_TakesCurrentIcon(L"C:\\Users\\X\\Desktop\\69A9.ico", FALSE, current));
+        Check("a shortcut showing another icon of ours takes the current one",
+              Core_TakesCurrentIcon(L"C:\\Users\\X\\AppData\\Local\\M\\icons\\04CA42D6-11111111.ico", TRUE, current));
+        Check("an icon the user chose stays while its file is there", !Core_TakesCurrentIcon(L"C:\\Users\\X\\Desktop\\69A9.ico", TRUE, current));
+        Check("an icon in a folder below ours is not ours", !Core_TakesCurrentIcon(L"C:\\Users\\X\\AppData\\Local\\M\\icons\\old\\a.ico", TRUE, current));
+    }
     Check("ends with", Core_EndsWithI(L"x\\APP\\claude.EXE", L"\\app\\Claude.exe"));
     Check("contains", Core_ContainsI(L"abc --User-Data-Dir=x", L"--user-data-dir"));
     Check("our exe by name", Core_IsOurExe(L"D:\\portable\\claudedesktopprofilesmanager.exe"));
@@ -784,6 +795,80 @@ static BOOL ReplaceCut(const char *in, size_t cut, const CoreSwap *swaps, int co
 }
 
 /* Transcript lines as the preview shows them. */
+/* CHANGELOG.md's form (tools/changelog.py) as the program shows it. */
+static void TestChangelogRead(void)
+{
+    static const char kMarkdown[] =
+        "\xEF\xBB\xBF# Changelog\r\n\r\n> The program in a line.\r\n\r\nWhat changed.\r\n\r\n"
+        "## v2026.10.12\r\n\r\nA **summary** of the day.\r\n\r\n### New features\r\n\r\n"
+        "1. **Bold**: an `item` with [a link](https://example.com/x) and **Sync settings\xE2\x80\xA6**\r\n"
+        "2. Escaped \\_name\\_, \\*star\\* and \\[brackets\\]\r\n\r\n"
+        "### Bug fixes\r\n\r\n1. Fixed one\r\n\r\n"
+        "## v2026.10.11\r\n\r\nAnother day.\r\n\r\n### Improvements\r\n\r\n7. One\r\n";
+    static const WCHAR kFirst[] =
+        L"A **summary** of the day.\n\n### New features\n"
+        L"1. **Bold**: an `item` with [a link](https://example.com/x) and **Sync settings\x2026**\n2. Escaped \\_name\\_, \\*star\\* and \\[brackets\\]\n\n"
+        L"### Bug fixes\n1. Fixed one";
+    static const char kChinese[] = "## v2026.09.30\n\n\xE4\xB8\x80\xE5\xA4\xA9\n\n### \xE6\x96\xB0\xE5\xA2\x9E\n\n\xE4\xB8\x80\n\xE4\xBA\x8C\n";
+    ChangelogVersion versions[4];
+    WCHAR text[1024], shown[512];
+    int count = Core_ChangelogRead(kMarkdown, sizeof kMarkdown - 1, versions, ARRAYSIZE(versions), text, ARRAYSIZE(text));
+    Check("changelog: its versions, newest first", count == 2 && wcscmp(versions[0].name, L"v2026.10.12") == 0 && wcscmp(versions[1].name, L"v2026.10.11") == 0);
+    if (count == 2) {
+        StringCchCopyNW(shown, ARRAYSIZE(shown), text + versions[0].from, versions[0].to - versions[0].from);
+        Check("changelog: a version's summary, then its sections, their lines numbered in each, in Markdown", wcscmp(shown, kFirst) == 0);
+        if (wcscmp(shown, kFirst) != 0) wprintf(L"        got: %ls\n", shown);
+        StringCchCopyNW(shown, ARRAYSIZE(shown), text + versions[1].from, versions[1].to - versions[1].from);
+        Check("changelog: each section numbered from 1, whatever the file says", wcscmp(shown, L"Another day.\n\n### Improvements\n1. One") == 0);
+    }
+    count = Core_ChangelogRead(kChinese, sizeof kChinese - 1, versions, ARRAYSIZE(versions), text, ARRAYSIZE(text));
+    Check("changelog: Chinese, LF line ends, lines numbered that the file did not", count == 1 &&
+          versions[0].to - versions[0].from == 20 && wcsncmp(text + versions[0].from, L"\x4E00\x5929\n\n### \x65B0\x589E\n1. \x4E00\n2. \x4E8C", 20) == 0);
+    Check("changelog: at most the versions asked for", Core_ChangelogRead(kMarkdown, sizeof kMarkdown - 1, versions, 1, text, ARRAYSIZE(text)) == 1);
+    Check("changelog: what does not fit is nothing", Core_ChangelogRead(kMarkdown, sizeof kMarkdown - 1, versions, ARRAYSIZE(versions), text, 20) == 0 && text[0] == 0);
+    Check("changelog: no version is nothing", Core_ChangelogRead("# Changelog\n\nText\n", 19, versions, ARRAYSIZE(versions), text, ARRAYSIZE(text)) == 0);
+    Check("changelog: no text is nothing", Core_ChangelogRead(NULL, 0, versions, ARRAYSIZE(versions), text, ARRAYSIZE(text)) == 0 &&
+          Core_ChangelogRead("", 0, versions, ARRAYSIZE(versions), text, ARRAYSIZE(text)) == 0);
+}
+
+/* Markdown as the theme shows it: the fonts and colors given, headings bold
+ * and larger, numbered lines indented past their number, a quote muted, and
+ * within them bold, code, links and escapes; RTF's own characters escaped,
+ * the rest of Unicode as \uN. */
+static void TestMarkdownRtf(void)
+{
+    static const WCHAR kMarkdown[] =
+        L"## v2026.10.12\n\nA \\*plain\\* **bold** `c{o}de` [link](https://example.com) \x4E2D\\\\\n\n"
+        L"### New features\n1. One\n10. Ten\n\n> A quote\n";
+    CoreRtfStyle style;
+    char rtf[2048];
+    size_t written;
+    ZeroMemory(&style, sizeof style);
+    style.face = L"Segoe UI";
+    style.codeFace = L"Consolas";
+    style.size = 18;
+    style.indent = 400;
+    style.text = RGB(1, 2, 3);
+    style.muted = RGB(4, 5, 6);
+    style.link = RGB(7, 8, 9);
+    style.codeBack = RGB(10, 11, 12);
+    written = Core_MarkdownRtf(kMarkdown, &style, rtf, ARRAYSIZE(rtf));
+    Check("markdown: RTF in the fonts and colors given",
+          written == strlen(rtf) && strncmp(rtf, "{\\rtf1\\ansi\\deff0\\uc1{\\fonttbl{\\f0\\fnil Segoe UI;}{\\f1\\fmodern Consolas;}}", 70) == 0 &&
+          strstr(rtf, "{\\colortbl ;\\red1\\green2\\blue3;\\red4\\green5\\blue6;\\red7\\green8\\blue9;\\red10\\green11\\blue12;}\\f0\\fs18\\cf1") != NULL &&
+          rtf[written - 1] == '}');
+    Check("markdown: the first heading bold and larger, with no space above", strstr(rtf, "\\pard\\sb0\\sa120\\b\\fs23 v2026.10.12\\b0\\fs18\\par") != NULL);
+    Check("markdown: a later heading with space above", strstr(rtf, "\\pard\\sb220\\sa60\\b\\fs20 New features\\b0\\fs18\\par") != NULL);
+    Check("markdown: a paragraph's bold, code and link; escapes gone, RTF's own characters escaped, the rest as \\uN",
+          strstr(rtf, "\\pard\\sa120 A *plain* {\\b bold} {\\f1\\highlight4 c\\{o\\}de} {\\cf3\\ul link} \\u20013?\\\\\\par") != NULL);
+    Check("markdown: numbered lines indented past their number",
+          strstr(rtf, "\\pard\\fi-400\\li400\\tx400\\sa40 1.\\tab One\\par") != NULL && strstr(rtf, "10.\\tab Ten\\par") != NULL);
+    Check("markdown: a quote in the muted color", strstr(rtf, "\\pard\\li400\\sa120\\cf2 A quote\\cf1\\par") != NULL);
+    if (!strstr(rtf, "\\pard\\sa120 A *plain*")) printf("        got: %s\n", rtf);
+    Check("markdown: what does not fit is nothing", Core_MarkdownRtf(kMarkdown, &style, rtf, 64) == 0 && rtf[0] == 0);
+    Check("markdown: no text, no style, nothing", Core_MarkdownRtf(NULL, &style, rtf, ARRAYSIZE(rtf)) == 0 && Core_MarkdownRtf(kMarkdown, NULL, rtf, ARRAYSIZE(rtf)) == 0);
+}
+
 static void TestTranscriptLines(void)
 {
     WCHAR out[256], small[12];
@@ -932,6 +1017,9 @@ static void TestSessionEdits(void)
                                wcscmp(back.key, e.key) == 0 && wcscmp(back.value, L"Weekly review ") == 0);
     Check("pending: a star", Core_PendingParse(L"star\tk\t1", &back) && back.op == PENDING_STAR && back.value[0] == L'1');
     Check("pending: a removal", Core_PendingParse(L"remove\tk\t", &back) && back.op == PENDING_REMOVE && back.value[0] == 0);
+    Check("pending: Claude's own title put back", Core_PendingParse(L"auto-title\tk\tPlan", &back) && back.op == PENDING_TITLE_AUTO &&
+                                                  wcscmp(back.value, L"Plan") == 0);
+    Check("pending: ... or none", Core_PendingParse(L"auto-title\tk\t", &back) && back.op == PENDING_TITLE_AUTO && back.value[0] == 0);
     Check("pending: an unknown change or a missing field is skipped",
           !Core_PendingParse(L"rename\tk\tx", &back) && !Core_PendingParse(L"title\tk", &back) && !Core_PendingParse(L"title\t\tx", &back));
     StringCchCopyW(e.key, ARRAYSIZE(e.key), L"a\tb");
@@ -943,6 +1031,8 @@ static void TestSessionEdits(void)
     e.op = PENDING_REMOVE;
     e.value[0] = 0;
     Check("pending: a removal written", Core_PendingFormat(&e, text, ARRAYSIZE(text)) && wcscmp(text, L"remove\tk\t") == 0);
+    e.op = PENDING_TITLE_AUTO;
+    Check("pending: Claude's own title written", Core_PendingFormat(&e, text, ARRAYSIZE(text)) && wcscmp(text, L"auto-title\tk\t") == 0);
     e.op = (PendingOp)7;
     Check("pending: an unknown change is not written", !Core_PendingFormat(&e, text, ARRAYSIZE(text)));
     {
@@ -954,8 +1044,14 @@ static void TestSessionEdits(void)
         queued.op = PENDING_TITLE;
         added.op = PENDING_TITLE;
         Check("pending: a newer title replaces the older one", Core_PendingReplaces(&queued, &added));
+        added.op = PENDING_TITLE_AUTO;
+        Check("pending: Claude's own title put back replaces a title", Core_PendingReplaces(&queued, &added) &&
+                                                                       Core_PendingReplaces(&added, &queued));
         added.op = PENDING_STAR;
         Check("pending: a star leaves a title queued", !Core_PendingReplaces(&queued, &added));
+        queued.op = PENDING_TITLE_AUTO;
+        Check("pending: ... and Claude's own", !Core_PendingReplaces(&queued, &added));
+        queued.op = PENDING_TITLE;
         added.op = PENDING_REMOVE;
         Check("pending: a removal replaces every change", Core_PendingReplaces(&queued, &added));
         queued.op = PENDING_REMOVE;
@@ -1036,6 +1132,23 @@ static void TestSessionSync(void)
     Check("sync plan: the sidebar's layout and the archived list are apart", !Core_SyncOpReplaces(&queued, &added));
     queued.kind = SYNC_LAYOUT;
     Check("sync plan: a layout replaces the one before", Core_SyncOpReplaces(&queued, &added));
+    {
+        DWORD all = 0, overlap = 0;
+        int g;
+        for (g = 0; g < SYNC_GROUP_COUNT; g++) {
+            overlap |= all & Core_SyncGroup(g);
+            all |= Core_SyncGroup(g);
+        }
+        Check("sync items: the groups part every item, none twice", all == SYNC_ITEMS_ALL && !overlap && !Core_SyncGroup(SYNC_GROUP_COUNT) &&
+                                                                    !Core_SyncGroup(-1));
+        Check("sync items: an earlier version's groups are their items whole",
+              Core_SyncItemsOfGroups(0x01) == SYNC_ITEM_SESSIONS && Core_SyncItemsOfGroups(0x80) == SYNC_ITEM_PERMISSIONS &&
+              Core_SyncItemsOfGroups(0x7F) == (SYNC_ITEMS_ALL & ~SYNC_ITEM_PERMISSIONS) && Core_SyncItemsOfGroups(0xFF) == SYNC_ITEMS_ALL &&
+              !Core_SyncItemsOfGroups(0));
+        Check("sync items: ... and back, a group with any of its items",
+              Core_SyncGroupsOf(SYNC_ITEM_SESSIONS_TITLES | SYNC_ITEM_APPEARANCE_ZOOM) == 0x09 && Core_SyncGroupsOf(SYNC_ITEMS_ALL) == 0xFF &&
+              Core_SyncGroupsOf(SYNC_ITEM_MODEL) == 0x20 && !Core_SyncGroupsOf(0));
+    }
     added.flags = SYNC_MARKED;
     added.kind = SYNC_REMOVE;
     added.time = added.seen = 0;
@@ -1230,7 +1343,7 @@ static void TestSessionsKeptTheSame(void)
     const char *keys[3] = { "preferences", "epitaxyPrefs", "starred-local-code-sessions" };
     char *set, *mapped;
     BOOL *excluded = NULL;
-    WCHAR name[MAX_PATH], stamp[32];
+    WCHAR name[MAX_PATH];
     size_t length = 0;
     int lines = 0;
 
@@ -1290,13 +1403,6 @@ static void TestSessionsKeptTheSame(void)
           !Core_TranscriptBranches(text, strlen(text), AtSecond(13), AtSecond(11), AtSecond(20), &excluded, &lines));
     Check("branches: the same line, nothing to keep apart",
           !Core_TranscriptBranches(text, strlen(text), AtSecond(13), AtSecond(13), AtSecond(5), &excluded, &lines));
-
-    Check("build stamp: the compiler's date and time", Core_BuildStamp("Oct  8 2026", "17:20:33", stamp, ARRAYSIZE(stamp)) &&
-          wcscmp(stamp, L"2026.10.08 17:20") == 0);
-    Check("build stamp: two-digit days", Core_BuildStamp("Dec 31 2026", "00:05:00", stamp, ARRAYSIZE(stamp)) &&
-          wcscmp(stamp, L"2026.12.31 00:05") == 0);
-    Check("build stamp: anything else is refused", !Core_BuildStamp("Foo  8 2026", "17:20:33", stamp, ARRAYSIZE(stamp)) &&
-          !Core_BuildStamp("Oct  8 2026", "7:20", stamp, ARRAYSIZE(stamp)) && !Core_BuildStamp(NULL, "17:20:33", stamp, ARRAYSIZE(stamp)));
 }
 
 static void TestDeflate(void)
@@ -1377,6 +1483,22 @@ static void TestDrawingMath(void)
     Check("scroll: all of it within 250 ms", frames * 16 <= 250);
     Check("scroll: the whole way exactly", moved == 90);
     Check("scroll: more notches start faster", Core_ScrollStep(270, 16) > Core_ScrollStep(90, 16));
+    {
+        int rest = 0, i, px = 0;
+        Check("wheel: a notch moves a notch", Core_WheelPixels(-120, 72, &rest) == -72 && rest == 0);
+        Check("wheel: a mouse's notch up", Core_WheelPixels(120, 72, &rest) == 72 && rest == 0);
+        /* A precision touchpad's notch in 120 messages of 1, for 48 px lines
+         * and 24 px ones: each alone is less than a px. */
+        for (i = 0; i < 120; i++) px += Core_WheelPixels(-1, 48, &rest);
+        Check("wheel: a touchpad's smallest steps add up to the notch", px == -48 && rest == 0);
+        for (px = 0, i = 0; i < 120; i++) px += Core_WheelPixels(1, 24, &rest);
+        Check("wheel: up as well", px == 24 && rest == 0);
+        for (px = 0, i = 0; i < 8; i++) px += Core_WheelPixels(-15, 72, &rest);
+        Check("wheel: steps of 15 add up to the notch", px == -72 && rest == 0);
+        Check("wheel: short of a px, it waits", Core_WheelPixels(-1, 72, &rest) == 0 && rest == -72);
+        Check("wheel: the other way drops what waited", Core_WheelPixels(1, 72, &rest) == 0 && rest == 72);
+        Check("wheel: a page at once", Core_WheelPixels(-120, 600, &rest) == -600);
+    }
 
     Check("hash: FNV-1a start", CORE_HASH_START == 0xCBF29CE484222325ULL);
     Check("hash: FNV-1a of \"a\"", Core_HashBytes(CORE_HASH_START, "a", 1) == 0xAF63DC4C8601EC8CULL);
@@ -1798,12 +1920,87 @@ static void TestLevelDb(void)
     Check("a value without its mark is refused", !Core_WebStorageText((const BYTE *)"\x02x", 2, text, ARRAYSIZE(text), &n));
 }
 
+#define JSON_ARG(text) text, sizeof text - 1   /* a literal and its length */
+
+static BOOL CountElement(void *context, const char *value, size_t valueLen)
+{
+    (void)value;
+    (void)valueLen;
+    (*(int *)context)++;
+    return TRUE;
+}
+
+static BOOL RegexFinds(const WCHAR *pattern, const WCHAR *text, BOOL ignoreCase)
+{
+    static CoreRegex rx;
+    return Core_RegexCompile(&rx, pattern, ignoreCase) && Core_RegexSearch(&rx, text, wcslen(text));
+}
+
+static BOOL RegexTaken(const WCHAR *pattern)
+{
+    static CoreRegex rx;
+    return Core_RegexCompile(&rx, pattern, FALSE);
+}
+
+/* The sessions view's search and filters: the regular expressions it
+ * takes, a text in UTF-8 transcripts, a session's environment and pull
+ * request as Claude's sidebar shows them. */
+static void TestSessionSearch(void)
+{
+    static const char kPrs[] =
+        "{\"sessionId\":\"local_1\",\"prs\":[{\"prNumber\":2,\"state\":\"MERGED\",\"dismissed\":true},"
+        "{\"prNumber\":3,\"repo\":\"a/b\",\"state\":\"OPEN\",\"branch\":\"x]\"}]}";
+    static const char kDraft[] = "{\"prs\":[{\"prNumber\":7,\"state\":\"OPEN\",\"isDraft\":true}]}";
+    static const char kDismissed[] = "{\"prs\":[{\"prNumber\":2,\"state\":\"MERGED\",\"dismissed\":true}]}";
+    static const char kTranscript[] = "{\"type\":\"user\",\"message\":{\"content\":\"Build the \xE4\xB8\xAD\xE6\x96\x87 Setup\"}}";
+    int number = -1, elements = 0;
+    Check("json: each element of an array, nested ones whole", Core_JsonEachElement(JSON_ARG(" [{\"id\":\"a\",\"x\":[1,2]}, \"s,]\", 3 ]"),
+                                                                                   CountElement, &elements) && elements == 3);
+    elements = 0;
+    Check("json: an empty array has no element, an object is no array",
+          Core_JsonEachElement(JSON_ARG("[]"), CountElement, &elements) && elements == 0 && !Core_JsonEachElement(JSON_ARG("{}"), CountElement, &elements));
+    Check("regex: a literal is found anywhere", RegexFinds(L"setup", L"run the setup now", FALSE));
+    Check("regex: case matters unless ignored", !RegexFinds(L"Setup", L"run the setup", FALSE) && RegexFinds(L"Setup", L"run the setup", TRUE));
+    Check("regex: dot, star and plus", RegexFinds(L"a.c", L"xabcx", FALSE) && RegexFinds(L"ab*c", L"ac", FALSE) && !RegexFinds(L"ab+c", L"ac", FALSE));
+    Check("regex: alternation and groups", RegexFinds(L"(foo|bar)baz", L"xbarbazx", FALSE) && !RegexFinds(L"(?:foo|bar)baz", L"bazbar", FALSE));
+    Check("regex: classes, ranges and negation", RegexFinds(L"[0-9]+-[a-f]", L"id 42-b", FALSE) && !RegexFinds(L"[^a-z]", L"abc", FALSE));
+    Check("regex: \\d \\w \\s and their capitals", RegexFinds(L"\\d\\d\\s\\w", L"x 12 a", FALSE) && !RegexFinds(L"\\D", L"123", FALSE) &&
+                                                      RegexFinds(L"[\\s,]x", L"a,x", FALSE));
+    Check("regex: anchors at the text's and a line's ends", RegexFinds(L"^bc", L"a\nbc", FALSE) && !RegexFinds(L"^bc", L"abc", FALSE) &&
+                                                             RegexFinds(L"ab$", L"ab\ncd", FALSE) && !RegexFinds(L"a$", L"ab", FALSE));
+    Check("regex: counted repeats", RegexFinds(L"^a{2,3}$", L"aaa", FALSE) && !RegexFinds(L"^a{2,3}$", L"aaaa", FALSE) &&
+                                     RegexFinds(L"x{2}", L"axxb", FALSE) && RegexFinds(L"a{1,}b", L"aaab", FALSE));
+    Check("regex: a brace that bounds nothing is a character", RegexFinds(L"a{b", L"xa{bx", FALSE));
+    Check("regex: escaped specials are characters", RegexFinds(L"1\\.5\\(x\\)", L"v1.5(x)", FALSE) && !RegexFinds(L"1\\.5", L"105", FALSE));
+    Check("regex: Chinese text and case-insensitive classes", RegexFinds(L"\x4E2D\x6587", L"\x5B66\x4E2D\x6587", FALSE) &&
+                                                                RegexFinds(L"[A-C]x", L"bx", TRUE));
+    Check("regex: an empty pattern matches", RegexFinds(L"", L"anything", FALSE));
+    Check("regex: a pattern that would backtrack forever still answers", !RegexFinds(L"(a*)*b", L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", FALSE));
+    Check("regex: malformed patterns are refused", !RegexTaken(L"(ab") && !RegexTaken(L"ab)") && !RegexTaken(L"[ab") &&
+                                                    !RegexTaken(L"*a") && !RegexTaken(L"a{5,2}") && !RegexTaken(L"[z-a]"));
+    Check("utf-8: found in either case", Core_ContainsUtf8(kTranscript, sizeof kTranscript - 1, "setup", 5, FALSE) &&
+                                         !Core_ContainsUtf8(kTranscript, sizeof kTranscript - 1, "setup", 5, TRUE));
+    Check("utf-8: Chinese bytes are found as they are", Core_ContainsUtf8(kTranscript, sizeof kTranscript - 1, "\xE4\xB8\xAD\xE6\x96\x87", 6, FALSE));
+    Check("utf-8: what is not there is not found", !Core_ContainsUtf8(kTranscript, sizeof kTranscript - 1, "missing", 7, FALSE));
+    Check("pull request: the latest one not dismissed", Core_SessionPullRequest(kPrs, sizeof kPrs - 1, &number) == PR_OPEN && number == 3);
+    Check("pull request: a draft", Core_SessionPullRequest(kDraft, sizeof kDraft - 1, &number) == PR_DRAFT && number == 7);
+    Check("pull request: none when all were dismissed", Core_SessionPullRequest(kDismissed, sizeof kDismissed - 1, &number) == PR_NONE && number == 0);
+    Check("pull request: none without prs", Core_SessionPullRequest(JSON_ARG("{\"sessionId\":\"x\"}"), &number) == PR_NONE);
+    Check("environment: this PC's", Core_SessionEnvironment(JSON_ARG("{\"sessionId\":\"x\"}")) == SESSION_ENV_LOCAL);
+    Check("environment: Remote Control", Core_SessionEnvironment(JSON_ARG("{\"remoteControlUserEnabled\":true}")) == SESSION_ENV_REMOTE);
+    Check("environment: SSH and the cloud", Core_SessionEnvironment(JSON_ARG("{\"sshConfig\":{\"host\":\"h\"}}")) == SESSION_ENV_SSH &&
+                                            Core_SessionEnvironment(JSON_ARG("{\"movedToCloud\":true}")) == SESSION_ENV_CLOUD);
+}
+
 int wmain(void)
 {
+    TestSessionSearch();
     TestJsonMerge();
     TestLevelDb();
     TestSessionEntries();
     TestTranscriptLines();
+    TestChangelogRead();
+    TestMarkdownRtf();
     TestSessionEdits();
     TestSessionSync();
     TestMirror();

@@ -548,6 +548,21 @@ static void PaintTray(void)
 
 /* The profile's tag and Claude's package, read again: the name, color or
  * badge may have changed while it runs. */
+/* The shortcuts Windows made for the button, whose icon it shows, get the
+ * current icon when theirs is gone or another of ours (a rename while no
+ * watcher ran, an icon the user gave it and deleted): the button reads it
+ * again through the temporary ID. */
+static void RepairButtonShortcuts(void)
+{
+    ProfileList list;
+    WCHAR icon[MAX_PATH], *comma;
+    int i;
+    Profiles_Load(&list, &g_watchPkg);
+    if ((i = Profiles_Find(&list, g_watch.folder)) < 0 || FAILED(StringCchCopyW(icon, ARRAYSIZE(icon), g_watch.icon))) return;
+    if ((comma = wcsrchr(icon, L',')) != NULL) *comma = 0;
+    if (TaskbarPin_RefreshImplicit(&list.items[i], icon)) PostMessageW(g_watchWindow, WM_WATCH_REFRESH, TRUE, 0);
+}
+
 static void ReloadTag(void)
 {
     ProfileList list;
@@ -977,6 +992,7 @@ static BOOL WatchClaude(HANDLE quit, HANDLE handover, WCHAR *ran, UINT32 ranCch)
     /* A window tagged by an earlier watcher (before an update) may show an
      * older badge. */
     if (TagProcessWindows(&g_watch, TAG_IF_NEEDED)) PostMessageW(g_watchWindow, WM_WATCH_REFRESH, 0, 0);
+    RepairButtonShortcuts();
     ScheduleTray();                                    /* its icon may be there already */
     Util_Log(L"taskbar watcher for %s (Claude pid %lu)", g_watch.folder, g_watch.pid);
 

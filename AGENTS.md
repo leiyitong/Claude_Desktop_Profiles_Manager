@@ -72,7 +72,8 @@ Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project s
     and is made once it closes. One session opened in a profile reaches it
     through `claude://resume`, which makes the entry; only `sessionsync.c`
     writes new entries, as Claude writes them, after backing up what they
-    replace (`sessionvault.c` sends its changes through it).
+    replace (`sessionvault.c` and the undo, `sessionundo.c`, send their changes
+    through it).
 14. **No links for sharing sessions.** Claude refuses to write an entries
     folder that is a junction or a symbolic link, so profiles keep the same
     sessions through `sessionvault.c` (entries copied, deletions marked),
@@ -104,6 +105,14 @@ Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project s
   code reaches through a variable is listed in the checker. English uses "…" (`\x2026` in
   `app.rc`, which stays ASCII); Chinese puts access keys after the text as "(&X)"; text naming
   Claude's interface uses Claude's own words. Comments explain why, not history.
+- A day's commits make one version, named after the day, written as a release page is: before a
+  commit that changes the program (`src/`), `python tools/changelog.py --stamp` sets
+  `APP_VERSION_DATE` in `src/version.h` (the version the manager shows) to today and puts
+  `## v<today>` on top of `CHANGELOG.md` and `CHANGELOG.zh-CN.md` when it is not there yet; under it,
+  in both, a sentence or two on what the day brings, then its changes in sections (New features,
+  Improvements, Bug fixes, Breaking changes, Upgrade guide; 新增功能, 优化改进, Bug 修复, 破坏性变更,
+  升级指南), one numbered line per change in the user's words, read as what that day changed.
+  `build.cmd` checks both, and that the last commit changing the program wrote them under its day.
 - Tests never touch the user's real state: private folders (`Util_SetStateDir` for the log and
   queued session changes), private registry keys, throwaway profiles.
 

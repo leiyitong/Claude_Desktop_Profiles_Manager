@@ -101,18 +101,43 @@ C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
 #define SESSION_TITLE_CCH  256
 #define SESSION_ID_CCH     64
 
-/* What a profile keeps the same as the others it syncs with (Profile.syncItems). */
-#define SYNC_ITEM_SESSIONS     0x01u   /* its sessions: new ones, titles, archived and deleted ones */
-#define SYNC_ITEM_SIDEBAR      0x02u   /* the sidebar: pins, groups, project order, filters, folded groups */
-#define SYNC_ITEM_DETAILS      0x04u   /* each session's model and effort, side pane, unread mark and cost */
-#define SYNC_ITEM_APPEARANCE   0x08u   /* fonts, the editor's settings, zoom, spelling */
-#define SYNC_ITEM_LANGUAGE     0x10u
-#define SYNC_ITEM_MODEL        0x20u   /* the default model */
-#define SYNC_ITEM_SETTINGS     0x40u   /* Claude's switches (auto-archive, Cowork, Remote Control) and Cowork's recent folders */
-#define SYNC_ITEM_PERMISSIONS  0x80u   /* folders' permission modes and their confirmations, Cowork's trusted folders */
-#define SYNC_ITEMS_ALL         0xFFu
-#define SYNC_ITEMS_DEFAULT     (SYNC_ITEMS_ALL & ~SYNC_ITEM_PERMISSIONS)
-#define SYNC_ITEM_COUNT        8
+/* What a profile keeps the same as the others it syncs with (Profile.syncItems), one bit each,
+ * under the groups the dialog shows them in (each group's mask, SYNC_ITEM_SESSIONS and so on). */
+#define SYNC_ITEM_SESSIONS_NEW        0x00000001u   /* a session one profile has and another lacks */
+#define SYNC_ITEM_SESSIONS_TITLES     0x00000002u
+#define SYNC_ITEM_SESSIONS_ARCHIVED   0x00000004u   /* archived or not, and Claude's list of the archived */
+#define SYNC_ITEM_SESSIONS_DELETED    0x00000008u   /* a deletion */
+#define SYNC_ITEM_SIDEBAR_PINS        0x00000010u   /* starred and pinned sessions, starred groups, Edit sidebar */
+#define SYNC_ITEM_SIDEBAR_GROUPS      0x00000020u   /* groups, their sections, the groups folded */
+#define SYNC_ITEM_SIDEBAR_ORDER       0x00000040u   /* the projects' order */
+#define SYNC_ITEM_SIDEBAR_FILTERS     0x00000080u   /* the filter menu, projects shown, grouping and sorting, Recents' filters */
+#define SYNC_ITEM_SIDEBAR_LAYOUT      0x00000100u   /* the sidebar's width, Routines' place */
+#define SYNC_ITEM_DETAILS_MODEL       0x00000200u   /* each session's model and effort */
+#define SYNC_ITEM_DETAILS_PANE        0x00000400u   /* each session's side pane and transcript view */
+#define SYNC_ITEM_DETAILS_UNREAD      0x00000800u
+#define SYNC_ITEM_DETAILS_COST        0x00001000u
+#define SYNC_ITEM_APPEARANCE_FONTS    0x00002000u
+#define SYNC_ITEM_APPEARANCE_EDITOR   0x00004000u
+#define SYNC_ITEM_APPEARANCE_ZOOM     0x00008000u
+#define SYNC_ITEM_APPEARANCE_SPELLING 0x00010000u
+#define SYNC_ITEM_LANGUAGE            0x00020000u
+#define SYNC_ITEM_MODEL               0x00040000u   /* the default model */
+#define SYNC_ITEM_SETTINGS_ARCHIVE    0x00080000u   /* auto-archive when the PR closes */
+#define SYNC_ITEM_SETTINGS_COWORK     0x00100000u   /* Cowork's switches and browser */
+#define SYNC_ITEM_SETTINGS_REMOTE     0x00200000u   /* Remote Control's folders */
+#define SYNC_ITEM_SETTINGS_RECENTS    0x00400000u   /* Cowork's recent folders */
+#define SYNC_ITEM_SETTINGS_CODE       0x00800000u   /* Code's scheduled tasks, links in previews, going on after a usage limit */
+#define SYNC_ITEM_PERMISSIONS_MODES   0x01000000u   /* folders' permission modes and their warnings confirmed */
+#define SYNC_ITEM_PERMISSIONS_TRUSTED 0x02000000u   /* Cowork's trusted folders */
+#define SYNC_ITEM_SESSIONS            0x0000000Fu
+#define SYNC_ITEM_SIDEBAR             0x000001F0u
+#define SYNC_ITEM_DETAILS             0x00001E00u
+#define SYNC_ITEM_APPEARANCE          0x0001E000u
+#define SYNC_ITEM_SETTINGS            0x00F80000u
+#define SYNC_ITEM_PERMISSIONS         0x03000000u
+#define SYNC_ITEMS_ALL                0x03FFFFFFu
+#define SYNC_ITEMS_DEFAULT            SYNC_ITEMS_ALL   /* what a group syncs until its profiles choose */
+#define SYNC_GROUP_COUNT              8   /* the groups, in the order the dialog shows them */
 
 /* ------------------------------------------------------------------ types */
 
@@ -162,7 +187,9 @@ typedef struct LinkInfo {
     WCHAR parsing[512];        /* shell parsing name when the target is not a file */
 } LinkInfo;
 
-typedef enum PendingOp { PENDING_TITLE, PENDING_STAR, PENDING_REMOVE } PendingOp;
+/* PENDING_TITLE_AUTO: a title Claude gave, put back (undone): titleSource "auto", so that Claude may name the
+ * session again; an empty one takes the entry's title away. */
+typedef enum PendingOp { PENDING_TITLE, PENDING_STAR, PENDING_REMOVE, PENDING_TITLE_AUTO } PendingOp;
 
 typedef struct PendingEdit {   /* a change to a session entry, waiting for its profile to close */
     PendingOp op;
@@ -268,6 +295,11 @@ BOOL         Core_EqualsI(const WCHAR *a, const WCHAR *b);
 size_t       Core_TrimmedPathLength(const WCHAR *path);
 int          Core_PathCompare(const WCHAR *a, const WCHAR *b);
 BOOL         Core_PathEquals(const WCHAR *a, const WCHAR *b);
+/* A shortcut showing icon `location` (empty: none; `exists`: its file is there)
+ * takes the profile's current icon `current`: when it shows none, one that is
+ * gone, or another of ours (in the folder of `current`). An icon the user
+ * chose stays while its file does. */
+BOOL         Core_TakesCurrentIcon(const WCHAR *location, BOOL exists, const WCHAR *current);
 BOOL         Core_EndsWithI(const WCHAR *s, const WCHAR *suffix);
 BOOL         Core_ContainsI(const WCHAR *s, const WCHAR *needle);
 DWORD        Core_HashIgnoringCase(const WCHAR *text);
@@ -285,13 +317,56 @@ BOOL         Core_JsonMember(const char *json, size_t len, const char *key, cons
  * object, or `each` returns FALSE. */
 typedef BOOL (*CoreJsonMember)(void *context, const char *key, size_t keyLen, const char *value, size_t valueLen);
 BOOL         Core_JsonEachMember(const char *json, size_t len, CoreJsonMember each, void *context);
+/* Each element of the JSON array `json`, in order, as its raw text. FALSE
+ * when `json` is no array, or `each` returns FALSE. */
+typedef BOOL (*CoreJsonElement)(void *context, const char *value, size_t valueLen);
+BOOL         Core_JsonEachElement(const char *json, size_t len, CoreJsonElement each, void *context);
 BOOL         Core_JsonIsValue(const char *text, size_t len);   /* one JSON value, whole (spaces around it aside) */
 BOOL         Core_JsonString(const char *raw, size_t len, WCHAR *out, size_t cch);
 BOOL         Core_JsonNumber(const char *raw, size_t len, ULONGLONG *value);
 BOOL         Core_JsonTrue(const char *raw, size_t len);
 SessionEntryKind Core_SessionEntryKind(const char *json, size_t len);
+/* Where a Code session runs, as Claude's sidebar filters sessions: one bit each. */
+#define SESSION_ENV_LOCAL  0x01u
+#define SESSION_ENV_CLOUD  0x02u
+#define SESSION_ENV_REMOTE 0x04u   /* Remote Control */
+#define SESSION_ENV_SSH    0x08u
+#define SESSION_ENV_SLACK  0x10u
+#define SESSION_ENV_ALL    0x1Fu
+DWORD        Core_SessionEnvironment(const char *json, size_t len);
+/* A session's pull request as Claude shows it: its latest one not dismissed. */
+typedef enum PullRequestState { PR_NONE, PR_OPEN, PR_DRAFT, PR_MERGED, PR_CLOSED } PullRequestState;
+PullRequestState Core_SessionPullRequest(const char *json, size_t len, int *number);
+/* `needle` in UTF-8 `text`; without `matchCase`, ASCII letters in either case. */
+BOOL         Core_ContainsUtf8(const char *text, size_t len, const char *needle, size_t needleLen, BOOL matchCase);
+/* A regular expression (core.c says what it accepts), compiled once and
+ * searched in many texts, from any thread. */
+#define CORE_REGEX_CODE   1024
+#define CORE_REGEX_RANGES 256
+typedef struct CoreRegexInstruction { BYTE op, negate; WCHAR ch; int x, y; } CoreRegexInstruction;
+typedef struct CoreRegex {
+    CoreRegexInstruction code[CORE_REGEX_CODE];
+    WCHAR range[CORE_REGEX_RANGES][2];
+    int   codeCount, rangeCount;
+    BOOL  ignoreCase, valid;
+} CoreRegex;
+BOOL         Core_RegexCompile(CoreRegex *rx, const WCHAR *pattern, BOOL ignoreCase);   /* FALSE: not a pattern it takes */
+BOOL         Core_RegexSearch(const CoreRegex *rx, const WCHAR *text, size_t length);   /* a match anywhere in the text */
 typedef enum TranscriptRole { TRANSCRIPT_NONE, TRANSCRIPT_USER, TRANSCRIPT_CLAUDE } TranscriptRole;
 TranscriptRole Core_TranscriptLine(const char *line, size_t len, WCHAR *out, size_t cch);   /* one line of a .jsonl, for the preview */
+#define CHANGELOG_NAME_CCH 24
+typedef struct ChangelogVersion {      /* a version of CHANGELOG.md, read by Core_ChangelogRead */
+    WCHAR  name[CHANGELOG_NAME_CCH];   /* its heading: "v2026.10.12" */
+    size_t from, to;                   /* its lines in the text read: characters */
+} ChangelogVersion;
+int          Core_ChangelogRead(const char *markdown, size_t length, ChangelogVersion *versions, int max, WCHAR *text, size_t cch);
+typedef struct CoreRtfStyle {          /* how Core_MarkdownRtf writes: what the theme gives */
+    const WCHAR *face, *codeFace;      /* the text's font, code's */
+    int          size;                 /* the text's size, half-points */
+    int          indent;               /* a numbered line's text past its number, twips */
+    COLORREF     text, muted, link, codeBack;
+} CoreRtfStyle;
+size_t       Core_MarkdownRtf(const WCHAR *markdown, const CoreRtfStyle *style, char *out, size_t cch);
 BOOL         Core_JsonSetMember(const char *json, size_t len, const char *key, const char *raw, char *out, size_t cap, size_t *outLen);
 BOOL         Core_JsonQuote(const WCHAR *text, char *out, size_t cap);
 BOOL         Core_ProjectDirName(const WCHAR *cwd, WCHAR *out, size_t cch);
@@ -308,6 +383,10 @@ BOOL         Core_JsonRemoveMember(const char *json, size_t len, const char *key
 BOOL         Core_SyncOpFormat(const SyncOp *op, WCHAR *out, size_t cch);
 BOOL         Core_SyncOpParse(const WCHAR *line, SyncOp *op);
 BOOL         Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added);
+DWORD        Core_SyncGroup(int index);                  /* group `index`'s mask (SYNC_ITEM_*), 0 past the last */
+/* Earlier versions kept one bit per group, in the dialog's order: those groups whole. */
+DWORD        Core_SyncItemsOfGroups(DWORD groups);
+DWORD        Core_SyncGroupsOf(DWORD items);             /* ... and back: a group with any of its items */
 int          Core_MirrorResolve(const MirrorSide *sides, int count, const MirrorSide *base);
 BOOL         Core_DatedCopyName(const WCHAR *name, const SYSTEMTIME *day, int copy, WCHAR *out, size_t cch);
 /* The weekly copy of folder `name` (sessionpurge.c): "<name>_auto_yyyymmdd". */
@@ -318,7 +397,6 @@ BOOL         Core_WeeklyCopyName(const WCHAR *name, const SYSTEMTIME *day, WCHAR
 BOOL         Core_CopyDay(const WCHAR *name, const WCHAR *copy, SYSTEMTIME *day, BOOL *weekly);
 /* A copy is due when the latest one (wYear 0: none) is CORE_WEEKLY_COPY_DAYS days old or more. */
 BOOL         Core_WeeklyCopyDue(const SYSTEMTIME *latest, const SYSTEMTIME *today);
-BOOL         Core_BuildStamp(const char *date, const char *time, WCHAR *out, size_t cch);   /* __DATE__, __TIME__ as "2026.10.08 17:20" */
 BOOL         Core_ScratchFolderName(const WCHAR *cwd, WCHAR *out, size_t cch);
 char        *Core_JsonSetNested(const char *json, size_t len, const char *const *keys, int depth, const char *raw, size_t *outLen);
 typedef size_t (*CoreStringMap)(void *context, const char *text, size_t length, char *out, size_t cap);
@@ -396,6 +474,7 @@ int          Core_ProcessDescendants(const CoreProcess *processes, int count, in
 BOOL         Core_ArchiveNameSafe(const char *name, size_t length);
 BOOL         Core_ConversationFileName(const WCHAR *relative);
 int          Core_ScrollStep(int pending, int elapsedMs);
+int          Core_WheelPixels(int delta, int notchPx, int *rest);
 ULONGLONG    Core_HashBytes(ULONGLONG hash, const void *data, size_t size);
 ULONGLONG    Core_HashText(ULONGLONG hash, const WCHAR *text);
 void         Core_CenterRect(const RECT *on, int width, int height, const RECT *work, RECT *out);
@@ -418,6 +497,9 @@ BOOL      Util_StateDir(WCHAR *out, size_t cch);       /* %LOCALAPPDATA%\Claude 
 #define SETTING_WEEKLY_BACKUP  L"WeeklyClaudeBackup"   /* 1: .claude copied beside itself once a week */
 DWORD     Util_GetSetting(const WCHAR *name, DWORD fallback);
 BOOL      Util_SetSetting(const WCHAR *name, DWORD value);
+/* A list kept in a section of its own of settings.ini: its items in order, at most `capacity`. */
+int       Util_GetSettingList(const WCHAR *section, WCHAR (*items)[MAX_PATH], int capacity);
+BOOL      Util_SetSettingList(const WCHAR *section, const WCHAR (*items)[MAX_PATH], int count);   /* none: the section goes */
 void      Util_SetStateDir(const WCHAR *dir);          /* tests: a private state folder */
 /* One sync at a time, across processes (the state folder's lock: a test has
  * its own). The thread that holds it takes it again; NULL after
@@ -661,6 +743,10 @@ HRESULT TaskbarPin_PrepareRecords(const BYTE *oldList, size_t oldLen, const BYTE
 HRESULT TaskbarPin_UpdateLeftover(const ClaudePackage *pkg, const Profile *profile, const WCHAR *lnk);
 HRESULT TaskbarPin_Pin(const ClaudePackage *pkg, const Profile *profile);
 void    TaskbarPin_Refresh(const Profile *before, const Profile *after, const WCHAR *icon);
+/* The shortcuts Windows made for the profile's taskbar button, whose icon
+ * that button shows, get `icon` (Core_TakesCurrentIcon) and the profile's
+ * name. TRUE when one changed. */
+BOOL    TaskbarPin_RefreshImplicit(const Profile *profile, const WCHAR *icon);
 void    TaskbarPin_RefreshProfiles(const ProfileList *list, const WCHAR *const *icons);
 void    TaskbarPin_TellShortcutChanged(const WCHAR *lnk);
 void    TaskbarPin_RepairOurs(void);
@@ -695,10 +781,15 @@ typedef struct SessionEntry {          /* one profile's entry for a session */
     WCHAR     file[LONG_PATH_CCH];     /* its local_*.json */
     WCHAR     title[SESSION_TITLE_CCH];
     BOOL      userTitle;               /* named by someone, not by Claude */
+    BOOL      autoTitle;               /* named by Claude itself (titleSource "auto"): it may name it again */
     BOOL      starred;
     BOOL      archived;
     BOOL      damaged;                 /* Claude's startup took it for a session whose transcript is gone (transcriptUnavailable) */
     ULONGLONG lastActivity;            /* ms since 1970 */
+    ULONGLONG created;                 /* ms since 1970; 0 when not known */
+    DWORD     environment;             /* SESSION_ENV_*: where it runs */
+    PullRequestState pullRequest;      /* its pull request as Claude shows it */
+    int       pullRequestNumber;
     /* Changes made here while the profile runs, waiting for it to close. */
     BOOL      pending;
     WCHAR     pendingTitle[SESSION_TITLE_CCH];   /* "" when unchanged */
@@ -791,6 +882,11 @@ void         SessionEdit_ApplyPendingFor(const WCHAR *folder);
 CopyResult   SessionEdit_CopyConversation(HWND owner, const SessionSet *set, int row, int target, WCHAR *newId, size_t idCch,
                                           WCHAR *error, size_t errorCch);
 BOOL         SessionEdit_RemoveCopy(const SessionSet *set, int row, int target, const WCHAR *copyId, WCHAR *left, size_t leftCch);
+BOOL         SessionEdit_CanDelete(const SessionSet *set, int row, WCHAR *error, size_t errorCch);
+BOOL         SessionEdit_RemovesWorkingFolder(const SessionSet *set, int row, WCHAR *physical, size_t cch);
+RemoveResult SessionEdit_DeleteEverywhere(HWND owner, const SessionSet *set, int row, WCHAR *error, size_t errorCch);
+BOOL         SessionEdit_ListFiles(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count,
+                                   WCHAR *error, size_t errorCch);
 BOOL         SessionEdit_ListConversation(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count,
                                           WCHAR *error, size_t errorCch);
 BOOL         SessionEdit_ListTranscriptFiles(const WCHAR *const *ids, int idCount, WCHAR (**paths)[LONG_PATH_CCH], int *count,
@@ -845,6 +941,11 @@ BOOL         SessionSync_LayoutPart(int index, LayoutPart *part);
 /* From now on, each change this thread makes in a profile calls `step` (a
  * progress bar's); NULL for none. */
 void         SessionSync_OnEachChange(void (*step)(void *context), void *context);
+/* From now on, each session entry this thread sends to a profile (put, or
+ * taken away) is told to `sent` once it is in that profile's plan, before it
+ * is made: `content` is the entry put, NULL for a removal. NULL for none. */
+typedef void (*SyncSentProc)(void *context, const Profile *p, const SyncOp *op, const char *content, size_t length);
+void         SessionSync_OnEachSent(SyncSentProc sent, void *context);
 /* `changes` made as the other sends are: at once in a closed profile, else
  * waiting for it to close; backed up first, each checked again then. */
 BOOL         SessionSync_Send(const SessionSet *set, const SyncSend *changes, int count, SyncReport *report);
@@ -987,6 +1088,8 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
 BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
 /* What `members` keep the same, chosen in a dialog (IDD_SYNC_ITEMS) from `*items`: FALSE when cancelled. */
 BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items);
+/* What to sync, as a list whose groups fold (Theme_SetFoldingRows), `items` checked: each group, its items under it. */
+void SyncUi_FillItemsList(HWND list, DWORD items);
 /* What a profile syncs, and with which, chosen in a dialog (IDD_SYNC_SETUP). */
 typedef struct SyncSetup {
     int   profile;    /* the profile set up */
@@ -1007,9 +1110,52 @@ BOOL SyncUi_BackUpCode(HWND owner);
 BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, BOOL backedUp, const WCHAR *button);
 BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const WCHAR *button);   /* sessions written: SyncUi_Confirm, backed up first */
 
+/* ------------------------------------------------------- sessionsearch.c */
+
+#define SESSION_SEARCH_CCH 128   /* what the sessions view's search box takes */
+/* Looks for `text` (a regular expression with `regex`) in the conversations
+ * of `paths` ("" for none), on a thread of its own, posting each one found
+ * to `window` (WM_APP_SESSION_SEARCH); it frees `paths`. A search under way
+ * stops first. FALSE when it cannot start (a pattern it does not take). */
+BOOL SessionSearch_Start(HWND window, ULONG generation, const WCHAR *text, BOOL regex, BOOL matchCase,
+                         WCHAR (*paths)[LONG_PATH_CCH], int count);
+void SessionSearch_Stop(void);   /* the search under way, stopped and gone */
+
+/* -------------------------------------------------------- sessionundo.c */
+/* What the manager changes in sessions, undone and redone (Ctrl+Z, Ctrl+Y in
+ * the sessions view) while it runs. Between SessionUndo_Begin and
+ * SessionUndo_End the changes make one action: stars, titles and entries
+ * removed or kept, told by the caller, and every entry sessionsync.c sends
+ * meanwhile, which it sees itself. `set`, the sessions as the caller sees
+ * them, names the entries those replace or take away. */
+void SessionUndo_Begin(const SessionSet *set);
+void SessionUndo_End(void);
+void SessionUndo_Star(const Profile *p, const WCHAR *key, BOOL before, BOOL after);
+void SessionUndo_Title(const Profile *p, const WCHAR *key, const WCHAR *before, BOOL beforeAuto, const WCHAR *after);
+/* Session `key` listed by `p` from now on (`listed`), or taken away;
+ * `content`: its entry, as it is or as it was (a heap block the undo keeps,
+ * NULL when it could not be read). */
+void SessionUndo_Listed(const Profile *p, const WCHAR *key, BOOL listed, char *content, size_t length);
+BOOL SessionUndo_CanUndo(void);
+BOOL SessionUndo_CanRedo(void);
+/* The latest action undone, or the latest one undone made again, through the
+ * profiles of `set`: each change at once where the profile is closed, else
+ * once it closes. FALSE, `error` saying why when it can, when not all of it
+ * could be; it moves to the other list either way. */
+BOOL SessionUndo_Undo(HWND owner, const SessionSet *set, WCHAR *error, size_t errorCch);
+BOOL SessionUndo_Redo(HWND owner, const SessionSet *set, WCHAR *error, size_t errorCch);
+void SessionUndo_Forget(const WCHAR *key);   /* a session deleted everywhere: what names it is undone no more */
+void SessionUndo_Clear(void);
+
 /* ------------------------------------------------------------ settings.c */
 
-void Settings_Show(HWND owner);   /* the vault's days, and help */
+/* The language, the vault's days, and help. Apply and OK save the days and
+ * give a new language (-1: Windows') to `applyLanguage`, which puts it in
+ * use; the dialog then follows it. */
+typedef void (*SettingsLanguageProc)(int language);
+void Settings_Show(HWND owner, SettingsLanguageProc applyLanguage);
+void About_Show(HWND owner);
+void About_Fill(HWND dialog);   /* IDD_ABOUT: the version, help's questions and the changelog's versions by month, the newest shown */
 
 /* ------------------------------------------------------------- sessions.c */
 
@@ -1017,11 +1163,13 @@ void Settings_Show(HWND owner);   /* the vault's days, and help */
 #define WM_APP_SESSIONS_READY (WM_APP + 13) /* background session snapshot ready for the window */
 #define WM_APP_SYNC_PROGRESS (WM_APP + 20)  /* to the manager, from any process: wParam steps done of lParam; 0 of 0 once done */
 #define WM_APP_SYNC_CONFLICTS (WM_APP + 21) /* to the manager, from any process: a sync left conflicts to the person */
+#define WM_APP_SESSION_SEARCH (WM_APP + 22) /* to the manager: wParam search found lParam's session (-1: done; sessionsearch.c) */
 
 void         SessionsView_Init(HWND dlg);
 void         SessionsView_Warm(const ProfileList *profiles);
 void         SessionsView_SetProfiles(const ProfileList *profiles);
 void         SessionsView_Ready(BOOL allowChanges);
+void         SessionsView_SearchFound(WPARAM search, LPARAM index);   /* WM_APP_SESSION_SEARCH */
 void         SessionsView_Enter(const ClaudePackage *pkg, const WCHAR *folder);   /* pkg: the manager's, kept current, read at each use */
 void         SessionsView_Leave(void);
 BOOL         SessionsView_Shown(void);
@@ -1035,9 +1183,11 @@ BOOL         SessionsView_Command(WPARAM wp);
 BOOL         SessionsView_ClearSearch(void);
 BOOL         SessionsView_Notify(const NMHDR *header, LRESULT *result);
 BOOL         SessionsView_ContextMenu(HWND from, LPARAM pos);
+/* WM_CONTEXTMENU from the profiles' list: the row under `pos` (from the keyboard, the one selected) shown, as a
+ * click shows it. 1: a profile's row, whose menu the manager shows; 0: the list, below its rows; -1: not the list. */
+int          SessionsView_ChooseProfileAt(HWND from, LPARAM pos);
 BOOL         SessionsView_DrawItem(const DRAWITEMSTRUCT *item);
 void         SessionsView_Relayout(void);
-void         SessionsView_Resize(void);
 void         SessionsView_Destroy(void);
 
 /* ----------------------------------------------------------------- tray.c */
@@ -1167,6 +1317,30 @@ void     Theme_BufferEnd(ThemeBuffer *buffer);
 void     Theme_SetScrollRow(HWND control, int rowPx);   /* how far a wheel line scrolls, 0: one row of the control */
 int      Theme_ScrollTarget(HWND window, WPARAM request, int linePx);   /* the position a WM_VSCROLL asks of a window scrolled by the pixel */
 void     Theme_SetHeadingRows(HWND list);   /* a report list's rows with nothing after their first column are headings: semibold */
+/* A report list whose heading rows fold (each one's overlay index, INDEXTOOVERLAYMASK, a THEME_FOLD_*):
+ * a heading shows an arrow in its indent's cell, before its check box or icon (headings at indent 1, their
+ * rows below); its owner folds them, hitting the arrow at Theme_FoldArrowRect. */
+#define THEME_FOLD_CLOSED 1
+#define THEME_FOLD_OPEN   2
+#define THEME_FOLD_NONE   3   /* a heading with nothing to fold: no arrow */
+/* A read-only rich edit (MSFTEDIT_CLASS, which Theme_RichTextReady loads) showing Markdown, in the theme's
+ * fonts and colors (Core_MarkdownRtf), again in a new theme. */
+BOOL     Theme_RichTextReady(void);
+void     Theme_SetRichText(HWND rich, const WCHAR *markdown);
+void     Theme_SetFoldingRows(HWND list);
+BOOL     Theme_FoldArrowRect(HWND list, int row, RECT *cell);
+/* Its rows: a heading's lParam names its group, every other row's is its own, never negative. */
+#define THEME_HEADING_ROW(k) ((LPARAM)(-1 - (k)))
+#define THEME_HEADING_OF(lp) ((int)(-1 - (lp)))
+LPARAM   Theme_RowParam(HWND list, int row);
+void     Theme_InsertFoldingRow(HWND list, int row, const WCHAR *text, int image, LPARAM param, int fold);
+void     Theme_SetFold(HWND list, int row, int fold);
+BOOL     Theme_OnFoldArrow(HWND list, int row, POINT pt);   /* heading `row`'s arrow under `pt` (the list's client) */
+void     Theme_DeleteFoldedRows(HWND list, int row);        /* heading `row` folds: its rows go */
+void     Theme_FocusRow(HWND list, int row);                /* the keyboard's row, alone selected, in sight */
+#define THEME_FOLD_MENU_EXPAND   1
+#define THEME_FOLD_MENU_COLLAPSE 2
+UINT     Theme_FoldMenu(HWND owner, HWND list, HWND from, LPARAM pos);   /* WM_CONTEXTMENU: Expand all, Collapse all, or 0 */
 HWND     Theme_SmoothView(HWND control);   /* a list or tree scrolled by the pixel; returns the view, which has its place */
 void     Theme_Follow(HWND dialog, UINT msg, WPARAM wp, LPARAM lp);
 void     Theme_Apply(HWND dialog);   /* what it keeps on the dialog goes with the dialog */

@@ -45,7 +45,8 @@ OWN_PUNCTUATION = {"zh-CN": "?;,!:"}
 
 # Commands that show in several places, in the same words.
 COMMAND_FAMILIES = [
-    ["&Edit\u2026", "&Edit\u2026\tF2"],
+    ["&Rename\u2026", "&Rename\u2026\tF2"],
+    ["&Delete sessions everywhere\u2026", "&Delete sessions everywhere\u2026\tShift+Del"],
     ["&Copy to", "&Copy to\u2026"],
     ["S&hare with", "&Share with\u2026"],
     ["Remove", "Re&move\u2026%s"],
@@ -66,7 +67,7 @@ NONLITERAL_CALLS = {
               "Theme_MainNote", "Theme_SessionsFolderState"],
     "localize.c": ["key"],
     "profiles.c": ["invalid"],
-    "syncui.c": ["kSyncItems[row].label", "kConflictKinds[k].heading"],
+    "syncui.c": ["kSyncKinds[g].heading", "kSyncKinds[k].heading", "kSyncItemRows[i].label"],
     "sessionvault.c": ["context->part->label"],
 }
 # Keys the code translates through a variable, by the source file that spells
@@ -82,14 +83,19 @@ TRANSLATED_THROUGH_VARIABLES = {
                "Use 32 characters or fewer.", "Use 48 characters or fewer.",
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
     "gui.c": ["A profile folder with this name already exists."],
-    "syncui.c": ["Sessions: new ones, titles, archived and deleted ones", "Sidebar: pins, groups, project order, filters", "Each session's model, effort, side pane, unread mark and cost", "Appearance: fonts, editor, zoom, spelling", "Interface language", "Default model", "Settings: auto-archive, Cowork, Remote Control, recent folders", "Permissions: folders' permission modes, Cowork's trusted folders", "Sessions", "Sidebar", "Session details", "Appearance", "Interface language", "Default model", "Settings", "Permissions"],
+    "syncui.c": ["Sessions", "Sidebar", "Session details", "Appearance", "Interface language", "Default model", "Settings", "Permissions",
+                 "New sessions", "Titles", "Archived or not", "Deleted sessions", "Stars and pins", "Groups and sections", "Project order",
+                 "Filters, grouping and sorting", "Width and the place of Routines", "Model and effort", "Side pane", "Unread marks", "Cost",
+                 "Fonts", "Editor", "Zoom", "Spelling", "Archive when the PR closes", "Cowork", "Cowork's recent folders",
+                 "Code: scheduled tasks, links in previews, going on after a usage limit", "Folders' permission modes",
+                 "Cowork's trusted folders"],
     "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "&Delete\u2026", "S&ync settings\u2026", "&Backup && Restore\u2026",
-                "Rep&air", "Set as de&fault", "S&hortcuts", "&Language", "Se&ttings", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
+                "Rep&air", "Set as de&fault", "S&hortcuts", "Se&ttings", "Search o&ptions", "F&ilter", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
                 "Pin to &taskbar", "Pinned", "Add to Start &menu", "Remove from Start &menu", "Sessions &view", "&Back",
                 "&Get Claude", "&Update",
                 "Profile", "Role", "Data folder", "Sessions", "Status", "Running", "Not running", "This profile", "Not signed in", "No sessions yet", "Link broken",
                 "Claude icon, default", "Claude icon", "Default",
-                "Version %s", "Version %s is available", "Downloading version %s\u2026", "Installing the new version\u2026",
+                "Version %s is available", "Downloading version %s\u2026", "Installing the new version\u2026",
                 "Claude Desktop %s\nclaude:// links are not set up yet",
                 "Claude Desktop %s\nclaude:// links are routed correctly",
                 "The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \u201c%s\u201d."],
@@ -99,19 +105,22 @@ TRANSLATED_THROUGH_VARIABLES = {
 # Close goes by Esc and has none (Windows' rule for OK, Cancel and Close).
 STATUS_ACTIONS = ["&Get Claude"]
 # The main window's toolbar, its icons alone included, shown in both views.
-TOOLBAR = ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "S&hortcuts", "&Language", "Se&ttings"]
+TOOLBAR = ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "S&hortcuts", "Se&ttings"]
 ACCESS_KEY_GROUPS = {
     "profiles view": TOOLBAR + ["Sessions &view", "S&ync settings\u2026", "&Backup && Restore\u2026", "Rep&air", "&Update"] + STATUS_ACTIONS,
-    "sessions view": TOOLBAR + ["&Back", "Show &archived", "&Update"] + STATUS_ACTIONS,
+    "sessions view": TOOLBAR + ["&Back", "Search o&ptions", "F&ilter"],
+    "filter menu": ["&Status", "&Environment", "&Group by", "S&ort by", "Show e&mpty groups", "Show &PR status", "&Clear filters"],
+    "search options": ["Search &titles and folders", "Search the con&versations", "&Regular expression", "Match &case"],
     "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "S&ync:", "Wha&t to sync\u2026",
                        "Open at &Windows sign-in",
                        "Copy &settings from \u201c%s\u201d", "&Open it now to sign in"],
     "menu of a profile without the session": ["&Share with\u2026", "&Copy to\u2026"],
-    "menu of a profile with the session": ["&Open in %s", "&Edit\u2026", "S&tar", "Uns&tar",
+    "menu of a profile with the session": ["&Open in %s", "&Rename\u2026", "S&tar", "Uns&tar",
                                                    "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s"],
-    "session menu": ["&Open in %s", "Pre&view\tSpace", "Open i&n", "S&hare with", "&Copy to", "&Edit\u2026\tF2", "S&tar",
+    "session menu": ["&Open in %s", "Pre&view\tSpace", "Open i&n", "S&hare with", "&Copy to", "&Rename\u2026\tF2", "S&tar",
                      "Uns&tar", "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s", "&Show folder",
-                     "Cop&y\tCtrl+C", "&Paste\tCtrl+V"],
+                     "&Delete session everywhere\u2026\tShift+Del", "Cop&y\tCtrl+C", "C&ut\tCtrl+X", "&Paste\tCtrl+V",
+                     "&Expand all", "Co&llapse all"],
     "profile list menu": ["&Open", "&Quit", "&Restart", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "&Sync now",
                           "S&ync settings\u2026", "Merge &all sessions\u2026", "&Copy all sessions to\u2026", "&Move all sessions to\u2026",
                           "U&nlink sessions folder\u2026", "&Back up\u2026", "Restore from back&up\u2026"],
@@ -120,16 +129,20 @@ ACCESS_KEY_GROUPS = {
                                   "Reco&ver sessions\u2026", "C&lean up sessions\u2026", "Back up .&claude\u2026",
                                   "Back up once a &week"],
     "conflicts dialog": ["&Use for all:"],
-    "session edit dialog": ["S&tarred"],
     "shortcuts menu of a profile": ["Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar",
                                     "Pinned", "Add to Start &menu", "Remove from Start &menu"],
-    "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "Cop&y\tCtrl+C", "&Paste\tCtrl+V",
-                                 "S&tar", "Uns&tar", "Re&move\u2026%s"],
-    "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026", "&Paste\tCtrl+V"],
+    "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "Cop&y\tCtrl+C", "C&ut\tCtrl+X",
+                                 "&Paste\tCtrl+V", "S&tar", "Uns&tar", "Re&move\u2026%s", "&Delete sessions everywhere\u2026\tShift+Del"],
+    "menu of a heading": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "Cop&y\tCtrl+C", "C&ut\tCtrl+X",
+                          "&Paste\tCtrl+V", "S&tar", "Uns&tar", "Re&move\u2026%s", "&Delete sessions everywhere\u2026",
+                          "&Expand all", "Co&llapse all"],
+    "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026", "&Paste\tCtrl+V", "&Undo\tCtrl+Z", "&Redo\tCtrl+Y",
+                                "&Expand all", "Co&llapse all"],
+    "menu of a list whose groups fold": ["&Expand all", "Co&llapse all"],
     "sessions dialog": ["&To these profiles:"],
     "recover dialog": ["&Profile:", "&Version:"],
     "clean-up dialog": ["&Show:", "Select &all", "&Back up .claude first", "&Restore"],
-    "settings dialog": ["&Keep versions for:"],
+    "settings dialog": ["&Language", "&Keep versions for:", "&Apply"],
 }
 # Choices made in the same place: a key of one choice never shows with a key of another.
 ALTERNATIVES = [

@@ -910,6 +910,71 @@ static void CheckTrayPicture(void)
     if (PrivatePath(L"pictures", pictures, ARRAYSIZE(pictures))) RemoveDirectoryW(pictures);
 }
 
+/* An icon file of two images, a red 16 x 16 one first and a blue 64 x 64 one. */
+static BOOL WriteTwoImageIcon(const WCHAR *path)
+{
+    static const int kSides[] = { 16, 64 };
+    static const DWORD kColors[] = { 0xFFE02020u, 0xFF2040E0u };
+    BYTE header[6 + 2 * 16];
+    DWORD offset = sizeof header, written;
+    HANDLE file;
+    BOOL ok;
+    int i, p;
+    ZeroMemory(header, sizeof header);
+    header[2] = 1;   /* an icon */
+    header[4] = 2;   /* two images */
+    for (i = 0; i < 2; i++) {
+        BYTE *entry = header + 6 + 16 * i;
+        DWORD bytes = 40 + (DWORD)(kSides[i] * kSides[i] * 4) + (DWORD)(kSides[i] * ((kSides[i] + 31) / 32 * 4));
+        entry[0] = entry[1] = (BYTE)kSides[i];
+        entry[4] = 1;
+        entry[6] = 32;
+        memcpy(entry + 8, &bytes, 4);
+        memcpy(entry + 12, &offset, 4);
+        offset += bytes;
+    }
+    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    ok = WriteFile(file, header, sizeof header, &written, NULL);
+    for (i = 0; ok && i < 2; i++) {
+        BITMAPINFOHEADER info;
+        BYTE mask[4] = { 0 };
+        ZeroMemory(&info, sizeof info);
+        info.biSize = sizeof info;
+        info.biWidth = kSides[i];
+        info.biHeight = 2 * kSides[i];   /* the colors, then the mask */
+        info.biPlanes = 1;
+        info.biBitCount = 32;
+        ok = WriteFile(file, &info, sizeof info, &written, NULL);
+        for (p = 0; ok && p < kSides[i] * kSides[i]; p++) ok = WriteFile(file, &kColors[i], 4, &written, NULL);
+        for (p = 0; ok && p < kSides[i] * ((kSides[i] + 31) / 32); p++) ok = WriteFile(file, mask, 4, &written, NULL);
+    }
+    CloseHandle(file);
+    return ok;
+}
+
+/* A picture read from an icon file comes from its largest image, not its
+ * first, which would grow blurred. */
+static void CheckIconPicture(void)
+{
+    WCHAR path[MAX_PATH];
+    DWORD *picture;
+    HRESULT hr = E_FAIL;
+    BOOL largest = FALSE;
+    if (!PrivatePath(L"two-images.ico", path, ARRAYSIZE(path)) || !WriteTwoImageIcon(path)) {
+        Check("picture: a private two-image icon is written", FALSE);
+        return;
+    }
+    picture = Icons_ReadPicture(path, &hr);
+    if (picture) {
+        DWORD middle = picture[(PICTURE_SIZE / 2) * PICTURE_SIZE + PICTURE_SIZE / 2];
+        largest = (middle & 0xFF) > 0xC0 && ((middle >> 16) & 0xFF) < 0x40;   /* blue, not red */
+        HeapFree(GetProcessHeap(), 0, picture);
+    }
+    Check("picture: an icon file gives its largest image, not its first", largest);
+    DeleteFileW(path);
+}
+
 /* The private folder and what the tests left in it (not a tree). */
 static BOOL RemovePrivateFolder(void)
 {
@@ -973,6 +1038,7 @@ int wmain(void)
     CheckLanguagePass();
     CheckFolderReadOnce();
     CheckTrayPicture();
+    CheckIconPicture();
 
     privateUser = OpenPrivateUserKey(keyPath, ARRAYSIZE(keyPath));
     if (privateUser && RegOverridePredefKey(HKEY_CURRENT_USER, privateUser) == ERROR_SUCCESS) {

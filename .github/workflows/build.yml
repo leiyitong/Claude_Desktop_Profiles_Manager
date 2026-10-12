@@ -1,7 +1,7 @@
 name: build
 
-# Only what goes into the exe or its checks starts a build: a change to the documents
-# alone (README, docs, BUILD.md...) builds nothing. A tag always builds: GitHub does
+# Only what goes into the exe or its checks starts a build (the changelogs do): a change
+# to the other documents alone (README, docs, BUILD.md...) builds nothing. A tag always builds: GitHub does
 # not apply path filters to tags.
 on:
   push:
@@ -11,6 +11,9 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'tools/check-localization.py'
+      - 'tools/changelog.py'
+      - 'CHANGELOG.md'
+      - 'CHANGELOG.zh-CN.md'
       - 'build.cmd'
       - '.gitattributes'
       - '.github/workflows/build.yml'
@@ -19,6 +22,9 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'tools/check-localization.py'
+      - 'tools/changelog.py'
+      - 'CHANGELOG.md'
+      - 'CHANGELOG.zh-CN.md'
       - 'build.cmd'
       - '.gitattributes'
       - '.github/workflows/build.yml'
@@ -60,9 +66,10 @@ jobs:
           path: build/ClaudeDesktopProfilesManager.exe
           if-no-files-found: error
 
-  # Every build of main, unsigned, as a pre-release of its own. Pre-releases are not
-  # "latest": the README's download link and the update check of installed copies
-  # (update.c, releases/latest) keep finding the signed release only.
+  # Every build of main, unsigned, as a pre-release of its own, its notes its version's
+  # lines in the changelogs. Pre-releases are not "latest": the README's download link and
+  # the update check of installed copies (update.c, releases/latest) keep finding the
+  # signed release only.
   prerelease:
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -70,6 +77,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v7
         with:
           name: ClaudeDesktopProfilesManager
@@ -80,7 +91,13 @@ jobs:
           TAG: build-${{ github.run_number }}
         run: |
           short=$(echo "$GITHUB_SHA" | cut -c1-7)
+          version=$(sed -n 's/^#define APP_VERSION_DATE *"\([^"]*\)".*/\1/p' src/version.h)
+          {
+            echo "> ⚠️ Unsigned build of \`$short\` on main, made by GitHub Actions: an installed copy does not update to it, its update check takes signed releases only. 未签名的 main 构建：已安装的程序不会自动更新到它。"
+            echo
+            python3 tools/changelog.py --notes latest
+          } > notes.md
           gh release create "$TAG" ClaudeDesktopProfilesManager.exe \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --latest=false \
-            --title "Build $GITHUB_RUN_NUMBER ($short)" \
-            --notes "Unsigned build of $GITHUB_SHA on main, made by GitHub Actions. An installed copy does not update to it: its update check takes signed releases only."
+            --title "Claude Desktop Profiles Manager v$version (build $GITHUB_RUN_NUMBER)" \
+            --notes-file notes.md

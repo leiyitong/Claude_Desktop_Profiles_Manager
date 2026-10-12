@@ -52,7 +52,7 @@ rem /MP: the sources compile in parallel, one per processor.
 cl %CFLAGS% /MP /Fo"%OUT%\obj\\" /Fe"%OUT%\obj\%EXE_NAME%" "%ROOT%src\*.c" "%OUT%\obj\app.res" ^
    /link /SUBSYSTEM:WINDOWS /GUARD:CF /DYNAMICBASE /NXCOMPAT /DEPENDENTLOADFLAG:0x800 /OPT:REF /OPT:ICF %LIBS% || exit /b 1
 
-rem Every interface text has its twelve translations. Needs Python 3.6 or later, which GitHub Actions has;
+rem Every interface text has its translations, and the two changelogs are in step. Needs Python 3.6 or later, which GitHub Actions has;
 rem the python.org installer may put only "py" on PATH, and the Microsoft Store's "python" placeholder fails.
 rem If blocks, not "a && (b || exit /b 1) || c": there exit /b ends "cmd /c build.cmd" with code 0.
 set "PYTHON="
@@ -60,8 +60,9 @@ python -c "import sys; sys.exit(sys.version_info < (3, 6))" >nul 2>&1 && set "PY
 if not defined PYTHON (py -3 -c "import sys; sys.exit(sys.version_info < (3, 6))" >nul 2>&1 && set "PYTHON=py -3")
 if defined PYTHON (
     %PYTHON% "%ROOT%tools\check-localization.py" || exit /b 1
+    %PYTHON% "%ROOT%tools\changelog.py" --check || exit /b 1
 ) else (
-    echo Python 3.6 or later not found: tools\check-localization.py skipped.
+    echo Python 3.6 or later not found: tools\check-localization.py and tools\changelog.py skipped.
 )
 
 rem The pure helpers alone: core.c needs nothing else.

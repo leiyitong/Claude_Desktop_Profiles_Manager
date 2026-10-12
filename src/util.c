@@ -684,3 +684,42 @@ BOOL Util_SetSetting(const WCHAR *name, DWORD value)
     StringCchPrintfW(text, ARRAYSIZE(text), L"%lu", value);
     return WritePrivateProfileStringW(L"Settings", name, text, path);
 }
+
+/* Windows reads at most this much of a section; what would not fit is not kept. */
+#define SETTING_SECTION_CCH 32767
+
+/* The list's items as "<n>=<item>" lines, their order kept by n. */
+int Util_GetSettingList(const WCHAR *section, WCHAR (*items)[MAX_PATH], int capacity)
+{
+    WCHAR path[MAX_PATH], *buffer, *line, *equals;
+    int count = 0;
+    if (!SettingsPath(path, ARRAYSIZE(path)) || (buffer = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, SETTING_SECTION_CCH * sizeof *buffer)) == NULL)
+        return 0;
+    if (GetPrivateProfileSectionW(section, buffer, SETTING_SECTION_CCH, path) > 0)
+        for (line = buffer; *line && count < capacity; line += wcslen(line) + 1)
+            if ((equals = wcschr(line, L'=')) != NULL && equals[1] && SUCCEEDED(StringCchCopyW(items[count], MAX_PATH, equals + 1))) count++;
+    HeapFree(GetProcessHeap(), 0, buffer);
+    return count;
+}
+
+BOOL Util_SetSettingList(const WCHAR *section, const WCHAR (*items)[MAX_PATH], int count)
+{
+    WCHAR path[MAX_PATH], dir[MAX_PATH], line[MAX_PATH + 16], *buffer;
+    size_t used = 0, length;
+    int i;
+    BOOL ok;
+    if (!Util_StateDir(dir, ARRAYSIZE(dir)) || !Util_EnsureDir(dir) || !SettingsPath(path, ARRAYSIZE(path))) return FALSE;
+    if (count <= 0) return WritePrivateProfileStringW(section, NULL, NULL, path) || GetLastError() == ERROR_FILE_NOT_FOUND;
+    if ((buffer = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, SETTING_SECTION_CCH * sizeof *buffer)) == NULL) return FALSE;
+    for (i = 0; i < count; i++) {
+        if (FAILED(StringCchPrintfW(line, ARRAYSIZE(line), L"%d=%s", i + 1, items[i]))) continue;
+        length = wcslen(line) + 1;
+        if (used + length + 1 > SETTING_SECTION_CCH) break;
+        CopyMemory(buffer + used, line, length * sizeof *buffer);
+        used += length;
+    }
+    buffer[used] = 0;   /* the list's end: an empty line */
+    ok = WritePrivateProfileSectionW(section, buffer, path);
+    HeapFree(GetProcessHeap(), 0, buffer);
+    return ok;
+}

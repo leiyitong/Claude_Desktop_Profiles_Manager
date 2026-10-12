@@ -933,6 +933,29 @@ static void CloseCodecs(Codecs *codecs)
     ZeroMemory(codecs, sizeof *codecs);
 }
 
+/* The frame a picture is taken from: a GIF's first; of an icon, its largest
+ * image (an icon often lists its smallest first, which would grow blurred). */
+static HRESULT PictureFrame(IWICBitmapDecoder *decoder, IWICBitmapFrameDecode **frame)
+{
+    GUID format;
+    UINT count = 0, i, best = 0;
+    ULONGLONG bestArea = 0;
+    if (SUCCEEDED(IWICBitmapDecoder_GetContainerFormat(decoder, &format)) && IsEqualGUID(&format, &GUID_ContainerFormatIco) &&
+        SUCCEEDED(IWICBitmapDecoder_GetFrameCount(decoder, &count))) {
+        for (i = 0; i < count; i++) {
+            IWICBitmapFrameDecode *candidate = NULL;
+            UINT width = 0, height = 0;
+            if (SUCCEEDED(IWICBitmapDecoder_GetFrame(decoder, i, &candidate)) &&
+                SUCCEEDED(IWICBitmapFrameDecode_GetSize(candidate, &width, &height)) && (ULONGLONG)width * height > bestArea) {
+                best = i;
+                bestArea = (ULONGLONG)width * height;
+            }
+            if (candidate) IWICBitmapFrameDecode_Release(candidate);
+        }
+    }
+    return IWICBitmapDecoder_GetFrame(decoder, best, frame);
+}
+
 DWORD *Icons_ReadPicture(const WCHAR *path, HRESULT *result)
 {
     const UINT stride = PICTURE_SIZE * sizeof(DWORD), bytes = stride * PICTURE_SIZE;
@@ -950,7 +973,7 @@ DWORD *Icons_ReadPicture(const WCHAR *path, HRESULT *result)
     if (SUCCEEDED(hr))
         hr = IWICImagingFactory_CreateDecoderFromFilename(codecs.factory, path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
                                                           &decoder);
-    if (SUCCEEDED(hr)) hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);   /* a GIF's first frame */
+    if (SUCCEEDED(hr)) hr = PictureFrame(decoder, &frame);
     /* Premultiplied, so that scaling does not bleed the color of transparent pixels. */
     if (SUCCEEDED(hr)) hr = WICConvertBitmapSource(&GUID_WICPixelFormat32bppPBGRA, (IWICBitmapSource *)frame, &converted);
     if (SUCCEEDED(hr)) hr = IWICBitmapSource_GetSize(converted, &width, &height);

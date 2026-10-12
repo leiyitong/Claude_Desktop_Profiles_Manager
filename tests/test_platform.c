@@ -4209,6 +4209,8 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #define Util_StateDir TestedUtil_StateDir
 #define Util_GetSetting TestedUtil_GetSetting
 #define Util_SetSetting TestedUtil_SetSetting
+#define Util_GetSettingList TestedUtil_GetSettingList
+#define Util_SetSettingList TestedUtil_SetSettingList
 #define Util_FileExists TestedUtil_FileExists
 #define Util_DirExists TestedUtil_DirExists
 #define Util_QueryPath TestedUtil_QueryPath
@@ -4264,6 +4266,8 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #undef Util_StateDir
 #undef Util_GetSetting
 #undef Util_SetSetting
+#undef Util_GetSettingList
+#undef Util_SetSettingList
 #undef Util_FileExists
 #undef Util_DirExists
 #undef Util_QueryPath

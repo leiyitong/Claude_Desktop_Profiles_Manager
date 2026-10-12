@@ -402,6 +402,19 @@ static void DeleteContent(const WCHAR *dir, const SyncOp *op)
     if (op->content[0] && SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", dir, op->content))) DeleteFileW(path);
 }
 
+/* Each entry this thread sends, told to the manager's undo. */
+typedef struct SentHook {
+    SyncSentProc sent;
+    void        *context;
+} SentHook;
+static __declspec(thread) SentHook g_onSent;
+
+void SessionSync_OnEachSent(SyncSentProc sent, void *context)
+{
+    g_onSent.sent = sent;
+    g_onSent.context = context;
+}
+
 /* What `sent` holds added to the plan of `p`, each change replacing the
  * queued ones it supersedes (Core_SyncOpReplaces), its entry kept in a file
  * of the plan's folder. */
@@ -445,6 +458,9 @@ static BOOL StageSent(const Profile *p, Sent *sent)
 done:
     SessionEdit_Unlock(lock);
     Free(plan.ops);
+    for (i = 0; ok && g_onSent.sent && i < sent->count; i++)
+        if (sent->ops[i].kind == SYNC_PUT || sent->ops[i].kind == SYNC_REMOVE)
+            g_onSent.sent(g_onSent.context, p, &sent->ops[i], sent->contents[i], sent->lengths[i]);
     return ok;
 }
 
@@ -816,28 +832,28 @@ typedef struct SettingPart {
     DWORD       item;
 } SettingPart;
 static const SettingPart kSettingParts[] = {
-    { "starred", "starred-local-code-sessions", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR },
-    { "slice", "dframe-local-slice", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR },
-    { "starredGroups", "starred-session-groups", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR },
-    { "order", "code-projects-order.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },
-    { "statusFilter", "code-sessions-status-filter.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },             /* the filter's Status */
-    { "environments", "code-sessions-selected-environments-v2.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },  /* ...its Environment */
-    { "showEmpty", "code-sessions-show-empty-projects.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },          /* ...Show empty groups */
-    { "showPrStatus", "code-sessions-show-pr-status.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR },           /* ...Show PR status */
-    { "projectsFilter", "ccd-sessions-filter", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR },                        /* the projects chosen */
-    { "transcriptLinks", "epitaxy-transcript-links-in-preview", TRUE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "autoResume", "autoResumeRateLimitOptIn.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SETTINGS },                 /* go on after a usage limit */
-    { "folderModes", "epitaxy-folder-permission-mode.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_PERMISSIONS },       /* each folder's mode */
-    { "modeAcks", "epitaxy-perm-mode-acks.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_PERMISSIONS },                 /* ...its warning confirmed */
-    { "autoArchive", "ccAutoArchiveOnPrClose", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "coworkWebSearch", "coworkWebSearchEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "coworkBrowserTools", "coworkBrowserToolsEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "coworkBrowser", "coworkPreferredBrowser", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "coworkSchedules", "coworkScheduledTasksEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "codeSchedules", "ccdScheduledTasksEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "remoteExcluded", "remoteControlExcludedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "remotePinned", "remoteControlPinnedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS },
-    { "trustedFolders", "localAgentModeTrustedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_PERMISSIONS },        /* Cowork's */
+    { "starred", "starred-local-code-sessions", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR_PINS },
+    { "slice", "dframe-local-slice", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR_PINS },
+    { "starredGroups", "starred-session-groups", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR_PINS },
+    { "order", "code-projects-order.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR_ORDER },
+    { "statusFilter", "code-sessions-status-filter.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR_FILTERS },             /* the filter's Status */
+    { "environments", "code-sessions-selected-environments-v2.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR_FILTERS },  /* ...its Environment */
+    { "showEmpty", "code-sessions-show-empty-projects.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR_FILTERS },          /* ...Show empty groups */
+    { "showPrStatus", "code-sessions-show-pr-status.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SIDEBAR_FILTERS },           /* ...Show PR status */
+    { "projectsFilter", "ccd-sessions-filter", TRUE, LAYOUT_ANY, SYNC_ITEM_SIDEBAR_FILTERS },                        /* the projects chosen */
+    { "transcriptLinks", "epitaxy-transcript-links-in-preview", TRUE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_CODE },
+    { "autoResume", "autoResumeRateLimitOptIn.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_SETTINGS_CODE },                 /* go on after a usage limit */
+    { "folderModes", "epitaxy-folder-permission-mode.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_PERMISSIONS_MODES },       /* each folder's mode */
+    { "modeAcks", "epitaxy-perm-mode-acks.", TRUE, LAYOUT_ACCOUNT, SYNC_ITEM_PERMISSIONS_MODES },                 /* ...its warning confirmed */
+    { "autoArchive", "ccAutoArchiveOnPrClose", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_ARCHIVE },
+    { "coworkWebSearch", "coworkWebSearchEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_COWORK },
+    { "coworkBrowserTools", "coworkBrowserToolsEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_COWORK },
+    { "coworkBrowser", "coworkPreferredBrowser", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_COWORK },
+    { "coworkSchedules", "coworkScheduledTasksEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_COWORK },
+    { "codeSchedules", "ccdScheduledTasksEnabled", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_CODE },
+    { "remoteExcluded", "remoteControlExcludedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_REMOTE },
+    { "remotePinned", "remoteControlPinnedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_SETTINGS_REMOTE },
+    { "trustedFolders", "localAgentModeTrustedFolders", FALSE, LAYOUT_ANY, SYNC_ITEM_PERMISSIONS_TRUSTED },        /* Cowork's */
 };
 
 /* The sidebar's groups and their sections, the "Edit sidebar" choices, the
@@ -879,39 +895,39 @@ typedef struct WebPart {
 #define SYNC_OWNER      L"ccd-sync-owner"
 #define WEB_NAME_CCH    160
 static const WebPart kWebParts[] = {
-    { "groups", SIDEBAR_STORE, FORM_STORE, "customGroupsByScope", LAYOUT_ORGANIZATION, "dframe-group-scopes", SYNC_ITEM_SIDEBAR, FALSE },
-    { "sections", SIDEBAR_STORE, FORM_STORE, "codeSidebarByScope", LAYOUT_ORGANIZATION, "dframe-code-sections", SYNC_ITEM_SIDEBAR, FALSE },
-    { "navPins", SIDEBAR_STORE, FORM_STORE, "navPinnedIds", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },   /* Edit sidebar */
-    { "folded", SIDEBAR_STORE, FORM_STORE, "collapsedGroups", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
-    { "groupBy", SIDEBAR_STORE, FORM_STORE, "groupByByMode", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
-    { "sortBy", SIDEBAR_STORE, FORM_STORE, "sortByByMode", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
-    { "recentsType", SIDEBAR_STORE, FORM_STORE, "recentsTypeFilter", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },   /* Recents' filter */
-    { "recentsStatus", SIDEBAR_STORE, FORM_STORE, "recentsStatusFilter", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
-    { "routines", SIDEBAR_STORE, FORM_STORE, "routinesSidebarPlacement", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
-    { "sidebarWidth", SIDEBAR_STORE, FORM_STORE, "sidebarWidth", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR, FALSE },
-    { "interfaceFont", SIDEBAR_STORE, FORM_STORE, "interfaceFont", LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE, FALSE },
-    { "systemFont", SIDEBAR_STORE, FORM_STORE, "systemFont", LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE, FALSE },
-    { "editor", L"epitaxy-editor-prefs", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE, FALSE },   /* font, theme, text size */
-    { "zoom", L"desktop-frame.mainViewZoomFactor.v1", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE, FALSE },
+    { "groups", SIDEBAR_STORE, FORM_STORE, "customGroupsByScope", LAYOUT_ORGANIZATION, "dframe-group-scopes", SYNC_ITEM_SIDEBAR_GROUPS, FALSE },
+    { "sections", SIDEBAR_STORE, FORM_STORE, "codeSidebarByScope", LAYOUT_ORGANIZATION, "dframe-code-sections", SYNC_ITEM_SIDEBAR_GROUPS, FALSE },
+    { "navPins", SIDEBAR_STORE, FORM_STORE, "navPinnedIds", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR_PINS, FALSE },   /* Edit sidebar */
+    { "folded", SIDEBAR_STORE, FORM_STORE, "collapsedGroups", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR_GROUPS, FALSE },
+    { "groupBy", SIDEBAR_STORE, FORM_STORE, "groupByByMode", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR_FILTERS, FALSE },
+    { "sortBy", SIDEBAR_STORE, FORM_STORE, "sortByByMode", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR_FILTERS, FALSE },
+    { "recentsType", SIDEBAR_STORE, FORM_STORE, "recentsTypeFilter", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR_FILTERS, FALSE },   /* Recents' filter */
+    { "recentsStatus", SIDEBAR_STORE, FORM_STORE, "recentsStatusFilter", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR_FILTERS, FALSE },
+    { "routines", SIDEBAR_STORE, FORM_STORE, "routinesSidebarPlacement", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR_LAYOUT, FALSE },
+    { "sidebarWidth", SIDEBAR_STORE, FORM_STORE, "sidebarWidth", LAYOUT_ANY, NULL, SYNC_ITEM_SIDEBAR_LAYOUT, FALSE },
+    { "interfaceFont", SIDEBAR_STORE, FORM_STORE, "interfaceFont", LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE_FONTS, FALSE },
+    { "systemFont", SIDEBAR_STORE, FORM_STORE, "systemFont", LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE_FONTS, FALSE },
+    { "editor", L"epitaxy-editor-prefs", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE_EDITOR, FALSE },   /* font, theme, text size */
+    { "zoom", L"desktop-frame.mainViewZoomFactor.v1", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_APPEARANCE_ZOOM, FALSE },
     { "locale", L"spa:locale", FORM_TEXT, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_LANGUAGE, FALSE },
     { "localeSource", L"spa:locale-source", FORM_TEXT, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_LANGUAGE, FALSE },
     { "defaultModel", L"default-model", FORM_TEXT, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_MODEL, FALSE },
-    { "coworkRecents", L"cowork-picker-recents", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_SETTINGS, FALSE },
-    { "pills", L"code-session-pills", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },   /* each session's model, effort */
-    { "unread", L"epitaxy-unread-v1", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
-    { "railSections", L"epitaxy.sessionRailSections", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
-    { "paneLayout", PANE_STORE, FORM_STORE, "tileLayout", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
-    { "paneSizes", PANE_STORE, FORM_STORE, "lastPaneFlexByKind", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
-    { "transcriptMode", PANE_STORE, FORM_STORE, "transcriptMode", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
-    { "transcriptModeDefault", PANE_STORE, FORM_STORE, "transcriptModeIsDefault", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
-    { "filesTree", PANE_STORE, FORM_STORE, "filesTreeShown", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
-    { "diffTree", PANE_STORE, FORM_STORE, "diffShowTree", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, FALSE },
-    { "paneLayouts", PANE_STORE, FORM_STORE, "tileLayoutBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
-    { "paneExpanded", PANE_STORE, FORM_STORE, "expandedTileBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
-    { "paneClosed", PANE_STORE, FORM_STORE, "closedPaneSlotsBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
-    { "transcriptModes", PANE_STORE, FORM_STORE, "transcriptModeBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
-    { "paneBands", PANE_STORE, FORM_STORE, "bandHeightsBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
-    { "costs", L"epitaxy-session-result:", FORM_FAMILY, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS, TRUE },
+    { "coworkRecents", L"cowork-picker-recents", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_SETTINGS_RECENTS, FALSE },
+    { "pills", L"code-session-pills", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_MODEL, FALSE },   /* each session's model, effort */
+    { "unread", L"epitaxy-unread-v1", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_UNREAD, FALSE },
+    { "railSections", L"epitaxy.sessionRailSections", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
+    { "paneLayout", PANE_STORE, FORM_STORE, "tileLayout", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
+    { "paneSizes", PANE_STORE, FORM_STORE, "lastPaneFlexByKind", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
+    { "transcriptMode", PANE_STORE, FORM_STORE, "transcriptMode", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
+    { "transcriptModeDefault", PANE_STORE, FORM_STORE, "transcriptModeIsDefault", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
+    { "filesTree", PANE_STORE, FORM_STORE, "filesTreeShown", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
+    { "diffTree", PANE_STORE, FORM_STORE, "diffShowTree", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
+    { "paneLayouts", PANE_STORE, FORM_STORE, "tileLayoutBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, TRUE },
+    { "paneExpanded", PANE_STORE, FORM_STORE, "expandedTileBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, TRUE },
+    { "paneClosed", PANE_STORE, FORM_STORE, "closedPaneSlotsBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, TRUE },
+    { "transcriptModes", PANE_STORE, FORM_STORE, "transcriptModeBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, TRUE },
+    { "paneBands", PANE_STORE, FORM_STORE, "bandHeightsBySession", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, TRUE },
+    { "costs", L"epitaxy-session-result:", FORM_FAMILY, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_COST, TRUE },
 };
 
 /* Two files of Claude's own: config.json (the app's state: its language, the
@@ -930,9 +946,9 @@ typedef struct FilePart {
 } FilePart;
 static const FilePart kFileParts[] = {
     { "appLocale", CLAUDE_APP_SETTINGS, { "locale", NULL, NULL }, 1, FALSE, SYNC_ITEM_LANGUAGE },
-    { "controlsZoom", CLAUDE_APP_SETTINGS, { "windowControlsZoomFactor", NULL, NULL }, 1, FALSE, SYNC_ITEM_APPEARANCE },
-    { "pageZoom", CHROMIUM_PREFERENCES, { "partition", "per_host_zoom_levels", NULL }, 3, TRUE, SYNC_ITEM_APPEARANCE },
-    { "spelling", CHROMIUM_PREFERENCES, { "spellcheck", "dictionaries", NULL }, 2, FALSE, SYNC_ITEM_APPEARANCE },
+    { "controlsZoom", CLAUDE_APP_SETTINGS, { "windowControlsZoomFactor", NULL, NULL }, 1, FALSE, SYNC_ITEM_APPEARANCE_ZOOM },
+    { "pageZoom", CHROMIUM_PREFERENCES, { "partition", "per_host_zoom_levels", NULL }, 3, TRUE, SYNC_ITEM_APPEARANCE_ZOOM },
+    { "spelling", CHROMIUM_PREFERENCES, { "spellcheck", "dictionaries", NULL }, 2, FALSE, SYNC_ITEM_APPEARANCE_SPELLING },
 };
 
 /* Each part as the person sees it, in a conflict (a catalog key). */

@@ -6,6 +6,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <limits.h>
+#include <stdarg.h>
 
 /* ---------------------------------------------------------------- strings */
 
@@ -87,6 +88,25 @@ int Core_PathCompare(const WCHAR *a, const WCHAR *b)
 BOOL Core_PathEquals(const WCHAR *a, const WCHAR *b)
 {
     return a && b && *a && *b && Core_PathCompare(a, b) == 0;
+}
+
+/* The folder part of `path`: its length up to the last separator, 0 for none. */
+static size_t FolderLength(const WCHAR *path)
+{
+    size_t n = Core_TrimmedPathLength(path);
+    while (n > 0 && path[n - 1] != L'\\' && path[n - 1] != L'/') n--;
+    return n;
+}
+
+BOOL Core_TakesCurrentIcon(const WCHAR *location, BOOL exists, const WCHAR *current)
+{
+    size_t folder;
+    if (!location || !location[0]) return TRUE;
+    if (Core_PathEquals(location, current)) return FALSE;
+    if (!exists) return TRUE;
+    folder = FolderLength(current);
+    return folder > 0 && FolderLength(location) == folder &&
+           CompareStringOrdinal(location, (int)folder, current, (int)folder, TRUE) == CSTR_EQUAL;
 }
 
 BOOL Core_IsOurExe(const WCHAR *path)
@@ -905,6 +925,482 @@ SessionEntryKind Core_SessionEntryKind(const char *json, size_t len)
     return ENTRY_LOCAL;
 }
 
+BOOL Core_JsonEachElement(const char *json, size_t len, CoreJsonElement each, void *context)
+{
+    size_t i = 0, end;
+    if (!json) return FALSE;
+    while (i < len && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) i++;
+    if (i >= len || json[i] != '[') return FALSE;
+    for (i++; i < len; i = end) {
+        while (i < len && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n' || json[i] == ',')) i++;
+        if (i >= len) return FALSE;
+        if (json[i] == ']') return TRUE;
+        if ((end = ValueEnd(json, len, i)) == 0 || !each(context, json + i, end - i)) return FALSE;
+    }
+    return FALSE;
+}
+
+DWORD Core_SessionEnvironment(const char *json, size_t len)
+{
+    const char *value;
+    size_t valueLength;
+    if (!json) return SESSION_ENV_LOCAL;
+    if (JsonIsSet(json, len, "sshConfig")) return SESSION_ENV_SSH;
+    if (JsonIsSet(json, len, "cloudSessionId") || JsonIsSet(json, len, "movedToCloud")) return SESSION_ENV_CLOUD;
+    if (JsonIsSet(json, len, "slackThread") || JsonIsSet(json, len, "slackChannelId")) return SESSION_ENV_SLACK;
+    if (Core_JsonMember(json, len, "remoteControlUserEnabled", &value, &valueLength) && Core_JsonTrue(value, valueLength))
+        return SESSION_ENV_REMOTE;
+    return SESSION_ENV_LOCAL;   /* WSL too: Claude lists it with this PC's */
+}
+
+PullRequestState Core_SessionPullRequest(const char *json, size_t len, int *number)
+{
+    const char *list, *member;
+    size_t listLength, memberLength, i, end;
+    PullRequestState shown = PR_NONE;
+    if (number) *number = 0;
+    if (!json || !Core_JsonMember(json, len, "prs", &list, &listLength) || listLength < 2 || list[0] != '[') return PR_NONE;
+    for (i = 1; i < listLength; i = end) {
+        WCHAR state[16];
+        ULONGLONG prNumber = 0;
+        PullRequestState kind;
+        while (i < listLength && (list[i] == ' ' || list[i] == '\t' || list[i] == '\r' || list[i] == '\n' || list[i] == ',')) i++;
+        if (i >= listLength || list[i] == ']' || (end = ValueEnd(list, listLength, i)) == 0) break;
+        if (list[i] != '{') continue;
+        /* One the person dismissed in Claude shows no more. */
+        if (Core_JsonMember(list + i, end - i, "dismissed", &member, &memberLength) && Core_JsonTrue(member, memberLength)) continue;
+        state[0] = 0;
+        if (Core_JsonMember(list + i, end - i, "state", &member, &memberLength)) Core_JsonString(member, memberLength, state, ARRAYSIZE(state));
+        if (Core_EqualsI(state, L"MERGED")) kind = PR_MERGED;
+        else if (Core_EqualsI(state, L"CLOSED")) kind = PR_CLOSED;
+        else if (Core_JsonMember(list + i, end - i, "isDraft", &member, &memberLength) && Core_JsonTrue(member, memberLength)) kind = PR_DRAFT;
+        else kind = PR_OPEN;
+        if (Core_JsonMember(list + i, end - i, "prNumber", &member, &memberLength)) Core_JsonNumber(member, memberLength, &prNumber);
+        shown = kind;   /* the last one: the latest */
+        if (number) *number = (int)min(prNumber, (ULONGLONG)INT_MAX);
+    }
+    return shown;
+}
+
+BOOL Core_ContainsUtf8(const char *text, size_t len, const char *needle, size_t needleLen, BOOL matchCase)
+{
+    size_t i, j;
+    char first, firstOther;
+    if (!needleLen) return TRUE;
+    if (!text || needleLen > len) return FALSE;
+    first = needle[0];
+    firstOther = matchCase ? first : (first >= 'A' && first <= 'Z') ? (char)(first + 32) : (first >= 'a' && first <= 'z') ? (char)(first - 32) : first;
+    for (i = 0; i + needleLen <= len; i++) {
+        if (text[i] != first && text[i] != firstOther) continue;
+        for (j = 1; j < needleLen; j++) {
+            char a = text[i + j], b = needle[j];
+            if (a == b) continue;
+            if (matchCase) break;
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+        }
+        if (j == needleLen) return TRUE;
+    }
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------ regex */
+
+/* A small regular expression engine: literals, ".", classes ([a-z], [^...],
+ * \d \w \s and their negations), "^" and "$" at line ends, groups ((...),
+ * (?:...)), "|", and the quantifiers * + ? {m} {m,} {m,n} (a lazy "?" after
+ * one is accepted: only whether it matches counts). Compiled to the
+ * instructions of a Pike VM, which runs in time linear in the text: no
+ * pattern can make a search hang. */
+enum { RX_CHAR, RX_ANY, RX_CLASS, RX_BOL, RX_EOL, RX_SPLIT, RX_JMP, RX_MATCH };
+enum { RXN_EMPTY, RXN_CHAR, RXN_ANY, RXN_CLASS, RXN_BOL, RXN_EOL, RXN_CAT, RXN_ALT, RXN_REPEAT };
+enum { RX_SPECIAL_DIGIT = 1, RX_SPECIAL_WORD, RX_SPECIAL_SPACE, RX_SPECIAL_NOT_DIGIT, RX_SPECIAL_NOT_WORD, RX_SPECIAL_NOT_SPACE };
+#define RX_NODES       512
+#define RX_INFINITE    (-1)
+#define RX_REPEAT_MAX  100   /* {m,n} beyond this is refused: its copies would not fit */
+
+typedef struct RegexNode {
+    BYTE kind, negate;
+    WCHAR ch;
+    int left, right, min, max;   /* children; a class's first range and count; a repeat's bounds */
+} RegexNode;
+
+typedef struct RegexParse {
+    const WCHAR *pattern;
+    size_t at, length;
+    RegexNode node[RX_NODES];
+    int count;
+    BOOL failed;
+    CoreRegex *rx;
+} RegexParse;
+
+static int RegexNodeOf(RegexParse *parse, BYTE kind, int left, int right)
+{
+    RegexNode *node;
+    if (parse->count >= RX_NODES) {
+        parse->failed = TRUE;
+        return 0;
+    }
+    node = &parse->node[parse->count];
+    ZeroMemory(node, sizeof *node);
+    node->kind = kind;
+    node->left = left;
+    node->right = right;
+    return parse->count++;
+}
+
+static BOOL RegexAddRange(RegexParse *parse, WCHAR low, WCHAR high)
+{
+    if (parse->rx->rangeCount >= CORE_REGEX_RANGES) return parse->failed = TRUE, FALSE;
+    parse->rx->range[parse->rx->rangeCount][0] = low;
+    parse->rx->range[parse->rx->rangeCount][1] = high;
+    parse->rx->rangeCount++;
+    return TRUE;
+}
+
+/* \d \w \s and their capitals as a class's special range; 0 for another letter. */
+static WCHAR RegexSpecial(WCHAR letter)
+{
+    switch (letter) {
+    case L'd': return RX_SPECIAL_DIGIT;
+    case L'w': return RX_SPECIAL_WORD;
+    case L's': return RX_SPECIAL_SPACE;
+    case L'D': return RX_SPECIAL_NOT_DIGIT;
+    case L'W': return RX_SPECIAL_NOT_WORD;
+    case L'S': return RX_SPECIAL_NOT_SPACE;
+    }
+    return 0;
+}
+
+static WCHAR RegexEscaped(WCHAR letter)
+{
+    switch (letter) {
+    case L'n': return L'\n';
+    case L't': return L'\t';
+    case L'r': return L'\r';
+    }
+    return letter;
+}
+
+static int RegexAlternation(RegexParse *parse);
+
+static int RegexClass(RegexParse *parse)
+{
+    int node = RegexNodeOf(parse, RXN_CLASS, 0, 0), first = parse->rx->rangeCount;
+    BOOL any = FALSE;
+    if (parse->at < parse->length && parse->pattern[parse->at] == L'^') {
+        parse->node[node].negate = TRUE;
+        parse->at++;
+    }
+    while (parse->at < parse->length && (parse->pattern[parse->at] != L']' || !any)) {
+        WCHAR low = parse->pattern[parse->at++], high, special = 0;
+        any = TRUE;
+        if (low == L'\\' && parse->at < parse->length) {
+            WCHAR letter = parse->pattern[parse->at++];
+            if ((special = RegexSpecial(letter)) != 0) {
+                RegexAddRange(parse, 0, special);
+                continue;
+            }
+            low = RegexEscaped(letter);
+        }
+        high = low;
+        if (parse->at + 1 < parse->length && parse->pattern[parse->at] == L'-' && parse->pattern[parse->at + 1] != L']') {
+            high = parse->pattern[parse->at + 1];
+            parse->at += 2;
+            if (high == L'\\' && parse->at < parse->length) high = RegexEscaped(parse->pattern[parse->at++]);
+            if (high < low) return parse->failed = TRUE, node;
+        }
+        RegexAddRange(parse, low ? low : 1, high ? high : 1);
+    }
+    if (parse->at >= parse->length) return parse->failed = TRUE, node;   /* no closing ']' */
+    parse->at++;
+    parse->node[node].left = first;
+    parse->node[node].right = parse->rx->rangeCount - first;
+    return node;
+}
+
+static int RegexAtom(RegexParse *parse)
+{
+    WCHAR c = parse->pattern[parse->at++];
+    int node;
+    switch (c) {
+    case L'(':
+        if (parse->at + 1 < parse->length && parse->pattern[parse->at] == L'?' && parse->pattern[parse->at + 1] == L':') parse->at += 2;
+        node = RegexAlternation(parse);
+        if (parse->at >= parse->length || parse->pattern[parse->at] != L')') return parse->failed = TRUE, node;
+        parse->at++;
+        return node;
+    case L'[':
+        return RegexClass(parse);
+    case L'.':
+        return RegexNodeOf(parse, RXN_ANY, 0, 0);
+    case L'^':
+        return RegexNodeOf(parse, RXN_BOL, 0, 0);
+    case L'$':
+        return RegexNodeOf(parse, RXN_EOL, 0, 0);
+    case L'*': case L'+': case L'?':
+        return parse->failed = TRUE, 0;   /* nothing to repeat */
+    case L'\\':
+        if (parse->at >= parse->length) return parse->failed = TRUE, 0;
+        c = parse->pattern[parse->at++];
+        if (RegexSpecial(c)) {
+            node = RegexNodeOf(parse, RXN_CLASS, parse->rx->rangeCount, 1);
+            RegexAddRange(parse, 0, RegexSpecial(c));
+            return node;
+        }
+        c = RegexEscaped(c);
+        break;
+    }
+    node = RegexNodeOf(parse, RXN_CHAR, 0, 0);
+    parse->node[node].ch = c;
+    return node;
+}
+
+/* "{m}", "{m,}" or "{m,n}" at the parse point: TRUE with its bounds, else
+ * the brace is a character of its own. */
+static BOOL RegexBounds(RegexParse *parse, int *min, int *max)
+{
+    size_t at = parse->at + 1;
+    int low = 0, high, digits = 0;
+    while (at < parse->length && parse->pattern[at] >= L'0' && parse->pattern[at] <= L'9' && digits < 4) low = low * 10 + (parse->pattern[at++] - L'0'), digits++;
+    if (!digits || at >= parse->length) return FALSE;
+    high = low;
+    if (parse->pattern[at] == L',') {
+        at++;
+        high = RX_INFINITE;
+        if (at < parse->length && parse->pattern[at] >= L'0' && parse->pattern[at] <= L'9') {
+            high = digits = 0;
+            while (at < parse->length && parse->pattern[at] >= L'0' && parse->pattern[at] <= L'9' && digits < 4) high = high * 10 + (parse->pattern[at++] - L'0'), digits++;
+        }
+    }
+    if (at >= parse->length || parse->pattern[at] != L'}') return FALSE;
+    if (low > RX_REPEAT_MAX || high > RX_REPEAT_MAX || (high != RX_INFINITE && high < low)) {
+        parse->failed = TRUE;
+        return FALSE;
+    }
+    parse->at = at + 1;
+    *min = low;
+    *max = high;
+    return TRUE;
+}
+
+static int RegexRepeat(RegexParse *parse)
+{
+    int node = RegexAtom(parse), min, max;
+    while (!parse->failed && parse->at < parse->length) {
+        WCHAR c = parse->pattern[parse->at];
+        if (c == L'*') min = 0, max = RX_INFINITE, parse->at++;
+        else if (c == L'+') min = 1, max = RX_INFINITE, parse->at++;
+        else if (c == L'?') min = 0, max = 1, parse->at++;
+        else if (c != L'{' || !RegexBounds(parse, &min, &max)) break;
+        if (parse->at < parse->length && parse->pattern[parse->at] == L'?') parse->at++;   /* lazy */
+        node = RegexNodeOf(parse, RXN_REPEAT, node, 0);
+        parse->node[node].min = min;
+        parse->node[node].max = max;
+    }
+    return node;
+}
+
+static int RegexConcatenation(RegexParse *parse)
+{
+    int node = RegexNodeOf(parse, RXN_EMPTY, 0, 0);
+    while (!parse->failed && parse->at < parse->length && parse->pattern[parse->at] != L'|' && parse->pattern[parse->at] != L')') {
+        int next = RegexRepeat(parse);
+        node = parse->node[node].kind == RXN_EMPTY ? next : RegexNodeOf(parse, RXN_CAT, node, next);
+    }
+    return node;
+}
+
+static int RegexAlternation(RegexParse *parse)
+{
+    int node = RegexConcatenation(parse);
+    while (!parse->failed && parse->at < parse->length && parse->pattern[parse->at] == L'|') {
+        parse->at++;
+        node = RegexNodeOf(parse, RXN_ALT, node, RegexConcatenation(parse));
+    }
+    return node;
+}
+
+static int RegexEmit(RegexParse *parse, BYTE op)
+{
+    CoreRegex *rx = parse->rx;
+    if (rx->codeCount >= CORE_REGEX_CODE) {
+        parse->failed = TRUE;
+        return 0;
+    }
+    ZeroMemory(&rx->code[rx->codeCount], sizeof rx->code[rx->codeCount]);
+    rx->code[rx->codeCount].op = op;
+    return rx->codeCount++;
+}
+
+static void RegexCompileNode(RegexParse *parse, int index)
+{
+    const RegexNode *node = &parse->node[index];
+    CoreRegex *rx = parse->rx;
+    int at, jump, i;
+    if (parse->failed) return;
+    switch (node->kind) {
+    case RXN_CHAR:
+        at = RegexEmit(parse, RX_CHAR);
+        rx->code[at].ch = node->ch;
+        break;
+    case RXN_ANY: RegexEmit(parse, RX_ANY); break;
+    case RXN_BOL: RegexEmit(parse, RX_BOL); break;
+    case RXN_EOL: RegexEmit(parse, RX_EOL); break;
+    case RXN_CLASS:
+        at = RegexEmit(parse, RX_CLASS);
+        rx->code[at].x = node->left;
+        rx->code[at].y = node->right;
+        rx->code[at].negate = node->negate;
+        break;
+    case RXN_CAT:
+        RegexCompileNode(parse, node->left);
+        RegexCompileNode(parse, node->right);
+        break;
+    case RXN_ALT:
+        at = RegexEmit(parse, RX_SPLIT);
+        rx->code[at].x = rx->codeCount;
+        RegexCompileNode(parse, node->left);
+        jump = RegexEmit(parse, RX_JMP);
+        rx->code[at].y = rx->codeCount;
+        RegexCompileNode(parse, node->right);
+        rx->code[jump].x = rx->codeCount;
+        break;
+    case RXN_REPEAT:
+        for (i = 0; i < node->min && !parse->failed; i++) RegexCompileNode(parse, node->left);
+        if (node->max == RX_INFINITE) {
+            at = RegexEmit(parse, RX_SPLIT);
+            rx->code[at].x = rx->codeCount;
+            RegexCompileNode(parse, node->left);
+            jump = RegexEmit(parse, RX_JMP);
+            rx->code[jump].x = at;
+            rx->code[at].y = rx->codeCount;
+        } else {
+            for (i = node->min; i < node->max && !parse->failed; i++) {
+                at = RegexEmit(parse, RX_SPLIT);
+                rx->code[at].x = rx->codeCount;
+                RegexCompileNode(parse, node->left);
+                rx->code[at].y = rx->codeCount;
+            }
+        }
+        break;
+    }
+}
+
+BOOL Core_RegexCompile(CoreRegex *rx, const WCHAR *pattern, BOOL ignoreCase)
+{
+    RegexParse *parse = (RegexParse *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *parse);   /* large: not on the stack */
+    ZeroMemory(rx, sizeof *rx);
+    rx->ignoreCase = ignoreCase;
+    if (!parse) return FALSE;
+    parse->pattern = pattern ? pattern : L"";
+    parse->length = wcslen(parse->pattern);
+    parse->rx = rx;
+    RegexCompileNode(parse, RegexAlternation(parse));
+    if (!parse->failed && parse->at < parse->length) parse->failed = TRUE;   /* a ')' with no '(' */
+    if (!parse->failed) RegexEmit(parse, RX_MATCH);
+    rx->valid = !parse->failed;
+    HeapFree(GetProcessHeap(), 0, parse);
+    return rx->valid;
+}
+
+static BOOL RegexSpecialHas(WCHAR special, WCHAR c)
+{
+    switch (special) {
+    case RX_SPECIAL_DIGIT: return c >= L'0' && c <= L'9';
+    case RX_SPECIAL_WORD: return iswalnum(c) || c == L'_';
+    case RX_SPECIAL_SPACE: return iswspace(c) != 0;
+    case RX_SPECIAL_NOT_DIGIT: return !(c >= L'0' && c <= L'9');
+    case RX_SPECIAL_NOT_WORD: return !(iswalnum(c) || c == L'_');
+    case RX_SPECIAL_NOT_SPACE: return !iswspace(c);
+    }
+    return FALSE;
+}
+
+static BOOL RegexClassHas(const CoreRegex *rx, const CoreRegexInstruction *in, WCHAR c)
+{
+    WCHAR lower = rx->ignoreCase ? towlower(c) : c, upper = rx->ignoreCase ? towupper(c) : c;
+    int i;
+    BOOL found = FALSE;
+    for (i = 0; i < in->y && !found; i++) {
+        WCHAR low = rx->range[in->x + i][0], high = rx->range[in->x + i][1];
+        if (!low) found = RegexSpecialHas(high, c);
+        else found = (c >= low && c <= high) || (lower >= low && lower <= high) || (upper >= low && upper <= high);
+    }
+    return found != (BOOL)in->negate;
+}
+
+typedef struct RegexRun {
+    const CoreRegex *rx;
+    const WCHAR *text;
+    size_t length;
+    int *mark, generation;
+    BOOL matched;
+} RegexRun;
+
+static void RegexThread(RegexRun *run, int *list, int *count, int pc, size_t at)
+{
+    const CoreRegexInstruction *in = &run->rx->code[pc];
+    if (run->mark[pc] == run->generation) return;
+    run->mark[pc] = run->generation;
+    switch (in->op) {
+    case RX_JMP:
+        RegexThread(run, list, count, in->x, at);
+        return;
+    case RX_SPLIT:
+        RegexThread(run, list, count, in->x, at);
+        RegexThread(run, list, count, in->y, at);
+        return;
+    case RX_BOL:
+        if (at == 0 || run->text[at - 1] == L'\n') RegexThread(run, list, count, pc + 1, at);
+        return;
+    case RX_EOL:
+        if (at == run->length || run->text[at] == L'\n' || run->text[at] == L'\r') RegexThread(run, list, count, pc + 1, at);
+        return;
+    case RX_MATCH:
+        run->matched = TRUE;
+        return;
+    }
+    list[(*count)++] = pc;
+}
+
+BOOL Core_RegexSearch(const CoreRegex *rx, const WCHAR *text, size_t length)
+{
+    int lists[2][CORE_REGEX_CODE], mark[CORE_REGEX_CODE], counts[2] = { 0, 0 }, current = 0, i;
+    RegexRun run;
+    size_t at;
+    if (!rx || !rx->valid || !text) return FALSE;
+    run.rx = rx;
+    run.text = text;
+    run.length = length;
+    run.mark = mark;
+    run.generation = 1;
+    run.matched = FALSE;
+    for (i = 0; i < rx->codeCount; i++) mark[i] = 0;
+    RegexThread(&run, lists[current], &counts[current], 0, 0);
+    for (at = 0; !run.matched && at < length; at++) {
+        int next = 1 - current;
+        WCHAR c = text[at];
+        counts[next] = 0;
+        run.generation++;
+        for (i = 0; i < counts[current]; i++) {
+            const CoreRegexInstruction *in = &rx->code[lists[current][i]];
+            BOOL step;
+            switch (in->op) {
+            case RX_CHAR: step = c == in->ch || (rx->ignoreCase && towlower(c) == towlower(in->ch)); break;
+            case RX_ANY: step = c != L'\n'; break;
+            case RX_CLASS: step = RegexClassHas(rx, in, c); break;
+            default: step = FALSE; break;
+            }
+            if (step) RegexThread(&run, lists[next], &counts[next], lists[current][i] + 1, at + 1);
+        }
+        RegexThread(&run, lists[next], &counts[next], 0, at + 1);   /* a match may start anywhere */
+        current = next;
+    }
+    return run.matched;
+}
+
 /* ------------------------------------------------------------ transcripts */
 
 #define TRANSCRIPT_CUT L"\x2026"
@@ -1244,8 +1740,8 @@ size_t Core_ReplaceChunk(const char *in, size_t len, const CoreSwap *swaps, int 
 
 /* A change to a session entry waiting for its profile to close, one per
  * line: "<op>\t<session id>\t<value>". */
-static const WCHAR *const kPendingOps[] = { L"title", L"star", L"remove" };
-C_ASSERT(ARRAYSIZE(kPendingOps) == PENDING_REMOVE + 1);
+static const WCHAR *const kPendingOps[] = { L"title", L"star", L"remove", L"auto-title" };
+C_ASSERT(ARRAYSIZE(kPendingOps) == PENDING_TITLE_AUTO + 1);
 
 BOOL Core_PendingFormat(const PendingEdit *edit, WCHAR *out, size_t cch)
 {
@@ -1274,12 +1770,19 @@ BOOL Core_PendingParse(const WCHAR *line, PendingEdit *edit)
     return TRUE;
 }
 
+static BOOL IsTitleOp(PendingOp op)
+{
+    return op == PENDING_TITLE || op == PENDING_TITLE_AUTO;
+}
+
 /* A change queued after `queued` replaces it: one of the same kind to the
- * same session, and a removal replaces them all (and is replaced by any). */
+ * same session (a title, whoever gave it), and a removal replaces them all
+ * (and is replaced by any). */
 BOOL Core_PendingReplaces(const PendingEdit *queued, const PendingEdit *added)
 {
     return EqualsI(queued->key, -1, added->key, -1) &&
-           (queued->op == added->op || queued->op == PENDING_REMOVE || added->op == PENDING_REMOVE);
+           (queued->op == added->op || (IsTitleOp(queued->op) && IsTitleOp(added->op)) || queued->op == PENDING_REMOVE ||
+            added->op == PENDING_REMOVE);
 }
 
 /* ------------------------------------------------------------- sync plans */
@@ -1364,6 +1867,34 @@ static int SyncOpFamily(SyncOpKind kind)
 BOOL Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added)
 {
     return SyncOpFamily(queued->kind) == SyncOpFamily(added->kind) && EqualsI(queued->key, -1, added->key, -1);
+}
+
+static const DWORD kSyncGroups[SYNC_GROUP_COUNT] = {
+    SYNC_ITEM_SESSIONS, SYNC_ITEM_SIDEBAR, SYNC_ITEM_DETAILS, SYNC_ITEM_APPEARANCE,
+    SYNC_ITEM_LANGUAGE, SYNC_ITEM_MODEL, SYNC_ITEM_SETTINGS, SYNC_ITEM_PERMISSIONS,
+};
+
+DWORD Core_SyncGroup(int index)
+{
+    return index >= 0 && index < SYNC_GROUP_COUNT ? kSyncGroups[index] : 0;
+}
+
+DWORD Core_SyncItemsOfGroups(DWORD groups)
+{
+    DWORD items = 0;
+    int g;
+    for (g = 0; g < SYNC_GROUP_COUNT; g++)
+        if (groups & (1u << g)) items |= kSyncGroups[g];
+    return items;
+}
+
+DWORD Core_SyncGroupsOf(DWORD items)
+{
+    DWORD groups = 0;
+    int g;
+    for (g = 0; g < SYNC_GROUP_COUNT; g++)
+        if (items & kSyncGroups[g]) groups |= 1u << g;
+    return groups;
 }
 
 /* What every profile of a group keeping the same sessions gets of one
@@ -1460,36 +1991,6 @@ BOOL Core_WeeklyCopyDue(const SYSTEMTIME *latest, const SYSTEMTIME *today)
     if (!SystemTimeToFileTime(&from, &a) || !SystemTimeToFileTime(&to, &b)) return TRUE;
     return (((ULONGLONG)b.dwHighDateTime << 32) | b.dwLowDateTime) >=
            (((ULONGLONG)a.dwHighDateTime << 32) | a.dwLowDateTime) + (ULONGLONG)CORE_WEEKLY_COPY_DAYS * 24 * 3600 * TICKS_PER_SECOND;
-}
-
-/* The version the manager shows, the time this copy was built: the
- * compiler's __DATE__ ("Oct  8 2026") and __TIME__ ("17:20:33") as
- * "2026.10.08 17:20". */
-static int Digits(const char *text, int count)
-{
-    int value = 0, i;
-    for (i = 0; i < count; i++) {
-        if (text[i] == ' ' && value == 0) continue;
-        if (text[i] < '0' || text[i] > '9') return -1;
-        value = value * 10 + (text[i] - '0');
-    }
-    return value;
-}
-
-BOOL Core_BuildStamp(const char *date, const char *time, WCHAR *out, size_t cch)
-{
-    static const char kMonths[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    int month, day, year, hour, minute;
-    if (cch) out[0] = 0;
-    if (!date || !time || strlen(date) != 11 || strlen(time) != 8 || date[3] != ' ' || date[6] != ' ' || time[2] != ':' || time[5] != ':')
-        return FALSE;
-    for (month = 0; month < 12 && memcmp(kMonths + 3 * month, date, 3) != 0; month++) {}
-    day = Digits(date + 4, 2);
-    year = Digits(date + 7, 4);
-    hour = Digits(time, 2);
-    minute = Digits(time + 3, 2);
-    if (month == 12 || day < 1 || day > 31 || year < 0 || hour < 0 || hour > 23 || minute < 0 || minute > 59) return FALSE;
-    return SUCCEEDED(StringCchPrintfW(out, cch, L"%04d.%02d.%02d %02d:%02d", year, month + 1, day, hour, minute));
 }
 
 /* The name of the "no folder" working folder `cwd` is, in whichever
@@ -1815,6 +2316,255 @@ BOOL Core_ConversationFileName(const WCHAR *relative)
     return project && (_wcsicmp(rest, L".jsonl") == 0 || _wcsicmp(rest, L".precompact.json") == 0);
 }
 
+/* ------------------------------------------------------------ the changelog */
+
+#define CHANGELOG_LINE_CCH 4096   /* a line's characters at most (tools/changelog.py keeps them shorter) */
+
+static BOOL ChangelogPut(WCHAR *out, size_t cch, size_t *used, const WCHAR *text, size_t length)
+{
+    if (*used + length >= cch) return FALSE;
+    memcpy(out + *used, text, length * sizeof(WCHAR));
+    *used += length;
+    out[*used] = 0;
+    return TRUE;
+}
+
+static BOOL StartsWith(const WCHAR *text, size_t length, const WCHAR *start)
+{
+    size_t n = wcslen(start);
+    return length >= n && wcsncmp(text, start, n) == 0;
+}
+
+/* The changelog `markdown` (UTF-8, in CHANGELOG.md's form: tools/changelog.py)
+ * as the program shows it: each version, newest first, at most `max`, its
+ * heading ("v2026.10.12") in `versions`, and between its `from` and `to` in
+ * `text` what it says, in Markdown (Core_MarkdownRtf renders it): its
+ * summary, then each section's heading ("### ...") and its lines, numbered
+ * "1. ", "2. "... in the section whatever number the file gives them, one a
+ * line (LF), an empty line before a section. What comes before the first
+ * version is left out. The versions read, 0 when there is none or the text
+ * does not fit. */
+int Core_ChangelogRead(const char *markdown, size_t length, ChangelogVersion *versions, int max, WCHAR *text, size_t cch)
+{
+    static const WCHAR kLineEnd[] = L"\n", kEmptyLine[] = L"\n\n";
+    WCHAR line[CHANGELOG_LINE_CCH], number[16];
+    size_t start = 0, end, used = 0, n, w, digits, skip;
+    int count = 0, entries = 0;
+    BOOL fits = TRUE, section = FALSE, said;
+    if (!text || !cch) return 0;
+    text[0] = 0;
+    if (!markdown || !versions || max <= 0) return 0;
+    if (length >= 3 && memcmp(markdown, "\xEF\xBB\xBF", 3) == 0) start = 3;
+    for (; start < length && fits; start = end + 1) {
+        for (end = start; end < length && markdown[end] != '\n'; end++) {}
+        n = end - start;
+        if (n && markdown[start + n - 1] == '\r') n--;
+        if (!n) continue;
+        if (n >= ARRAYSIZE(line)) return 0;
+        w = (size_t)MultiByteToWideChar(CP_UTF8, 0, markdown + start, (int)n, line, (int)ARRAYSIZE(line) - 1);
+        if (!w) return 0;
+        line[w] = 0;
+        if (StartsWith(line, w, L"## ")) {
+            if (count == max) break;
+            if (FAILED(StringCchCopyNW(versions[count].name, ARRAYSIZE(versions[count].name), line + 3, w - 3))) return 0;
+            versions[count].from = versions[count].to = used;
+            count++;
+            section = FALSE;
+            continue;
+        }
+        if (!count) continue;
+        said = versions[count - 1].to > versions[count - 1].from;
+        if (StartsWith(line, w, L"### ")) {
+            if (said) fits = ChangelogPut(text, cch, &used, kEmptyLine, 2);
+            fits = fits && ChangelogPut(text, cch, &used, line, w);
+            section = TRUE;
+            entries = 0;
+        } else if (section) {
+            for (digits = 0; digits < w && line[digits] >= L'0' && line[digits] <= L'9'; digits++) {}
+            skip = digits && StartsWith(line + digits, w - digits, L". ") ? digits + 2 : 0;
+            fits = ChangelogPut(text, cch, &used, kLineEnd, 1) && SUCCEEDED(StringCchPrintfW(number, ARRAYSIZE(number), L"%d. ", ++entries)) &&
+                   ChangelogPut(text, cch, &used, number, wcslen(number)) && ChangelogPut(text, cch, &used, line + skip, w - skip);
+        } else {
+            if (said) fits = ChangelogPut(text, cch, &used, kEmptyLine, 2);   /* the summary's paragraphs */
+            fits = fits && ChangelogPut(text, cch, &used, line, w);
+        }
+        versions[count - 1].to = used;
+    }
+    if (!fits || !count) {
+        text[0] = 0;
+        return 0;
+    }
+    return count;
+}
+
+/* ------------------------------------------------------------ Markdown as RTF */
+
+typedef struct RtfOut {
+    char  *out;
+    size_t cch, used;
+    BOOL   full;
+} RtfOut;
+
+static void RtfRaw(RtfOut *rtf, const char *piece)
+{
+    size_t n = strlen(piece);
+    if (rtf->full || rtf->used + n >= rtf->cch) {
+        rtf->full = TRUE;
+        return;
+    }
+    memcpy(rtf->out + rtf->used, piece, n);
+    rtf->used += n;
+    rtf->out[rtf->used] = 0;
+}
+
+static void RtfFormat(RtfOut *rtf, const char *format, ...)
+{
+    char piece[256];
+    va_list args;
+    va_start(args, format);
+    if (FAILED(StringCchVPrintfA(piece, ARRAYSIZE(piece), format, args))) rtf->full = TRUE;
+    else RtfRaw(rtf, piece);
+    va_end(args);
+}
+
+/* One character of text: RTF's own escaped, the rest of ASCII as it is,
+ * every other one as its UTF-16 unit (\uN, with "?" for a reader without). */
+static void RtfChar(RtfOut *rtf, WCHAR c)
+{
+    if (c == L'\\' || c == L'{' || c == L'}') RtfFormat(rtf, "\\%c", (char)c);
+    else if (c == L'\t') RtfRaw(rtf, "\\tab ");
+    else if (c >= 32 && c < 127) RtfFormat(rtf, "%c", (char)c);
+    else if (c >= 127) RtfFormat(rtf, "\\u%d?", (int)(short)c);
+}
+
+/* A run of text, its Markdown made RTF: **bold**, `code` (in the code font
+ * on the code's color), [text](address) (the text, in the link's color,
+ * underlined), a backslash escaping what follows. */
+static void RtfInline(RtfOut *rtf, const WCHAR *text, size_t length)
+{
+    size_t i, close, end, j;
+    for (i = 0; i < length; i++) {
+        WCHAR c = text[i];
+        if (c == L'\\' && i + 1 < length && text[i + 1] < 128 && iswpunct(text[i + 1])) {
+            RtfChar(rtf, text[++i]);
+            continue;
+        }
+        if (c == L'*' && i + 1 < length && text[i + 1] == L'*') {
+            for (close = i + 2; close + 1 < length && !(text[close] == L'*' && text[close + 1] == L'*'); close++) {}
+            if (close + 1 < length) {
+                RtfRaw(rtf, "{\\b ");
+                RtfInline(rtf, text + i + 2, close - i - 2);
+                RtfRaw(rtf, "}");
+                i = close + 1;
+                continue;
+            }
+        }
+        if (c == L'`') {
+            for (close = i + 1; close < length && text[close] != L'`'; close++) {}
+            if (close < length) {
+                RtfRaw(rtf, "{\\f1\\highlight4 ");
+                for (j = i + 1; j < close; j++) RtfChar(rtf, text[j]);
+                RtfRaw(rtf, "}");
+                i = close;
+                continue;
+            }
+        }
+        if (c == L'[') {
+            for (close = i + 1; close < length && text[close] != L']'; close++) {}
+            if (close + 1 < length && text[close + 1] == L'(') {
+                for (end = close + 2; end < length && text[end] != L')'; end++) {}
+                if (end < length) {
+                    RtfRaw(rtf, "{\\cf3\\ul ");
+                    RtfInline(rtf, text + i + 1, close - i - 1);
+                    RtfRaw(rtf, "}");
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        RtfChar(rtf, c);
+    }
+}
+
+static void RtfFaceName(RtfOut *rtf, const WCHAR *face)
+{
+    for (; face && *face; face++) RtfChar(rtf, *face);
+}
+
+static void RtfColor(RtfOut *rtf, COLORREF color)
+{
+    RtfFormat(rtf, "\\red%u\\green%u\\blue%u;", GetRValue(color), GetGValue(color), GetBValue(color));
+}
+
+/* `markdown` as RTF in `out` (ASCII), as a release page shows it, in
+ * `style`'s fonts and colors: "# ", "## " and "### " headings bold and
+ * larger, a line "N. text" numbered with its text indented past the number
+ * (lines that wrap stay under it), "> " a quote in the muted color, every
+ * other line a paragraph; within each, bold, code and links (RtfInline).
+ * Empty lines only part blocks. The characters written, 0 when it does not
+ * fit. */
+size_t Core_MarkdownRtf(const WCHAR *markdown, const CoreRtfStyle *style, char *out, size_t cch)
+{
+    static const int kHeadingSize[] = { 0, 16, 13, 11 };   /* tenths of the text's size, for "#" to "###" */
+    static const int kHeadingBefore[] = { 0, 0, 360, 220 };   /* twips above a heading, but the first block */
+    RtfOut rtf;
+    const WCHAR *line, *next;
+    size_t length, digits;
+    int level, size;
+    BOOL first = TRUE;
+    if (!out || !cch) return 0;
+    out[0] = 0;
+    if (!markdown || !style) return 0;
+    ZeroMemory(&rtf, sizeof rtf);
+    rtf.out = out;
+    rtf.cch = cch;
+    RtfRaw(&rtf, "{\\rtf1\\ansi\\deff0\\uc1{\\fonttbl{\\f0\\fnil ");
+    RtfFaceName(&rtf, style->face);
+    RtfRaw(&rtf, ";}{\\f1\\fmodern ");
+    RtfFaceName(&rtf, style->codeFace);
+    RtfRaw(&rtf, ";}}{\\colortbl ;");
+    RtfColor(&rtf, style->text);
+    RtfColor(&rtf, style->muted);
+    RtfColor(&rtf, style->link);
+    RtfColor(&rtf, style->codeBack);
+    RtfFormat(&rtf, "}\\f0\\fs%d\\cf1\n", style->size);
+    for (line = markdown; *line; line = *next ? next + 1 : next) {
+        for (next = line; *next && *next != L'\n'; next++) {}
+        length = (size_t)(next - line);
+        if (length && line[length - 1] == L'\r') length--;
+        if (!length) continue;
+        for (level = 0; level < 3 && (size_t)level < length && line[level] == L'#'; level++) {}
+        for (digits = 0; digits < length && line[digits] >= L'0' && line[digits] <= L'9'; digits++) {}
+        if (level && (size_t)level < length && line[level] == L' ') {
+            size = (style->size * kHeadingSize[level] + 5) / 10;
+            RtfFormat(&rtf, "\\pard\\sb%d\\sa%d\\b\\fs%d ", first ? 0 : kHeadingBefore[level], level == 3 ? 60 : 120, size);
+            RtfInline(&rtf, line + level + 1, length - level - 1);
+            RtfFormat(&rtf, "\\b0\\fs%d\\par\n", style->size);
+        } else if (digits && digits + 1 < length && line[digits] == L'.' && line[digits + 1] == L' ') {
+            RtfFormat(&rtf, "\\pard\\fi-%d\\li%d\\tx%d\\sa40 ", style->indent, style->indent, style->indent);
+            RtfInline(&rtf, line, digits + 1);
+            RtfRaw(&rtf, "\\tab ");
+            RtfInline(&rtf, line + digits + 2, length - digits - 2);
+            RtfRaw(&rtf, "\\par\n");
+        } else if (length > 1 && line[0] == L'>' && line[1] == L' ') {
+            RtfFormat(&rtf, "\\pard\\li%d\\sa120\\cf2 ", style->indent);
+            RtfInline(&rtf, line + 2, length - 2);
+            RtfRaw(&rtf, "\\cf1\\par\n");
+        } else {
+            RtfRaw(&rtf, "\\pard\\sa120 ");
+            RtfInline(&rtf, line, length);
+            RtfRaw(&rtf, "\\par\n");
+        }
+        first = FALSE;
+    }
+    RtfRaw(&rtf, "}");
+    if (rtf.full) {
+        out[0] = 0;
+        return 0;
+    }
+    return rtf.used;
+}
+
 /* ------------------------------------------------------------ drawing math */
 
 /* One frame of a smooth wheel scroll: how many px of the `pending` ones it
@@ -1830,6 +2580,20 @@ int Core_ScrollStep(int pending, int elapsedMs)
     px = (int)(part + (part >= 0 ? 0.5 : -0.5));
     if (px == 0) px = pending > 0 ? 1 : -1;
     return px;
+}
+
+/* The px a wheel message of `delta` (WHEEL_DELTA a notch, the sign of the
+ * wheel's) moves when a notch moves `notchPx`. A precision touchpad sends a
+ * notch in many small messages, down to a delta of 1: what each leaves short
+ * of a whole px waits in `*rest` for the next one, so they add up to the
+ * notch exactly; turning the other way drops it. */
+int Core_WheelPixels(int delta, int notchPx, int *rest)
+{
+    int total;
+    if (*rest && (*rest > 0) != (delta > 0)) *rest = 0;
+    total = delta * notchPx + *rest;
+    *rest = total % WHEEL_DELTA;
+    return total / WHEEL_DELTA;
 }
 
 /* FNV-1a, 64 bits: `hash` goes on with `size` more bytes (start from CORE_HASH_START). */

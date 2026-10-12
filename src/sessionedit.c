@@ -115,7 +115,7 @@ static BOOL SaveFile(const WCHAR *path, const char *data, size_t length, const P
     return ok;
 }
 
-/* Sets members of an entry file (`raws` are JSON values). */
+/* Sets members of an entry file (`raws` are JSON values; NULL takes that member away). */
 static BOOL SetMembers(const Profile *profile, const WCHAR *file, const char *const *keys, const char *const *raws, int count)
 {
     DWORD length = 0;
@@ -124,7 +124,7 @@ static BOOL SetMembers(const Profile *profile, const WCHAR *file, const char *co
     BOOL ok = json != NULL;
     int i;
     if (!ok) Util_Log(L"could not read %s whole", file);   /* missing, empty, too big or still written */
-    for (i = 0; i < count; i++) capacity += strlen(keys[i]) + strlen(raws[i]) + JSON_MEMBER_SYNTAX;
+    for (i = 0; i < count; i++) capacity += strlen(keys[i]) + (raws[i] ? strlen(raws[i]) : 0) + JSON_MEMBER_SYNTAX;
     if (ok) {
         current = (char *)HeapAlloc(GetProcessHeap(), 0, capacity);
         next = (char *)HeapAlloc(GetProcessHeap(), 0, capacity);
@@ -133,7 +133,8 @@ static BOOL SetMembers(const Profile *profile, const WCHAR *file, const char *co
     if (ok) memcpy(current, json, length);
     for (i = 0; ok && i < count; i++) {
         char *swap;
-        ok = Core_JsonSetMember(current, used, keys[i], raws[i], next, capacity, &used);
+        ok = raws[i] ? Core_JsonSetMember(current, used, keys[i], raws[i], next, capacity, &used)
+                     : Core_JsonRemoveMember(current, used, keys[i], next, capacity, &used);
         swap = current;
         current = next;
         next = swap;
@@ -150,12 +151,19 @@ static BOOL SetInEntry(const Profile *profile, const WCHAR *file, const PendingE
 {
     char title[SESSION_TITLE_CCH * 6 + 3];   /* every character escaped as \u00XX, and the quotes */
     const char *keys[2], *raws[2];
-    if (edit->op == PENDING_TITLE) {
+    if (edit->op == PENDING_TITLE_AUTO && !edit->value[0]) {   /* untitled again */
+        keys[0] = "title";
+        raws[0] = NULL;
+        keys[1] = "titleSource";
+        raws[1] = NULL;
+        return SetMembers(profile, file, keys, raws, 2);
+    }
+    if (edit->op == PENDING_TITLE || edit->op == PENDING_TITLE_AUTO) {
         if (!edit->value[0] || !Core_JsonQuote(edit->value, title, sizeof title)) return FALSE;
         keys[0] = "title";
         raws[0] = title;
-        keys[1] = "titleSource";   /* a title someone chose: Claude does not replace it */
-        raws[1] = "\"user\"";
+        keys[1] = "titleSource";   /* a title someone chose: Claude does not replace it; its own, it may */
+        raws[1] = edit->op == PENDING_TITLE ? "\"user\"" : "\"auto\"";
         return SetMembers(profile, file, keys, raws, 2);
     }
     keys[0] = "isStarred";
@@ -403,7 +411,9 @@ static PendingEdit *SessionKeys(const SessionSet *set, int row, int profile, Pen
 
 static const WCHAR *ChangeName(PendingOp operation)
 {
-    return operation == PENDING_TITLE ? L"title changed" : operation == PENDING_STAR ? L"star changed" : L"entry removed";
+    return operation == PENDING_TITLE || operation == PENDING_TITLE_AUTO ? L"title changed"
+           : operation == PENDING_STAR                                    ? L"star changed"
+                                                                          : L"entry removed";
 }
 
 /* Changes one profile's entries for a session: at once when the profile is
@@ -1150,6 +1160,108 @@ static BOOL AddTemporaryFolders(WCHAR (**paths)[LONG_PATH_CCH], int *count, int 
     return TRUE;
 }
 
+/* The transcript Claude staged when it took the session in (stagedTranscriptPath),
+ * when it is in the staging folder beside entry `file`, as Claude's delete checks. */
+static BOOL AddStagedTranscript(WCHAR (**paths)[LONG_PATH_CCH], int *count, int *capacity, const WCHAR *file,
+                                WCHAR *failed, DWORD *code)
+{
+    WCHAR staging[LONG_PATH_CCH], staged[LONG_PATH_CCH], *slash;
+    const char *value;
+    size_t valueLength;
+    DWORD length = 0;
+    char *json = Util_ReadFile(file, SESSION_ENTRY_MAX_BYTES, FALSE, &length);
+    BOOL named;
+    if (!json) return TRUE;
+    named = Core_JsonMember(json, length, "stagedTranscriptPath", &value, &valueLength) &&
+            Core_JsonString(value, valueLength, staged, ARRAYSIZE(staged));
+    HeapFree(GetProcessHeap(), 0, json);
+    if (!named || FAILED(StringCchCopyW(staging, ARRAYSIZE(staging), file)) || (slash = wcsrchr(staging, L'\\')) == NULL) return TRUE;
+    *slash = 0;
+    if (FAILED(StringCchCatW(staging, ARRAYSIZE(staging), L"\\" STAGING_DIR)) || !Core_PathUnder(staged, staging) ||
+        Core_PathEquals(staged, staging) || wcsstr(staged, L"\\..") || wcschr(staged, L'/'))
+        return TRUE;
+    return AddIfPresent(paths, count, capacity, staged, FALSE, failed, code);
+}
+
+/* A session without a folder works in a folder of its own, right in its
+ * profile's "no folder" area: Claude's delete removes it with the session,
+ * unless another session works there. TRUE with its physical path when it
+ * would go. */
+BOOL SessionEdit_RemovesWorkingFolder(const SessionSet *set, int row, WCHAR *physical, size_t cch)
+{
+    const SessionRow *session = &set->rows[row];
+    WCHAR area[MAX_PATH], *slash;
+    int owner, r;
+    if (!set->groups || session->group < 0 || session->group >= set->groupCount ||
+        (owner = set->groups[session->group].scratchOf) < 0 || !set->source[owner].scratchDir[0] ||
+        FAILED(StringCchCopyW(area, ARRAYSIZE(area), session->cwd)) || (slash = wcsrchr(area, L'\\')) == NULL)
+        return FALSE;
+    *slash = 0;
+    if (!Core_PathEquals(area, set->source[owner].scratchDir)) return FALSE;
+    for (r = 0; r < set->rowCount; r++)
+        if (r != row && Core_PathUnder(set->rows[r].cwd, session->cwd)) return FALSE;
+    return SessionStore_WorkingDir(set, session->cwd, physical, cch) && Util_DirExists(physical);
+}
+
+/* The complete removal, listed before any file moves: the session's entries
+ * in every profile with the transcript Claude staged for each; for each of
+ * its transcripts that no other session claims, what Claude Code keeps for
+ * it (kSessionItems) and its temporary folder; for a session without a
+ * folder, its working folder (SessionEdit_RemovesWorkingFolder). The caller
+ * frees the heap array. FALSE with the reason in `error` (and logged) when
+ * a part of it could not be told. */
+BOOL SessionEdit_ListFiles(const SessionSet *set, int row, WCHAR (**paths)[LONG_PATH_CCH], int *count, WCHAR *error, size_t errorCch)
+{
+    const SessionRow *session;
+    const WCHAR **ids = NULL;
+    WCHAR failed[LONG_PATH_CCH], working[MAX_PATH];
+    DWORD code = ERROR_INVALID_PARAMETER;
+    BOOL ok = FALSE;
+    int p, entry, capacity = 0, idCount = 0, i;
+    *paths = NULL;
+    *count = 0;
+    error[0] = 0;
+    failed[0] = 0;
+    if (row < 0 || row >= set->rowCount) goto done;
+    session = &set->rows[row];
+    StringCchCopyW(failed, ARRAYSIZE(failed), session->key);
+    for (p = 0; p < set->profiles.count; p++)
+        for (entry = session->entry[p]; entry >= 0; entry = set->entries[entry].duplicate) {
+            if (!AddSessionFile(paths, count, &capacity, set->entries[entry].file)) {
+                code = ERROR_NOT_ENOUGH_MEMORY;
+                goto done;
+            }
+            if (!AddStagedTranscript(paths, count, &capacity, set->entries[entry].file, failed, &code)) goto done;
+        }
+    if (SessionEdit_RemovesWorkingFolder(set, row, working, ARRAYSIZE(working)) &&
+        !AddIfPresent(paths, count, &capacity, working, TRUE, failed, &code))
+        goto done;
+    if ((ids = SessionStore_TranscriptIds(set, row, &idCount)) == NULL) {
+        code = ERROR_NOT_ENOUGH_MEMORY;
+        goto done;
+    }
+    /* A transcript another session claims stays, with what Claude Code keeps for it. */
+    for (i = 0; i < idCount; i++)
+        if (SessionStore_ClaimedByOther(set, row, -1, ids[i])) ids[i--] = ids[--idCount];
+    if (idCount == 0) {
+        ok = TRUE;
+        goto done;
+    }
+    ok = AddStoreItems(paths, count, &capacity, ids, idCount, FALSE, failed, &code) &&
+         AddTemporaryFolders(paths, count, &capacity, ids, idCount, failed, &code) &&
+         AddProjectItems(paths, count, &capacity, ids, idCount, FALSE, failed, &code);
+done:
+    if (ids) HeapFree(GetProcessHeap(), 0, (void *)ids);
+    if (!ok) {
+        if (*paths) HeapFree(GetProcessHeap(), 0, *paths);
+        *paths = NULL;
+        *count = 0;
+        StringCchPrintfW(error, errorCch, TR(L"Its files could not all be listed (error %lu): %s"), code, failed);
+        Util_Log(L"session files could not all be listed (error %lu): %s", code, failed);
+    }
+    return ok;
+}
+
 /* What makes up the conversation of session `row` in Claude Code's folder,
  * for each of its transcripts, other sessions' too (an export takes it
  * whole): the files and folders kSessionItems marks as part of it. The
@@ -1185,7 +1297,7 @@ BOOL SessionEdit_ListConversation(const SessionSet *set, int row, WCHAR (**paths
 }
 
 /* What Claude Code keeps for transcripts `ids` that no session lists any
- * more: in its stores,
+ * more, as SessionEdit_ListFiles lists it for a session's own: in its stores,
  * its temporary folder and each project folder; never a working folder. */
 BOOL SessionEdit_ListTranscriptFiles(const WCHAR *const *ids, int idCount, WCHAR (**paths)[LONG_PATH_CCH], int *count, WCHAR *error,
                                      size_t errorCch)
@@ -1216,4 +1328,87 @@ BOOL SessionEdit_ListTranscriptFiles(const WCHAR *const *ids, int idCount, WCHAR
 BOOL SessionEdit_TemporaryDir(WCHAR *out, size_t cch)
 {
     return ClaudeCodeTempDir(out, cch);
+}
+
+/* No Claude would write the session back once it is deleted: no profile
+ * that lists it runs, and no Claude Code runs it (one a profile started
+ * without listing it yet, or one in a terminal). FALSE with the reason in
+ * `error`. */
+BOOL SessionEdit_CanDelete(const SessionSet *set, int row, WCHAR *error, size_t errorCch)
+{
+    const SessionRow *session = &set->rows[row];
+    ProfileList now;
+    DWORD running = 0;
+    BOOL outside = FALSE;
+    int p;
+    if (errorCch) error[0] = 0;
+    for (p = 0; p < set->profiles.count; p++)
+        if (session->entry[p] >= 0 && Claude_IsRunning(&set->profiles.items[p])) running |= 1u << p;
+    if (!running) {
+        now = set->profiles;
+        Claude_UpdateRunning(&now);
+        running = SessionStore_RunningNow(&now, session->key, &outside);
+    }
+    for (p = 0; p < set->profiles.count && !(running & (1u << p)); p++) {}
+    if (p < set->profiles.count)
+        StringCchPrintfW(error, errorCch, TR(L"Close \x201C%s\x201D first: while it runs, Claude keeps this session and would write it back."),
+                         set->profiles.items[p].name);
+    else if (outside)
+        StringCchCopyW(error, errorCch, TR(L"Close the Claude Code that runs it first (in a terminal, for example): it would write it back."));
+    else
+        return TRUE;
+    Util_Log(L"session %s not deleted: it runs in %s", session->key,
+             p < set->profiles.count ? set->profiles.items[p].folder : L"a Claude Code of no profile");
+    return FALSE;
+}
+
+/* Every entry of the session (in each profile's current account and
+ * organization) and its conversation (SessionEdit_ListFiles) to the Recycle
+ * Bin, then Claude's marks that it was deleted and the changes waiting for it
+ * dropped. Only when nothing runs it; a profile started while Windows asked
+ * keeps the session in its Claude: its entry goes when that Claude closes. */
+RemoveResult SessionEdit_DeleteEverywhere(HWND owner, const SessionSet *set, int row, WCHAR *error, size_t errorCch)
+{
+    const SessionRow *session = &set->rows[row];
+    WCHAR (*paths)[LONG_PATH_CCH] = NULL;
+    const WCHAR **list = NULL;
+    int pathCount = 0, i, p;
+    RemoveResult result = REMOVE_FAILED;
+
+    error[0] = 0;
+    if (!SessionEdit_CanDelete(set, row, error, errorCch) || !SessionEdit_ListFiles(set, row, &paths, &pathCount, error, errorCch)) goto done;
+    /* Rather nothing deleted than a part. */
+    for (i = 0; i < pathCount; i++)
+        if (!FitsRecycleBin(paths[i], error, errorCch)) goto done;
+    list = (const WCHAR **)HeapAlloc(GetProcessHeap(), 0, (size_t)max(pathCount, 1) * sizeof *list);
+    if (!list) {
+        StringCchPrintfW(error, errorCch, TR(L"Its files could not all be listed (error %lu): %s"), (DWORD)ERROR_NOT_ENOUGH_MEMORY, session->key);
+        goto done;
+    }
+    /* Listing can take time; a Claude may have started meanwhile. */
+    if (!SessionEdit_CanDelete(set, row, error, errorCch)) goto done;
+    for (i = 0; i < pathCount; i++) list[i] = paths[i];
+    result = Util_Recycle(owner, list, pathCount);
+    Util_Log(L"session %s deleted everywhere (%d item(s)): %s", session->key, pathCount,
+             result == REMOVE_DONE ? L"done" : result == REMOVE_CANCELLED ? L"cancelled" : L"FAILED");
+    if (result == REMOVE_FAILED) StringCchCopyW(error, errorCch, TR(L"Some of its files could not be moved to the Recycle Bin."));
+    if (result != REMOVE_DONE) goto done;
+    for (p = 0; p < set->profiles.count; p++) {
+        int keyCount = 0;
+        PendingEdit *keys = SessionKeys(set, row, p, PENDING_REMOVE, &keyCount);
+        if (!keys) continue;
+        if (session->entry[p] >= 0 && Claude_IsRunning(&set->profiles.items[p])) {
+            if (RewritePendingLocked(&set->profiles.items[p], &keys[0], NULL, 0, FALSE))
+                Util_Log(L"session %s in %s: removal waits, its Claude started", session->key, set->profiles.items[p].folder);
+        } else {
+            if (session->entry[p] >= 0) MarkDeleted(set, row, p);
+            /* What waited for the session there has nothing to change now. */
+            RewritePendingLocked(&set->profiles.items[p], NULL, keys, keyCount, TRUE);
+        }
+        HeapFree(GetProcessHeap(), 0, keys);
+    }
+done:
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    if (list) HeapFree(GetProcessHeap(), 0, (void *)list);
+    return result;
 }

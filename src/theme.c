@@ -39,6 +39,15 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <vssym32.h>
+/* richedit.h declares nameless unions (C4201 at /W4) */
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4201)
+#endif
+#include <richedit.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
@@ -53,6 +62,7 @@
 #define STRONG_PROP       L"ClaudeDesktopProfilesManager.Strong"          /* the semibold font a control shows its text in */
 #define HEADINGS_PROP     L"ClaudeDesktopProfilesManager.Headings"        /* a list's semibold font for its heading rows */
 #define HEADINGS_BASE_PROP L"ClaudeDesktopProfilesManager.HeadingsBase"   /* the font it was made from */
+#define FOLDING_PROP      L"ClaudeDesktopProfilesManager.Folding"         /* a list whose headings fold (Theme_SetFoldingRows) */
 #define TIP_PROP          L"ClaudeDesktopProfilesManager.CellTip"
 #define TABLE_STATE_PROP  L"ClaudeDesktopProfilesManager.TableState"
 #define HOT_PROP          L"ClaudeDesktopProfilesManager.Hot"             /* an edit or drop-down list under the mouse */
@@ -618,18 +628,39 @@ void Theme_SetHeadingRows(HWND list)
     if (old) DeleteObject(old);
 }
 
+/* A list whose heading rows fold: each heading says by its overlay index
+ * (INDEXTOOVERLAYMASK) whether it is open, closed, or has nothing to fold;
+ * it shows no overlay. Its headings are semibold, as Theme_SetHeadingRows
+ * makes them, and its owner folds them. */
+void Theme_SetFoldingRows(HWND list)
+{
+    SetPropW(list, FOLDING_PROP, (HANDLE)1);
+    Theme_SetHeadingRows(list);
+}
+
+/* Row `index`'s THEME_FOLD_*, 0 for no heading of a list whose headings fold. */
+static int FoldOf(HWND list, int index)
+{
+    return (int)((ListView_GetItemState(list, index, LVIS_OVERLAYMASK) & LVIS_OVERLAYMASK) >> 8);
+}
+
 /* Row `index` of a list with heading rows, when it is one (nothing in its
- * other columns): the semibold font it is written in, made again when the
- * list's font changed (a new scale). NULL for any other row. */
+ * other columns; in a list whose headings fold, a THEME_FOLD_* row): the
+ * semibold font it is written in, made again when the list's font changed
+ * (a new scale). NULL for any other row. */
 static HFONT HeadingFontOf(HWND list, int index, HFONT font)
 {
     HFONT strong = (HFONT)GetPropW(list, HEADINGS_PROP), made;
     int column, columns = Header_GetItemCount(ListView_GetHeader(list));
     if (!strong) return NULL;
-    for (column = 1; column < columns; column++) {
-        WCHAR text[2];
-        ListView_GetItemText(list, index, column, text, ARRAYSIZE(text));
-        if (text[0]) return NULL;
+    if (GetPropW(list, FOLDING_PROP)) {
+        if (!FoldOf(list, index)) return NULL;
+    } else {
+        for (column = 1; column < columns; column++) {
+            WCHAR text[2];
+            ListView_GetItemText(list, index, column, text, ARRAYSIZE(text));
+            if (text[0]) return NULL;
+        }
     }
     if ((HFONT)GetPropW(list, HEADINGS_BASE_PROP) != font && (made = StrongOf(font)) != NULL) {
         SetPropW(list, HEADINGS_PROP, made);
@@ -1265,7 +1296,7 @@ UINT Theme_TrackDropDown(HWND owner, HMENU menu, const RECT *screenBox)
 
 /* ------------------------------------------------------------- own menus */
 
-/* A menu the program draws itself (the manager's Shortcuts and Language):
+/* A menu the program draws itself (the manager's Shortcuts and its list's):
  * the rows of its lists on the field's color in a thin frame a quarter of
  * the way from the field's color to the text's (the separator's gray is the
  * field's own, and a light theme's is white), a check
@@ -2338,13 +2369,111 @@ static BOOL StateImageSpan(HWND list, int row, const RECT *bounds, int iconLeft,
     return *left >= 0;
 }
 
+/* The arrow of heading row `row` that folds: the cell before its check box
+ * or icon, which its indent (one image wide) leaves free. FALSE for a row
+ * that is no heading of a list whose headings fold, or has nothing to fold. */
+BOOL Theme_FoldArrowRect(HWND list, int row, RECT *cell)
+{
+    HIMAGELIST images = ListView_GetImageList(list, LVSIL_SMALL);
+    RECT bounds, icon;
+    int fold, unit, height, left, right;
+    if (!GetPropW(list, FOLDING_PROP) || (fold = FoldOf(list, row)) != THEME_FOLD_CLOSED && fold != THEME_FOLD_OPEN) return FALSE;
+    if (!ListView_GetItemRect(list, row, &bounds, LVIR_BOUNDS) || !ListView_GetItemRect(list, row, &icon, LVIR_ICON)) return FALSE;
+    if (!images || !ImageList_GetIconSize(images, &unit, &height)) unit = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(list));
+    right = icon.left;
+    if (ListView_GetImageList(list, LVSIL_STATE) && StateImageSpan(list, row, &bounds, icon.left, &left, &height)) right = left;
+    SetRect(cell, right - unit, bounds.top, right, bounds.bottom);
+    return TRUE;
+}
+
+LPARAM Theme_RowParam(HWND list, int row)
+{
+    LVITEMW item;
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_PARAM;
+    item.iItem = row;
+    return ListView_GetItem(list, &item) ? item.lParam : 0;
+}
+
+/* A row of a list whose headings fold, inserted at `row`: a heading
+ * (`fold`, THEME_FOLD_*) at indent 1, a row of it (`fold` 0) below. */
+void Theme_InsertFoldingRow(HWND list, int row, const WCHAR *text, int image, LPARAM param, int fold)
+{
+    LVITEMW item;
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM | LVIF_INDENT | LVIF_STATE;
+    item.iItem = row;
+    item.pszText = (LPWSTR)text;
+    item.iImage = image;
+    item.lParam = param;
+    item.iIndent = fold ? 1 : 2;
+    item.state = INDEXTOOVERLAYMASK(fold);
+    item.stateMask = LVIS_OVERLAYMASK;
+    ListView_InsertItem(list, &item);
+}
+
+void Theme_SetFold(HWND list, int row, int fold)
+{
+    ListView_SetItemState(list, row, INDEXTOOVERLAYMASK(fold), LVIS_OVERLAYMASK);
+}
+
+BOOL Theme_OnFoldArrow(HWND list, int row, POINT pt)
+{
+    RECT arrow;
+    return row >= 0 && Theme_FoldArrowRect(list, row, &arrow) && PtInRect(&arrow, pt);
+}
+
+void Theme_DeleteFoldedRows(HWND list, int row)
+{
+    while (row + 1 < ListView_GetItemCount(list) && Theme_RowParam(list, row + 1) >= 0) ListView_DeleteItem(list, row + 1);
+}
+
+void Theme_FocusRow(HWND list, int row)
+{
+    ListView_SetItemState(list, -1, 0, LVIS_SELECTED);
+    ListView_SetItemState(list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(list, row, FALSE);
+}
+
+/* WM_CONTEXTMENU on a list whose groups fold (or its view): "Expand all" and
+ * "Collapse all" at the mouse, or from the keyboard at the keyboard's row.
+ * The one chosen, 0 for none or another window. */
+UINT Theme_FoldMenu(HWND owner, HWND list, HWND from, LPARAM pos)
+{
+    HMENU menu;
+    POINT pt;
+    UINT cmd;
+    if (from != list && from != GetParent(list)) return 0;
+    if (pos == (LPARAM)-1) {
+        RECT rc;
+        int row = ListView_GetNextItem(list, -1, LVNI_FOCUSED);
+        if (row < 0 || !ListView_GetItemRect(list, row, &rc, LVIR_LABEL)) GetClientRect(list, &rc);
+        pt.x = rc.left;
+        pt.y = rc.bottom;
+        ClientToScreen(list, &pt);
+    } else {
+        pt.x = (int)(short)LOWORD(pos);
+        pt.y = (int)(short)HIWORD(pos);
+    }
+    if ((menu = CreatePopupMenu()) == NULL) return 0;
+    AppendMenuW(menu, MF_STRING, THEME_FOLD_MENU_EXPAND, TR(L"&Expand all"));
+    AppendMenuW(menu, MF_STRING, THEME_FOLD_MENU_COLLAPSE, TR(L"Co&llapse all"));
+    cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | (Localize_IsRTL() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, owner, NULL);
+    DestroyMenu(menu);
+    return cmd;
+}
+
 /* A row's check box (the theme's glyph, where Windows draws its state
- * image) or other state image, and its icon, at the native item geometry. */
-static void PaintTableRowImages(HWND list, HDC dc, const RECT *bounds, const LVITEMW *item)
+ * image) or other state image, and its icon, at the native item geometry;
+ * a folding heading's arrow before them. */
+static void PaintTableRowImages(HWND list, HDC dc, const RECT *bounds, const LVITEMW *item, UINT rowState)
 {
     HIMAGELIST images = ListView_GetImageList(list, LVSIL_SMALL), states = ListView_GetImageList(list, LVSIL_STATE);
-    RECT icon;
+    RECT icon, arrow;
+    BOOL folding = GetPropW(list, FOLDING_PROP) != NULL;
     int width, height, stateImage = (int)((item->state & LVIS_STATEIMAGEMASK) >> 12) - 1;
+    if (folding && Theme_FoldArrowRect(list, item->iItem, &arrow))
+        Theme_DrawTreeGlyph(list, dc, &arrow, rowState, FoldOf(list, item->iItem) == THEME_FOLD_OPEN);
     if (!ListView_GetItemRect(list, item->iItem, &icon, LVIR_ICON)) return;
     if (states && stateImage >= 0 && ImageList_GetIconSize(states, &width, &height)) {
         HTHEME theme = NULL;
@@ -2374,7 +2503,7 @@ static void PaintTableRowImages(HWND list, HDC dc, const RECT *bounds, const LVI
     }
     if (images && item->iImage >= 0 && ImageList_GetIconSize(images, &width, &height))
         ImageList_Draw(images, item->iImage, dc, icon.left, bounds->top + (bounds->bottom - bounds->top - height) / 2,
-                       ILD_TRANSPARENT | (item->state & LVIS_OVERLAYMASK) | ((item->state & LVIS_CUT) ? ILD_BLEND50 : 0));
+                       ILD_TRANSPARENT | (folding ? 0 : (item->state & LVIS_OVERLAYMASK)) | ((item->state & LVIS_CUT) ? ILD_BLEND50 : 0));
 }
 
 /* DrawText's alignment of a column whose header format is `format` (HDF_*). */
@@ -2412,7 +2541,7 @@ static BOOL PaintTableRow(HWND list, HDC dc, int index)
     item.iItem = index;
     item.iImage = I_IMAGENONE;
     ListView_GetItem(list, &item);
-    PaintTableRowImages(list, dc, &bounds, &item);
+    PaintTableRowImages(list, dc, &bounds, &item, state);
     for (column = 0; column < columns; column++) {
         WCHAR local[512], *text;
         HDITEMW heading = { 0 };
@@ -2563,7 +2692,9 @@ void Theme_SetColumnWidth(HWND list, int column, int width)
  * and the table's outer edge in both modes); and the columns the user sizes
  * (a divider dragged or double-clicked, where the list fits the column to its
  * content) are recorded, so that layout keeps their width. */
-static LRESULT CALLBACK ListSubclass(HWND list, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
+static LRESULT CALLBACK ListSubclass(HWND list, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref);
+
+static LRESULT TableMessage(HWND list, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
 {
     TableState *table = (TableState *)ref;
     /* Over a selected row, the list is told the mouse is off its rows, so the
@@ -2630,6 +2761,54 @@ static LRESULT CALLBACK ListSubclass(HWND list, UINT msg, WPARAM wp, LPARAM lp, 
     return DefSubclassProc(list, msg, wp, lp);
 }
 
+/* The rows a list shows apart: under the mouse, the keyboard's, the selected. */
+static void ShownRows(HWND list, int rows[3])
+{
+    rows[0] = ListView_GetHotItem(list);
+    rows[1] = ListView_GetNextItem(list, -1, LVNI_FOCUSED);
+    rows[2] = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+}
+
+/* Row `row` drawn again whole, its indent included, which the list itself
+ * leaves out when a row stops being hot or selected. */
+static void InvalidateWholeRow(HWND list, int row)
+{
+    RECT rc, client;
+    if (row < 0 || !ListView_GetItemRect(list, row, &rc, LVIR_BOUNDS)) return;
+    GetClientRect(list, &client);
+    rc.left = client.left;
+    rc.right = client.right;
+    InvalidateRect(list, &rc, FALSE);
+}
+
+/* A list whose headings fold has rows indented: a row that stops or starts
+ * being hot, the keyboard's or selected is drawn again whole. */
+static LRESULT CALLBACK ListSubclass(HWND list, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
+{
+    int before[3], after[3], i;
+    BOOL folding = FALSE;
+    LRESULT result;
+    /* Only what can change those rows: the questions ShownRows asks the list
+     * come through here too. */
+    switch (msg) {
+    case WM_MOUSEMOVE: case WM_MOUSELEAVE: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_KEYDOWN:
+    case WM_SETFOCUS: case WM_KILLFOCUS: case LVM_SETITEMSTATE: case LVM_SETHOTITEM:
+        folding = GetPropW(list, FOLDING_PROP) != NULL;
+        break;
+    }
+    if (folding) ShownRows(list, before);
+    result = TableMessage(list, msg, wp, lp, id, ref);
+    if (folding && IsWindow(list)) {
+        ShownRows(list, after);
+        for (i = 0; i < 3; i++)
+            if (before[i] != after[i]) {
+                InvalidateWholeRow(list, before[i]);
+                InvalidateWholeRow(list, after[i]);
+            }
+    }
+    return result;
+}
+
 /* The table component: the list's subclass and its state, made once. */
 static void ApplyTableComponent(HWND list)
 {
@@ -2653,6 +2832,9 @@ static void ApplyTableComponent(HWND list)
  * the next row once the animation is half way across it, so its rows come at
  * the animation's pace. Each frame moves the control at once (ScrollBy),
  * never through the animation a list box adds to its own steps. */
+#ifndef DM_POINTERHITTEST
+#define DM_POINTERHITTEST       0x0250   /* WinUser.h, Windows 8 and later */
+#endif
 #define SCROLL_TIMER            0x5C01
 #define SCROLL_FRAME_MS         USER_TIMER_MINIMUM   /* without the frame clock, a timer's frames */
 #define SCROLL_FRAME_LATEST_MS  1000   /* a later frame (a busy window) moves as far as this one would */
@@ -2662,6 +2844,7 @@ typedef struct SmoothScroll {
     int      pending;   /* px the animation has still to cover, down > 0 */
     int      owed;      /* px it covered that the control has not moved yet */
     int      rowPx;     /* a wheel line; 0: one scroll unit */
+    int      wheelRest; /* what the last wheel messages moved short of a px (Core_WheelPixels) */
     int      direction; /* 1 down, -1 up */
     BOOL     running, scrollingItself;
     BOOL     clocked;   /* its frames come from the frame clock, else from its timer */
@@ -2840,11 +3023,14 @@ static int WheelRow(HWND window, int unit);
 static LRESULT CALLBACK ScrollSubclass(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
 {
     SmoothScroll *scroll = (SmoothScroll *)ref;
-    if (StopsWheel(msg)) ScrollStop(window, scroll);
+    if (StopsWheel(msg)) {
+        ScrollStop(window, scroll);
+        scroll->wheelRest = 0;
+    }
     switch (msg) {
     case WM_MOUSEWHEEL: {
         UINT lines = 3;
-        int unit = ScrollUnit(window), notch, frames;
+        int unit = ScrollUnit(window), notch, frames, px;
         /* A control in a view that scrolls it passes the wheel on
          * (ViewedSubclass): its own serves while it is too tall for one. */
         if (unit <= 0 || ViewScrollsControl(window)) break;
@@ -2858,8 +3044,10 @@ static LRESULT CALLBACK ScrollSubclass(HWND window, UINT msg, WPARAM wp, LPARAM 
         }
         /* The other way: what was left of the last move is dropped. */
         if ((GET_WHEEL_DELTA_WPARAM(wp) > 0) == (scroll->pending + scroll->owed > 0)) scroll->pending = scroll->owed = 0;
-        scroll->pending -= MulDiv(GET_WHEEL_DELTA_WPARAM(wp), notch, WHEEL_DELTA);
         scroll->direction = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1;
+        px = Core_WheelPixels(GET_WHEEL_DELTA_WPARAM(wp), notch, &scroll->wheelRest);
+        if (!px) return 0;   /* a touchpad's step short of a px: the next ones add to it */
+        scroll->pending -= px;
         if (!scroll->running) {
             scroll->clocked = FramesStart(window);
             scroll->running = scroll->clocked || SetTimer(window, SCROLL_TIMER, SCROLL_FRAME_MS, NULL) != 0;
@@ -3042,6 +3230,7 @@ static BOOL ScrollingItself(HWND window)
 #define FRAME_CENTER 2   /* a one-line edit: its text centered in its height */
 #define FRAME_BARE   4   /* a scrolling control whose frame is omitted in dark mode */
 #define FRAME_EDIT   8   /* native edit layout and glyphs, one buffered paint */
+#define FRAME_RICH   16  /* a rich edit: it paints its text, the theme its rounded frame */
 
 typedef struct ControlCorners {
     HRGN original;
@@ -3800,6 +3989,76 @@ static void FollowEdit(HWND edit, UINT msg, WPARAM wp, LPARAM lp, DWORD_PTR fram
     }
 }
 
+#define RICH_PROP L"ClaudeDesktopProfilesManager.RichText"   /* the Markdown a rich edit shows (Theme_SetRichText) */
+
+static void ForgetRichText(HWND rich)
+{
+    WCHAR *markdown = (WCHAR *)RemovePropW(rich, RICH_PROP);
+    if (markdown) HeapFree(GetProcessHeap(), 0, markdown);
+}
+
+BOOL Theme_RichTextReady(void)
+{
+    static HMODULE module;
+    if (!module) module = LoadLibraryExW(L"msftedit.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return module != NULL;
+}
+
+/* The rich edit's Markdown in its font and the palette (again in a new
+ * theme or font): its text, its field, its margins, the top in sight. */
+static void RenderRichText(HWND rich)
+{
+    const WCHAR *markdown = (const WCHAR *)GetPropW(rich, RICH_PROP);
+    HFONT font = (HFONT)SendMessageW(rich, WM_GETFONT, 0, 0);   /* a rich edit may answer none: its dialog's then */
+    LOGFONTW logical;
+    CoreRtfStyle style;
+    SETTEXTEX set = { ST_DEFAULT, CP_ACP };
+    UINT dpi = GetDpiForWindow(rich);
+    int margin = MulDiv(8, (int)dpi, 96);
+    size_t cch;
+    char *rtf;
+    SendMessageW(rich, EM_SETBKGNDCOLOR, 0, (LPARAM)g_palette.color[THEME_FIELD]);
+    SendMessageW(rich, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(margin, margin));
+    /* Every script in the window's font: the rich edit's own font binding
+     * would give Chinese, and the runs around it, its default (serif) face. */
+    SendMessageW(rich, EM_SETLANGOPTIONS, 0, SendMessageW(rich, EM_GETLANGOPTIONS, 0, 0) & ~(LRESULT)(IMF_AUTOFONT | IMF_DUALFONT));
+    if (!markdown) return;
+    ZeroMemory(&logical, sizeof logical);
+    if (!font) font = (HFONT)SendMessageW(GetParent(rich), WM_GETFONT, 0, 0);
+    if (!font || !GetObjectW(font, sizeof logical, &logical)) GetObjectW(GetStockObject(DEFAULT_GUI_FONT), sizeof logical, &logical);
+    ZeroMemory(&style, sizeof style);
+    style.face = Localize_FontFace();   /* the interface's face, as every control has it (Theme_CreateFonts) */
+    style.codeFace = L"Consolas";
+    style.size = max(12, MulDiv(abs(logical.lfHeight), 144, (int)dpi));   /* px at the window's DPI, in half-points */
+    style.indent = 400;
+    style.text = g_palette.color[THEME_TEXT];
+    style.muted = g_palette.color[THEME_MUTED];
+    style.link = g_palette.color[g_dark ? THEME_BRIGHT_BLUE : THEME_MAIN_BLUE];
+    style.codeBack = g_palette.color[THEME_SEPARATOR];
+    cch = wcslen(markdown) * 10 + 1024;   /* a character takes "\u-32768?" at most */
+    if ((rtf = (char *)HeapAlloc(GetProcessHeap(), 0, cch)) == NULL) return;
+    if (Core_MarkdownRtf(markdown, &style, rtf, cch)) {
+        SendMessageW(rich, EM_SETTEXTEX, (WPARAM)&set, (LPARAM)rtf);
+        SendMessageW(rich, EM_SETSEL, 0, 0);
+        SendMessageW(rich, EM_SCROLLCARET, 0, 0);
+    }
+    HeapFree(GetProcessHeap(), 0, rtf);
+}
+
+void Theme_SetRichText(HWND rich, const WCHAR *markdown)
+{
+    size_t length = markdown ? wcslen(markdown) + 1 : 0;
+    WCHAR *copy = length ? (WCHAR *)HeapAlloc(GetProcessHeap(), 0, length * sizeof(WCHAR)) : NULL;
+    if (!rich) return;
+    ForgetRichText(rich);
+    if (copy) {
+        memcpy(copy, markdown, length * sizeof(WCHAR));
+        if (!SetPropW(rich, RICH_PROP, copy)) HeapFree(GetProcessHeap(), 0, copy);
+    }
+    SendMessageW(rich, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+    RenderRichText(rich);
+}
+
 /* What the theme keeps on a control goes with it. */
 static LRESULT ForgetChild(HWND control, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id)
 {
@@ -3815,6 +4074,8 @@ static LRESULT ForgetChild(HWND control, UINT msg, WPARAM wp, LPARAM lp, UINT_PT
     RemovePropW(control, EDIT_PAUSED_PROP);
     RemovePropW(control, EDIT_UPDATE_PROP);
     RemovePropW(control, HEADINGS_BASE_PROP);
+    RemovePropW(control, FOLDING_PROP);
+    ForgetRichText(control);
     RemoveWindowSubclass(control, ChildSubclass, id);
     result = DefSubclassProc(control, msg, wp, lp);
     if (strong) DeleteObject(strong);
@@ -3836,6 +4097,12 @@ static LRESULT CALLBACK ChildSubclass(HWND control, UINT msg, WPARAM wp, LPARAM 
         }
     }
     if ((frame & FRAME_EDIT) && EditDrawing(control, msg, wp, lp, &result)) return result;
+    /* A rich edit's frame and margins are the edit's, drawn over its own. */
+    if ((frame & FRAME_RICH) && msg == WM_NCPAINT) {
+        result = (frame & FRAME_BARE) ? DefWindowProcW(control, msg, wp, lp) : DefSubclassProc(control, msg, wp, lp);
+        PaintEditFrame(control, NULL);
+        return result;
+    }
     /* A scrolling control without its frame (FRAME_BARE: dark mode) leaves
      * its non-client area, its scroll bars only, to Windows: the control's
      * own painting would draw the frame it was made with. An edit's rounded
@@ -4331,6 +4598,19 @@ static BOOL ViewHandlesFirst(HWND view, HWND control, UINT msg, WPARAM wp, LPARA
     View *viewState = ViewOf(view);
     if (msg == WM_MOUSEWHEEL && viewState && !viewState->native) {
         *result = SendMessageW(view, msg, wp, lp);
+        return TRUE;
+    }
+    /* A touchpad's driver may scroll by lines what is under the pointer, the
+     * control (no scroll bar of its own sends it: lp 0): the view scrolls. */
+    if (msg == WM_VSCROLL && !lp && viewState && !viewState->native) {
+        *result = SendMessageW(view, msg, wp, 0);
+        return TRUE;
+    }
+    /* A precision touchpad's pan is a list's or a tree's own (DirectManipulation)
+     * when it takes it here; in a view it never scrolls itself, so it does not,
+     * and Windows sends the pan as the wheel, which the view scrolls by. */
+    if (msg == DM_POINTERHITTEST && viewState && !viewState->native) {
+        *result = DefWindowProcW(control, msg, wp, lp);
         return TRUE;
     }
     if (StopsWheel(msg)) StopSmoothScroll(view);
@@ -5142,9 +5422,8 @@ void Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name)
 #define MAIN_RESOURCE_HEIGHT_DIPS     522
 #define MAIN_GROUP_GAP_DIPS           12     /* between the toolbar's groups, and the column's */
 #define COLUMN_NOTE_GAP_DIPS          9      /* above the note */
-#define DETAILS_MINIMUM_ROWS          4      /* the sessions' details are at least as tall as this many buttons */
-#define ARCHIVED_INSET_DIPS           5      /* "Show archived" ends before the tree: room before the details */
-#define VERSION_SAMPLE                L"2026.12.31 23:59"   /* the longest version the label shows */
+#define TREE_MINIMUM_ROWS             4      /* the sessions' tree is at least as tall as this many buttons */
+#define VERSION_SAMPLE                L"2026.12.31"         /* the longest version the label shows */
 #define CLAUDE_VERSION_SAMPLE         L"2.99999.99"         /* the longest Claude Desktop version the status shows */
 
 /* A button, with every caption it shows (catalog keys) and the icon that
@@ -5171,11 +5450,17 @@ static const MainButton kMainToolbar[] = {
     { IDC_DEFAULT, { L"Set as de&fault", NULL }, { 0xE735, 0 }, { THEME_TINT_GOLD, THEME_TINT_NONE } }
 };
 static const int kMainToolbarGroups[] = { 3, 6 };   /* the actions that start a group of their own */
-/* At the toolbar's right end, icons alone: the menus of shortcuts and languages, and the settings. */
+/* After the buttons, a group of icons alone: the shortcuts' menu, the settings (the language among them), and
+ * About (the version, help and the changelog), which has no access key: every letter of it is another button's. */
 static const MainButton kMainToolIcons[] = {
     { IDC_SHORTCUTS, { L"S&hortcuts", NULL }, { 0xE71B, 0 }, { THEME_TINT_TEAL, THEME_TINT_NONE }, TRUE },
-    { IDC_LANGUAGE, { L"&Language", NULL }, { 0xE774, 0 }, { THEME_TINT_PURPLE, THEME_TINT_NONE }, TRUE },
-    { IDC_SETTINGS, { L"Se&ttings", NULL }, { 0xE713, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE }, TRUE }
+    { IDC_SETTINGS, { L"Se&ttings", NULL }, { 0xE713, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE }, TRUE },
+    { IDC_ABOUT, { L"About", NULL }, { 0xE946, 0 }, { THEME_TINT_PURPLE, THEME_TINT_NONE }, TRUE }
+};
+/* Beside the sessions' search box, icons alone: its options and the filter menu. */
+static const MainButton kMainSessionIcons[] = {
+    { IDC_S_FIND, { L"Search o&ptions", NULL }, { 0xE721, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE }, TRUE },
+    { IDC_S_FILTER, { L"F&ilter", NULL }, { 0xE71C, 0 }, { THEME_TINT_PURPLE, THEME_TINT_NONE }, TRUE }
 };
 /* The column's actions, below the view's button: the profiles' sync and
  * backups, and the repair. */
@@ -5206,6 +5491,8 @@ static const MainButton *MainButtonOf(int id)
         if (kMainColumn[i].id == id) return &kMainColumn[i];
     for (i = 0; i < ARRAYSIZE(kMainToolIcons); i++)
         if (kMainToolIcons[i].id == id) return &kMainToolIcons[i];
+    for (i = 0; i < ARRAYSIZE(kMainSessionIcons); i++)
+        if (kMainSessionIcons[i].id == id) return &kMainSessionIcons[i];
     for (i = 0; i < ARRAYSIZE(kMainShortcuts); i++)
         if (kMainShortcuts[i].id == id) return &kMainShortcuts[i];
     for (i = 0; i < ARRAYSIZE(single); i++)
@@ -5238,6 +5525,7 @@ static void ApplyMainGlyphs(HWND dialog)
     for (i = 0; i < ARRAYSIZE(kMainToolbar); i++) Theme_SetMainGlyph(dialog, kMainToolbar[i].id, 0);
     for (i = 0; i < ARRAYSIZE(kMainColumn); i++) Theme_SetMainGlyph(dialog, kMainColumn[i].id, 0);
     for (i = 0; i < ARRAYSIZE(kMainToolIcons); i++) Theme_SetMainGlyph(dialog, kMainToolIcons[i].id, 0);
+    for (i = 0; i < ARRAYSIZE(kMainSessionIcons); i++) Theme_SetMainGlyph(dialog, kMainSessionIcons[i].id, 0);
     if (!GlyphOf(GetDlgItem(dialog, IDC_SESSIONS))) Theme_SetMainGlyph(dialog, IDC_SESSIONS, 0);
 }
 
@@ -5284,7 +5572,8 @@ typedef struct MainBudget {
     SIZE minimum;
     int margin, gap, sideGap, groupGap, column, buttonHeight, searchRow;
     int toolbarWidth[ARRAYSIZE(kMainToolbar)], toolbarTotal;   /* with the icons at its end, square */
-    int profileWidth, roleWidth, dataMinimum, sessionsMinimum, stateWidth, profilesPane, archivedWidth;
+    int profileWidth, roleWidth, dataMinimum, sessionsMinimum, stateWidth, profilesPane;
+    int viewButton;   /* the view's button: atop the column, or at the end of the sessions' search row */
     int noteHeight, footHeight, minimumBody;
 } MainBudget;
 
@@ -5371,7 +5660,8 @@ static ULONGLONG HashControlFont(ULONGLONG key, HWND control)
 static ULONGLONG MainFontKey(HWND dialog)
 {
     static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_BACKUP,
-        IDC_REPAIR, IDC_SHORTCUTS, IDC_LANGUAGE, IDC_SETTINGS, IDC_SESSIONS, IDC_STATUS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_ARCHIVED, IDC_S_SEARCH, IDC_S_DETAILS, IDC_NOTE };
+        IDC_REPAIR, IDC_SHORTCUTS, IDC_SETTINGS, IDC_ABOUT, IDC_SESSIONS, IDC_STATUS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_SEARCH,
+        IDC_S_FIND, IDC_S_FILTER, IDC_NOTE };
     HWND list = MainViewContent(dialog, IDC_LIST);
     ULONGLONG key = Core_HashBytes(CORE_HASH_START, &g_dark, sizeof g_dark);
     size_t i;
@@ -5441,34 +5731,29 @@ static void MeasureMainButtons(HWND dialog, const DialogBase *base, MainBudget *
     for (i = 0; i < (int)(ARRAYSIZE(kColumn) + ARRAYSIZE(kMainColumn)); i++) {
         MainButtonBudget(dialog, base, dpi, i < (int)ARRAYSIZE(kColumn) ? kColumn[i] : &kMainColumn[i - (int)ARRAYSIZE(kColumn)], &width, &height);
         budget->column = max(budget->column, width);
+        if (kColumn[0] == &kMainSessions && i == 0) budget->viewButton = width;
         budget->buttonHeight = max(budget->buttonHeight, height);
     }
     /* The icons alone, square, a group of their own. */
     budget->toolbarTotal += budget->groupGap + (int)ARRAYSIZE(kMainToolIcons) * (budget->buttonHeight + budget->gap);
 }
 
-/* The sessions view's panes: the profiles' side bar as in the resource, the
- * details at least as wide as their widest button and their Actions box in
- * its widest language (sessions.c sizes the box to the current one,
- * Theme_DropDownWidth): the column is as wide; and the tree's, under the
- * search box and "Show archived". Returns the tree pane's least width; the
- * search row's height goes to the budget. */
+/* The sessions view's panes: the profiles' side bar as in the resource; the
+ * search row: its box at least as in the resource, its two icons, square,
+ * and the view's button. Returns the tree's least width. */
 static int MeasureSessionsPanes(HWND dialog, const DialogBase *base, MainBudget *budget)
 {
-    HWND search = GetDlgItem(dialog, IDC_S_SEARCH), details = GetDlgItem(dialog, IDC_S_DETAILS);
+    HWND search = GetDlgItem(dialog, IDC_S_SEARCH);
     RECT source;
     UINT dpi = budget->dpi;
-    int searchWidth, textWidth, tallestFont, searchHeight, archivedHeight;
-    MainCheckBoxBudget(GetDlgItem(dialog, IDC_S_ARCHIVED), &budget->archivedWidth, &archivedHeight);
+    int searchWidth, textWidth, tallestFont, searchHeight;
     LayoutSourceRect(dialog, base, GetDlgItem(dialog, IDC_S_PROFILES), dpi, &source);
     budget->profilesPane = source.right - source.left;
-    LayoutSourceRect(dialog, base, details, dpi, &source);
-    budget->column = max(budget->column, source.right - source.left);
     LayoutSourceRect(dialog, base, search, dpi, &source);
     searchWidth = source.right - source.left;
     LayoutTextBudget(search, searchWidth, FALSE, &textWidth, &searchHeight, &tallestFont);
-    budget->searchRow = max(budget->buttonHeight, max(searchHeight, archivedHeight));
-    return searchWidth + budget->gap + budget->archivedWidth + MulDiv(ARCHIVED_INSET_DIPS, (int)dpi, 96);
+    budget->searchRow = max(budget->buttonHeight, searchHeight);
+    return searchWidth + 2 * (budget->buttonHeight + budget->gap) + budget->gap + budget->viewButton;
 }
 
 /* What the profile list's frames take of its width: the view's and the
@@ -5523,7 +5808,7 @@ static void MeasureMain(HWND dialog, const DialogBase *base, MainBudget *budget)
     budget->footHeight = MainFootHeight(dialog, budget);
     profilesColumn = budget->buttonHeight + budget->groupGap + (int)ARRAYSIZE(kMainColumn) * budget->buttonHeight +
                      ((int)ARRAYSIZE(kMainColumn) - 1) * budget->gap + MulDiv(COLUMN_NOTE_GAP_DIPS, (int)dpi, 96) + budget->noteHeight;
-    sessionsColumn = budget->buttonHeight + budget->gap + DETAILS_MINIMUM_ROWS * budget->buttonHeight;
+    sessionsColumn = budget->searchRow + budget->gap + TREE_MINIMUM_ROWS * budget->buttonHeight;
     budget->minimumBody = max(budget->minimumBody, max(profilesColumn, sessionsColumn) + budget->groupGap + budget->footHeight);
     budget->minimum.cy = budget->gap + budget->buttonHeight + budget->sideGap + budget->minimumBody + budget->margin;
     budget->minimum.cy = max(budget->minimum.cy, MulDiv(MAIN_RESOURCE_HEIGHT_DIPS, (int)dpi, 96));
@@ -5610,8 +5895,9 @@ static void PlaceMainToolbar(MainMoves *moves, const MainBudget *budget, const M
         PlaceMainControl(moves, GetDlgItem(moves->dialog, kMainToolbar[i].id), x, area->toolbarTop, budget->toolbarWidth[i], budget->buttonHeight);
         x += budget->toolbarWidth[i] + budget->gap;
     }
-    /* The icons alone at the right end, over the column. */
-    x = area->right - (int)ARRAYSIZE(kMainToolIcons) * budget->buttonHeight - ((int)ARRAYSIZE(kMainToolIcons) - 1) * budget->gap;
+    /* The icons alone, the last group: as far from the buttons as the groups
+     * are from each other, whatever the window's width. */
+    x += budget->groupGap;
     for (i = 0; i < (int)ARRAYSIZE(kMainToolIcons); i++) {
         PlaceMainControl(moves, GetDlgItem(moves->dialog, kMainToolIcons[i].id), x, area->toolbarTop, budget->buttonHeight, budget->buttonHeight);
         x += budget->buttonHeight + budget->gap;
@@ -5662,33 +5948,34 @@ static void PlaceProfilesView(MainMoves *moves, const MainBudget *budget, const 
     PlaceMainControl(moves, GetDlgItem(dialog, IDC_NOTE), area->columnLeft, top, width, budget->noteHeight);
 }
 
-/* The sessions: profiles and tree down to the margin, the search box and
- * "Show archived" (as wide as its caption in the current language) above
- * the tree; the details in the column, between the view's button and the
- * foot. */
+/* The sessions: the profiles' side bar and the tree down to the margin,
+ * the tree to the content's right edge (the view has no column); above it,
+ * the search box, its options and the filter menu's button, then the view's
+ * button, which leads back (PlaceMain). */
 static void PlaceSessionsView(MainMoves *moves, const MainBudget *budget, const MainArea *area)
 {
-    HWND dialog = moves->dialog, archived = GetDlgItem(dialog, IDC_S_ARCHIVED);
-    SIZE ideal;
-    int gap = budget->gap, bottom = area->bodyBottom, detailsTop = area->bodyTop + budget->buttonHeight + gap;
-    int treeLeft = area->left + budget->profilesPane + gap, treeRight = area->bodyRight;
-    int archivedRight = treeRight - MulDiv(ARCHIVED_INSET_DIPS, (int)budget->dpi, 96);
-    int archivedWidth = Theme_CheckBoxSize(archived, &ideal) && ideal.cx > 0 ? ideal.cx : budget->archivedWidth;
+    HWND dialog = moves->dialog;
+    int gap = budget->gap, bottom = area->bodyBottom, row = budget->searchRow, icon = budget->buttonHeight;
+    int treeLeft = area->left + budget->profilesPane + gap, filter = area->right - budget->viewButton - gap - icon, find = filter - gap - icon;
+    int iconTop = area->bodyTop + (row - icon) / 2;
     PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_PROFILES), area->left, area->bodyTop, budget->profilesPane, bottom - area->bodyTop);
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_DETAILS), area->columnLeft, detailsTop, area->right - area->columnLeft,
-                     max(budget->buttonHeight, area->footTop - budget->groupGap - detailsTop));
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_SEARCH), treeLeft, area->bodyTop, archivedRight - archivedWidth - gap - treeLeft,
-                     budget->searchRow);
-    PlaceMainControl(moves, archived, archivedRight - archivedWidth, area->bodyTop, archivedWidth, budget->searchRow);
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_TREE), treeLeft, area->bodyTop + budget->searchRow + gap, treeRight - treeLeft,
-                     bottom - area->bodyTop - budget->searchRow - gap);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_SEARCH), treeLeft, area->bodyTop, find - gap - treeLeft, row);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_FIND), find, iconTop, icon, icon);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_FILTER), filter, iconTop, icon, icon);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_S_TREE), treeLeft, area->bodyTop + row + gap, area->right - treeLeft, bottom - area->bodyTop - row - gap);
 }
 
 static void PlaceMain(MainMoves *moves, const MainBudget *budget, MainArea *area)
 {
+    HWND view = GetDlgItem(moves->dialog, IDC_SESSIONS);
     PlaceMainToolbar(moves, budget, area);
-    PlaceMainControl(moves, GetDlgItem(moves->dialog, IDC_SESSIONS), area->columnLeft, area->bodyTop, area->right - area->columnLeft,
-                     budget->buttonHeight);
+    /* The view's button tops the column; in the sessions view, which has
+     * none, it ends the search row. */
+    if (Shown(moves->dialog, IDC_S_TREE))
+        PlaceMainControl(moves, view, area->right - budget->viewButton, area->bodyTop + (budget->searchRow - budget->buttonHeight) / 2,
+                         budget->viewButton, budget->buttonHeight);
+    else
+        PlaceMainControl(moves, view, area->columnLeft, area->bodyTop, area->right - area->columnLeft, budget->buttonHeight);
     area->footTop = PlaceMainFoot(moves, budget, area);
     PlaceProfilesView(moves, budget, area);
     PlaceSessionsView(moves, budget, area);
@@ -6071,6 +6358,7 @@ static DWORD_PTR ChildFrame(HWND child, INT_PTR made, BOOL scrolls)
         frame = FRAME_EDIT;
         if (!(GetWindowLongW(child, GWL_STYLE) & ES_MULTILINE) && !IsClass(GetParent(child), WC_COMBOBOXW)) frame |= FRAME_CENTER;
     }
+    if (IsClass(child, MSFTEDIT_CLASS)) frame = FRAME_RICH;
     if (scrolls && g_dark && (made & (MADE_BORDER | MADE_EDGE))) frame |= FRAME_BARE;
     return frame;
 }
@@ -6107,15 +6395,15 @@ static void ThemeTree(HWND tree)
 static BOOL CALLBACK ThemeChild(HWND child, LPARAM lp)
 {
     BOOL edit = IsClass(child, WC_EDITW), list = IsClass(child, WC_LISTVIEWW), tree = IsClass(child, WC_TREEVIEWW);
-    BOOL listbox = IsClass(child, WC_LISTBOXW), combo = IsClass(child, WC_COMBOBOXW);
+    BOOL listbox = IsClass(child, WC_LISTBOXW), combo = IsClass(child, WC_COMBOBOXW), rich = IsClass(child, MSFTEDIT_CLASS);
     BOOL view = IsClass(child, VIEW_CLASS), viewed = ViewAround(child) != NULL;
-    BOOL multiline = edit && (GetWindowLongW(child, GWL_STYLE) & ES_MULTILINE), scrolls = list || tree || listbox || multiline || view;
+    BOOL multiline = edit && (GetWindowLongW(child, GWL_STYLE) & ES_MULTILINE), scrolls = list || tree || listbox || multiline || view || rich;
     INT_PTR made = RecordedFrameFlags(child);
     DWORD_PTR frame = ChildFrame(child, made, scrolls);
     (void)lp;
     if (g_allowDarkModeForWindow) g_allowDarkModeForWindow(child, g_dark);
     if (SetWindowSubclass(child, ChildSubclass, CHILD_SUBCLASS, frame))
-        RoundControl(child, edit || view || ((list || tree || listbox) && !viewed));
+        RoundControl(child, edit || view || rich || ((list || tree || listbox) && !viewed));
     if (frame & FRAME_COMBO) FitComboRows(child);
     if (scrolls) FitFrame(child, made);
     if (frame & FRAME_CENTER)   /* the edit's font determines its client area */
@@ -6130,6 +6418,10 @@ static BOOL CALLBACK ThemeChild(HWND child, LPARAM lp)
     } else if (listbox || edit) {
         /* A list box's scroll bar; an edit's native scroll bars (its client and frame are painted here). */
         SetWindowTheme(child, g_dark ? L"DarkMode_Explorer" : L"Explorer", NULL);
+    } else if (rich) {
+        /* Its scroll bar; its text, field and margins in the palette and its font. */
+        SetWindowTheme(child, g_dark ? L"DarkMode_Explorer" : L"Explorer", NULL);
+        RenderRichText(child);
     } else if (IsClass(child, WC_BUTTONW)) {
         SetWindowTheme(child, g_dark ? L"DarkMode_Explorer" : NULL, NULL);
     } else if (combo) {

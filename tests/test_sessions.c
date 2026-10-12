@@ -338,6 +338,10 @@ static int FixtureFileOperation(LPSHFILEOPSTRUCTW operation)
 #define SessionEdit_ApplyPendingFor      TestedSessionEdit_ApplyPendingFor
 #define SessionEdit_CopyConversation     TestedSessionEdit_CopyConversation
 #define SessionEdit_RemoveCopy           TestedSessionEdit_RemoveCopy
+#define SessionEdit_CanDelete            TestedSessionEdit_CanDelete
+#define SessionEdit_RemovesWorkingFolder TestedSessionEdit_RemovesWorkingFolder
+#define SessionEdit_ListFiles            TestedSessionEdit_ListFiles
+#define SessionEdit_DeleteEverywhere     TestedSessionEdit_DeleteEverywhere
 #define SessionEdit_ListConversation     TestedSessionEdit_ListConversation
 #define SessionEdit_CopiedCwd            TestedSessionEdit_CopiedCwd
 #define SessionEdit_ListTranscriptFiles  TestedSessionEdit_ListTranscriptFiles
@@ -1073,10 +1077,11 @@ static void TestEntryDetails(void)
     ProfileList profiles;
     SessionSet set, shown;
     PendingEdit edit, keep[3];
-    WCHAR entries[MAX_PATH], name[MAX_PATH], older[MAX_PATH], newer[MAX_PATH], pending[MAX_PATH];
+    WCHAR entries[MAX_PATH], name[MAX_PATH], older[MAX_PATH], newer[MAX_PATH], pending[MAX_PATH], error[512];
+    WCHAR (*paths)[LONG_PATH_CCH] = NULL;
     HWND window;
     char json[2048], titleText[301];
-    int row, head, shownRow;
+    int row, count = 0, head, shownRow;
     BOOL ready, waiting;
     ZeroMemory(&profiles, sizeof profiles);
     profiles.count = 1;
@@ -1107,6 +1112,13 @@ static void TestEntryDetails(void)
     Check("the other entry of that session follows it",
           head >= 0 && set.entries[head].duplicate >= 0 && wcscmp(set.entries[set.entries[head].duplicate].title, L"Older") == 0 &&
           set.entries[set.entries[head].duplicate].duplicate < 0);
+    Check("a session listed twice lists both entries for deletion",
+          row >= 0 && SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)) &&
+          Listed(paths, count, older) && Listed(paths, count, newer));
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    paths = NULL;
+    Check("a row that is not there lists nothing, with a reason",
+          !SessionEdit_ListFiles(&set, -1, &paths, &count, error, ARRAYSIZE(error)) && !paths && count == 0 && error[0]);
     if (head >= 0 && SessionStore_PendingPath(&profiles.items[0], pending, ARRAYSIZE(pending))) {
         Profile *profile = &profiles.items[0];
         ZeroMemory(&edit, sizeof edit);
@@ -1367,6 +1379,61 @@ static void TestReadonlyPending(const ProfileList *profiles)
     SessionStore_Free(&set);
 }
 
+static void TestDeletionList(const ProfileList *profiles, const WCHAR *projects)
+{
+    enum { COPIES = 56 };
+    SessionSet set;
+    WCHAR file[LONG_PATH_CCH], child[LONG_PATH_CCH], error[1024], (*paths)[LONG_PATH_CCH] = NULL;
+    BOOL ready = TRUE, intact = TRUE;
+    int copy, count = 0, row;
+    for (copy = 0; copy < COPIES && ready; copy++) {
+        ready = SUCCEEDED(StringCchPrintfW(file, ARRAYSIZE(file), L"%s\\deletion-%02d\\%s.jsonl", projects, copy, g_projectId)) &&
+                Save(file, "{}\n") &&
+                SUCCEEDED(StringCchPrintfW(child, ARRAYSIZE(child), L"%s\\deletion-%02d\\%s\\sentinel.txt", projects, copy, g_projectId)) &&
+                Save(child, "subagent fixture\n");
+    }
+    Check("many-project deletion fixtures prepared", ready);
+    if (!ready) return;
+    Check("many-project deletion snapshot loads", SessionStore_LoadProfiles(&set, profiles));
+    row = FindRow(&set, g_projectId);
+    Check("deletion collection finds conversation", row >= 0);
+    if (row >= 0) {
+        Check("deletion collection completes", SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)));
+        Check("deletion collection retains every path beyond its initial capacity", count == COPIES * 2 + 2);
+        for (copy = 0; copy < count; copy++)
+            if (!Core_PathUnder(paths[copy], g_root) || (!FileThere(paths[copy]) && !DirThere(paths[copy]))) intact = FALSE;
+        Check("deletion preparation leaves all private files intact", intact);
+        if (paths) HeapFree(GetProcessHeap(), 0, paths);
+        paths = NULL;
+        {
+            /* A project folder whose transcript paths are longer than MAX_PATH. */
+            WCHAR leaf[MAX_PATH], longDir[LONG_PATH_CCH], transcript[LONG_PATH_CCH];
+            size_t length = wcslen(projects) + 24 < MAX_PATH ? MAX_PATH - wcslen(projects) - 24 : 0;
+            wmemset(leaf, L'x', length);
+            leaf[length] = 0;
+            ready = length > 0 && Join(projects, leaf, longDir, ARRAYSIZE(longDir)) && MakeDir(longDir);
+            Check("long project directory fixture created", ready);
+            if (ready) {
+                Check("an unrelated long project folder does not stop deletion",
+                      SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)) && count == COPIES * 2 + 2 && !error[0]);
+                if (paths) HeapFree(GetProcessHeap(), 0, paths);
+                paths = NULL;
+                ready = SUCCEEDED(StringCchPrintfW(transcript, ARRAYSIZE(transcript), L"%s\\%s.jsonl", longDir, g_projectId)) &&
+                        wcslen(transcript) >= MAX_PATH && Save(transcript, "{}\n");
+                Check("a transcript past MAX_PATH fixture", ready);
+                Check("a transcript past MAX_PATH is listed for deletion",
+                      ready && SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)) && count == COPIES * 2 + 3 &&
+                      Listed(paths, count, transcript));
+                if (paths) HeapFree(GetProcessHeap(), 0, paths);
+                paths = NULL;
+                Check("long project directory fixture removed", RemoveFixture(longDir));
+            }
+        }
+        Check("failed or partial preparation leaves the original entry intact", Util_FileExists(set.entries[set.rows[row].entry[0]].file));
+    }
+    SessionStore_Free(&set);
+}
+
 /* A session's other transcripts (earlier ones, the one before a /clear) and
  * what Claude Code keeps for each, a transcript another session goes on
  * with, and a transcript filed in two project folders. */
@@ -1374,9 +1441,10 @@ static void TestOtherTranscripts(const WCHAR *projects)
 {
     ProfileList profiles;
     SessionSet set;
-    WCHAR entries[MAX_PATH], code[MAX_PATH], path[LONG_PATH_CCH], entry[MAX_PATH];
+    WCHAR entries[MAX_PATH], code[MAX_PATH], path[LONG_PATH_CCH], error[1024], entry[MAX_PATH];
+    WCHAR (*paths)[LONG_PATH_CCH] = NULL;
     char extra[512];
-    int row;
+    int row, count = 0;
     BOOL ready;
     ZeroMemory(&profiles, sizeof profiles);
     profiles.count = 1;
@@ -1403,9 +1471,35 @@ static void TestOtherTranscripts(const WCHAR *projects)
     if (!ready) return;
     row = FindRow(&set, g_lineageId);
     Check("a conversation's size counts its other transcripts, not another session's", row >= 0 && set.rows[row].transcriptBytes == 70);
+    Check("a session's other transcripts list for deletion with what Claude Code keeps for them",
+          row >= 0 && SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)) && count == 8 && Listed(paths, count, entry));
+    if (paths) {
+        const WCHAR *const expected[] = { L"lineage\\aaaaaaaa-0000-4000-8000-000000000001.jsonl",
+                                          L"lineage\\aaaaaaaa-0000-4000-8000-000000000002.jsonl",
+                                          L"lineage\\aaaaaaaa-0000-4000-8000-000000000003.jsonl",
+                                          L"lineage\\aaaaaaaa-0000-4000-8000-000000000001.desktop-released.json" };
+        const WCHAR *const stores[] = { L"file-history\\aaaaaaaa-0000-4000-8000-000000000001",
+                                        L"session-env\\aaaaaaaa-0000-4000-8000-000000000002",
+                                        L"debug\\aaaaaaaa-0000-4000-8000-000000000001.txt" };
+        BOOL all = TRUE;
+        int i;
+        for (i = 0; i < (int)ARRAYSIZE(expected); i++)
+            all = all && Join(projects, expected[i], path, ARRAYSIZE(path)) && Listed(paths, count, path);
+        for (i = 0; i < (int)ARRAYSIZE(stores); i++)
+            all = all && Join(code, stores[i], path, ARRAYSIZE(path)) && Listed(paths, count, path);
+        Check("the transcripts, Claude's marks and Claude Code's folders of the session are listed", all);
+        Check("a transcript another session goes on with stays, with its folders",
+              SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\lineage\\%s.jsonl", projects, g_claimedId)) && !Listed(paths, count, path) &&
+              SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\file-history\\%s", code, g_claimedId)) && !Listed(paths, count, path));
+        HeapFree(GetProcessHeap(), 0, paths);
+        paths = NULL;
+    }
     row = FindRow(&set, g_duplicateId);
     Check("a transcript filed twice is the larger one",
           row >= 0 && set.rows[row].transcriptBytes == 50 && Core_EndsWithI(set.rows[row].transcriptPath, L"\\dup-large\\aaaaaaaa-0000-4000-8000-000000000005.jsonl"));
+    Check("both copies of a transcript filed twice are listed for deletion",
+          row >= 0 && SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)) && count == 3);
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
     SessionStore_Free(&set);
 }
 
@@ -1474,10 +1568,13 @@ static void TestLongPaths(const WCHAR *projects)
     WCHAR leaf[MAX_PATH], storage[MAX_PATH], entries[LONG_PATH_CCH], entry[LONG_PATH_CCH], folder[LONG_PATH_CCH];
     WCHAR transcript[LONG_PATH_CCH], code[MAX_PATH], exe[MAX_PATH], id[SESSION_ID_CCH], error[2048], title[SESSION_TITLE_CCH];
     WCHAR left[LONG_PATH_CCH];
+    WCHAR (*paths)[LONG_PATH_CCH] = NULL;
+    HWND window;
+    RemoveResult result;
     /* A profile folder of 145 characters: its entries folder (95 more) is
      * shorter than MAX_PATH, an entry in it (48 more) is not. */
     size_t storageLength = MAX_PATH - 115, padding = storageLength > wcslen(g_root) + 1 ? storageLength - wcslen(g_root) - 1 : 0;
-    int row, calls;
+    int row, count = 0, i, calls;
     BOOL ready, waiting, outside, loaded;
     ZeroMemory(&profiles, sizeof profiles);
     profiles.count = 1;
@@ -1526,6 +1623,29 @@ static void TestLongPaths(const WCHAR *projects)
         Check("a copy past MAX_PATH that could not be opened is removed",
               SessionEdit_RemoveCopy(&set, row, 0, id, left, ARRAYSIZE(left)) && !FileThere(copied));
     } else Check("a transcript past MAX_PATH is copied", FALSE);
+    Check("every file of the session is listed for deletion",
+          SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)) && count == 2 &&
+          Listed(paths, count, entry) && Listed(paths, count, transcript));
+    for (i = 0; paths && i < count; i++) ready = ready && wcslen(paths[i]) >= MAX_PATH;
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    if (ready) {
+        Check("nothing runs the session: it can be deleted", SessionEdit_CanDelete(&set, row, error, ARRAYSIZE(error)) && !error[0]);
+        result = SessionEdit_DeleteEverywhere(NULL, &set, row, error, ARRAYSIZE(error));
+        Check("a deletion needing the Recycle Bin for paths past MAX_PATH is refused with the path",
+              result == REMOVE_FAILED && wcsstr(error, entry) != NULL);
+        Check("a refused deletion moves nothing", FileThere(entry) && FileThere(transcript) && g_recycle.calls == calls);
+    }
+
+    window = StartFakeClaude(&profiles.items[0]);
+    if (ready && window && Claude_IsRunning(&profiles.items[0])) {
+        Check("a session whose profile runs cannot be deleted, the profile named",
+              !SessionEdit_CanDelete(&set, row, error, ARRAYSIZE(error)) && wcsstr(error, profiles.items[0].name) != NULL);
+        result = SessionEdit_DeleteEverywhere(NULL, &set, row, error, ARRAYSIZE(error));
+        Check("deletion is refused while a profile listing the session runs", result == REMOVE_FAILED && error[0] &&
+              wcsstr(error, profiles.items[0].name) != NULL && FileThere(entry) && FileThere(transcript));
+    } else Check("running profile fixture for deletion", FALSE);
+    StopFakeClaude(window);
+
     /* A Claude Code running the session: a suspended child of this process, recorded as Claude Code records itself. */
     ZeroMemory(&startup, sizeof startup);
     startup.cb = sizeof startup;
@@ -1552,8 +1672,12 @@ static void TestLongPaths(const WCHAR *projects)
         if (loaded) SessionStore_Free(&set);
         loaded = ready && SessionStore_LoadProfiles(&set, &profiles);
         row = loaded ? FindRow(&set, g_longId) : -1;
-        Check("a Claude Code of no profile is found running the session",
-              row >= 0 && SessionStore_RunningNow(&profiles, g_longId, &outside) == 0 && outside);
+        if (row >= 0 && SessionStore_RunningNow(&profiles, g_longId, &outside) == 0 && outside) {
+            Check("a session a Claude Code of no profile runs cannot be deleted", !SessionEdit_CanDelete(&set, row, error, ARRAYSIZE(error)) && error[0]);
+            result = SessionEdit_DeleteEverywhere(NULL, &set, row, error, ARRAYSIZE(error));
+            Check("deletion is refused while a Claude Code of no profile runs the session",
+                  result == REMOVE_FAILED && error[0] && FileThere(entry) && FileThere(transcript));
+        } else Check("Claude Code of no profile fixture", FALSE);
         TerminateProcess(child.hProcess, 0);
         WaitForSingleObject(child.hProcess, 5000);
         CloseHandle(child.hThread);
@@ -1727,6 +1851,137 @@ static void TestRemovals(void)
     SessionStore_Free(&set);
 }
 
+/* Delete everywhere: every entry, the conversation and everything Claude's
+ * own delete removes with it, in one go; nothing when Windows' question is
+ * declined; with a Claude started meanwhile, its entry there goes when it
+ * closes. */
+static void TestDeleteEverywhere(const WCHAR *projects)
+{
+    ProfileList profiles;
+    SessionSet set;
+    PendingEdit edit;
+    WCHAR entries[2][MAX_PATH], files[2][MAX_PATH], staged[MAX_PATH], scratch[MAX_PATH], working[MAX_PATH], subfolder[MAX_PATH];
+    WCHAR temporary[MAX_PATH], temporaryFolder[MAX_PATH], longTemporary[LONG_PATH_CCH], leaf[MAX_PATH], neighbor[MAX_PATH];
+    WCHAR transcript[MAX_PATH], preImport[MAX_PATH], sessionFolder[MAX_PATH], physical[MAX_PATH], pending[MAX_PATH], error[1024];
+    WCHAR (*paths)[LONG_PATH_CCH] = NULL;
+    const WCHAR *listed[8];
+    char quoted[MAX_PATH * 6 + 4], extra[MAX_PATH * 6 + 64];
+    HWND window;
+    RemoveResult result;
+    size_t padding;
+    int p, row, count = 0, i;
+    BOOL ready = TRUE, all, waiting;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    for (p = 0; p < 2 && ready; p++)
+        ready = PrepareProfile(&profiles.items[p], p ? L"DeleteB" : L"DeleteA", p ? L"delete\\b" : L"delete\\a", g_accountId, g_organizationId,
+                               entries[p], MAX_PATH);
+    /* D: listed in both profiles, without a folder in A's "no folder" area;
+     * the transcript A staged for it; Claude Code's transcript, the one it
+     * kept before taking it in, its folder and its temporary folder. */
+    ready = ready && SUCCEEDED(StringCchPrintfW(scratch, ARRAYSIZE(scratch), L"%s\\scratch-workspaces\\%s\\%s", profiles.items[0].dataDir,
+                                                g_accountId, g_organizationId)) &&
+            Join(scratch, L"scratch-delete", working, ARRAYSIZE(working)) && SaveIn(working, L"notes.txt", "scratch\n") &&
+            Join(working, L"sub", subfolder, ARRAYSIZE(subfolder)) &&
+            SUCCEEDED(StringCchPrintfW(staged, ARRAYSIZE(staged), L"%s\\imported-staging\\%s.jsonl", entries[0], g_deletedId)) && Save(staged, "{}\n") &&
+            Core_JsonQuote(staged, quoted, sizeof quoted) &&
+            SUCCEEDED(StringCchPrintfA(extra, sizeof extra, ",\"stagedTranscriptPath\":%s", quoted)) &&
+            WriteEntryIn(entries[0], g_deletedId, working, extra) && WriteEntryIn(entries[1], g_deletedId, working, "") &&
+            EntryPath(entries[0], g_deletedId, files[0], MAX_PATH) && EntryPath(entries[1], g_deletedId, files[1], MAX_PATH) &&
+            WriteEntryIn(entries[0], g_neighborId, subfolder, "") && EntryPath(entries[0], g_neighborId, neighbor, ARRAYSIZE(neighbor)) &&
+            WriteEntry(entries[0], g_startedId, "") && WriteEntry(entries[1], g_startedId, "") &&
+            SUCCEEDED(StringCchPrintfW(transcript, ARRAYSIZE(transcript), L"%s\\delete\\%s.jsonl", projects, g_deletedId)) && Save(transcript, "{}\n") &&
+            SUCCEEDED(StringCchPrintfW(preImport, ARRAYSIZE(preImport), L"%s.pre-import", transcript)) && Save(preImport, "{}\n") &&
+            SUCCEEDED(StringCchPrintfW(sessionFolder, ARRAYSIZE(sessionFolder), L"%s\\delete\\%s", projects, g_deletedId)) &&
+            SaveIn(sessionFolder, L"subagent.jsonl", "{}\n") &&
+            GetEnvironmentVariableW(L"CLAUDE_CODE_TMPDIR", temporary, ARRAYSIZE(temporary)) > 0 &&
+            SUCCEEDED(StringCchPrintfW(temporaryFolder, ARRAYSIZE(temporaryFolder), L"%s\\claude\\C--Fixture\\%s", temporary, g_deletedId)) &&
+            SaveIn(temporaryFolder, L"output.txt", "task\n") && SessionStore_PendingPath(&profiles.items[1], pending, ARRAYSIZE(pending));
+    /* A temporary folder too long for the Recycle Bin, left to Claude Code. */
+    padding = wcslen(temporary) + 40 < MAX_PATH ? MAX_PATH - wcslen(temporary) - 40 : 1;
+    wmemset(leaf, L't', padding);
+    leaf[padding] = 0;
+    ready = ready && SUCCEEDED(StringCchPrintfW(longTemporary, ARRAYSIZE(longTemporary), L"%s\\claude\\%s\\%s", temporary, leaf, g_deletedId)) &&
+            wcslen(longTemporary) >= MAX_PATH && MakeDir(longTemporary);
+    /* A title waiting for D in B. */
+    window = ready ? StartFakeClaude(&profiles.items[1]) : NULL;
+    ZeroMemory(&edit, sizeof edit);
+    edit.op = PENDING_TITLE;
+    StringCchCopyW(edit.key, ARRAYSIZE(edit.key), g_deletedId);
+    StringCchCopyW(edit.value, ARRAYSIZE(edit.value), L"Waiting title");
+    ready = ready && window && SessionEdit_Change(NULL, &profiles.items[1], NULL, &edit, &waiting, NULL, 0) && waiting;
+    StopFakeClaude(window);
+    ready = ready && SessionStore_LoadProfiles(&set, &profiles);
+    Check("delete everywhere fixtures ready", ready);
+    listed[0] = files[0];
+    listed[1] = files[1];
+    listed[2] = staged;
+    listed[3] = working;            /* folders: 3, 4 and 7 */
+    listed[4] = temporaryFolder;
+    listed[5] = transcript;
+    listed[6] = preImport;
+    listed[7] = sessionFolder;
+    if (!ready) return;
+    row = FindRow(&set, g_deletedId);
+    Check("a session another one works under keeps its working folder",
+          row >= 0 && !SessionEdit_RemovesWorkingFolder(&set, row, physical, ARRAYSIZE(physical)));
+    Check("so its working folder is not listed for deletion",
+          row >= 0 && SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)) && count == 7 && !Listed(paths, count, working));
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    paths = NULL;
+    SessionStore_Free(&set);
+    ready = RemoveFixture(neighbor) && SessionStore_LoadProfiles(&set, &profiles) && (row = FindRow(&set, g_deletedId)) >= 0;
+    Check("delete everywhere fixture without the other session", ready);
+    if (!ready) {
+        SessionStore_Free(&set);
+        return;
+    }
+    Check("a session without a folder takes its working folder with it",
+          SessionEdit_RemovesWorkingFolder(&set, row, physical, ARRAYSIZE(physical)) && Core_PathEquals(physical, working));
+    all = SessionEdit_ListFiles(&set, row, &paths, &count, error, ARRAYSIZE(error)) && count == (int)ARRAYSIZE(listed);
+    for (i = 0; all && i < (int)ARRAYSIZE(listed); i++) all = Listed(paths, count, listed[i]);
+    Check("the deletion lists the entries, the staged transcript, the working folder, the transcript kept before, the temporary folder", all);
+    Check("a temporary folder too long for the Recycle Bin is not listed", paths && !Listed(paths, count, longTemporary));
+    if (paths) HeapFree(GetProcessHeap(), 0, paths);
+    paths = NULL;
+
+    RecycleWill(REMOVE_CANCELLED, NULL);
+    result = SessionEdit_DeleteEverywhere(NULL, &set, row, error, ARRAYSIZE(error));
+    all = result == REMOVE_CANCELLED && g_recycle.calls == 1 && g_recycle.count == (int)ARRAYSIZE(listed);
+    for (i = 0; all && i < (int)ARRAYSIZE(listed); i++) all = Recycled(listed[i]) && PathThere(listed[i], i == 3 || i == 4 || i == 7);
+    Check("a deletion declined at Windows' question leaves everything", all);
+    Check("a declined deletion marks nothing and keeps what waits",
+          CountMarks(entries[0]) == 0 && CountMarks(entries[1]) == 0 && Util_FileExists(pending));
+
+    RecycleWill(REMOVE_DONE, NULL);
+    result = SessionEdit_DeleteEverywhere(NULL, &set, row, error, ARRAYSIZE(error));
+    all = result == REMOVE_DONE && !g_recycle.escaped && g_recycle.calls == 1 && g_recycle.count == (int)ARRAYSIZE(listed);
+    for (i = 0; all && i < (int)ARRAYSIZE(listed); i++) all = !PathThere(listed[i], i == 3 || i == 4 || i == 7);
+    Check("a session is deleted everywhere in one go", all && !error[0]);
+    Check("each profile that listed it gets Claude's mark",
+          DeletedMark(entries[0], g_deletedId) > 0 && DeletedMark(entries[1], g_deletedId) > 0 && CountMarks(entries[0]) == 1 && CountMarks(entries[1]) == 1);
+    Check("what waited for it is dropped", !Util_FileExists(pending));
+    Check("a temporary folder too long for the Recycle Bin is left", DirThere(longTemporary));
+    SessionStore_Free(&set);
+
+    /* B's Claude starts while Windows asks. */
+    ready = SessionStore_LoadProfiles(&set, &profiles) && (row = FindRow(&set, g_startedId)) >= 0;
+    Check("started-during-deletion fixture read", ready);
+    if (ready) {
+        RecycleWill(REMOVE_DONE, &profiles.items[1]);
+        result = SessionEdit_DeleteEverywhere(NULL, &set, row, error, ARRAYSIZE(error));
+        Check("a deletion overtaken by a profile starting is made", result == REMOVE_DONE && g_recycle.count == 2);
+        Check("the profile that did not start gets Claude's mark", DeletedMark(entries[0], g_startedId) > 0);
+        Check("the profile that started waits to remove the entry its Claude keeps, unmarked",
+              RemovalQueued(&profiles.items[1]) && DeletedMark(entries[1], g_startedId) == 0);
+        StopStartedClaude();
+        Check("once that Claude has run without the session, its removal waits no more",
+              SessionEdit_ApplyPendingAfterRun(&profiles.items[1]) == 1 && !RemovalQueued(&profiles.items[1]));
+    }
+    RecycleWill(REMOVE_DONE, NULL);
+    SessionStore_Free(&set);
+}
+
 typedef struct ConcurrentRead {
     const ProfileList *profiles;
     HANDLE start;
@@ -1868,8 +2123,8 @@ static BOOL WaitForViewChange(HWND window, HWND tree, int expected, BOOL notific
 
 static void TestBackgroundView(const ProfileList *profiles)
 {
-    static const int ids[] = { IDC_S_PROFILES, IDC_S_TREE, IDC_S_SEARCH, IDC_S_ARCHIVED, IDC_S_DETAILS };
-    static const WCHAR *const classes[] = { L"LISTBOX", WC_TREEVIEWW, L"EDIT", L"BUTTON", L"STATIC" };
+    static const int ids[] = { IDC_S_PROFILES, IDC_S_TREE, IDC_S_SEARCH, IDC_S_FIND, IDC_S_FILTER };
+    static const WCHAR *const classes[] = { L"LISTBOX", WC_TREEVIEWW, L"EDIT", L"BUTTON", L"BUTTON" };
     HWND window, tree;
     ClaudePackage package;
     ProfileList newer;
@@ -2205,6 +2460,284 @@ static void TestSessionSync(const WCHAR *projects)
     }
     if (before) HeapFree(GetProcessHeap(), 0, before);
     if (after) HeapFree(GetProcessHeap(), 0, after);
+}
+
+/* ------------------------------------------------------------ sessionundo.c */
+
+static const WCHAR *const g_undoIds[3] = {
+    L"cdcdcdcd-0000-4000-8000-000000000001", L"cdcdcdcd-0000-4000-8000-000000000002", L"cdcdcdcd-0000-4000-8000-000000000003"
+};
+
+/* The latest action undone (or done again) through a snapshot of `profiles` read now. */
+static BOOL UndoLatest(const ProfileList *profiles, BOOL redo)
+{
+    SessionSet set;
+    WCHAR error[LONG_PATH_CCH];
+    BOOL ok;
+    if (!SessionStore_LoadProfiles(&set, profiles)) return FALSE;
+    ok = redo ? SessionUndo_Redo(NULL, &set, error, ARRAYSIZE(error)) : SessionUndo_Undo(NULL, &set, error, ARRAYSIZE(error));
+    if (!ok) printf("  (%ls)\n", error);
+    SessionStore_Free(&set);
+    return ok;
+}
+
+/* Profile `p`'s entry of `key` changed as the sessions view changes it, one action kept for undoing. */
+static BOOL ChangeAndKeep(const ProfileList *profiles, int p, PendingOp op, const WCHAR *key, const WCHAR *value)
+{
+    SessionSet set;
+    PendingEdit edit;
+    const SessionEntry *entry;
+    WCHAR before[SESSION_TITLE_CCH];
+    char *content = NULL;
+    DWORD length = 0;
+    int found;
+    BOOL waiting, made, starred, beforeAuto;
+    if (!SessionStore_LoadProfiles(&set, profiles)) return FALSE;
+    if ((found = SessionStore_FindEntry(&set, p, key, NULL)) < 0) {
+        SessionStore_Free(&set);
+        return FALSE;
+    }
+    entry = &set.entries[found];
+    starred = entry->starred;
+    beforeAuto = entry->autoTitle;
+    StringCchCopyW(before, ARRAYSIZE(before), entry->title);
+    if (op == PENDING_REMOVE) content = Util_ReadFile(entry->file, SESSION_ENTRY_MAX_BYTES, FALSE, &length);
+    ZeroMemory(&edit, sizeof edit);
+    edit.op = op;
+    StringCchCopyW(edit.key, ARRAYSIZE(edit.key), key);
+    StringCchCopyW(edit.value, ARRAYSIZE(edit.value), value);
+    SessionUndo_Begin(&set);
+    made = SessionEdit_Change(NULL, &profiles->items[p], entry, &edit, &waiting, NULL, 0) && !waiting;
+    if (made && op == PENDING_STAR) SessionUndo_Star(&profiles->items[p], key, starred, value[0] == L'1');
+    else if (made && op == PENDING_TITLE) SessionUndo_Title(&profiles->items[p], key, before, beforeAuto, value);
+    else if (made) SessionUndo_Listed(&profiles->items[p], key, FALSE, content, length);
+    else if (content) HeapFree(GetProcessHeap(), 0, content);
+    SessionUndo_End();
+    SessionStore_Free(&set);
+    return made;
+}
+
+static BOOL SourceIs(const WCHAR *path, const WCHAR *expected)
+{
+    WCHAR source[16];
+    return ReadString(path, "titleSource", source, ARRAYSIZE(source)) && wcscmp(source, expected) == 0;
+}
+
+static BOOL OnlyQueued(const Profile *p, SyncOpKind kind)
+{
+    SyncOp *ops = NULL;
+    int count = SessionSync_Queued(p, &ops);
+    BOOL only = count == 1 && ops[0].kind == kind;
+    if (ops) HeapFree(GetProcessHeap(), 0, ops);
+    return only;
+}
+
+/* Ctrl+Z and Ctrl+Y of the sessions view: a star, a title (Claude's own
+ * given back as Claude's, none taken away again), a removal to the Recycle
+ * Bin, and a share, also while the other profile runs. */
+static void TestUndo(void)
+{
+    static const WCHAR *const labels[2] = { L"Undo-A", L"Undo-B" };
+    static const WCHAR *const leaves[2] = { L"undo\\A", L"undo\\B" };
+    static const WCHAR *const accounts[2] = { L"undo-a", L"undo-b" };
+    ProfileList profiles;
+    SessionSet set;
+    SyncReport report;
+    WCHAR entries[2][MAX_PATH], path[MAX_PATH], untitled[MAX_PATH], mark[MAX_PATH];
+    char json[512];
+    HWND window;
+    int p, row = -1;
+    BOOL ready = TRUE, loaded, autoTitle = FALSE;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    for (p = 0; p < profiles.count && ready; p++)
+        ready = PrepareProfile(&profiles.items[p], labels[p], leaves[p], accounts[p], L"undo-organization", entries[p], ARRAYSIZE(entries[p]));
+    ready = ready &&
+            SUCCEEDED(StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"cwd\":\"C:\\\\Fixture\","
+                                                          "\"title\":\"Claude's title\",\"titleSource\":\"auto\",\"lastActivityAt\":500}",
+                                       g_undoIds[0], g_undoIds[0])) &&
+            EntryPath(entries[0], g_undoIds[0], path, ARRAYSIZE(path)) && Save(path, json) &&
+            WriteSyncEntry(entries[0], g_undoIds[1], "Shared", 400) &&
+            SUCCEEDED(StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"cwd\":\"C:\\\\Fixture\","
+                                                          "\"lastActivityAt\":300}", g_undoIds[2], g_undoIds[2])) &&
+            EntryPath(entries[0], g_undoIds[2], untitled, ARRAYSIZE(untitled)) && Save(untitled, json) &&
+            MarkPath(entries[0], g_undoIds[0], mark, ARRAYSIZE(mark));
+    Check("undo fixtures created", ready);
+    if (!ready) return;
+    SessionUndo_Clear();
+    SessionUndo_Star(&profiles.items[0], g_undoIds[0], FALSE, TRUE);
+    Check("a change told outside an action is not kept", !SessionUndo_CanUndo());
+    if ((loaded = SessionStore_LoadProfiles(&set, &profiles)) != FALSE) {
+        int found = SessionStore_FindEntry(&set, 0, g_undoIds[0], NULL);
+        autoTitle = found >= 0 && set.entries[found].autoTitle && !set.entries[found].userTitle;
+        SessionStore_Free(&set);
+    }
+    Check("an entry tells Claude's own title apart", autoTitle);
+
+    /* A star, then a title: each an action, undone from the latest. */
+    Check("a star and a title made, each kept",
+          ChangeAndKeep(&profiles, 0, PENDING_STAR, g_undoIds[0], L"1") && ChangeAndKeep(&profiles, 0, PENDING_TITLE, g_undoIds[0], L"Mine") &&
+          ReadTrue(path, "isStarred") && TitledAs(path, L"Mine") && SourceIs(path, L"user") && SessionUndo_CanUndo() && !SessionUndo_CanRedo());
+    Check("undoing the title gives Claude's own back, as Claude's",
+          UndoLatest(&profiles, FALSE) && TitledAs(path, L"Claude's title") && SourceIs(path, L"auto") && ReadTrue(path, "isStarred"));
+    Check("undoing the star takes it away", UndoLatest(&profiles, FALSE) && !ReadTrue(path, "isStarred") && !SessionUndo_CanUndo() &&
+          SessionUndo_CanRedo());
+    Check("nothing more to undo", !UndoLatest(&profiles, FALSE));
+    Check("redoing makes the star again", UndoLatest(&profiles, TRUE) && ReadTrue(path, "isStarred"));
+    Check("... then the title, as someone's", UndoLatest(&profiles, TRUE) && TitledAs(path, L"Mine") && SourceIs(path, L"user") &&
+          !SessionUndo_CanRedo());
+    Check("a session without a title renamed", ChangeAndKeep(&profiles, 0, PENDING_TITLE, g_undoIds[2], L"Named") && TitledAs(untitled, L"Named"));
+    Check("undone, it has no title again", UndoLatest(&profiles, FALSE) && !HasMember(untitled, "title") && !HasMember(untitled, "titleSource"));
+
+    /* Removed as Remove removes it: undoing puts the entry back without Claude's marks; redoing takes it out again. */
+    RecycleWill(REMOVE_DONE, NULL);
+    Check("a session removed to the Recycle Bin, marked", ChangeAndKeep(&profiles, 0, PENDING_REMOVE, g_undoIds[0], L"") && Recycled(path) &&
+          !FileThere(path) && FileThere(mark));
+    Check("undoing the removal puts its entry back, unmarked", UndoLatest(&profiles, FALSE) && TitledAs(path, L"Mine") && !FileThere(mark));
+    Check("redoing it takes it out again, marked", UndoLatest(&profiles, TRUE) && !FileThere(path) && FileThere(mark));
+    Check("... and undoing that brings it back", UndoLatest(&profiles, FALSE) && TitledAs(path, L"Mine") && ReadTrue(path, "isStarred"));
+
+    /* Shared with the other profile: undoing takes it out of that one only. */
+    if ((loaded = SessionStore_LoadProfiles(&set, &profiles)) != FALSE) {
+        row = FindRow(&set, g_undoIds[1]);
+        ZeroMemory(&report, sizeof report);
+        SessionUndo_Begin(&set);
+        ready = row >= 0 && SessionSync_Share(&set, 0, &row, 1, 0x2, &report) && report.added == 1;
+        SessionUndo_End();
+        SessionStore_Free(&set);
+    }
+    Check("a share is kept as it is made", loaded && ready && EntryThere(entries[1], g_undoIds[1]) && SessionUndo_CanUndo());
+    Check("undoing the share takes it out of the other profile only",
+          UndoLatest(&profiles, FALSE) && !EntryThere(entries[1], g_undoIds[1]) && EntryThere(entries[0], g_undoIds[1]));
+    Check("redoing shares it again", UndoLatest(&profiles, TRUE) && EntryTitled(entries[1], g_undoIds[1], L"Shared"));
+
+    /* The other profile running: the share waits in its plan, and undoing it takes its place. */
+    Check("the share undone again", UndoLatest(&profiles, FALSE) && !EntryThere(entries[1], g_undoIds[1]));
+    window = StartFakeClaude(&profiles.items[1]);
+    Check("redone while the other profile runs, it waits", window && UndoLatest(&profiles, TRUE) && !EntryThere(entries[1], g_undoIds[1]) &&
+          OnlyQueued(&profiles.items[1], SYNC_PUT));
+    Check("undone while it runs, a removal waits in its place", UndoLatest(&profiles, FALSE) && OnlyQueued(&profiles.items[1], SYNC_REMOVE));
+    StopFakeClaude(window);
+    SessionEdit_ApplyPending(NULL, &profiles.items[1]);
+    Check("once it closed, it does not list the session", !EntryThere(entries[1], g_undoIds[1]) &&
+          SessionSync_PendingCount(&profiles.items[1]) == 0);
+
+    SessionUndo_Forget(g_undoIds[1]);
+    Check("what names a session deleted everywhere is forgotten", !SessionUndo_CanRedo() && SessionUndo_CanUndo());
+    SessionUndo_Clear();
+    Check("cleared, nothing is undone", !SessionUndo_CanUndo() && !SessionUndo_CanRedo());
+}
+
+/* The headings left open, kept in settings.ini of the (private) state folder: in order, an item with "=" whole. */
+static void TestSettingList(void)
+{
+    WCHAR items[3][MAX_PATH] = { L"*starred", L"C:\\Work\\a=b", L"*archived|*date:1" }, back[4][MAX_PATH];
+    int count;
+    Check("a list kept in settings.ini", Util_SetSettingList(L"TestList", (const WCHAR (*)[MAX_PATH])items, 3));
+    count = Util_GetSettingList(L"TestList", back, 4);
+    Check("... reads back whole, in order", count == 3 && wcscmp(back[0], items[0]) == 0 && wcscmp(back[1], items[1]) == 0 &&
+                                            wcscmp(back[2], items[2]) == 0);
+    Check("... at most as many as asked", Util_GetSettingList(L"TestList", back, 2) == 2);
+    Check("an empty list takes the section away", Util_SetSettingList(L"TestList", NULL, 0) && Util_GetSettingList(L"TestList", back, 4) == 0);
+    Check("a list never kept is empty", Util_GetSettingList(L"NoSuchList", back, 4) == 0);
+}
+
+/* ------------------------------------------------------------ what sessions sync */
+
+static const WCHAR *const g_itemIds[3] = {
+    L"dededede-0000-4000-8000-000000000001", L"dededede-0000-4000-8000-000000000002", L"dededede-0000-4000-8000-000000000003"
+};
+
+static BOOL WriteItemEntry(const WCHAR *entries, const WCHAR *id, const char *title, int activity, BOOL archived)
+{
+    WCHAR file[MAX_PATH];
+    char json[512];
+    return SUCCEEDED(StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"cwd\":\"C:\\\\Fixture\","
+                                                         "\"title\":\"%s\",\"titleSource\":\"user\",\"isArchived\":%s,\"lastActivityAt\":%d}",
+                                      id, id, title, archived ? "true" : "false", activity)) &&
+           EntryPath(entries, id, file, ARRAYSIZE(file)) && Save(file, json);
+}
+
+static BOOL EntryActivityIs(const WCHAR *entries, const WCHAR *id, ULONGLONG expected)
+{
+    WCHAR path[MAX_PATH];
+    DWORD length = 0;
+    char *json;
+    const char *value;
+    size_t valueLength;
+    ULONGLONG activity = 0;
+    BOOL same;
+    if (!EntryPath(entries, id, path, ARRAYSIZE(path)) || (json = Util_ReadFile(path, 65536, FALSE, &length)) == NULL) return FALSE;
+    same = Core_JsonMember(json, length, "lastActivityAt", &value, &valueLength) && Core_JsonNumber(value, valueLength, &activity) &&
+           activity == expected;
+    HeapFree(GetProcessHeap(), 0, json);
+    return same;
+}
+
+static BOOL KeepItemsGroup(const ProfileList *profiles, DWORD items)
+{
+    WCHAR listName[FOLDER_CCH];
+    SyncReport report;
+    int p;
+    for (p = 0; p < profiles->count; p++) ((ProfileList *)profiles)->items[p].syncItems = items;
+    ZeroMemory(&report, sizeof report);
+    return SessionVault_GroupListName(7, listName, ARRAYSIZE(listName)) && SessionVault_Keep(profiles, 0x3, listName, TRUE, &report) &&
+           report.failed == 0;
+}
+
+/* Sessions synced by part: new ones, titles, archived states and deletions,
+ * each left out alone, in a group of two profiles of their own. */
+static void TestSessionItems(void)
+{
+    static const WCHAR *const labels[2] = { L"Parts-A", L"Parts-B" };
+    static const WCHAR *const leaves[2] = { L"parts\\A", L"parts\\B" };
+    static const WCHAR *const accounts[2] = { L"parts-a", L"parts-b" };
+    ProfileList profiles;
+    WCHAR entries[2][MAX_PATH], path[MAX_PATH], mark[MAX_PATH];
+    char time[32];
+    int p;
+    BOOL ready = TRUE;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    for (p = 0; p < profiles.count && ready; p++)
+        ready = PrepareProfile(&profiles.items[p], labels[p], leaves[p], accounts[p], L"parts-organization", entries[p], ARRAYSIZE(entries[p]));
+    profiles.items[0].syncGroup = profiles.items[1].syncGroup = 7;
+    ready = ready && WriteItemEntry(entries[0], g_itemIds[0], "Planning", 100, FALSE);
+    Check("sync parts: fixtures created", ready);
+    if (!ready) return;
+    Check("sync parts: a new session goes across", KeepItemsGroup(&profiles, SYNC_ITEMS_ALL) && EntryTitled(entries[1], g_itemIds[0], L"Planning"));
+
+    /* Titles and archived states left out: each keeps its own; what else changed goes across. */
+    ready = WriteItemEntry(entries[1], g_itemIds[0], "Mine", 100, FALSE);
+    Check("sync parts: a title changed in one profile stays there",
+          ready && KeepItemsGroup(&profiles, SYNC_ITEMS_ALL & ~(SYNC_ITEM_SESSIONS_TITLES | SYNC_ITEM_SESSIONS_ARCHIVED)) &&
+          EntryTitled(entries[0], g_itemIds[0], L"Planning") && EntryTitled(entries[1], g_itemIds[0], L"Mine"));
+    ready = WriteItemEntry(entries[0], g_itemIds[0], "Planning", 300, TRUE);
+    Check("sync parts: going on goes across, the title and the archived state do not",
+          ready && KeepItemsGroup(&profiles, SYNC_ITEMS_ALL & ~(SYNC_ITEM_SESSIONS_TITLES | SYNC_ITEM_SESSIONS_ARCHIVED)) &&
+          EntryActivityIs(entries[1], g_itemIds[0], 300) && EntryTitled(entries[1], g_itemIds[0], L"Mine") &&
+          EntryPath(entries[1], g_itemIds[0], path, ARRAYSIZE(path)) && !ReadTrue(path, "isArchived"));
+    Check("sync parts: syncing again changes nothing",
+          KeepItemsGroup(&profiles, SYNC_ITEMS_ALL & ~(SYNC_ITEM_SESSIONS_TITLES | SYNC_ITEM_SESSIONS_ARCHIVED)) &&
+          EntryTitled(entries[1], g_itemIds[0], L"Mine") && EntryTitled(entries[0], g_itemIds[0], L"Planning"));
+
+    /* New sessions left out: one made in a profile stays there; one both list still follows. */
+    ready = WriteItemEntry(entries[0], g_itemIds[1], "Only here", 500, FALSE) && WriteItemEntry(entries[0], g_itemIds[0], "Planning", 600, TRUE);
+    Check("sync parts: without new sessions, one made in a profile stays there; updates still go across",
+          ready && KeepItemsGroup(&profiles, SYNC_ITEMS_ALL & ~(SYNC_ITEM_SESSIONS_NEW | SYNC_ITEM_SESSIONS_TITLES)) &&
+          !EntryThere(entries[1], g_itemIds[1]) && EntryActivityIs(entries[1], g_itemIds[0], 600));
+
+    /* Deletions left out: deleted in one profile, the other keeps it, and it does not come back. */
+    ready = EntryPath(entries[0], g_itemIds[0], path, ARRAYSIZE(path)) && DeleteFileW(path) && MarkPath(entries[0], g_itemIds[0], mark, ARRAYSIZE(mark)) &&
+            SUCCEEDED(StringCchPrintfA(time, sizeof time, "%I64u", NowMs())) && Save(mark, time);
+    Check("sync parts: without deletions, the other profile keeps a session deleted in one",
+          ready && KeepItemsGroup(&profiles, SYNC_ITEMS_ALL & ~SYNC_ITEM_SESSIONS_DELETED) && EntryThere(entries[1], g_itemIds[0]) &&
+          !EntryThere(entries[0], g_itemIds[0]));
+    Check("sync parts: ... and it does not come back where it was deleted",
+          KeepItemsGroup(&profiles, SYNC_ITEMS_ALL & ~SYNC_ITEM_SESSIONS_DELETED) && !EntryThere(entries[0], g_itemIds[0]) &&
+          EntryThere(entries[1], g_itemIds[0]));
+    Check("sync parts: with deletions again, it goes everywhere",
+          KeepItemsGroup(&profiles, SYNC_ITEMS_ALL) && !EntryThere(entries[1], g_itemIds[0]) && !EntryThere(entries[0], g_itemIds[0]));
 }
 
 /* ------------------------------------------------- sessionvault.c, sessionpurge.c */
@@ -2854,11 +3387,12 @@ static BOOL MakeWebStorage(const WCHAR *storageDir, const WCHAR *const *names, c
 }
 
 /* Conflict `part` of `item` is among `conflicts`, between the profiles of `members`. */
+/* A conflict over `part`, which belongs to `item` (an item, or a group of them). */
 static BOOL HasConflict(const VaultConflict *conflicts, int count, const char *part, DWORD item, DWORD members)
 {
     int c;
     for (c = 0; c < count; c++)
-        if (strcmp(conflicts[c].part, part) == 0 && conflicts[c].item == item && conflicts[c].members == members) return TRUE;
+        if (strcmp(conflicts[c].part, part) == 0 && (conflicts[c].item & item) && conflicts[c].members == members) return TRUE;
     return FALSE;
 }
 
@@ -3205,8 +3739,8 @@ static void TestSyncItems(void)
     StopFakeClaude(window);
     Check("sync items: the waiting change is made once it closes", SessionEdit_ApplyPending(NULL, &profiles.items[0]) > 0 &&
           FileHas(configs[0], "\"selectedProjects\":[\"C:\\\\B\"]") && WebHas(&profiles.items[0], L"default-model", "claude-opus-5-5"));
-    Check("sync items: the default leaves permissions out", (SessionVault_GroupItems(&profiles, 0x3) & SYNC_ITEM_PERMISSIONS) == 0 &&
-          SessionVault_GroupItems(&profiles, 0x3) == SYNC_ITEMS_DEFAULT);
+    Check("sync items: unchosen, a group syncs everything", SessionVault_GroupItems(&profiles, 0x3) == SYNC_ITEMS_ALL &&
+          SYNC_ITEMS_DEFAULT == SYNC_ITEMS_ALL);
 }
 
 /* --------------------------------------------- one sync at a time, conflicts */
@@ -3322,8 +3856,9 @@ static void TestReliableSync(void)
 
     /* Both change it each their own way: each keeps its own until the person chooses. */
     Sleep(30);
-    ready = SetWebGroups(&profiles.items[0], "rel-a/rel-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"From A\"}],\"assignments\":{},\"order\":{}}", backup) &&
-            SetWebGroups(&profiles.items[1], "rel-b/rel-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"From B\"}],\"assignments\":{},\"order\":{}}", backup);
+    ready = SetWebGroups(&profiles.items[0], "rel-a/rel-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"From A\"}],\"assignments\":{},\"order\":{}}", backup);
+    Sleep(30);   /* B's change written later than A's: the same clock tick would leave them equal */
+    ready = ready && SetWebGroups(&profiles.items[1], "rel-b/rel-organization", "{\"groups\":[{\"id\":\"cg-1\",\"name\":\"From B\"}],\"assignments\":{},\"order\":{}}", backup);
     ZeroMemory(&report, sizeof report);
     ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report);
     count = SessionVault_Conflicts(&profiles, 6, conflicts, ARRAYSIZE(conflicts));
@@ -3426,7 +3961,9 @@ int wmain(int argc, WCHAR **argv)
             TestPendingChanges();
             TestReadonlyPending(&profiles);
             TestRemovals();
+            TestDeletionList(&profiles, projects);
             TestOtherTranscripts(projects);
+            TestDeleteEverywhere(projects);
             TestEntryCounts();
             TestLongPaths(projects);
             TestCancelledRead();
@@ -3435,6 +3972,9 @@ int wmain(int argc, WCHAR **argv)
             TestIndexedSessions();
             TestGroupAliases();
             TestSessionSync(projects);
+            TestUndo();
+            TestSessionItems();
+            TestSettingList();
             TestVault(projects);
             TestKeptGroups(projects);
             TestWebLayout();

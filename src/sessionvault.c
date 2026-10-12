@@ -329,6 +329,77 @@ static ULONGLONG EntryHash(const char *json, size_t length)
     return hash ? hash : 1;
 }
 
+/* The members of an entry each profile keeps its own when what it syncs
+ * leaves them out: the title, and whether the session is archived. */
+static const struct { const char *member; DWORD item; } kOwnMembers[] = {
+    { "title", SYNC_ITEM_SESSIONS_TITLES },
+    { "titleSource", SYNC_ITEM_SESSIONS_TITLES },
+    { "isArchived", SYNC_ITEM_SESSIONS_ARCHIVED },
+    { "autoArchiveExempt", SYNC_ITEM_SESSIONS_ARCHIVED },   /* taken out of the archive by hand */
+};
+
+static BOOL KeepsOwnMembers(DWORD items)
+{
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kOwnMembers); i++)
+        if (!(items & kOwnMembers[i].item)) return TRUE;
+    return FALSE;
+}
+
+/* An entry's hash as profiles syncing `items` compare it: without the
+ * members each keeps its own (EntryHash itself when they sync them all). */
+static ULONGLONG SyncedHash(const char *json, size_t length, DWORD items)
+{
+    char *without;
+    size_t used = length, i;
+    ULONGLONG hash;
+    if (!KeepsOwnMembers(items) || (without = CopyOf(json, length)) == NULL) return EntryHash(json, length);
+    for (i = 0; i < ARRAYSIZE(kOwnMembers); i++)
+        if (!(items & kOwnMembers[i].item) && !Core_JsonRemoveMember(without, used, kOwnMembers[i].member, without, used + 1, &used)) {
+            Free(without);
+            return EntryHash(json, length);
+        }
+    hash = EntryHash(without, used);
+    Free(without);
+    return hash;
+}
+
+/* Entry `content` as a profile whose own entry is `own` (NULL: none) takes
+ * it when it syncs `items`: with its own members where they are left out (a
+ * member it lacks taken away). A heap block (Free it); NULL without memory. */
+static char *WithOwnMembers(const char *content, size_t length, const char *own, size_t ownLength, DWORD items, size_t *outLength)
+{
+    char *out = CopyOf(content, length), *next;
+    size_t used = length, i;
+    for (i = 0; out && i < ARRAYSIZE(kOwnMembers); i++) {
+        const char *value;
+        size_t valueLength, capacity;
+        char *raw;
+        if (items & kOwnMembers[i].item) continue;
+        if (!own || !Core_JsonMember(own, ownLength, kOwnMembers[i].member, &value, &valueLength)) {
+            if (!Core_JsonRemoveMember(out, used, kOwnMembers[i].member, out, used + 1, &used)) {
+                Free(out);
+                out = NULL;
+            }
+            continue;
+        }
+        capacity = used + strlen(kOwnMembers[i].member) + valueLength + 8;
+        raw = CopyOf(value, valueLength);
+        next = raw ? (char *)HeapAlloc(GetProcessHeap(), 0, capacity + 1) : NULL;
+        if (next && Core_JsonSetMember(out, used, kOwnMembers[i].member, raw, next, capacity, &used)) {
+            next[used] = 0;
+        } else {
+            Free(next);
+            next = NULL;
+        }
+        Free(raw);
+        Free(out);
+        out = next;
+    }
+    *outLength = out ? used : 0;
+    return out;
+}
+
 static ULONGLONG EntryActivity(const char *json, size_t length)
 {
     const char *value;
@@ -1252,9 +1323,13 @@ static BOOL GoesOnAsAnother(const SessionSet *set, const EarlierIds *earlier, co
 }
 
 /* One session made the same in every member: `row` of `set` (-1: listed by
- * none, only by the base, as `key`). */
+ * none, only by the base, as `key`), as far as `items` goes: without
+ * SYNC_ITEM_SESSIONS_NEW, a member that does not list it does not get it;
+ * without SYNC_ITEM_SESSIONS_DELETED, a deletion stays in the member that
+ * made it and the others go on with the session; without titles or
+ * archived states, each member keeps its own (WithOwnMembers). */
 static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, const Member *members, const VaultList *base,
-                           DatedSet *ledger, BOOL same, const int *heal, Changes *changes, VaultList *next)
+                           DatedSet *ledger, BOOL same, DWORD items, const int *heal, Changes *changes, VaultList *next)
 {
     MirrorSide sides[MAX_PROFILES], baseSide;
     char *contents[MAX_PROFILES], *content = NULL;
@@ -1272,7 +1347,7 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
         ZeroMemory(&sides[m], sizeof sides[m]);
         if (entry >= 0 && (contents[m] = ReadEntry(set->entries[entry].file, &lengths[m], &sides[m].time)) != NULL) {
             sides[m].state = MIRROR_LISTED;
-            sides[m].hash = EntryHash(contents[m], lengths[m]);
+            sides[m].hash = SyncedHash(contents[m], lengths[m], items);
         } else if (entry >= 0) {
             sides[m].state = MIRROR_MISSING;   /* listed, but cut short or being written: it says nothing */
         } else if ((marked = MarkTime(&members[m].marks, key)) != 0) {
@@ -1338,12 +1413,12 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
             if (ForkSession(set, row, second, contents[second], lengths[second], firstTime, secondTime, since, forkKey, ARRAYSIZE(forkKey),
                             &fork, &forkLength) &&
                 Own(changes, fork) != NULL) {
-                ULONGLONG hash = EntryHash(fork, forkLength), activity = EntryActivity(fork, forkLength);
+                ULONGLONG hash = SyncedHash(fork, forkLength, items), activity = EntryActivity(fork, forkLength);
                 ok = SaveObject(hash, fork, forkLength);
                 for (m = 0; ok && m < n; m++) {
                     const char *mapped;
                     size_t mappedLength = 0;
-                    if (!members[m].taker) continue;
+                    if (!members[m].taker || (!(items & SYNC_ITEM_SESSIONS_NEW) && set->rows[row].entry[m] < 0 && !waits[m])) continue;
                     ok = (mapped = ContentFor(set, m, fork, forkLength, changes, &mappedLength)) != NULL &&
                          AddChange(changes, m, SYNC_PUT, SYNC_UNDELETE, forkKey, activity, 0, mapped, mappedLength);
                 }
@@ -1356,6 +1431,15 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
     baseSide.state = at >= 0 ? MIRROR_LISTED : MIRROR_DELETED;
     if (at >= 0) baseSide.hash = base->items[at].hash;
     winner = Core_MirrorResolve(sides, n, at >= 0 || deleted >= 0 ? &baseSide : NULL);
+    if (same && !(items & SYNC_ITEM_SESSIONS_DELETED)) {
+        /* A deletion stays where it was made: the others go on with the session as it is. */
+        MirrorSide others[MAX_PROFILES];
+        for (m = 0; m < n; m++) {
+            others[m] = sides[m];
+            if (others[m].state == MIRROR_DELETED || others[m].state == MIRROR_REMOVED) others[m].state = MIRROR_MISSING;
+        }
+        winner = Core_MirrorResolve(others, n, at >= 0 ? &baseSide : NULL);
+    }
     if (winner >= 0) {
         ULONGLONG hash = winner < n ? sides[winner].hash : baseSide.hash;
         if (winner < n) {
@@ -1390,6 +1474,17 @@ static BOOL ResolveSession(const SessionSet *set, int row, const WCHAR *key, con
             if (!members[m].taker || (waits[m] ? holds[m] == hash
                                                : sides[m].state == MIRROR_LISTED && sides[m].hash == hash && !InOthersArea(set, m, own, ownLength)))
                 continue;
+            if (!(items & SYNC_ITEM_SESSIONS_DELETED) && (sides[m].state == MIRROR_DELETED || sides[m].state == MIRROR_REMOVED)) continue;
+            if (!(items & SYNC_ITEM_SESSIONS_NEW) && entry < 0 && !waits[m]) continue;
+            if (own && m != winner && KeepsOwnMembers(items)) {
+                /* Its own title or archived state stays. */
+                size_t keptLength = 0;
+                char *kept = Own(changes, WithOwnMembers(content, length, own, ownLength, items, &keptLength));
+                ok = kept && (mapped = ContentFor(set, m, kept, keptLength, changes, &mappedLength)) != NULL &&
+                     AddChange(changes, m, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, key, EntryActivity(content, length),
+                               entry >= 0 ? set->entries[entry].lastActivity : 0, mapped, mappedLength);
+                continue;
+            }
             ok = (mapped = ContentFor(set, m, content, length, changes, &mappedLength)) != NULL &&
                  AddChange(changes, m, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, key, EntryActivity(content, length),
                            entry >= 0 ? set->entries[entry].lastActivity : 0, mapped, mappedLength);
@@ -2355,18 +2450,20 @@ static BOOL KeepLocked(const ProfileList *list, DWORD profiles, const WCHAR *lis
             const int *rowHeal = heal ? heal + (size_t)r * MAX_PROFILES : NULL;
             /* A row of entries that lost their session's id is no session of its own: the session's row heals them. */
             if (!(heal && heal[((size_t)set.rowCount + r) * MAX_PROFILES]) && !GoesOnAsAnother(&set, &earlier, set.rows[r].key, &ledger))
-                ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, rowHeal, &changes, &next);
+                ok = ResolveSession(&set, r, set.rows[r].key, member, &base, &ledger, same, items, rowHeal, &changes, &next);
             Step(progress, 1);
         }
         Free(heal);
         for (i = 0; i < base.count && ok; i++)
             if (SessionStore_FindRow(&set, base.items[i].key) < 0) {
                 if (!GoesOnAsAnother(&set, &earlier, base.items[i].key, &ledger))
-                    ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, NULL, &changes, &next);
+                    ok = ResolveSession(&set, -1, base.items[i].key, member, &base, &ledger, same, items, NULL, &changes, &next);
                 Step(progress, 1);
             }
         Free(earlier.items);
-        if (ok) ok = ResolveIndex(&set, member, &base, same, &changes, &next);
+        /* Claude's list of the archived goes with whether they are archived; else each keeps its own. */
+        if (ok && (items & SYNC_ITEM_SESSIONS_ARCHIVED)) ok = ResolveIndex(&set, member, &base, same, &changes, &next);
+        else next.index = base.index;
     } else {
         /* Sessions not kept the same: the list stays as it was, to go on
          * from once they are again (a session gone since is gone then). */

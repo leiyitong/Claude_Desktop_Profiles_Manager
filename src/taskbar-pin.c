@@ -1358,12 +1358,115 @@ static BOOL RefreshPinShortcuts(const Profile *before, const Profile *after, con
     return anyChanged;
 }
 
+/* --------------------------------------------------- implicit shortcuts */
+
+/* Where Windows keeps the shortcuts it makes by itself for the buttons it
+ * shows (from a window's relaunch values), one folder per button. */
+static BOOL ImplicitShortcutsDir(WCHAR *out, size_t cch)
+{
+    WCHAR pinned[MAX_PATH];
+    return Util_KnownFolder(&FOLDERID_UserPinned, pinned, ARRAYSIZE(pinned)) &&
+           SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\ImplicitAppShortcuts", pinned));
+}
+
+/* Windows' own shortcuts that open `profile` (free `found->items`). */
+static void ImplicitShortcuts(const Profile *profile, PathList *found)
+{
+    WCHAR dir[MAX_PATH], pattern[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAW folder, file;
+    HANDLE folders, files;
+    ZeroMemory(found, sizeof *found);
+    if (!ImplicitShortcutsDir(dir, ARRAYSIZE(dir)) || FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\*", dir))) return;
+    if ((folders = FindFirstFileW(pattern, &folder)) == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(folder.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || folder.cFileName[0] == L'.' ||
+            FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\%s\\*.lnk", dir, folder.cFileName)) ||
+            (files = FindFirstFileW(pattern, &file)) == INVALID_HANDLE_VALUE)
+            continue;
+        do {
+            if (!(file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s\\%s", dir, folder.cFileName, file.cFileName)) &&
+                OpensProfile(path, profile))
+                AppendPath(found, path);
+        } while (FindNextFileW(files, &file));
+        FindClose(files);
+    } while (FindNextFileW(folders, &folder));
+    FindClose(folders);
+}
+
+/* The icon file `lnk` shows, its variables expanded (Windows keeps
+ * "%USERPROFILE%\..."); "" when it shows none or cannot be read. */
+static void ShortcutIcon(const WCHAR *lnk, WCHAR *icon, size_t cch)
+{
+    WCHAR stored[MAX_PATH];
+    IShellLinkW *link = NULL;
+    IPersistFile *file = NULL;
+    int index;
+    icon[0] = stored[0] = 0;
+    if (SUCCEEDED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void **)&link)) &&
+        SUCCEEDED(IShellLinkW_QueryInterface(link, &IID_IPersistFile, (void **)&file)) &&
+        SUCCEEDED(IPersistFile_Load(file, lnk, STGM_READ)) &&
+        SUCCEEDED(IShellLinkW_GetIconLocation(link, stored, ARRAYSIZE(stored), &index)) && stored[0]) {
+        DWORD length = ExpandEnvironmentStringsW(stored, icon, (DWORD)cch);
+        if (!length || length > cch) icon[0] = 0;
+    }
+    if (file) IPersistFile_Release(file);
+    if (link) IShellLinkW_Release(link);
+}
+
+/* One of Windows' shortcuts of the profile's button gets its icon (see
+ * Core_TakesCurrentIcon) and its name. TRUE when it changed. */
+static BOOL RefreshImplicit(const WCHAR *lnk, const Profile *after, const WCHAR *icon)
+{
+    WCHAR shown[MAX_PATH], target[MAX_PATH], name[MAX_PATH], *slash;
+    const WCHAR *path = lnk;
+    BOOL changed = FALSE;
+    HRESULT hr;
+    ShortcutIcon(lnk, shown, ARRAYSIZE(shown));
+    if (Core_TakesCurrentIcon(shown, shown[0] && Util_FileExists(shown), icon)) {
+        hr = Shortcut_Update(path, after, icon);
+        if (hr == S_OK) {
+            Util_Log(L"gave %s the icon of %s (it showed %s)", path, after->folder, shown[0] ? shown : L"none");
+            changed = TRUE;
+        } else if (FAILED(hr)) {
+            Util_Log(L"could not give %s the icon of %s (0x%08lX)", path, after->folder, (unsigned long)hr);
+        }
+    }
+    /* Named after the profile as Windows named it then: after it now. */
+    Core_ShortcutFileName(after->name, 1, name, ARRAYSIZE(name));
+    if (SUCCEEDED(StringCchCopyW(target, ARRAYSIZE(target), lnk)) && (slash = wcsrchr(target, L'\\')) != NULL &&
+        SUCCEEDED(StringCchCopyW(slash + 1, ARRAYSIZE(target) - (size_t)(slash + 1 - target), name)) && wcscmp(target, lnk) != 0 &&
+        (Core_PathEquals(target, lnk) || GetFileAttributesW(target) == INVALID_FILE_ATTRIBUTES)) {
+        if (MoveFileW(lnk, target)) {
+            SHChangeNotify(SHCNE_RENAMEITEM, SHCNF_PATHW | SHCNF_FLUSH, lnk, target);
+            path = target;
+            changed = TRUE;
+        } else {
+            Util_Log(L"could not rename %s to %s (error %lu)", lnk, target, GetLastError());
+        }
+    }
+    if (changed) TaskbarPin_TellShortcutChanged(path);
+    return changed;
+}
+
+BOOL TaskbarPin_RefreshImplicit(const Profile *profile, const WCHAR *icon)
+{
+    PathList found;
+    DWORD i;
+    BOOL anyChanged = FALSE;
+    ImplicitShortcuts(profile, &found);
+    for (i = 0; i < found.count; i++) anyChanged = RefreshImplicit(found.items[i], profile, icon) || anyChanged;
+    FreeMemory(found.items);
+    return anyChanged;
+}
+
 /* After a rename or a color change: the profile's pins get the new icon,
- * description and name. */
+ * description and name, and so do the shortcuts Windows made for its button. */
 void TaskbarPin_Refresh(const Profile *before, const Profile *after, const WCHAR *icon)
 {
     /* Explorer saves a changed pin's entry again: its record must follow it. */
     if (RefreshPinShortcuts(before, after, icon)) TaskbarPin_RepairOurs();
+    TaskbarPin_RefreshImplicit(after, icon);
 }
 
 /* After a change of language: every profile's pins get their description in
