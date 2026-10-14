@@ -335,25 +335,8 @@ static void LinkCaptions(HWND dialog, const WCHAR *name)
  * column the view sizes, sign-in left unchecked. */
 static void PopulateBackupParts(HWND dialog)
 {
-    static const WCHAR *const kParts[] = { L"Code sessions and their conversations (%d)", L"Cowork sessions",
-                                           L"Settings: MCP servers, preferences, language and theme", L"Sign-in" };
     HWND list = GetDlgItem(dialog, IDC_B_LIST);
-    WCHAR text[256];
-    LVCOLUMNW column;
-    LVITEMW item;
-    int i;
-    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-    ZeroMemory(&column, sizeof column);
-    ListView_InsertColumn(list, 0, &column);
-    for (i = 0; i < (int)ARRAYSIZE(kParts); i++) {
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(kParts[i]), 1234);
-        ZeroMemory(&item, sizeof item);
-        item.mask = LVIF_TEXT;
-        item.iItem = i;
-        item.pszText = text;
-        ListView_InsertItem(list, &item);
-        ListView_SetCheckState(list, i, i != 3);
-    }
+    Backup_FillPartsList(list, 1234);
     Theme_SmoothView(list);
 }
 
@@ -615,6 +598,8 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         int language;
         Theme_SetStrong(GetDlgItem(dialog, IDC_G_LANGUAGE_LABEL));
         Theme_SetStrong(GetDlgItem(dialog, IDC_G_VAULT));
+        Theme_SetStrong(GetDlgItem(dialog, IDC_G_CODE));
+        CheckDlgButton(dialog, IDC_G_WEEKLY, BST_CHECKED);
         for (language = -1; language < Localize_LanguageCount(); language++)
             SendMessageW(languages, CB_ADDSTRING, 0, (LPARAM)Localize_LanguageName(language));
         SendMessageW(languages, CB_SETCURSEL, 0, 0);
@@ -677,6 +662,10 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         break;
     case IDD_BACKUP_HUB:
         BackupHubCaptions(dialog, name, TRUE);
+        break;
+    case IDD_PASSWORD:
+        SetWindowTextW(dialog, TR(L"Password"));
+        SetDlgItemTextW(dialog, IDC_K_TEXT, TR(L"Choose the password that opens the sign-in on another PC. Without it, the backup's sign-in restores on this PC only."));
         break;
     }
 }
@@ -1634,7 +1623,7 @@ static void CheckLanguageRoundTrips(void)
 {
     static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
                                       IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS,
-                                      IDD_ABOUT };
+                                      IDD_ABOUT, IDD_PASSWORD };
     static const WCHAR *const kVisited[] = { L"zh-CN" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"en");
@@ -1729,7 +1718,7 @@ static void CheckHiddenRows(void)
         { IDD_PROFILE, IDC_P_COPY, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
         { IDD_UNINSTALL, IDC_U_KEEP, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
         /* The label is centered on the drop-down list: at some scales it ends below it. */
-        { IDD_PROFILE, IDC_P_PICTURE, { IDC_P_SYNC_LABEL, IDC_P_SYNC, IDC_P_SYNC_ITEMS }, 3, "the profile dialog without its sessions" },
+        { IDD_PROFILE, IDC_P_TITLE, { IDC_P_SYNC_LABEL, IDC_P_SYNC, IDC_P_SYNC_ITEMS }, 3, "the profile dialog without its sessions" },
     };
     size_t i, scale;
     for (i = 0; i < ARRAYSIZE(kCases); i++) for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) {
@@ -1793,11 +1782,95 @@ static void CheckHiddenRows(void)
     }
 }
 
+#define SHARED_ROWS_MAX 64
+
+/* A list's rows as the group each sits under (-1 for a heading itself) and its text. */
+static int ReadGroupedRows(HWND list, int *group, WCHAR (*text)[128])
+{
+    int row, count = ListView_GetItemCount(list), g = -1;
+    for (row = 0; row < count && row < SHARED_ROWS_MAX; row++) {
+        LVITEMW item;
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT | LVIF_PARAM;
+        item.iItem = row;
+        item.pszText = text[row];
+        item.cchTextMax = 128;
+        text[row][0] = 0;
+        ListView_GetItem(list, &item);
+        if (item.lParam < 0) g++;
+        group[row] = item.lParam < 0 ? -1 : g;
+    }
+    return min(count, SHARED_ROWS_MAX);
+}
+
+/* What a backup keeps and what profiles sync are one list: the backup's is
+ * built on what to sync's groups and items (syncui.c), its own content added.
+ * Every group opened, the same headings come in the same order (Account the
+ * backup's own, last), and under the settings side's groups the same items,
+ * the Settings group's MCP servers added at its end. */
+static void CheckSharedItemLists(void)
+{
+    static const WCHAR opened[9][MAX_PATH] = { L"sessions", L"sidebar", L"details", L"appearance", L"language", L"model", L"settings", L"permissions",
+                                               L"account" };
+    static WCHAR syncText[SHARED_ROWS_MAX][128], backupText[SHARED_ROWS_MAX][128];
+    int syncGroup[SHARED_ROWS_MAX], backupGroup[SHARED_ROWS_MAX], syncRows, backupRows, s, b, g, syncHeads = 0, backupHeads = 0;
+    BOOL headingsSame = TRUE, itemsSame = TRUE;
+    LayoutFixture fixture;
+    HWND parent, sync, backup;
+    ZeroMemory(&fixture, sizeof fixture);
+    fixture.resource = IDD_BACKUP;
+    fixture.language = Language(L"en");
+    Localize_SetLanguage(fixture.language, FALSE);
+    Util_SetSettingList(L"SyncItemsOpened", opened, 8);
+    Util_SetSettingList(L"BackupPartsOpened", opened, 9);
+    parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 400, 400, NULL, NULL, g_hInst, NULL);
+    sync = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL, 0, 0, 300, 300, parent, NULL, g_hInst, NULL);
+    backup = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL, 0, 0, 300, 300, parent, NULL, g_hInst, NULL);
+    Check(&fixture, NULL, "shared lists: made", parent && sync && backup);
+    if (sync && backup) {
+        SyncUi_FillItemsList(sync, SYNC_ITEMS_DEFAULT);
+        Backup_FillPartsList(backup, 3);
+        syncRows = ReadGroupedRows(sync, syncGroup, syncText);
+        backupRows = ReadGroupedRows(backup, backupGroup, backupText);
+        /* The headings, in order. */
+        for (s = 0, b = 0; s < syncRows; s++) {
+            if (syncGroup[s] != -1) continue;
+            syncHeads++;
+            while (b < backupRows && backupGroup[b] != -1) b++;
+            if (b >= backupRows || wcscmp(syncText[s], backupText[b]) != 0) headingsSame = FALSE;
+            b++;
+        }
+        for (b = 0; b < backupRows; b++)
+            if (backupGroup[b] == -1) backupHeads++;
+        Check(&fixture, NULL, "shared lists: the same headings in the same order, Account added last",
+              headingsSame && backupHeads == syncHeads + 1 && syncHeads == 8);
+        /* The settings side's groups (all but Sessions): the same items, the backup's MCP servers last in Settings. */
+        for (g = 1; g < syncHeads; g++) {
+            int syncItems = 0, backupItems = 0;
+            for (s = 0; s < syncRows; s++) syncItems += syncGroup[s] == g;
+            for (b = 0; b < backupRows; b++) backupItems += backupGroup[b] == g;
+            for (s = 0, b = 0; s < syncRows; s++) {
+                if (syncGroup[s] != g) continue;
+                while (b < backupRows && backupGroup[b] != g) b++;
+                if (b >= backupRows || wcscmp(syncText[s], backupText[b]) != 0) itemsSame = FALSE;
+                b++;
+            }
+            if (backupItems != syncItems + (g == 6 ? 1 : 0)) itemsSame = FALSE;
+        }
+        Check(&fixture, NULL, "shared lists: the settings side's items are what to sync's, MCP servers added to Settings", itemsSame);
+        Check(&fixture, NULL, "shared lists: Sessions holds the backup's own content",
+              backupRows > 2 && backupGroup[1] == 0 && backupGroup[2] == 0 && wcsstr(backupText[2], L"Cowork") != NULL);
+    }
+    if (parent) DestroyWindow(parent);
+    Util_SetSettingList(L"SyncItemsOpened", NULL, 0);
+    Util_SetSettingList(L"BackupPartsOpened", NULL, 0);
+}
+
 /* The dialogs other than the manager window, in every language and scale. */
 static void CheckDialogs(void)
 {
     static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE,
-                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS, IDD_ABOUT };
+                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS, IDD_ABOUT, IDD_PASSWORD };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)
@@ -3331,6 +3404,7 @@ int wmain(void)
     CheckDialogs();
     CheckMessageBoxes();
     CheckSettingsDialog();
+    CheckSharedItemLists();
     CheckAboutDialog();
     CheckHiddenRows();
     CheckMainStates();

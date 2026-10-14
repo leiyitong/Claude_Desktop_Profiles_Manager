@@ -14,6 +14,7 @@
 #define VALUE_NAME            L"Name"             /* under the profile's key */
 #define VALUE_COLOR           L"Color"
 #define VALUE_BADGE           L"Badge"            /* the badge's own text, absent for the initial */
+#define VALUE_WINDOW_TITLE    L"WindowTitle"      /* its windows' title, absent for the default */
 #define VALUE_PICTURE         L"Picture"          /* the stamp of its own picture (icons.c), absent for none */
 #define VALUE_SYNC_SESSIONS   L"SyncSessions"     /* the group whose sessions it keeps the same (1 to MAX_PROFILES), absent for none */
 #define VALUE_SYNC_PARTS      L"SyncParts"        /* what that keeps the same (SYNC_ITEM_*), absent for the default */
@@ -78,6 +79,7 @@ static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isS
     p->color = (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_COLOR, &color) && color < PALETTE_SIZE) ? (int)color : -1;
     if (Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_BADGE, badge, ARRAYSIZE(badge))) Core_CleanBadge(badge, p->badge, ARRAYSIZE(p->badge));
     if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_PICTURE, &picture)) p->picture = picture;
+    Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_WINDOW_TITLE, p->windowTitle, ARRAYSIZE(p->windowTitle));
     p->syncGroup = Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, &sync) && sync >= 1 && sync <= MAX_PROFILES ? (int)sync : 0;
     if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_PARTS, &items)) p->syncItems = items & SYNC_ITEMS_ALL;
     else if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_ITEMS, &items)) p->syncItems = Core_SyncItemsOfGroups(items);
@@ -346,6 +348,22 @@ BOOL Profiles_Update(const WCHAR *folder, const WCHAR *label, int color, const W
     return WriteOrDelete(key, VALUE_BADGE, cleanBadge[0] != 0,
                          cleanBadge[0] && Util_RegSetString(HKEY_CURRENT_USER, key, VALUE_BADGE, cleanBadge)) &&
            WriteOrDelete(key, VALUE_PICTURE, picture != 0, picture && Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_PICTURE, picture));
+}
+
+BOOL Profiles_SetWindowTitle(const WCHAR *folder, const WCHAR *title)
+{
+    WCHAR key[MAX_PATH], clean[WINDOW_TITLE_CCH];
+    size_t start = 0, end;
+    /* No spaces at its ends, and no line breaks (a title is one line). */
+    StringCchCopyW(clean, ARRAYSIZE(clean), title ? title : L"");
+    for (end = 0; clean[end]; end++)
+        if (clean[end] == L'\r' || clean[end] == L'\n' || clean[end] == L'\t') clean[end] = L' ';
+    while (clean[start] == L' ') start++;
+    while (end > start && clean[end - 1] == L' ') end--;
+    clean[end] = 0;
+    ProfileKey(folder, key, ARRAYSIZE(key));
+    return WriteOrDelete(key, VALUE_WINDOW_TITLE, clean[start] != 0,
+                         clean[start] && Util_RegSetString(HKEY_CURRENT_USER, key, VALUE_WINDOW_TITLE, clean + start));
 }
 
 BOOL Profiles_SetDefault(const WCHAR *folder)

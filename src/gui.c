@@ -656,6 +656,7 @@ typedef struct ProfileDialog {
     WCHAR          name[LABEL_CCH];
     int            color;
     WCHAR          badge[BADGE_CCH];   /* once closed: the badge's own text, empty for the initial */
+    WCHAR          windowTitle[WINDOW_TITLE_CCH];   /* once closed: its windows' title, empty for the default */
     DWORD         *picture;            /* the picture shown, NULL for the Claude icon; the caller frees it */
     BOOL           pictureChanged;     /* chosen or removed in the dialog */
     BOOL           badgeOwn;           /* the badge shows text the user typed, not the initial */
@@ -736,6 +737,16 @@ static void ChosenBadge(HWND dialog, const ProfileDialog *state, const WCHAR *na
 }
 
 /* The badge box follows the name while the user has not typed in it. */
+/* The title box shows, greyed while empty, the default title: Claude's,
+ * then the name typed. */
+static void ShowDefaultTitle(HWND dialog)
+{
+    WCHAR name[LABEL_CCH], cue[LABEL_CCH + 16];
+    GetDlgItemTextW(dialog, IDC_P_NAME, name, ARRAYSIZE(name));
+    StringCchPrintfW(cue, ARRAYSIZE(cue), L"Claude (%s)", name[0] ? name : L"\x2026");
+    SendDlgItemMessageW(dialog, IDC_P_TITLE, EM_SETCUEBANNER, TRUE, (LPARAM)cue);
+}
+
 static void FollowName(HWND dialog, ProfileDialog *state)
 {
     WCHAR name[LABEL_CCH], initial[2] = { 0, 0 };
@@ -979,7 +990,8 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
         if (state->several) {
             /* Several profiles: what they share, their sessions; the rows of the rest close (Theme_FitDialog). */
             static const int kOwn[] = { IDC_P_NAME_LABEL, IDC_P_NAME, IDC_P_COLOR_LABEL, IDC_P_COLOR, IDC_P_PREVIEW, IDC_P_BADGE_LABEL,
-                                        IDC_P_BADGE, IDC_P_PICTURE, IDC_P_NO_PICTURE, IDC_P_STARTUP, IDC_P_COPY, IDC_P_OPEN, IDC_P_ERROR };
+                                        IDC_P_BADGE, IDC_P_PICTURE, IDC_P_NO_PICTURE, IDC_P_TITLE_LABEL, IDC_P_TITLE, IDC_P_STARTUP,
+                                        IDC_P_COPY, IDC_P_OPEN, IDC_P_ERROR };
             size_t own;
             for (own = 0; own < ARRAYSIZE(kOwn); own++) ShowWindow(GetDlgItem(dialog, kOwn[own]), SW_HIDE);
             ValidateProfileDialog(dialog, state, FALSE);
@@ -988,8 +1000,11 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
         }
         SendDlgItemMessageW(dialog, IDC_P_NAME, EM_LIMITTEXT, state->existing ? MAX_LABEL : MAX_NAME, 0);
         SendDlgItemMessageW(dialog, IDC_P_BADGE, EM_LIMITTEXT, 2 * MAX_BADGE, 0);   /* surrogate pairs too */
+        SendDlgItemMessageW(dialog, IDC_P_TITLE, EM_LIMITTEXT, WINDOW_TITLE_CCH - 1, 0);
         FillColors(dialog, state);
         if (state->existing) SetDlgItemTextW(dialog, IDC_P_NAME, state->existing->name);
+        if (state->existing) SetDlgItemTextW(dialog, IDC_P_TITLE, state->existing->windowTitle);
+        ShowDefaultTitle(dialog);
         state->badgeOwn = state->existing && state->existing->badge[0];
         if (state->badgeOwn) {
             state->filling = TRUE;
@@ -1020,6 +1035,7 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
             if (HIWORD(wp) == EN_CHANGE) {
                 ValidateProfileDialog(dialog, state, TRUE);
                 FollowName(dialog, state);
+                ShowDefaultTitle(dialog);
                 UpdatePreview(dialog, state);
             }
             return TRUE;
@@ -1069,6 +1085,7 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
             }
             state->color = ChosenColor(dialog, state);
             ChosenBadge(dialog, state, state->name, state->badge, ARRAYSIZE(state->badge));
+            GetDlgItemTextW(dialog, IDC_P_TITLE, state->windowTitle, ARRAYSIZE(state->windowTitle));
             state->openNow = IsDlgButtonChecked(dialog, IDC_P_OPEN) == BST_CHECKED;
             state->startup = IsDlgButtonChecked(dialog, IDC_P_STARTUP) == BST_CHECKED;
             state->copy = !state->existing && state->copyFrom && IsDlgButtonChecked(dialog, IDC_P_COPY) == BST_CHECKED;
@@ -1527,6 +1544,8 @@ static void DoNew(void)
             Util_Log(L"could not save the badge and picture of %s (error %lu)", folder, GetLastError());
     }
     if (dialog.picture) HeapFree(GetProcessHeap(), 0, dialog.picture);
+    if (dialog.windowTitle[0] && !Profiles_SetWindowTitle(folder, dialog.windowTitle))
+        Util_Log(L"could not save the window title of %s (error %lu)", folder, GetLastError());
     Refresh(FALSE);
     i = Profiles_Find(&g_manager.profiles, folder);
     if (i < 0) {
@@ -1655,6 +1674,8 @@ static void DoEdit(void)
         return;
     }
     if (!picture && before.picture) Icons_DeletePicture(before.folder);
+    if (wcscmp(before.windowTitle, dialog.windowTitle) != 0 && !Profiles_SetWindowTitle(before.folder, dialog.windowTitle))
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The window title could not be saved."));
     after = before;
     StringCchCopyW(after.name, ARRAYSIZE(after.name), dialog.name);
     after.color = dialog.color;
@@ -1667,6 +1688,8 @@ static void DoEdit(void)
          before.picture != after.picture) &&
         Icons_Ensure(&g_manager.pkg, &after, icon, ARRAYSIZE(icon)))
         ApplyBadge(&before, &after, icon);
+    /* The windows of a running profile take a new title at once (its watcher). */
+    if (wcscmp(before.windowTitle, dialog.windowTitle) != 0 || wcscmp(before.name, after.name) != 0) Taskbar_Refresh(&after, FALSE);
     if (dialog.startup != atStartup) SetProfileStartup(&after, dialog.startup);
     g_manager.shortcutStateFolder[0] = 0;
     UpdateButtons();
@@ -3344,8 +3367,10 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         case IDC_STATUS_ACTION: DoStatusAction(); return TRUE;
         case IDC_UPDATE:        DoUpdate(); return TRUE;
         case IDCANCEL:
-            /* Esc in a search box that holds text clears it. */
-            if (!SessionsView_ClearSearch()) Close(dialog);
+            /* Esc clears a search box that holds text, and never closes the
+             * window: its close box, Alt+F4 and the tray do (WM_CLOSE), so a
+             * key pressed by mistake cannot quit the manager. */
+            SessionsView_ClearSearch();
             return TRUE;
         }
         if (SessionsView_Command(wp)) return TRUE;

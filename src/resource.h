@@ -24,6 +24,7 @@
 #define IDD_PREVIEW       114
 #define IDD_SETTINGS      115
 #define IDD_ABOUT         116
+#define IDD_PASSWORD      117
 
 /* the changelogs, embedded (RCDATA): CHANGELOG.md and CHANGELOG.zh-CN.md */
 #define IDR_CHANGELOG_EN  200
@@ -89,6 +90,8 @@
 #define IDC_P_COLOR_LABEL 1114
 #define IDC_P_BADGE_LABEL 1115
 #define IDC_P_SYNC_ITEMS  1116
+#define IDC_P_TITLE_LABEL 1117
+#define IDC_P_TITLE       1118
 
 /* uninstall dialog */
 #define IDC_U_KEEP        1200
@@ -170,6 +173,8 @@
 #define IDC_V_TEXT        2501
 
 /* settings: the language and the vault's days */
+#define IDC_G_CODE        2604
+#define IDC_G_WEEKLY      2605   /* SETTING_WEEKLY_BACKUP, as Backup & Restore's IDC_H_WEEKLY */
 #define IDC_G_VAULT       2600
 #define IDC_G_DAYS_LABEL  2601
 #define IDC_G_DAYS        2602
@@ -177,6 +182,13 @@
 #define IDC_G_LANGUAGE_LABEL 2607
 #define IDC_G_LANGUAGE    2608
 #define IDC_G_APPLY       2609
+
+/* a password: a backup's sign-in for any PC */
+#define IDC_K_TEXT        2800
+#define IDC_K_LABEL       2801
+#define IDC_K_PASSWORD    2802
+#define IDC_K_AGAIN_LABEL 2803
+#define IDC_K_AGAIN       2804
 
 /* About: the version, help and the changelog */
 #define IDC_W_TEXT        2700

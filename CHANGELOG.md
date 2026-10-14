@@ -6,6 +6,41 @@
 
 Every version of Claude Desktop Profiles Manager, newest first. A day's updates make one version, named after that day, which is the version the program shows; **About**, the icon right of Settings, shows this list too: a version chosen on the left, or **Changelog** for all of it. Each build of `main` is also published as an unsigned pre-release (`build-<number>`), which an installed copy does not update to.
 
+## v2026.10.14
+
+Backups choose from the same detailed list as what to sync and restore only what you check, a profile's window shows its own title and icon, and Esc no longer closes the manager window.
+
+### New features
+
+1. A profile's window shows the profile in the taskbar's thumbnail and in Alt+Tab: its icon, and the title "Claude (<name>)", or a title of your own set under **Title** in **Edit…**; a running profile takes a new title at once
+
+### Improvements
+
+1. A backup and a restore choose from the same list as what to sync, item by item: the sidebar's stars, groups, order, filters and width; each session's model, side pane, unread mark and cost; fonts, editor, zoom and spelling; the language; the default model; each setting; the permissions. Code sessions and Cowork, MCP servers and the sign-in are there too
+2. A restore puts back only the items you check and leaves the rest of the profile as it is: restoring the MCP servers alone, say, no longer replaces every other setting. Backups made before still restore as they did
+
+### Bug fixes
+
+1. Esc in the main window no longer closes the manager: it only clears the sessions search box when that holds text. The close box, Alt+F4 and the notification area still close it, and Esc still closes a dialog
+
+## v2026.10.13
+
+Menus the program draws take a letter typed alone, the sessions view shows where each session runs, backups choose their parts as what to sync does and can keep a sign-in for any PC, several backups restore into one profile at once, a Remote Control session turns into a local one, and Settings gets the weekly copy of .claude.
+
+### New features
+
+1. Settings has **Back up once a week** for .claude too, as Backup & Restore has it
+2. A backup can keep the sign-in for any PC: its key goes into the backup behind a password you choose, and a restore on another PC or Windows user asks for it, so the profile is signed in again at once
+3. Sessions view: each session shows where it runs by its icon: a blue message on this PC, a teal cloud in the cloud, a purple phone for Remote Control, a green command prompt over SSH, a gold chat bubble for Slack
+4. Restore several backups into one profile at once, such as the backups of several accounts: choose them together in **Restore from backup…**; sessions, scheduled tasks and Cowork come from all of them, and when more than one holds the settings or the sign-in, a list of restore conflicts asks which backup each comes from
+5. Sessions view: a Remote Control session's menu has **Turn into a local session**: its conversation is already on this PC, so only Remote Control is turned off, and it opens as a plain local session; in a profile that is open it waits until that profile closes, and Ctrl+Z turns Remote Control back on
+
+### Improvements
+
+1. In the menus the program draws (a profile's right-click menu, Shortcuts), a letter typed alone chooses its item, as in Windows' menus: right-click, then E, edits
+2. A backup and a restore choose their parts in a list like what to sync: Sessions, Settings and Account, each a group that folds, with its boxes
+3. A restore adds the backup's scheduled tasks to the profile's instead of replacing them, and keeps the profile's list with what else it replaced
+
 ## v2026.10.12
 
 What profiles sync can be chosen item by item, and every list whose groups fold opens or folds all at once; a changelog and an About window arrive, and lists scroll with a precision touchpad again.

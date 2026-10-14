@@ -68,7 +68,16 @@
 #define FOLDER_ROW_LINE_TENTHS 19       /* a folder's row: 1.9 lines of text, at least a line and the padding */
 #define UNIX_EPOCH_FILETIME    116444736000000000ULL   /* 1970-01-01 in FILETIME units (100 ns from 1601) */
 #define ARCHIVED_GLYPH         0xE7B8   /* Archive, of Windows' icon font: before an archived session's title */
-#define SESSION_GLYPH          0xE8BD   /* Message: before the title of a session not archived */
+#define SESSION_GLYPH          0xE8BD   /* Message: before the title of a session on this PC, not archived */
+
+/* Before the title of a session that runs elsewhere, not archived: where, by
+ * Windows' icon font and a tint of its own. */
+static const struct { DWORD environment; WCHAR glyph; ThemeTint tint; } kEnvironmentMarks[] = {
+    { SESSION_ENV_CLOUD, 0xE753, THEME_TINT_TEAL },     /* Cloud */
+    { SESSION_ENV_REMOTE, 0xE8EA, THEME_TINT_PURPLE },  /* CellPhone: steered from another device */
+    { SESSION_ENV_SSH, 0xE756, THEME_TINT_GREEN },      /* CommandPrompt */
+    { SESSION_ENV_SLACK, 0xE8F2, THEME_TINT_GOLD },     /* Chat */
+};
 #define DAY_MS                 (24ull * 60 * 60 * 1000)
 /* What the filter menu chose, kept across starts (settings.ini). */
 #define SETTING_SESSIONS_STATUS   L"SessionsStatus"
@@ -96,6 +105,7 @@
 
 typedef enum Action {
     ACT_OPEN, ACT_RENAME, ACT_STAR, ACT_REMOVE, ACT_KEEP, ACT_SHARE, ACT_COPY, ACT_SHOW_FOLDER, ACT_PREVIEW, ACT_DELETE_ALL,
+    ACT_TO_LOCAL,
     ACTIONS
 } Action;
 
@@ -1720,11 +1730,32 @@ static BOOL ArchivedIn(LPARAM node)
     return node == NODE_ARCHIVED || UnderArchived(node);
 }
 
-/* A session's icon before its title: the archive mark when it is archived
- * in the profile shown, else a message. */
+/* A session's icon before its title and its tint: the archive mark, amber,
+ * when it is archived in the profile shown; else where it runs, a blue
+ * message for this PC. */
+static WCHAR RowGlyphTinted(LPARAM node, ThemeTint *tint)
+{
+    const SessionEntry *entry;
+    size_t i;
+    *tint = THEME_TINT_BLUE;
+    if (node < 0 || node >= g_view.set.rowCount) return SESSION_GLYPH;
+    if (RowArchived(&g_view.set.rows[node], ShownProfileIndex())) {
+        *tint = THEME_TINT_AMBER;
+        return ARCHIVED_GLYPH;
+    }
+    entry = EntryOf(&g_view.set.rows[node], ShownProfileIndex());
+    for (i = 0; entry && i < ARRAYSIZE(kEnvironmentMarks); i++)
+        if (entry->environment & kEnvironmentMarks[i].environment) {
+            *tint = kEnvironmentMarks[i].tint;
+            return kEnvironmentMarks[i].glyph;
+        }
+    return SESSION_GLYPH;
+}
+
 static WCHAR RowGlyph(LPARAM node)
 {
-    return node >= 0 && node < g_view.set.rowCount && RowArchived(&g_view.set.rows[node], ShownProfileIndex()) ? ARCHIVED_GLYPH : SESSION_GLYPH;
+    ThemeTint tint;
+    return RowGlyphTinted(node, &tint);
 }
 
 static int GlyphRoom(HDC dc, WCHAR glyph)
@@ -1864,9 +1895,10 @@ static void DrawTreeItem(const NMTVCUSTOMDRAW *customDraw)
         BOOL archived = entry && entry->archived, selected = (state & THEME_ROW_SELECTED) != 0;
         COLORREF titleColor = !row->transcript || (entry && entry->pendingRemove) ? muted
                             : archived && !selected ? Theme_TintColor(THEME_TINT_AMBER) : text;
+        ThemeTint tint;
+        WCHAR glyph = RowGlyphTinted(node, &tint);
         baseline = CenteredBaseline(&rc, THEME_FONT_TEXT);
-        DrawRowGlyph(dc, &rc, &title, RowGlyph(node),
-                     selected ? text : Theme_TintColor(archived ? THEME_TINT_AMBER : THEME_TINT_BLUE));
+        DrawRowGlyph(dc, &rc, &title, glyph, selected ? text : Theme_TintColor(tint));
         left = TextAt(dc, THEME_FONT_TEXT, titleColor, ShownTitle(row, p), title.left, title.right, baseline);
         if (tail[0]) TextAt(dc, THEME_FONT_TEXT, muted, tail, left, right, baseline);
         if (PullRequestText(node, pullRequest, ARRAYSIZE(pullRequest), &prColor)) {
@@ -2151,6 +2183,35 @@ static BOOL ChangeEntry(int r, int p, PendingOp op, const WCHAR *value)
     return TRUE;
 }
 
+/* A Remote Control session turned into a plain local one in profile `p`: its
+ * conversation is already on this PC, so only the entry changes (the fields
+ * that make Claude bridge it to claude.ai are taken away). Queued when the
+ * profile is open, and then not individually undone. */
+static BOOL ConvertEntry(int r, int p)
+{
+    const SessionRow *row = &g_view.set.rows[r];
+    const SessionEntry *entry = EntryOf(row, p);
+    PendingEdit edit;
+    WCHAR reason[LONG_PATH_CCH + NOTE_CCH];
+    BOOL waiting;
+    char *before, *after;
+    DWORD beforeLength = 0, afterLength = 0;
+    if (!entry || !entry->file[0]) return FALSE;
+    before = Util_ReadFile(entry->file, SESSION_ENTRY_MAX_BYTES, FALSE, &beforeLength);
+    MakeEdit(&edit, PENDING_UNREMOTE, row->key, L"");
+    if (!SessionEdit_Change(g_view.dlg, ProfileAt(p), entry, &edit, &waiting, reason, ARRAYSIZE(reason))) {
+        if (before) HeapFree(GetProcessHeap(), 0, before);
+        TellNotChanged(p, reason);
+        return FALSE;
+    }
+    /* Made at once (closed profile): the before and after entry recorded, so Ctrl+Z puts Remote Control back. */
+    if (!waiting && before && (after = Util_ReadFile(entry->file, SESSION_ENTRY_MAX_BYTES, FALSE, &afterLength)) != NULL)
+        SessionUndo_Replaced(ProfileAt(p), row->key, before, beforeLength, after, afterLength);
+    else if (before)
+        HeapFree(GetProcessHeap(), 0, before);
+    return TRUE;
+}
+
 /* The title of the session in profile `p`, changed when another is typed. */
 static BOOL RenameEntry(int r, int p)
 {
@@ -2388,6 +2449,7 @@ static void RunAction(Action action, int p)
         break;
     case ACT_PREVIEW:     PreviewSession(r); break;
     case ACT_DELETE_ALL:  changed = DeleteSessionEverywhere(r); break;
+    case ACT_TO_LOCAL:    changed = ConvertEntry(r, p); break;
     default: break;
     }
     SessionUndo_End();
@@ -2444,6 +2506,8 @@ static void AppendEntryActions(HMENU menu, const SessionRow *row, int p, const W
     }
     AppendMenuW(menu, MF_STRING, MenuId(ACT_RENAME, p), keys ? TR(L"&Rename\x2026\tF2") : TR(L"&Rename\x2026"));
     AppendMenuW(menu, MF_STRING, MenuId(ACT_STAR, p), StarredIn(entry) ? TR(L"Uns&tar") : TR(L"S&tar"));
+    if (entry->environment == SESSION_ENV_REMOTE)
+        AppendMenuW(menu, MF_STRING, MenuId(ACT_TO_LOCAL, p), TR(L"Turn into a &local session"));
     if (ProfilesKeeping(row, p)) StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Re&move from %s\x2026%s"), name, keys ? TR(L"\tDel") : L"");
     else StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Re&move\x2026%s"), keys ? TR(L"\tDel") : L"");
     AppendMenuW(menu, MF_STRING, MenuId(ACT_REMOVE, p), text);

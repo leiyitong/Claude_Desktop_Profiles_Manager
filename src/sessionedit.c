@@ -166,6 +166,21 @@ static BOOL SetInEntry(const Profile *profile, const WCHAR *file, const PendingE
         raws[1] = edit->op == PENDING_TITLE ? "\"user\"" : "\"auto\"";
         return SetMembers(profile, file, keys, raws, 2);
     }
+    if (edit->op == PENDING_UNREMOTE) {
+        /* What makes Claude bridge the session to claude.ai and show it as
+         * Remote Control, taken away: a plain local session is left, its
+         * conversation already on this PC. */
+        static const char *const bridged[] = { "remoteControlUserEnabled", "bridgeSessionIds", "steeredByRemoteClient",
+                                               "remoteControlAutoEligible", "remoteControlUserToggled", "remoteControlSpawn",
+                                               "remoteControlDescendant" };
+        const char *gone[ARRAYSIZE(bridged)], *empty[ARRAYSIZE(bridged)];
+        int i;
+        for (i = 0; i < (int)ARRAYSIZE(bridged); i++) {
+            gone[i] = bridged[i];
+            empty[i] = NULL;
+        }
+        return SetMembers(profile, file, gone, empty, (int)ARRAYSIZE(bridged));
+    }
     keys[0] = "isStarred";
     raws[0] = edit->value[0] == L'1' ? "true" : "false";
     return SetMembers(profile, file, keys, raws, 1);
@@ -413,6 +428,7 @@ static const WCHAR *ChangeName(PendingOp operation)
 {
     return operation == PENDING_TITLE || operation == PENDING_TITLE_AUTO ? L"title changed"
            : operation == PENDING_STAR                                    ? L"star changed"
+           : operation == PENDING_UNREMOTE                                ? L"converted to a local session"
                                                                           : L"entry removed";
 }
 

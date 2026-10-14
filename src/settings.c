@@ -1,7 +1,8 @@
 /*
  * Settings, from the gear at the toolbar's end: the interface language,
- * and how long the session vault keeps the versions of each list
- * (sessionvault.c). Help and the changelog are in About (about.c).
+ * how long the session vault keeps the versions of each list
+ * (sessionvault.c), and the weekly copy of .claude (sessionpurge.c), as
+ * Backup & Restore has it. Help and the changelog are in About (about.c).
  */
 #include "app.h"
 #include "resource.h"
@@ -13,6 +14,7 @@
 typedef struct SettingsDialog {
     SettingsLanguageProc applyLanguage;   /* the program takes a new language; the dialog follows it itself */
     UINT days;                            /* the vault's days as saved */
+    BOOL weekly;                          /* the weekly copy of .claude, as saved */
 } SettingsDialog;
 
 /* Windows' language first, then each of the program's, the one in use
@@ -32,7 +34,8 @@ static BOOL Changed(HWND dialog, const SettingsDialog *state)
     LRESULT choice = SendDlgItemMessageW(dialog, IDC_G_LANGUAGE, CB_GETCURSEL, 0, 0);
     BOOL read = FALSE;
     UINT days = GetDlgItemInt(dialog, IDC_G_DAYS, &read, FALSE);
-    return (choice != CB_ERR && (int)choice - 1 != Localize_CurrentLanguage()) || !read || days != state->days;
+    BOOL weekly = IsDlgButtonChecked(dialog, IDC_G_WEEKLY) == BST_CHECKED;
+    return (choice != CB_ERR && (int)choice - 1 != Localize_CurrentLanguage()) || !read || days != state->days || weekly != state->weekly;
 }
 
 /* Apply only while there is something to apply; the focus it had goes to OK. */
@@ -54,13 +57,14 @@ static void FollowLanguage(HWND dialog)
     Theme_Apply(dialog);
 }
 
-/* What the dialog shows, saved (the days only when they changed) and
- * applied; FALSE, and says why, when the days are not a number it takes. */
+/* What the dialog shows, saved (the days and the weekly copy only when they
+ * changed) and applied; FALSE, and says why, when the days are not a number
+ * it takes. */
 static BOOL ApplySettings(HWND dialog, SettingsDialog *state)
 {
     LRESULT choice = SendDlgItemMessageW(dialog, IDC_G_LANGUAGE, CB_GETCURSEL, 0, 0);
     int languageBefore = Localize_EffectiveLanguage();
-    BOOL read = FALSE;
+    BOOL read = FALSE, weekly = IsDlgButtonChecked(dialog, IDC_G_WEEKLY) == BST_CHECKED;
     UINT days = GetDlgItemInt(dialog, IDC_G_DAYS, &read, FALSE);
     if (!read || days > DAYS_MAX) {
         Ui_Message(dialog, MB_ICONINFORMATION, TR(L"Enter a number of days from 0 to %d."), DAYS_MAX);
@@ -69,6 +73,10 @@ static BOOL ApplySettings(HWND dialog, SettingsDialog *state)
     }
     if (days != state->days) {
         if (Util_SetSetting(SETTING_VAULT_DAYS, days)) state->days = days;
+        else Ui_Message(dialog, MB_ICONWARNING, TR(L"The settings could not be saved."));
+    }
+    if (weekly != state->weekly) {
+        if (Util_SetSetting(SETTING_WEEKLY_BACKUP, weekly)) state->weekly = weekly;
         else Ui_Message(dialog, MB_ICONWARNING, TR(L"The settings could not be saved."));
     }
     if (choice != CB_ERR && (int)choice - 1 != Localize_CurrentLanguage() && state->applyLanguage) state->applyLanguage((int)choice - 1);
@@ -80,7 +88,7 @@ static BOOL ApplySettings(HWND dialog, SettingsDialog *state)
 
 static INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
-    static const int kHeadings[] = { IDC_G_LANGUAGE_LABEL, IDC_G_VAULT };
+    static const int kHeadings[] = { IDC_G_LANGUAGE_LABEL, IDC_G_VAULT, IDC_G_CODE };
     SettingsDialog *state = (SettingsDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
     switch (message) {
     case WM_INITDIALOG: {
@@ -88,6 +96,8 @@ static INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wp, LPARA
         state = (SettingsDialog *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
         state->days = Util_GetSetting(SETTING_VAULT_DAYS, SETTING_VAULT_DAYS_DEFAULT);
+        state->weekly = Util_GetSetting(SETTING_WEEKLY_BACKUP, 0) != 0;
+        CheckDlgButton(dialog, IDC_G_WEEKLY, state->weekly ? BST_CHECKED : BST_UNCHECKED);
         for (i = 0; i < ARRAYSIZE(kHeadings); i++) Theme_SetStrong(GetDlgItem(dialog, kHeadings[i]));
         FillLanguages(GetDlgItem(dialog, IDC_G_LANGUAGE));
         SendDlgItemMessageW(dialog, IDC_G_DAYS, EM_LIMITTEXT, 4, 0);
@@ -107,6 +117,9 @@ static INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wp, LPARA
             return TRUE;
         case IDC_G_DAYS:
             if (HIWORD(wp) == EN_CHANGE) UpdateApply(dialog, state);
+            return TRUE;
+        case IDC_G_WEEKLY:
+            if (HIWORD(wp) == BN_CLICKED) UpdateApply(dialog, state);
             return TRUE;
         case IDC_G_APPLY:
             if (HIWORD(wp) == BN_CLICKED) ApplySettings(dialog, state);

@@ -12,6 +12,11 @@
  * profile opened again while its watcher is ending goes to that watcher. At
  * uninstall it gives the windows and the icon back to Claude.
  *
+ * The windows that show in the taskbar's thumbnails and in Alt+Tab also get
+ * the profile's title (its own, else its name after Claude's title) and the
+ * profile's icon (WM_SETTEXT, WM_SETICON): Claude's own title comes back when
+ * the watcher ends with Claude still running, and its class icon too.
+ *
  * After a new badge, a pinned profile's button follows its pin
  * (taskbar-pin.c); a button showing one of the profile's shortcuts, with none
  * of its windows in a snap group, is told the shortcut changed; otherwise the
@@ -57,6 +62,8 @@ typedef struct WindowTag {
     WCHAR claudeAumid[RTL_FIELD_SIZE(ClaudePackage, aumid) / sizeof(WCHAR)];   /* Claude's own package ID: where the window goes back */
     WCHAR command[MAX_PATH + FOLDER_CCH + 32];
     WCHAR name[LABEL_CCH + 16];
+    WCHAR profileName[LABEL_CCH];   /* put after the windows' titles */
+    WCHAR windowTitle[WINDOW_TITLE_CCH];   /* the profile's own title for them, empty for that */
     WCHAR icon[MAX_PATH + 4];
     DWORD pid;
 } WindowTag;
@@ -315,6 +322,154 @@ static BOOL TagProcessWindows(const WindowTag *tag, TagMode mode)
     return context.stale;
 }
 
+/* ------------------------------------------- the windows' title and icon */
+
+#define DRESS_SEND_MS 1000   /* Claude hung: its window is left as it is */
+
+#define DRESS_BURST_MS 10000   /* titles set again this often...                         */
+#define DRESS_BURST    20      /* ...at most: a Claude that keeps setting its own wins   */
+
+static HICON g_dressIcons[2];                     /* the profile's small and big icons, this watcher's */
+static ULONGLONG g_dressBurstStart;
+static int g_dressBurst;
+static BOOL g_dressTitlesGivenUp;
+static WCHAR g_ownTitle[512];        /* Claude's own title, as last seen on its windows */
+static WCHAR g_dressedTitle[512];    /* the title the windows were given */
+static WCHAR g_earlierTitle[512];    /* ...and the one before a rename or a new title */
+
+/* A Claude window the taskbar shows a thumbnail of: visible, with a caption,
+ * Chromium's (never its hidden message windows, which running detection reads). */
+static BOOL IsDressable(HWND window, BOOL shownOnly)
+{
+    WCHAR cls[32];
+    return IsButtonWindow(window) && (!shownOnly || IsWindowVisible(window)) &&
+           (GetWindowLongPtrW(window, GWL_STYLE) & WS_CAPTION) == WS_CAPTION && GetClassNameW(window, cls, ARRAYSIZE(cls)) &&
+           wcsncmp(cls, L"Chrome_WidgetWin", 16) == 0;
+}
+
+/* A title the watcher gave, now or before a rename or a new title. */
+static BOOL IsOurTitle(const WCHAR *title)
+{
+    return (g_dressedTitle[0] && wcscmp(title, g_dressedTitle) == 0) || (g_earlierTitle[0] && wcscmp(title, g_earlierTitle) == 0);
+}
+
+/* The window's title (the profile's own, else its name after Claude's), and
+ * the profile's icon. */
+static void DressWindow(HWND window)
+{
+    WCHAR title[512], wanted[512];
+    DWORD_PTR result = 0;
+    if (!g_watch.profileName[0] || !IsDressable(window, TRUE)) return;
+    GetWindowTextW(window, title, ARRAYSIZE(title));   /* no message: a hung Claude does not hold the watcher */
+    if (title[0] && !g_dressTitlesGivenUp) {
+        if (!IsOurTitle(title) && !(g_watch.windowTitle[0] && wcscmp(title, g_watch.windowTitle) == 0)) {
+            /* Claude set its own; one an earlier watcher left loses the name it added. */
+            WCHAR suffix[LABEL_CCH + 8];
+            size_t length = wcslen(title), suffixLength;
+            StringCchPrintfW(suffix, ARRAYSIZE(suffix), L" (%s)", g_watch.profileName);
+            suffixLength = wcslen(suffix);
+            StringCchCopyW(g_ownTitle, ARRAYSIZE(g_ownTitle), title);
+            if (length > suffixLength && wcscmp(title + length - suffixLength, suffix) == 0) g_ownTitle[length - suffixLength] = 0;
+        }
+        if (g_watch.windowTitle[0]) StringCchCopyW(wanted, ARRAYSIZE(wanted), g_watch.windowTitle);
+        else StringCchPrintfW(wanted, ARRAYSIZE(wanted), L"%s (%s)", g_ownTitle[0] ? g_ownTitle : L"Claude", g_watch.profileName);
+        if (wcscmp(title, wanted) != 0) {
+            ULONGLONG now = GetTickCount64();
+            if (now - g_dressBurstStart > DRESS_BURST_MS) {
+                g_dressBurstStart = now;
+                g_dressBurst = 0;
+            }
+            if (++g_dressBurst > DRESS_BURST) {
+                g_dressTitlesGivenUp = TRUE;   /* Claude sets its title back each time: its own stays */
+                Util_Log(L"taskbar watcher for %s: Claude keeps setting its window title: the profile's is no longer given", g_watch.folder);
+            } else {
+                StringCchCopyW(g_dressedTitle, ARRAYSIZE(g_dressedTitle), wanted);   /* before: the change comes back as an event */
+                SendMessageTimeoutW(window, WM_SETTEXT, 0, (LPARAM)wanted, SMTO_ABORTIFHUNG, DRESS_SEND_MS, &result);
+            }
+        } else {
+            StringCchCopyW(g_dressedTitle, ARRAYSIZE(g_dressedTitle), wanted);
+        }
+    }
+    if (g_dressIcons[0] && SendMessageTimeoutW(window, WM_GETICON, ICON_SMALL, 0, SMTO_ABORTIFHUNG, DRESS_SEND_MS, &result) &&
+        (HICON)result != g_dressIcons[0]) {
+        SendMessageTimeoutW(window, WM_SETICON, ICON_SMALL, (LPARAM)g_dressIcons[0], SMTO_ABORTIFHUNG, DRESS_SEND_MS, &result);
+        SendMessageTimeoutW(window, WM_SETICON, ICON_BIG, (LPARAM)(g_dressIcons[1] ? g_dressIcons[1] : g_dressIcons[0]), SMTO_ABORTIFHUNG,
+                            DRESS_SEND_MS, &result);
+    }
+}
+
+/* Claude's own title and class icon back: the icons go with this watcher. */
+static void UndressWindow(HWND window)
+{
+    WCHAR title[512];
+    DWORD_PTR result = 0;
+    if (!IsDressable(window, FALSE)) return;
+    GetWindowTextW(window, title, ARRAYSIZE(title));
+    if (IsOurTitle(title))   /* Claude's own back: its title before, else its usual one */
+        SendMessageTimeoutW(window, WM_SETTEXT, 0, (LPARAM)(g_ownTitle[0] ? g_ownTitle : L"Claude"), SMTO_ABORTIFHUNG, DRESS_SEND_MS, &result);
+    if (g_dressIcons[0] && SendMessageTimeoutW(window, WM_GETICON, ICON_SMALL, 0, SMTO_ABORTIFHUNG, DRESS_SEND_MS, &result) &&
+        (HICON)result == g_dressIcons[0]) {
+        SendMessageTimeoutW(window, WM_SETICON, ICON_SMALL, 0, SMTO_ABORTIFHUNG, DRESS_SEND_MS, &result);
+        SendMessageTimeoutW(window, WM_SETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, DRESS_SEND_MS, &result);
+    }
+}
+
+typedef struct DressContext { DWORD pid; BOOL dress; } DressContext;
+
+static BOOL CALLBACK DressProc(HWND window, LPARAM parameter)
+{
+    const DressContext *context = (const DressContext *)parameter;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid == context->pid) {
+        if (context->dress) DressWindow(window);
+        else UndressWindow(window);
+    }
+    return TRUE;
+}
+
+static void FreeDressIcons(void)
+{
+    int i;
+    for (i = 0; i < 2; i++) {
+        if (g_dressIcons[i]) DestroyIcon(g_dressIcons[i]);
+        g_dressIcons[i] = NULL;
+    }
+}
+
+/* Every window of the profile's Claude dressed in the tag's name and icon,
+ * the icon read again (a new color or picture); the icons it had before go
+ * once no window shows them. */
+static void DressProcessWindows(void)
+{
+    WCHAR path[MAX_PATH + 4], *comma;
+    HICON old[2];
+    UINT dpi = GetDpiForSystem();
+    DressContext context;
+    int i;
+    for (i = 0; i < 2; i++) old[i] = g_dressIcons[i];
+    StringCchCopyW(path, ARRAYSIZE(path), g_watch.icon);
+    if ((comma = wcsrchr(path, L',')) != NULL) *comma = 0;
+    g_dressIcons[0] = (HICON)LoadImageW(NULL, path, IMAGE_ICON, GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi),
+                                        LR_LOADFROMFILE);
+    g_dressIcons[1] = (HICON)LoadImageW(NULL, path, IMAGE_ICON, GetSystemMetricsForDpi(SM_CXICON, dpi), GetSystemMetricsForDpi(SM_CYICON, dpi),
+                                        LR_LOADFROMFILE);
+    context.pid = g_watch.pid;
+    context.dress = TRUE;
+    if (g_dressedTitle[0]) StringCchCopyW(g_earlierTitle, ARRAYSIZE(g_earlierTitle), g_dressedTitle);
+    if (context.pid) EnumWindows(DressProc, (LPARAM)&context);
+    for (i = 0; i < 2; i++)
+        if (old[i]) DestroyIcon(old[i]);
+}
+
+static void UndressProcessWindows(void)
+{
+    DressContext context;
+    context.pid = g_watch.pid;
+    context.dress = FALSE;
+    if (context.pid) EnumWindows(DressProc, (LPARAM)&context);
+}
+
 /* The installed copy, which shortcuts and pins start; this exe when there is none. */
 static void ProgramExe(WCHAR *out, size_t cch)
 {
@@ -333,6 +488,8 @@ static BOOL PrepareTag(const ClaudePackage *pkg, const Profile *p, WindowTag *ta
     ProgramExe(exe, ARRAYSIZE(exe));
     StringCchPrintfW(tag->command, ARRAYSIZE(tag->command), L"\"%s\" --launch \"%s\"", exe, p->folder);
     StringCchPrintfW(tag->name, ARRAYSIZE(tag->name), L"Claude (%s)", p->name);
+    StringCchCopyW(tag->profileName, ARRAYSIZE(tag->profileName), p->name);
+    StringCchCopyW(tag->windowTitle, ARRAYSIZE(tag->windowTitle), p->windowTitle);
     if (!Icons_Ensure(pkg, p, icon, ARRAYSIZE(icon))) return FALSE;
     StringCchPrintfW(tag->icon, ARRAYSIZE(tag->icon), L"%s,0", icon);
     tag->pid = p->pid;
@@ -691,6 +848,7 @@ static void StartRefresh(BOOL linksChanged)
 {
     BOOL stale;
     ReloadTag();
+    DressProcessWindows();
     stale = TagProcessWindows(&g_watch, TAG_RELAUNCH);
     ScheduleTray();
     /* A retag under way ends with the profile's ID again: the taskbar reads
@@ -788,6 +946,16 @@ static void CALLBACK WindowShown(HWINEVENTHOOK hook, DWORD event, HWND window, L
     (void)hook; (void)event; (void)thread; (void)time;
     if (object != OBJID_WINDOW || child != CHILDID_SELF || !IsButtonWindow(window)) return;
     if (TagWindow(window, &g_watch, TAG_IF_NEEDED)) PostMessageW(g_watchWindow, WM_WATCH_REFRESH, 0, 0);
+    DressWindow(window);
+}
+
+/* A window of the profile's Claude has a new title (Claude set its own
+ * again): the profile's name goes after it again. Its own change ends here
+ * too, already dressed. */
+static void CALLBACK WindowRenamed(HWINEVENTHOOK hook, DWORD event, HWND window, LONG object, LONG child, DWORD thread, DWORD time)
+{
+    (void)hook; (void)event; (void)thread; (void)time;
+    if (object == OBJID_WINDOW && child == CHILDID_SELF && window) DressWindow(window);
 }
 
 /* Waits for one of `handles`, at most `ms`, handling the watcher's messages
@@ -963,7 +1131,7 @@ static void TakeQueuedStarts(void)
 static BOOL WatchClaude(HANDLE quit, HANDLE handover, WCHAR *ran, UINT32 ranCch)
 {
     HANDLE process, handles[RUNNING_HANDLE_COUNT];
-    HWINEVENTHOOK show, create;
+    HWINEVENTHOOK show, create, rename;
     UINT32 cch = ranCch;
     DWORD wait, waitError;
 
@@ -987,11 +1155,13 @@ static BOOL WatchClaude(HANDLE quit, HANDLE handover, WCHAR *ran, UINT32 ranCch)
     show = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, NULL, WindowShown, g_watch.pid, 0, WINEVENT_OUTOFCONTEXT);
     if (!show) Util_Log(L"taskbar watcher for %s: Claude's windows cannot be watched (error %lu)", g_watch.folder, GetLastError());
     create = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE, NULL, TrayHostCreated, g_watch.pid, 0, WINEVENT_OUTOFCONTEXT);
+    rename = SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, NULL, WindowRenamed, g_watch.pid, 0, WINEVENT_OUTOFCONTEXT);
     if (!create)
         Util_Log(L"taskbar watcher for %s: Claude's notification-area icon cannot be watched (error %lu)", g_watch.folder, GetLastError());
     /* A window tagged by an earlier watcher (before an update) may show an
      * older badge. */
     if (TagProcessWindows(&g_watch, TAG_IF_NEEDED)) PostMessageW(g_watchWindow, WM_WATCH_REFRESH, 0, 0);
+    DressProcessWindows();
     RepairButtonShortcuts();
     ScheduleTray();                                    /* its icon may be there already */
     Util_Log(L"taskbar watcher for %s (Claude pid %lu)", g_watch.folder, g_watch.pid);
@@ -1005,6 +1175,11 @@ static BOOL WatchClaude(HANDLE quit, HANDLE handover, WCHAR *ran, UINT32 ranCch)
      * again while they go back to Claude. */
     if (show) UnhookWinEvent(show);
     if (create) UnhookWinEvent(create);
+    if (rename) UnhookWinEvent(rename);
+    /* Claude still running (an uninstall, or a newer watcher taking over):
+     * its own title and icon back, before this watcher's icons go. */
+    if (wait != RUNNING_CLAUDE_EXIT) UndressProcessWindows();
+    FreeDressIcons();
     KillTimer(g_watchWindow, TIMER_APPS);
     g_waitingForApps = FALSE;
     if (wait == RUNNING_QUIT) {                                 /* uninstall */

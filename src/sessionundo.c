@@ -193,6 +193,21 @@ void SessionUndo_Listed(const Profile *p, const WCHAR *key, BOOL listed, char *c
     step->length[listed ? 1 : 0] = content ? length : 0;
 }
 
+void SessionUndo_Replaced(const Profile *p, const WCHAR *key, char *before, size_t beforeLength, char *after, size_t afterLength)
+{
+    UndoStep *step = NewStep(UNDO_ENTRY, p, key);
+    if (!step) {
+        if (before) HeapFree(GetProcessHeap(), 0, before);
+        if (after) HeapFree(GetProcessHeap(), 0, after);
+        return;
+    }
+    step->listed[0] = step->listed[1] = TRUE;   /* listed throughout: only its content changed */
+    step->entry[0] = before;
+    step->length[0] = before ? beforeLength : 0;
+    step->entry[1] = after;
+    step->length[1] = after ? afterLength : 0;
+}
+
 BOOL SessionUndo_CanUndo(void)
 {
     return g_done.count > 0;

@@ -11,6 +11,7 @@
  * (sessions.c). Built and run by build.cmd; exits non-zero when a check fails.
  */
 #include "../src/app.h"
+#include <wincrypt.h>
 #include "../src/resource.h"
 #include <commctrl.h>
 #include <objbase.h>
@@ -56,6 +57,16 @@ static void Check(const char *name, BOOL ok)
 static BOOL Join(const WCHAR *dir, const WCHAR *leaf, WCHAR *out, size_t cch)
 {
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\%s", dir, leaf));
+}
+
+/* `text` written as `path`, whole. */
+static BOOL WriteWholeFile(const WCHAR *path, const char *text)
+{
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD done = 0;
+    BOOL ok = file != INVALID_HANDLE_VALUE && WriteFile(file, text, (DWORD)strlen(text), &done, NULL) && done == strlen(text);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    return ok;
 }
 
 static BOOL FixturePath(const WCHAR *leaf, WCHAR *out, size_t cch)
@@ -1184,6 +1195,68 @@ static void TestEntryDetails(void)
 
 /* Stars made at once and later, what a snapshot shows of waiting
  * changes, changes that cannot be made, the queue's limit and Forget. */
+/* A Remote Control session turned into a plain local one (PENDING_UNREMOTE):
+ * the members that make Claude bridge it go, the rest stays; at once in a
+ * closed profile, else once its Claude closes. */
+static void TestTurnLocal(void)
+{
+    static const WCHAR *const ids[2] = { L"cccccccc-0000-4000-8000-0000000000a1", L"cccccccc-0000-4000-8000-0000000000a2" };
+    static const char *const bridged =
+        ",\"remoteControlUserEnabled\":true,\"bridgeSessionIds\":[\"session_01Fixture\"],\"steeredByRemoteClient\":false,"
+        "\"remoteControlAutoEligible\":false,\"isStarred\":true";
+    ProfileList profiles;
+    Profile *profile = &profiles.items[0];
+    SessionSet set;
+    PendingEdit edit;
+    WCHAR entries[MAX_PATH], files[2][MAX_PATH], pending[MAX_PATH], title[SESSION_TITLE_CCH];
+    HWND window;
+    BOOL ready, waiting;
+    int i, rows[2];
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 1;
+    ready = PrepareProfile(profile, L"Turn local", L"turnlocal\\profile", g_accountId, g_organizationId, entries, ARRAYSIZE(entries)) &&
+            SessionStore_PendingPath(profile, pending, ARRAYSIZE(pending));
+    for (i = 0; ready && i < 2; i++) ready = WriteEntry(entries, ids[i], bridged) && EntryPath(entries, ids[i], files[i], MAX_PATH);
+    ready = ready && SessionStore_LoadProfiles(&set, &profiles);
+    Check("turn local: fixtures ready", ready);
+    if (!ready) return;
+    for (i = 0; i < 2; i++) rows[i] = FindRow(&set, ids[i]);
+    if (rows[0] < 0 || rows[1] < 0) {
+        Check("turn local: sessions listed", FALSE);
+        SessionStore_Free(&set);
+        return;
+    }
+    Check("turn local: listed as Remote Control", set.entries[set.rows[rows[0]].entry[0]].environment == SESSION_ENV_REMOTE);
+
+    ZeroMemory(&edit, sizeof edit);
+    edit.op = PENDING_UNREMOTE;
+    StringCchCopyW(edit.key, ARRAYSIZE(edit.key), ids[0]);
+    Check("turn local: made at once in a closed profile",
+          SessionEdit_Change(NULL, profile, &set.entries[set.rows[rows[0]].entry[0]], &edit, &waiting, NULL, 0) && !waiting &&
+          !Util_FileExists(pending));
+    Check("turn local: Remote Control's members gone",
+          !HasMember(files[0], "remoteControlUserEnabled") && !HasMember(files[0], "bridgeSessionIds") &&
+          !HasMember(files[0], "steeredByRemoteClient") && !HasMember(files[0], "remoteControlAutoEligible"));
+    Check("turn local: the rest kept", ReadTrue(files[0], "isStarred") && ReadString(files[0], "title", title, ARRAYSIZE(title)) &&
+          wcscmp(title, L"Fixture session") == 0);
+
+    window = StartFakeClaude(profile);
+    Check("turn local: running profile", window != NULL);
+    if (window) {
+        StringCchCopyW(edit.key, ARRAYSIZE(edit.key), ids[1]);
+        Check("turn local: waits while the profile runs",
+              SessionEdit_Change(NULL, profile, &set.entries[set.rows[rows[1]].entry[0]], &edit, &waiting, NULL, 0) && waiting &&
+              ReadTrue(files[1], "remoteControlUserEnabled"));
+        StopFakeClaude(window);
+        Check("turn local: made once its Claude closes", SessionEdit_ApplyPending(NULL, profile) == 1 &&
+              !HasMember(files[1], "remoteControlUserEnabled") && !HasMember(files[1], "bridgeSessionIds") && !Util_FileExists(pending));
+    }
+    SessionStore_Free(&set);
+    Check("turn local: listed as local after", SessionStore_LoadProfiles(&set, &profiles) && (rows[0] = FindRow(&set, ids[0])) >= 0 &&
+          set.entries[set.rows[rows[0]].entry[0]].environment == SESSION_ENV_LOCAL);
+    SessionStore_Free(&set);
+}
+
 static void TestPendingChanges(void)
 {
     ProfileList profiles;
@@ -3917,6 +3990,50 @@ static BOOL KeepVariable(const WCHAR *name, WCHAR **kept)
     return *kept && GetEnvironmentVariableW(name, *kept, cch) < cch;
 }
 
+/* A profile's sign-in key, as a backup for any PC takes it (Backup_ReadAppKey)
+ * and a restore on another PC writes it (Backup_WriteAppKey): Local State's
+ * os_crypt key, "DPAPI" and its DPAPI blob in base64, opened for this Windows
+ * user; written protected again, Local State's other members kept. */
+static void TestAccountKey(void)
+{
+    static const BYTE kKey[32] = { 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32 };
+    WCHAR storage[MAX_PATH], localState[MAX_PATH];
+    DATA_BLOB in, out;
+    BYTE blob[512], read[64], other[32];
+    char encoded[1024], json[1400];
+    size_t length = 0, i;
+    DWORD size = 0;
+    char *after;
+    BOOL ready;
+    ready = FixturePath(L"account-key", storage, ARRAYSIZE(storage)) && Util_EnsureDir(storage) && Join(storage, L"Local State", localState, ARRAYSIZE(localState));
+    ZeroMemory(&out, sizeof out);
+    in.pbData = (BYTE *)kKey;
+    in.cbData = sizeof kKey;
+    ready = ready && CryptProtectData(&in, NULL, NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &out);
+    if (ready) {
+        memcpy(blob, "DPAPI", 5);
+        memcpy(blob + 5, out.pbData, out.cbData);
+        ready = Core_Base64Encode(blob, out.cbData + 5, encoded, sizeof encoded) > 0;
+        LocalFree(out.pbData);
+    }
+    ready = ready && SUCCEEDED(StringCchPrintfA(json, sizeof json, "{\"browser\":{\"enabled_labs_experiments\":[]},\"os_crypt\":{\"audit_enabled\":true,\"encrypted_key\":\"%s\"},\"profile\":{}}", encoded)) &&
+            WriteWholeFile(localState, json);
+    Check("account key: fixture written", ready);
+    if (!ready) return;
+    Check("account key: Local State's key, opened for this Windows user", Backup_ReadAppKey(storage, read, sizeof read, &length) &&
+          length == sizeof kKey && memcmp(read, kKey, sizeof kKey) == 0);
+    for (i = 0; i < sizeof other; i++) other[i] = (BYTE)(200 + i);
+    Check("account key: another written, protected again", Backup_WriteAppKey(storage, other, sizeof other) &&
+          Backup_ReadAppKey(storage, read, sizeof read, &length) && length == sizeof other && memcmp(read, other, sizeof other) == 0);
+    after = Util_ReadFile(localState, 64 * 1024, FALSE, &size);
+    Check("account key: Local State's other members kept", after && strstr(after, "\"enabled_labs_experiments\":[]") && strstr(after, "\"audit_enabled\":true") &&
+          strstr(after, "\"profile\":{}") && !strstr(after, encoded));
+    if (after) HeapFree(GetProcessHeap(), 0, after);
+    Check("account key: a key this Windows user cannot open is none",
+          WriteWholeFile(localState, "{\"os_crypt\":{\"encrypted_key\":\"RFBBUElub3QgYSBibG9i\"}}") && !Backup_ReadAppKey(storage, read, sizeof read, &length) && length == 0);
+    Check("account key: no Local State, none", DeleteFileW(localState) && !Backup_ReadAppKey(storage, read, sizeof read, &length));
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     ProfileList profiles;
@@ -3959,6 +4076,7 @@ int wmain(int argc, WCHAR **argv)
             TestPendingQueueFile();
             TestEntryDetails();
             TestPendingChanges();
+            TestTurnLocal();
             TestReadonlyPending(&profiles);
             TestRemovals();
             TestDeletionList(&profiles, projects);
@@ -3980,6 +4098,7 @@ int wmain(int argc, WCHAR **argv)
             TestWebLayout();
             TestSyncItems();
             TestReliableSync();
+            TestAccountKey();
         }
         Check("nothing outside the fixture was given to the Recycle Bin", !g_recycle.escaped);
         StopStartedClaude();

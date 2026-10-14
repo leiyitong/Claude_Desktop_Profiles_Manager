@@ -778,7 +778,7 @@ static const ThemeTint kSyncTints[IMAGES] = {
 
 /* Each group of what syncs, in Core_SyncGroup's order (its SYNC_ITEM_* mask):
  * its heading, its image, and its name as settings.ini keeps it opened. */
-static const struct { DWORD item; const WCHAR *heading; int image; const WCHAR *name; } kSyncKinds[SYNC_GROUP_COUNT] = {
+static const CheckGroup kSyncKinds[SYNC_GROUP_COUNT] = {
     { SYNC_ITEM_SESSIONS, L"Sessions", IMAGE_SESSION, L"sessions" },
     { SYNC_ITEM_SIDEBAR, L"Sidebar", IMAGE_GROUP, L"sidebar" },
     { SYNC_ITEM_DETAILS, L"Session details", IMAGE_LAYOUT, L"details" },
@@ -791,7 +791,7 @@ static const struct { DWORD item; const WCHAR *heading; int image; const WCHAR *
 #define ITEMS_OPENED_SECTION L"SyncItemsOpened"
 
 /* Each item under its group, as the person sees it; a group of one item is a heading alone. */
-static const struct { DWORD item; const WCHAR *label; int image; } kSyncItemRows[] = {
+static const CheckItem kSyncItemRows[] = {
     { SYNC_ITEM_SESSIONS_NEW, L"New sessions", IMAGE_SESSION },
     { SYNC_ITEM_SESSIONS_TITLES, L"Titles", IMAGE_SESSION },
     { SYNC_ITEM_SESSIONS_ARCHIVED, L"Archived or not", IMAGE_SESSION },
@@ -818,195 +818,59 @@ static const struct { DWORD item; const WCHAR *label; int image; } kSyncItemRows
     { SYNC_ITEM_PERMISSIONS_TRUSTED, L"Cowork's trusted folders", IMAGE_PERMISSION },
 };
 
-/* What to sync, as a list whose groups fold, with check boxes: what it
- * shows comes from `items`; the groups start folded, but those the person
- * opened before (settings.ini). A box the list checks itself (a click,
- * Space) is undone, then turned over here (WM_ITEMS_BOX): a group's
- * checks all of it, or none once it all is checked. */
-typedef struct ItemsList {
-    HWND  list;
-    DWORD items;                       /* what is checked */
-    BOOL  open[SYNC_GROUP_COUNT];
-    BOOL  filling;                     /* boxes set here, not clicked */
-} ItemsList;
-
-#define WM_ITEMS_BOX (WM_APP + 0x100)   /* a box clicked: wParam its row */
-
-static BOOL HasItems(int g)
+/* What to sync, as a checked list whose groups fold (checklist.c): `items`
+ * checked, the groups opened before open. */
+static void SetupItemsList(CheckList *checks, HWND list, DWORD items)
 {
-    size_t i;
-    for (i = 0; i < ARRAYSIZE(kSyncItemRows); i++)
-        if (kSyncItemRows[i].item & Core_SyncGroup(g)) return TRUE;
-    return FALSE;
-}
-
-static DWORD RowMask(LPARAM param)
-{
-    return param < 0 ? Core_SyncGroup(THEME_HEADING_OF(param)) : (DWORD)param;
-}
-
-/* Each row's box as `items` says: a group's checked when all of it is, mixed when some. */
-static void ShowBoxes(ItemsList *rows)
-{
-    int row, count = ListView_GetItemCount(rows->list);
-    rows->filling = TRUE;
-    for (row = 0; row < count; row++) {
-        DWORD mask = RowMask(Theme_RowParam(rows->list, row)), chosen = rows->items & mask;
-        ListView_SetItemState(rows->list, row, INDEXTOSTATEIMAGEMASK(chosen == mask ? 2 : chosen ? 3 : 1), LVIS_STATEIMAGEMASK);
-    }
-    rows->filling = FALSE;
-}
-
-/* Group `g`'s items, below its heading at `row`. */
-static void InsertGroupItems(ItemsList *rows, int row, int g)
-{
-    size_t i;
-    for (i = 0; i < ARRAYSIZE(kSyncItemRows); i++)
-        if (kSyncItemRows[i].item & Core_SyncGroup(g))
-            Theme_InsertFoldingRow(rows->list, ++row, TR(kSyncItemRows[i].label), kSyncItemRows[i].image, (LPARAM)kSyncItemRows[i].item, 0);
-}
-
-/* Every row again: each group's heading, and its items when it is open. */
-static void InsertItemsRows(ItemsList *rows)
-{
-    int g, row;
-    rows->filling = TRUE;
-    ListView_DeleteAllItems(rows->list);
-    for (g = 0; g < SYNC_GROUP_COUNT; g++) {
-        int fold = !HasItems(g) ? THEME_FOLD_NONE : rows->open[g] ? THEME_FOLD_OPEN : THEME_FOLD_CLOSED;
-        row = ListView_GetItemCount(rows->list);
-        Theme_InsertFoldingRow(rows->list, row, TR(kSyncKinds[g].heading), kSyncKinds[g].image, THEME_HEADING_ROW(g), fold);
-        if (fold == THEME_FOLD_OPEN) InsertGroupItems(rows, row, g);
-    }
-    rows->filling = FALSE;
-    ShowBoxes(rows);
-}
-
-static void SetupItemsList(ItemsList *rows, HWND list, DWORD items)
-{
-    WCHAR opened[SYNC_GROUP_COUNT][MAX_PATH];
-    LVCOLUMNW column;
-    HIMAGELIST states;
-    int g, o, openedCount = Util_GetSettingList(ITEMS_OPENED_SECTION, opened, SYNC_GROUP_COUNT);
-    ZeroMemory(rows, sizeof *rows);
-    rows->list = list;
-    rows->items = items & SYNC_ITEMS_ALL;
-    for (g = 0; g < SYNC_GROUP_COUNT; g++)
-        for (o = 0; o < openedCount; o++)
-            if (Core_EqualsI(opened[o], kSyncKinds[g].name)) rows->open[g] = TRUE;
-    rows->filling = TRUE;
-    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-    if ((states = ListView_GetImageList(list, LVSIL_STATE)) != NULL) ImageList_SetImageCount(states, 3);   /* the third: some of a group */
-    ListView_SetImageList(list, Theme_GlyphImages(list, kSyncGlyphs, kSyncTints, IMAGES), LVSIL_SMALL);
-    ZeroMemory(&column, sizeof column);
-    ListView_InsertColumn(list, 0, &column);   /* the view it scrolls in gives it the list's width */
-    Theme_SetFoldingRows(list);
-    rows->filling = FALSE;
-    InsertItemsRows(rows);
+    ZeroMemory(checks, sizeof *checks);
+    checks->groups = kSyncKinds;
+    checks->groupCount = SYNC_GROUP_COUNT;
+    checks->items = kSyncItemRows;
+    checks->itemCount = (int)ARRAYSIZE(kSyncItemRows);
+    checks->openedSection = ITEMS_OPENED_SECTION;
+    checks->offered = SYNC_ITEMS_ALL;
+    checks->checked = items;
+    CheckList_Setup(checks, list, kSyncGlyphs, kSyncTints, IMAGES);
 }
 
 void SyncUi_FillItemsList(HWND list, DWORD items)
 {
-    static ItemsList shown;   /* a list alone, as the tests show it */
+    static CheckList shown;   /* a list alone, as the tests show it */
     SetupItemsList(&shown, list, items);
 }
 
-/* The groups open, kept for the next time. */
-static void KeepOpenedGroups(const ItemsList *rows)
+/* The what-to-sync groups and items, and the glyphs they draw with, shared
+ * so a backup's list shows the same ones (backup.c builds its own list from
+ * these plus its content parts). */
+const CheckGroup *SyncUi_Groups(int *count)
 {
-    WCHAR opened[SYNC_GROUP_COUNT][MAX_PATH];
-    int g, count = 0;
-    for (g = 0; g < SYNC_GROUP_COUNT; g++)
-        if (rows->open[g] && SUCCEEDED(StringCchCopyW(opened[count], ARRAYSIZE(opened[count]), kSyncKinds[g].name))) count++;
-    if (!Util_SetSettingList(ITEMS_OPENED_SECTION, (const WCHAR (*)[MAX_PATH])opened, count))
-        Util_Log(L"what to sync: the groups opened could not be kept (error %lu)", GetLastError());
+    if (count) *count = SYNC_GROUP_COUNT;
+    return kSyncKinds;
 }
 
-/* Heading `row` opened or folded by the person. */
-static void FoldItemsGroup(ItemsList *rows, int row, BOOL open)
+const CheckItem *SyncUi_Items(int *count)
 {
-    int g = THEME_HEADING_OF(Theme_RowParam(rows->list, row));
-    if (g < 0 || g >= SYNC_GROUP_COUNT || !HasItems(g) || !rows->open[g] == !open) return;
-    rows->open[g] = open;
-    rows->filling = TRUE;
-    Theme_SetFold(rows->list, row, open ? THEME_FOLD_OPEN : THEME_FOLD_CLOSED);
-    if (open) InsertGroupItems(rows, row, g);
-    else Theme_DeleteFoldedRows(rows->list, row);
-    rows->filling = FALSE;
-    ShowBoxes(rows);
-    KeepOpenedGroups(rows);
+    if (count) *count = (int)ARRAYSIZE(kSyncItemRows);
+    return kSyncItemRows;
 }
 
-/* Every group opened, or every one folded (Theme_FoldMenu), and kept so. */
-static void FoldAllItems(ItemsList *rows, BOOL open)
+const WCHAR *SyncUi_Glyphs(const ThemeTint **tints, int *images)
 {
-    int g;
-    for (g = 0; g < SYNC_GROUP_COUNT; g++) rows->open[g] = open && HasItems(g);
-    InsertItemsRows(rows);
-    if (ListView_GetItemCount(rows->list)) Theme_FocusRow(rows->list, 0);
-    KeepOpenedGroups(rows);
-}
-
-/* Row `row`'s box clicked, or Space on it. */
-static void ToggleItemsBox(ItemsList *rows, int row)
-{
-    DWORD mask;
-    if (row < 0 || row >= ListView_GetItemCount(rows->list)) return;
-    mask = RowMask(Theme_RowParam(rows->list, row));
-    rows->items = (rows->items & mask) == mask ? rows->items & ~mask : rows->items | mask;
-    ShowBoxes(rows);
-}
-
-/* What the list tells about its boxes and folds: TRUE when the dialog
- * answers `result` (a box the list was checking itself, undone). */
-static BOOL ItemsListNotify(ItemsList *rows, HWND dialog, const NMHDR *header, LRESULT *result)
-{
-    *result = 0;
-    if (header->hwndFrom != rows->list) return FALSE;
-    if (header->code == LVN_ITEMCHANGING) {
-        const NMLISTVIEW *change = (const NMLISTVIEW *)header;
-        if (rows->filling || !(change->uChanged & LVIF_STATE) || !((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK)) return FALSE;
-        PostMessageW(dialog, WM_ITEMS_BOX, (WPARAM)change->iItem, 0);
-        *result = TRUE;
-        return TRUE;
-    }
-    if (header->code == NM_CLICK || header->code == NM_DBLCLK) {
-        /* The arrow folds or opens a group; so does a double-click on its heading. */
-        LVHITTESTINFO hit;
-        ZeroMemory(&hit, sizeof hit);
-        hit.pt = ((const NMITEMACTIVATE *)header)->ptAction;
-        if (ListView_SubItemHitTest(rows->list, &hit) >= 0 && Theme_RowParam(rows->list, hit.iItem) < 0 &&
-            (Theme_OnFoldArrow(rows->list, hit.iItem, hit.pt) || (header->code == NM_DBLCLK && !(hit.flags & LVHT_ONITEMSTATEICON)))) {
-            int g = THEME_HEADING_OF(Theme_RowParam(rows->list, hit.iItem));
-            if (g >= 0 && g < SYNC_GROUP_COUNT) FoldItemsGroup(rows, hit.iItem, !rows->open[g]);
-        }
-        return FALSE;
-    }
-    if (header->code == LVN_KEYDOWN) {
-        /* Right opens a group, Left folds it, or goes from an item up to its group. */
-        WORD key = ((const NMLVKEYDOWN *)header)->wVKey;
-        int row = ListView_GetNextItem(rows->list, -1, LVNI_FOCUSED);
-        if (row < 0 || (key != VK_LEFT && key != VK_RIGHT)) return FALSE;
-        if (Theme_RowParam(rows->list, row) < 0) {
-            FoldItemsGroup(rows, row, key == VK_RIGHT);
-        } else if (key == VK_LEFT) {
-            while (row > 0 && Theme_RowParam(rows->list, row) >= 0) row--;
-            Theme_FocusRow(rows->list, row);
-        }
-    }
-    return FALSE;
+    if (tints) *tints = kSyncTints;
+    if (images) *images = IMAGES;
+    return kSyncGlyphs;
 }
 
 typedef struct ItemsDialog {
     const WCHAR *text;
     DWORD        items;
-    ItemsList    rows;
+    CheckList    rows;
 } ItemsDialog;
 
 /* What the boxes checked say; OK only with one at least. */
 static void ReadItems(HWND dialog, ItemsDialog *state)
 {
-    state->items = state->rows.items;
+    state->items = state->rows.checked;
     EnableWindow(GetDlgItem(dialog, IDOK), state->items != 0);
 }
 
@@ -1028,27 +892,22 @@ static INT_PTR CALLBACK ItemsProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
 
     case WM_NOTIFY: {
         LRESULT result;
-        if (state && ItemsListNotify(&state->rows, dialog, (const NMHDR *)lp, &result)) {
+        if (state && CheckList_Notify(&state->rows, dialog, (const NMHDR *)lp, &result)) {
             SetWindowLongPtrW(dialog, DWLP_MSGRESULT, result);
             return TRUE;
         }
         break;
     }
 
-    case WM_ITEMS_BOX:
-        if (state) {
-            ToggleItemsBox(&state->rows, (int)wp);
-            ReadItems(dialog, state);
-        }
-        return TRUE;
-
-    case WM_CONTEXTMENU:
-        if (state && ((HWND)wp == state->rows.list || (HWND)wp == GetParent(state->rows.list))) {
-            UINT cmd = Theme_FoldMenu(dialog, state->rows.list, (HWND)wp, lp);
-            if (cmd) FoldAllItems(&state->rows, cmd == THEME_FOLD_MENU_EXPAND);
+    case WM_CHECKLIST_BOX:
+    case WM_CONTEXTMENU: {
+        BOOL toggled;
+        if (state && CheckList_Message(&state->rows, dialog, message, wp, lp, &toggled)) {
+            if (toggled) ReadItems(dialog, state);
             return TRUE;
         }
         break;
+    }
 
     case WM_COMMAND:
         if (!state) break;
@@ -1086,7 +945,7 @@ typedef struct SetupDialog {
     const ProfileList *profiles;
     SyncSetup         *setup;
     HWND               partners;
-    ItemsList          items;
+    CheckList          items;
     int                rowProfile[MAX_PROFILES];
     int                rowCount;
     BOOL               filling;
@@ -1099,7 +958,7 @@ static void ReadSetup(HWND dialog, SetupDialog *state)
     state->setup->partners = 0;
     for (row = 0; row < state->rowCount; row++)
         if (ListView_GetCheckState(state->partners, row)) state->setup->partners |= 1u << state->rowProfile[row];
-    state->setup->items = state->items.items;
+    state->setup->items = state->items.checked;
     EnableWindow(GetDlgItem(dialog, IDC_Z_ITEMS_LABEL), state->setup->partners != 0);
     EnableWindow(state->items.list, state->setup->partners != 0);
     EnableWindow(GetDlgItem(dialog, IDC_Z_SYNC_NOW), state->setup->partners && state->setup->items);
@@ -1159,7 +1018,7 @@ static INT_PTR CALLBACK SetupProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
 
     case WM_NOTIFY: {
         LRESULT result;
-        if (state && ItemsListNotify(&state->items, dialog, (const NMHDR *)lp, &result)) {
+        if (state && CheckList_Notify(&state->items, dialog, (const NMHDR *)lp, &result)) {
             SetWindowLongPtrW(dialog, DWLP_MSGRESULT, result);
             return TRUE;
         }
@@ -1172,20 +1031,15 @@ static INT_PTR CALLBACK SetupProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
         break;
     }
 
-    case WM_ITEMS_BOX:
-        if (state) {
-            ToggleItemsBox(&state->items, (int)wp);
-            ReadSetup(dialog, state);
-        }
-        return TRUE;
-
-    case WM_CONTEXTMENU:
-        if (state && ((HWND)wp == state->items.list || (HWND)wp == GetParent(state->items.list))) {
-            UINT cmd = Theme_FoldMenu(dialog, state->items.list, (HWND)wp, lp);
-            if (cmd) FoldAllItems(&state->items, cmd == THEME_FOLD_MENU_EXPAND);
+    case WM_CHECKLIST_BOX:
+    case WM_CONTEXTMENU: {
+        BOOL toggled;
+        if (state && CheckList_Message(&state->items, dialog, message, wp, lp, &toggled)) {
+            if (toggled) ReadSetup(dialog, state);
             return TRUE;
         }
         break;
+    }
 
     case WM_COMMAND:
         if (!state) break;
@@ -1248,7 +1102,7 @@ static int ConflictImage(const VaultConflict *conflict)
     if (strcmp(conflict->part, "slice") == 0 || strcmp(conflict->part, "navPins") == 0) return IMAGE_PIN;
     if (strncmp(conflict->part, "starred", 7) == 0) return IMAGE_STAR;
     for (k = 0; k < ARRAYSIZE(kSyncKinds); k++)
-        if (kSyncKinds[k].item & conflict->item) return kSyncKinds[k].image;
+        if (kSyncKinds[k].mask & conflict->item) return kSyncKinds[k].image;
     return IMAGE_SETTING;
 }
 
@@ -1256,7 +1110,7 @@ static int KindOf(const VaultConflict *conflict)
 {
     int k;
     for (k = 0; k < (int)ARRAYSIZE(kSyncKinds); k++)
-        if (kSyncKinds[k].item & conflict->item) return k;
+        if (kSyncKinds[k].mask & conflict->item) return k;
     return (int)ARRAYSIZE(kSyncKinds) - 1;
 }
 

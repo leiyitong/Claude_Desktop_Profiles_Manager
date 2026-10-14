@@ -3,6 +3,7 @@
  * exits non-zero when a check fails.
  */
 #include "../src/app.h"
+#include <bcrypt.h>   /* sealing as Chromium does, to open it */
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -869,6 +870,38 @@ static void TestMarkdownRtf(void)
     Check("markdown: no text, no style, nothing", Core_MarkdownRtf(NULL, &style, rtf, ARRAYSIZE(rtf)) == 0 && Core_MarkdownRtf(kMarkdown, NULL, rtf, ARRAYSIZE(rtf)) == 0);
 }
 
+/* Base64, and a secret sealed behind a password: opened by it alone, its
+ * text changed fails, the salt and nonce new each time. */
+static void TestSealedSecret(void)
+{
+    static const BYTE kSecret[32] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32 };
+    char text[64], sealed[1024], other[1024];
+    BYTE bytes[64], opened[64];
+    size_t length = 0;
+    Check("base64: encoded", Core_Base64Encode((const BYTE *)"foobar", 6, text, sizeof text) == 8 && strcmp(text, "Zm9vYmFy") == 0);
+    Check("base64: padded", Core_Base64Encode((const BYTE *)"fo", 2, text, sizeof text) == 4 && strcmp(text, "Zm8=") == 0 &&
+          Core_Base64Encode((const BYTE *)"f", 1, text, sizeof text) == 4 && strcmp(text, "Zg==") == 0);
+    Check("base64: decoded, padding or not", Core_Base64Decode("Zm9vYmFy", 8, bytes, sizeof bytes) == 6 && memcmp(bytes, "foobar", 6) == 0 &&
+          Core_Base64Decode("Zm8=", 4, bytes, sizeof bytes) == 2 && memcmp(bytes, "fo", 2) == 0 && Core_Base64Decode("Zg", 2, bytes, sizeof bytes) == 1);
+    Check("base64: anything else refused", Core_Base64Decode("Zm9v!mFy", 8, bytes, sizeof bytes) == (size_t)-1 &&
+          Core_Base64Decode("Zm8=Zm8=", 8, bytes, sizeof bytes) == (size_t)-1 && Core_Base64Decode("Zm9vYmFy", 8, bytes, 3) == (size_t)-1);
+    Check("base64: what does not fit is nothing", Core_Base64Encode((const BYTE *)"foobar", 6, text, 8) == 0 && text[0] == 0);
+    Check("sealed: written", Core_SealSecret(kSecret, sizeof kSecret, L"correct horse \x4E2D", 1000, sealed, sizeof sealed) &&
+          strstr(sealed, "\"kdf\":\"pbkdf2-sha256\"") && strstr(sealed, "\"iterations\":1000") && strstr(sealed, "\"cipher\":\"aes-256-gcm\""));
+    Check("sealed: opened by its password", Core_OpenSecret(sealed, strlen(sealed), L"correct horse \x4E2D", opened, sizeof opened, &length) &&
+          length == sizeof kSecret && memcmp(opened, kSecret, sizeof kSecret) == 0);
+    Check("sealed: not by another", !Core_OpenSecret(sealed, strlen(sealed), L"correct horse", opened, sizeof opened, &length) && length == 0);
+    {
+        char *at = strstr(sealed, "\"sealed\":\"") + 10;
+        *at = *at == 'A' ? 'B' : 'A';   /* one character of what is sealed, changed */
+        Check("sealed: its text changed, it does not open", !Core_OpenSecret(sealed, strlen(sealed), L"correct horse \x4E2D", opened, sizeof opened, &length));
+    }
+    Check("sealed: a new salt and nonce each time",
+          Core_SealSecret(kSecret, sizeof kSecret, L"pw", 1000, sealed, sizeof sealed) && Core_SealSecret(kSecret, sizeof kSecret, L"pw", 1000, other, sizeof other) &&
+          strcmp(sealed, other) != 0);
+    Check("sealed: no password, nothing", !Core_SealSecret(kSecret, sizeof kSecret, L"", 1000, sealed, sizeof sealed) && sealed[0] == 0);
+}
+
 static void TestTranscriptLines(void)
 {
     WCHAR out[256], small[12];
@@ -1017,6 +1050,7 @@ static void TestSessionEdits(void)
                                wcscmp(back.key, e.key) == 0 && wcscmp(back.value, L"Weekly review ") == 0);
     Check("pending: a star", Core_PendingParse(L"star\tk\t1", &back) && back.op == PENDING_STAR && back.value[0] == L'1');
     Check("pending: a removal", Core_PendingParse(L"remove\tk\t", &back) && back.op == PENDING_REMOVE && back.value[0] == 0);
+    Check("pending: a session turned local", Core_PendingParse(L"unremote\tk\t", &back) && back.op == PENDING_UNREMOTE && back.value[0] == 0);
     Check("pending: Claude's own title put back", Core_PendingParse(L"auto-title\tk\tPlan", &back) && back.op == PENDING_TITLE_AUTO &&
                                                   wcscmp(back.value, L"Plan") == 0);
     Check("pending: ... or none", Core_PendingParse(L"auto-title\tk\t", &back) && back.op == PENDING_TITLE_AUTO && back.value[0] == 0);
@@ -1708,6 +1742,94 @@ static BOOL MergeTwo(const char *base, const char *a, const char *b, ULONGLONG w
     return ok;
 }
 
+/* `base` joined with `other`'s scheduledTasks, as Core_JsonArrayUnion does; `expected` NULL: no result. */
+static void CheckUnion(const char *name, const char *base, const char *other, const char *expected)
+{
+    size_t length = 0;
+    char *joined = Core_JsonArrayUnion(base, strlen(base), other, strlen(other), "scheduledTasks", "id", &length);
+    BOOL ok = expected ? joined && length == strlen(expected) && strcmp(joined, expected) == 0 : joined == NULL;
+    if (!ok && joined) printf("    got %s\n", joined);
+    Check(name, ok);
+    if (joined) HeapFree(GetProcessHeap(), 0, joined);
+}
+
+/* The scheduled tasks of several backups restored into one profile: each
+ * backup's tasks join the profile's, by id, the backup's own kept. */
+static void TestJsonArrayUnion(void)
+{
+    CheckUnion("union: the other's new task added, the same id's kept as it is",
+               "{\"scheduledTasks\":[{\"id\":\"a\",\"n\":1}],\"recordedSkips\":{}}",
+               "{\"scheduledTasks\":[{\"id\":\"a\",\"n\":2},{\"id\":\"b\"}]}",
+               "{\"scheduledTasks\":[{\"id\":\"a\",\"n\":1},{\"id\":\"b\"}],\"recordedSkips\":{}}");
+    CheckUnion("union: an empty array given the other's",
+               "{\"scheduledTasks\":[ ],\"x\":true}", "{\"scheduledTasks\":[{\"id\":\"b\"}]}",
+               "{\"scheduledTasks\":[ {\"id\":\"b\"}],\"x\":true}");
+    CheckUnion("union: written as Claude writes it, spaces kept",
+               "{\n  \"scheduledTasks\": [\n    {\"id\": \"a\"}\n  ]\n}", "{\"scheduledTasks\":[{\"id\":\"b\"}]}",
+               "{\n  \"scheduledTasks\": [\n    {\"id\": \"a\"}\n  ,{\"id\":\"b\"}]\n}");
+    CheckUnion("union: no array yet, the other's made",
+               "{\"x\":1}", "{\"scheduledTasks\":[{\"id\":\"b\"}]}", "{\"x\":1,\"scheduledTasks\":[{\"id\":\"b\"}]}");
+    CheckUnion("union: the other without the array, unchanged",
+               "{\"scheduledTasks\":[{\"id\":\"a\"}]}", "{\"recordedSkips\":{}}", "{\"scheduledTasks\":[{\"id\":\"a\"}]}");
+    CheckUnion("union: elements without an id, added unless equal",
+               "{\"scheduledTasks\":[1,\"s\"]}", "{\"scheduledTasks\":[\"s\",2]}", "{\"scheduledTasks\":[1,\"s\",2]}");
+    CheckUnion("union: not an object, none", "[1]", "{\"scheduledTasks\":[]}", NULL);
+    CheckUnion("union: an array that is not one, none", "{\"scheduledTasks\":{}}", "{\"scheduledTasks\":[]}", NULL);
+    CheckUnion("union: the other damaged, the first as it is", "{\"scheduledTasks\":[]}", "{\"scheduledTasks\":[{\"id\":\"b\"}",
+               "{\"scheduledTasks\":[]}");
+}
+
+/* `plain` sealed as OSCrypt does on Windows ("v10", nonce, AES-256-GCM, tag), with bcrypt itself. */
+static size_t SealLikeChromium(const BYTE *key, const BYTE *nonce, const char *plain, BYTE *out)
+{
+    BCRYPT_ALG_HANDLE aes = NULL;
+    BCRYPT_KEY_HANDLE handle = NULL;
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO mode;
+    ULONG done = 0, length = (ULONG)strlen(plain);
+    BOOL ok;
+    BCRYPT_INIT_AUTH_MODE_INFO(mode);
+    memcpy(out, "v10", 3);
+    memcpy(out + 3, nonce, 12);
+    mode.pbNonce = (PUCHAR)nonce;
+    mode.cbNonce = 12;
+    mode.pbTag = out + 15 + length;
+    mode.cbTag = 16;
+    ok = BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&aes, BCRYPT_AES_ALGORITHM, NULL, 0)) &&
+         BCRYPT_SUCCESS(BCryptSetProperty(aes, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof BCRYPT_CHAIN_MODE_GCM, 0)) &&
+         BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(aes, &handle, NULL, 0, (PUCHAR)key, 32, 0)) &&
+         BCRYPT_SUCCESS(BCryptEncrypt(handle, (PUCHAR)plain, length, &mode, NULL, 0, out + 15, length, &done, 0));
+    if (handle) BCryptDestroyKey(handle);
+    if (aes) BCryptCloseAlgorithmProvider(aes, 0);
+    return ok && done == length ? 15 + length + 16 : 0;
+}
+
+/* Electron's safeStorage, which keeps Claude's token cache in config.json:
+ * opened with Local State's key, checked by its tag. */
+static void TestSafeStorage(void)
+{
+    BYTE key[32], other[32], nonce[12], sealed[256], plain[256];
+    size_t length, opened = 0, i;
+    const char *text = "{\"org:scopes\":{\"expiresAt\":1}}";
+    for (i = 0; i < sizeof key; i++) {
+        key[i] = (BYTE)(i * 7 + 1);
+        other[i] = (BYTE)(i * 7 + 2);
+    }
+    for (i = 0; i < sizeof nonce; i++) nonce[i] = (BYTE)(0xA0 + i);
+    length = SealLikeChromium(key, nonce, text, sealed);
+    Check("safe storage: sealed by bcrypt for the test", length == strlen(text) + 31);
+    Check("safe storage: opened with its key", Core_OpenSafeStorage(sealed, length, key, sizeof key, plain, sizeof plain, &opened) &&
+          opened == strlen(text) && memcmp(plain, text, opened) == 0);
+    Check("safe storage: another key opens nothing", !Core_OpenSafeStorage(sealed, length, other, sizeof other, plain, sizeof plain, &opened) && opened == 0);
+    sealed[20] ^= 1;
+    Check("safe storage: a changed byte opens nothing", !Core_OpenSafeStorage(sealed, length, key, sizeof key, plain, sizeof plain, &opened));
+    sealed[20] ^= 1;
+    sealed[1] = '2';
+    Check("safe storage: only v10", !Core_OpenSafeStorage(sealed, length, key, sizeof key, plain, sizeof plain, &opened));
+    sealed[1] = '1';
+    Check("safe storage: too short, nothing", !Core_OpenSafeStorage(sealed, 30, key, sizeof key, plain, sizeof plain, &opened));
+    Check("safe storage: no room, nothing", !Core_OpenSafeStorage(sealed, length, key, sizeof key, plain, 4, &opened));
+}
+
 static void TestJsonMerge(void)
 {
     MergeProbe probe;
@@ -1996,11 +2118,14 @@ int wmain(void)
 {
     TestSessionSearch();
     TestJsonMerge();
+    TestJsonArrayUnion();
+    TestSafeStorage();
     TestLevelDb();
     TestSessionEntries();
     TestTranscriptLines();
     TestChangelogRead();
     TestMarkdownRtf();
+    TestSealedSecret();
     TestSessionEdits();
     TestSessionSync();
     TestMirror();

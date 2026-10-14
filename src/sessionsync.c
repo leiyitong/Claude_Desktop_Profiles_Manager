@@ -1690,6 +1690,38 @@ static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *cont
     return made ? OP_MADE : OP_SAME;
 }
 
+char *SessionSync_FilterLayout(const char *layout, size_t length, DWORD items, size_t *outLength)
+{
+    char *out;
+    LayoutPart part;
+    int p;
+    size_t used = length;
+    *outLength = 0;
+    if (!layout || (out = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1)) == NULL) return NULL;
+    memcpy(out, layout, length);
+    out[used] = 0;
+    for (p = 0; SessionSync_LayoutPart(p, &part); p++)
+        if (!(part.item & items) && !Core_JsonRemoveMember(out, used, part.name, out, used + 1, &used)) {
+            HeapFree(GetProcessHeap(), 0, out);
+            return NULL;
+        }
+    out[used] = 0;
+    *outLength = used;
+    return out;
+}
+
+BOOL SessionSync_RestoreLayout(const Profile *p, const WCHAR *entriesDir, const char *layout, size_t length, SyncReport *report)
+{
+    OpResult result;
+    SyncReport ignored;
+    if (!report) {
+        ZeroMemory(&ignored, sizeof ignored);
+        report = &ignored;
+    }
+    result = ApplyLayout(p, entriesDir, layout, length, report);
+    return result == OP_MADE || result == OP_SAME;
+}
+
 /* Each change this thread makes, told to a progress bar. */
 typedef struct ChangeHook {
     void (*step)(void *context);

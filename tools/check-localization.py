@@ -67,7 +67,8 @@ NONLITERAL_CALLS = {
               "Theme_MainNote", "Theme_SessionsFolderState"],
     "localize.c": ["key"],
     "profiles.c": ["invalid"],
-    "syncui.c": ["kSyncKinds[g].heading", "kSyncKinds[k].heading", "kSyncItemRows[i].label"],
+    "syncui.c": ["kSyncKinds[k].heading"],
+    "checklist.c": ["checks->groups[g].heading", "item->label"],
     "sessionvault.c": ["context->part->label"],
 }
 # Keys the code translates through a variable, by the source file that spells
@@ -83,7 +84,7 @@ TRANSLATED_THROUGH_VARIABLES = {
                "Use 32 characters or fewer.", "Use 48 characters or fewer.",
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
     "gui.c": ["A profile folder with this name already exists."],
-    "syncui.c": ["Sessions", "Sidebar", "Session details", "Appearance", "Interface language", "Default model", "Settings", "Permissions",
+    "syncui.c": ["Sessions", "Sidebar", "Session details", "Appearance", "Interface language", "Default model", "Permissions",
                  "New sessions", "Titles", "Archived or not", "Deleted sessions", "Stars and pins", "Groups and sections", "Project order",
                  "Filters, grouping and sorting", "Width and the place of Routines", "Model and effort", "Side pane", "Unread marks", "Cost",
                  "Fonts", "Editor", "Zoom", "Spelling", "Archive when the PR closes", "Cowork", "Cowork's recent folders",

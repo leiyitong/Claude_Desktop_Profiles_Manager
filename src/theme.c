@@ -1637,6 +1637,8 @@ UINT Theme_TrackMenu(HWND owner, HMENU source, const RECT *screenBox)
             break;
         }
         if (msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST) {
+            /* A letter typed alone makes its WM_CHAR, an access key, as in Windows' menus (Alt closes it). */
+            if (msg.message == WM_KEYDOWN) TranslateMessage(&msg);
             OwnMenuKey(menu, &msg);
             continue;
         }

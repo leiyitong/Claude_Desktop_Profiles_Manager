@@ -7,6 +7,8 @@
 #include <wchar.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <bcrypt.h>
 
 /* ---------------------------------------------------------------- strings */
 
@@ -1740,8 +1742,8 @@ size_t Core_ReplaceChunk(const char *in, size_t len, const CoreSwap *swaps, int 
 
 /* A change to a session entry waiting for its profile to close, one per
  * line: "<op>\t<session id>\t<value>". */
-static const WCHAR *const kPendingOps[] = { L"title", L"star", L"remove", L"auto-title" };
-C_ASSERT(ARRAYSIZE(kPendingOps) == PENDING_TITLE_AUTO + 1);
+static const WCHAR *const kPendingOps[] = { L"title", L"star", L"remove", L"auto-title", L"unremote" };
+C_ASSERT(ARRAYSIZE(kPendingOps) == PENDING_UNREMOTE + 1);
 
 BOOL Core_PendingFormat(const PendingEdit *edit, WCHAR *out, size_t cch)
 {
@@ -2049,6 +2051,90 @@ char *Core_JsonSetNested(const char *json, size_t len, const char *const *keys, 
         return NULL;
     }
     out[*outLen] = 0;
+    return out;
+}
+
+/* Core_JsonArrayUnion's walk: the element sought, and the array it writes. */
+typedef struct ArrayUnion {
+    const char *idKey;
+    const char *sought;           /* an element's id (raw), or the element itself when it has none */
+    size_t      soughtLength;
+    BOOL        whole, found;
+    const char *base;             /* the first object's array */
+    size_t      baseLength;
+    char       *out;
+    size_t      used, cap;
+    BOOL        any;              /* an element written */
+} ArrayUnion;
+
+static BOOL SameElement(void *context, const char *element, size_t length)
+{
+    ArrayUnion *u = (ArrayUnion *)context;
+    const char *value;
+    size_t valueLength;
+    if (u->whole) u->found = length == u->soughtLength && memcmp(element, u->sought, length) == 0;
+    else u->found = Core_JsonMember(element, length, u->idKey, &value, &valueLength) && valueLength == u->soughtLength &&
+                    memcmp(value, u->sought, valueLength) == 0;
+    return !u->found;
+}
+
+static BOOL AddMissingElement(void *context, const char *element, size_t length)
+{
+    ArrayUnion *u = (ArrayUnion *)context;
+    u->whole = !Core_JsonMember(element, length, u->idKey, &u->sought, &u->soughtLength);
+    if (u->whole) {
+        u->sought = element;
+        u->soughtLength = length;
+    }
+    u->found = FALSE;
+    Core_JsonEachElement(u->base, u->baseLength, SameElement, u);
+    if (u->found) return TRUE;
+    if (u->used + length + 3 > u->cap) return FALSE;
+    if (u->any) u->out[u->used++] = ',';
+    memcpy(u->out + u->used, element, length);
+    u->used += length;
+    u->any = TRUE;
+    return TRUE;
+}
+
+char *Core_JsonArrayUnion(const char *base, size_t baseLen, const char *other, size_t otherLen, const char *key, const char *idKey, size_t *outLen)
+{
+    const char *baseArray, *otherArray;
+    size_t baseArrayLength, otherArrayLength, end, i;
+    ArrayUnion u;
+    char *out;
+    *outLen = 0;
+    if (!Core_JsonMember(base, baseLen, key, &baseArray, &baseArrayLength)) {
+        baseArray = "[]";
+        baseArrayLength = 2;
+    }
+    if (!Core_JsonMember(other, otherLen, key, &otherArray, &otherArrayLength)) {
+        otherArray = "[]";
+        otherArrayLength = 2;
+    }
+    for (end = baseArrayLength; end > 0 && IsJsonSpace(baseArray[end - 1]); end--) {}
+    if (end < 2 || baseArray[0] != '[' || baseArray[end - 1] != ']' || !Core_JsonIsValue(baseArray, baseArrayLength) ||
+        otherArray[0] != '[' || !Core_JsonIsValue(otherArray, otherArrayLength))
+        return NULL;
+    ZeroMemory(&u, sizeof u);
+    u.idKey = idKey;
+    u.base = baseArray;
+    u.baseLength = baseArrayLength;
+    u.cap = baseArrayLength + otherArrayLength + 4;
+    if ((u.out = (char *)HeapAlloc(GetProcessHeap(), 0, u.cap)) == NULL) return NULL;
+    /* The first array as it is, without its "]", then the second's elements it lacks. */
+    memcpy(u.out, baseArray, end - 1);
+    u.used = end - 1;
+    for (i = 1; i < end - 1 && IsJsonSpace(baseArray[i]); i++) {}
+    u.any = i < end - 1;
+    if (!Core_JsonEachElement(otherArray, otherArrayLength, AddMissingElement, &u)) {
+        HeapFree(GetProcessHeap(), 0, u.out);
+        return NULL;
+    }
+    u.out[u.used++] = ']';
+    u.out[u.used] = 0;
+    out = Core_JsonSetNested(base, baseLen, &key, 1, u.out, outLen);
+    HeapFree(GetProcessHeap(), 0, u.out);
     return out;
 }
 
@@ -2563,6 +2649,167 @@ size_t Core_MarkdownRtf(const WCHAR *markdown, const CoreRtfStyle *style, char *
         return 0;
     }
     return rtf.used;
+}
+
+/* ------------------------------------------------------------ keys behind a password */
+
+static const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+size_t Core_Base64Encode(const BYTE *data, size_t length, char *out, size_t cch)
+{
+    size_t i, used = 0;
+    if (!out || !cch || (length + 2) / 3 * 4 >= cch) {
+        if (out && cch) out[0] = 0;
+        return 0;
+    }
+    for (i = 0; i < length; i += 3) {
+        DWORD group = (DWORD)data[i] << 16 | (i + 1 < length ? (DWORD)data[i + 1] << 8 : 0) | (i + 2 < length ? data[i + 2] : 0);
+        out[used++] = kBase64[(group >> 18) & 63];
+        out[used++] = kBase64[(group >> 12) & 63];
+        out[used++] = i + 1 < length ? kBase64[(group >> 6) & 63] : '=';
+        out[used++] = i + 2 < length ? kBase64[group & 63] : '=';
+    }
+    out[used] = 0;
+    return used;
+}
+
+/* `text` (`length` characters, padding allowed, nothing else) decoded into
+ * `out`: the bytes written, (size_t)-1 when it is no base64 or does not fit. */
+size_t Core_Base64Decode(const char *text, size_t length, BYTE *out, size_t cap)
+{
+    size_t i, used = 0;
+    DWORD group = 0;
+    int bits = 0;
+    for (i = 0; i < length; i++) {
+        const char *at;
+        if (text[i] == '=') break;
+        if (!text[i] || (at = strchr(kBase64, text[i])) == NULL) return (size_t)-1;
+        group = group << 6 | (DWORD)(at - kBase64);
+        if ((bits += 6) >= 8) {
+            bits -= 8;
+            if (used >= cap) return (size_t)-1;
+            out[used++] = (BYTE)(group >> bits);
+        }
+    }
+    for (; i < length; i++)
+        if (text[i] != '=') return (size_t)-1;
+    return used;
+}
+
+#define SEAL_SALT  16
+#define SEAL_NONCE 12
+#define SEAL_TAG   16
+#define SEAL_KEY   32
+
+/* The AES-256 key `password` (UTF-8) derives over `salt`, PBKDF2-SHA256, `iterations` times. */
+static BOOL SealDerive(const WCHAR *password, const BYTE *salt, ULONG iterations, BYTE *key)
+{
+    BCRYPT_ALG_HANDLE hmac = NULL;
+    char utf8[4 * 256];
+    int bytes = password ? WideCharToMultiByte(CP_UTF8, 0, password, -1, utf8, sizeof utf8, NULL, NULL) : 0;
+    BOOL ok = bytes > 0 && BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hmac, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG)) &&
+              BCRYPT_SUCCESS(BCryptDeriveKeyPBKDF2(hmac, (PUCHAR)utf8, (ULONG)(bytes - 1), (PUCHAR)salt, SEAL_SALT, iterations, key, SEAL_KEY, 0));
+    if (hmac) BCryptCloseAlgorithmProvider(hmac, 0);
+    SecureZeroMemory(utf8, sizeof utf8);
+    return ok;
+}
+
+/* AES-256-GCM over `in` with `key` and `nonce`: sealing writes `tag`, opening checks it. */
+static BOOL SealCipher(BOOL seal, const BYTE *key, const BYTE *nonce, BYTE *tag, const BYTE *in, ULONG length, BYTE *out)
+{
+    BCRYPT_ALG_HANDLE aes = NULL;
+    BCRYPT_KEY_HANDLE handle = NULL;
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO mode;
+    ULONG done = 0;
+    NTSTATUS status = -1;
+    BCRYPT_INIT_AUTH_MODE_INFO(mode);
+    mode.pbNonce = (PUCHAR)nonce;
+    mode.cbNonce = SEAL_NONCE;
+    mode.pbTag = tag;
+    mode.cbTag = SEAL_TAG;
+    if (BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&aes, BCRYPT_AES_ALGORITHM, NULL, 0)) &&
+        BCRYPT_SUCCESS(BCryptSetProperty(aes, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof BCRYPT_CHAIN_MODE_GCM, 0)) &&
+        BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(aes, &handle, NULL, 0, (PUCHAR)key, SEAL_KEY, 0)))
+        status = seal ? BCryptEncrypt(handle, (PUCHAR)in, length, &mode, NULL, 0, out, length, &done, 0)
+                      : BCryptDecrypt(handle, (PUCHAR)in, length, &mode, NULL, 0, out, length, &done, 0);
+    if (handle) BCryptDestroyKey(handle);
+    if (aes) BCryptCloseAlgorithmProvider(aes, 0);
+    return BCRYPT_SUCCESS(status) && done == length;
+}
+
+/* `secret` sealed with `password` as JSON in `out`: PBKDF2-SHA256
+ * `iterations` times over a random salt gives the AES-256-GCM key, a random
+ * nonce, the tag checked when it is opened. FALSE when it cannot. */
+BOOL Core_SealSecret(const BYTE *secret, size_t length, const WCHAR *password, ULONG iterations, char *out, size_t cch)
+{
+    BYTE salt[SEAL_SALT], nonce[SEAL_NONCE], tag[SEAL_TAG], key[SEAL_KEY], sealed[256];
+    char saltText[64], nonceText[64], tagText[64], sealedText[512];
+    BOOL ok;
+    if (!out || !cch) return FALSE;
+    out[0] = 0;
+    if (!secret || !length || length > sizeof sealed || !password || !password[0] || !iterations) return FALSE;
+    ok = BCRYPT_SUCCESS(BCryptGenRandom(NULL, salt, sizeof salt, BCRYPT_USE_SYSTEM_PREFERRED_RNG)) &&
+         BCRYPT_SUCCESS(BCryptGenRandom(NULL, nonce, sizeof nonce, BCRYPT_USE_SYSTEM_PREFERRED_RNG)) &&
+         SealDerive(password, salt, iterations, key) && SealCipher(TRUE, key, nonce, tag, secret, (ULONG)length, sealed) &&
+         Core_Base64Encode(salt, sizeof salt, saltText, sizeof saltText) && Core_Base64Encode(nonce, sizeof nonce, nonceText, sizeof nonceText) &&
+         Core_Base64Encode(tag, sizeof tag, tagText, sizeof tagText) && Core_Base64Encode(sealed, length, sealedText, sizeof sealedText) &&
+         SUCCEEDED(StringCchPrintfA(out, cch, "{\"kdf\":\"pbkdf2-sha256\",\"iterations\":%lu,\"salt\":\"%s\",\"cipher\":\"aes-256-gcm\","
+                                              "\"nonce\":\"%s\",\"tag\":\"%s\",\"sealed\":\"%s\"}",
+                                   iterations, saltText, nonceText, tagText, sealedText));
+    SecureZeroMemory(key, sizeof key);
+    SecureZeroMemory(sealed, sizeof sealed);
+    if (!ok) out[0] = 0;
+    return ok;
+}
+
+/* A JSON string member of `json` decoded from base64 into `out`, exactly `want` bytes (0: any up to `cap`). */
+static size_t SealMember(const char *json, size_t length, const char *name, BYTE *out, size_t cap, size_t want)
+{
+    const char *value;
+    size_t valueLength, got;
+    if (!Core_JsonMember(json, length, name, &value, &valueLength) || valueLength < 2 || value[0] != '"') return 0;
+    got = Core_Base64Decode(value + 1, valueLength - 2, out, cap);
+    return got == (size_t)-1 || (want && got != want) ? 0 : got;
+}
+
+/* What Core_SealSecret sealed, opened with `password` into `secret`
+ * (`*length` its bytes): FALSE for a wrong password, a changed text, or no
+ * sealed secret. */
+BOOL Core_OpenSecret(const char *json, size_t length, const WCHAR *password, BYTE *secret, size_t cap, size_t *secretLength)
+{
+    BYTE salt[SEAL_SALT], nonce[SEAL_NONCE], tag[SEAL_TAG], key[SEAL_KEY], sealed[256];
+    const char *value;
+    size_t valueLength, sealedLength;
+    ULONG iterations;
+    BOOL ok;
+    if (secretLength) *secretLength = 0;
+    if (!json || !password || !secret) return FALSE;
+    if (!Core_JsonMember(json, length, "iterations", &value, &valueLength) || (iterations = strtoul(value, NULL, 10)) == 0 || iterations > 100000000) return FALSE;
+    sealedLength = SealMember(json, length, "sealed", sealed, sizeof sealed, 0);
+    ok = sealedLength && sealedLength <= cap && SealMember(json, length, "salt", salt, sizeof salt, SEAL_SALT) &&
+         SealMember(json, length, "nonce", nonce, sizeof nonce, SEAL_NONCE) && SealMember(json, length, "tag", tag, sizeof tag, SEAL_TAG) &&
+         SealDerive(password, salt, iterations, key) && SealCipher(FALSE, key, nonce, tag, sealed, (ULONG)sealedLength, secret);
+    SecureZeroMemory(key, sizeof key);
+    if (ok && secretLength) *secretLength = sealedLength;
+    if (!ok) SecureZeroMemory(secret, min(cap, sizeof sealed));
+    return ok;
+}
+
+BOOL Core_OpenSafeStorage(const BYTE *sealed, size_t length, const BYTE *key, size_t keyLength, BYTE *out, size_t cap, size_t *outLength)
+{
+    BYTE tag[SEAL_TAG];
+    size_t textLength;
+    *outLength = 0;
+    if (!sealed || !key || keyLength != SEAL_KEY || length < 3 + SEAL_NONCE + SEAL_TAG || memcmp(sealed, "v10", 3) != 0) return FALSE;
+    textLength = length - 3 - SEAL_NONCE - SEAL_TAG;
+    if (textLength > cap || textLength > 0x7FFFFFFF) return FALSE;
+    memcpy(tag, sealed + length - SEAL_TAG, SEAL_TAG);
+    if (!SealCipher(FALSE, key, sealed + 3, tag, sealed + 3 + SEAL_NONCE, (ULONG)textLength, out)) {
+        SecureZeroMemory(out, textLength);
+        return FALSE;
+    }
+    *outLength = textLength;
+    return TRUE;
 }
 
 /* ------------------------------------------------------------ drawing math */

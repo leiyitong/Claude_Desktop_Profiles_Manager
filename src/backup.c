@@ -1,35 +1,54 @@
 /*
  * A profile backed up to one compressed archive (zip.c), and restored from
- * it into a profile, the same or another one, a part at a time:
+ * it into a profile, the same or another one, an item at a time. Its list is
+ * what to sync's (syncui.c), its own content added:
  *
- *   sessions  the Code sessions it lists, as a session archive of
- *             sessionsync.c (entries and conversations), and its scheduled
- *             tasks; restored through that archive's import, into the
- *             account the profile is signed in to
- *   cowork    local-agent-mode-sessions (Cowork's sessions; not its VM)
- *   settings  claude_desktop_config.json (MCP servers, preferences), window
- *             and developer settings, and the language and theme of
- *             config.json
- *   signin    what keeps it signed in: cookies and the web storage of the
- *             app, Local State (whose key, DPAPI-protected, opens them only
- *             on this PC for this Windows user) and config.json; whole
- *             folders replaced, so no database mixes old and new files
+ *   Code sessions  the sessions it lists, as a session archive of
+ *                  sessionsync.c (entries and conversations), and its
+ *                  scheduled tasks; restored through that archive's import,
+ *                  into the account the profile is signed in to
+ *   Cowork         local-agent-mode-sessions (Cowork's sessions; not its VM)
+ *   the settings   sidebar, session details, appearance, language, default
+ *   side           model, settings and permissions, member by member as the
+ *                  sync reads them (SessionSync_ReadLayout), in one layout
+ *                  restored part by part (SessionSync_RestoreLayout); the
+ *                  theme of config.json beside it
+ *   MCP servers    those of claude_desktop_config.json alone, and the window
+ *                  and developer settings
+ *   sign-in        what keeps it signed in: cookies and the web storage of
+ *                  the app, Local State (whose key, DPAPI-protected, opens
+ *                  them only on this PC for this Windows user) and
+ *                  config.json; whole folders replaced, so no database mixes
+ *                  old and new files
+ *   its key        that key itself, opened with DPAPI and sealed behind a
+ *                  password (Core_SealSecret): the sign-in then restores on
+ *                  any PC, its key protected again there for its Windows user
+ *
+ * A backup of version 1 (before the items were fine) kept the whole
+ * claude_desktop_config.json: it is still restored whole.
  *
  * Caches, logs, the Claude Code and Cowork programs Claude downloads again
  * and Cowork's VM image are never in it. A restore needs the profile closed
  * (and every profile sharing its session folder), and keeps what it replaces
  * in backups\<time>\<folder>-restore of the state folder.
+ *
+ * One restore can read several backups, of several accounts, into one
+ * profile: sessions, scheduled tasks and Cowork from all of them, the
+ * newest's copy of what several hold; settings and the sign-in, which only
+ * one can give, from the one the person picks where several hold them
+ * (IDD_CONFLICTS, the sync conflicts' look).
  */
 #include "app.h"
 #include "resource.h"
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <wincrypt.h>   /* DPAPI: the sign-in's key */
 #include <stdarg.h>
 #include <string.h>
 
 #define BACKUP_FORMAT     "claude-desktop-profiles-manager-backup"
-#define BACKUP_VERSION    1
+#define BACKUP_VERSION    2
 #define MANIFEST_NAME     "manifest.json"
 #define SESSIONS_ARCHIVE  "sessions/archive.zip"
 #define SCHEDULED_TASKS   L"scheduled-tasks.json"
@@ -39,27 +58,83 @@
 #define JSON_MAX          (16u * 1024u * 1024u)
 #define BACKUPS_DIR       L"backups"
 #define ARCHIVE_EXTENSION L"zip"
+#define LOCAL_STATE       L"Local State"
+#define KEY_NAME          "account-key.json"   /* the sign-in's key behind a password, beside the sign-in, never extracted */
+#define KEY_ITERATIONS    600000               /* PBKDF2-SHA256's, as OWASP advises */
+#define PASSWORD_MIN      8
 
-typedef enum BackupPart { PART_SESSIONS, PART_COWORK, PART_SETTINGS, PART_SIGNIN, PARTS } BackupPart;
+typedef enum BackupPart { PART_SESSIONS, PART_COWORK, PART_SETTINGS, PART_SIGNIN, PART_KEY, PARTS } BackupPart;
 
-static const char *const kPartNames[PARTS] = { "sessions", "cowork", "settings", "signin" };
+/* What a backup holds, its own content a bit each above the what-to-sync bits
+ * (SYNC_ITEM_*). The settings side it keeps member by member, through the
+ * layout of sessionsync.c under those same SYNC_ITEM_* bits, so a backup's
+ * list shows the same groups and items as what to sync (syncui.c), its own
+ * content added. The content bits map to the parts the files are written and
+ * read by (BitsToParts). */
+#define BK_CONVERSATIONS  0x04000000u   /* Code sessions: entries, transcripts, scheduled tasks */
+#define BK_COWORK         0x08000000u   /* local-agent-mode-sessions */
+#define BK_APPCONFIG      0x10000000u   /* MCP servers, window and developer settings */
+#define BK_SIGNIN         0x20000000u   /* this PC: cookies, the app's storage, Local State */
+#define BK_KEY            0x40000000u   /* the sign-in's key, for any PC, behind a password */
+#define BK_CONTENT        (BK_CONVERSATIONS | BK_COWORK | BK_APPCONFIG | BK_SIGNIN | BK_KEY)
+#define BK_LAYOUT         (SYNC_ITEM_SIDEBAR | SYNC_ITEM_DETAILS | SYNC_ITEM_APPEARANCE | SYNC_ITEM_LANGUAGE | \
+                           SYNC_ITEM_MODEL | SYNC_ITEM_SETTINGS | SYNC_ITEM_PERMISSIONS)
+#define BK_ALL            (BK_CONTENT | BK_LAYOUT)
+#define LAYOUT_NAME       "layout/layout.json"
+#define MCP_NAME          "settings/app.json"   /* just the MCP servers, so a restore leaves the rest */
 
-/* The settings files, whole, and what keeps a profile signed in. */
-static const WCHAR *const kSettingsFiles[] = { CLAUDE_DESKTOP_SETTINGS, L"window-state.json", L"developer_settings.json" };
+/* The content bits map to the five parts the file code reads and writes. */
+static void BitsToParts(DWORD items, BOOL *chosen)
+{
+    chosen[PART_SESSIONS] = (items & BK_CONVERSATIONS) != 0;
+    chosen[PART_COWORK]   = (items & BK_COWORK) != 0;
+    chosen[PART_SETTINGS] = (items & BK_APPCONFIG) != 0;
+    chosen[PART_SIGNIN]   = (items & BK_SIGNIN) != 0;
+    chosen[PART_KEY]      = (items & BK_KEY) != 0;
+}
+
+static const char *const kPartNames[PARTS] = { "sessions", "cowork", "settings", "signin", "key" };
+
+/* The app files saved whole under settings/ (no account state, no layout). */
+static const WCHAR *const kSettingsFiles[] = { L"window-state.json", L"developer_settings.json" };
 static const WCHAR *const kSigninFiles[] = { L"Local State", L"Preferences", CLAUDE_APP_SETTINGS, L"ant-did", L"ant-device-registry.json",
                                              L"buddy-tokens.json", L"ccd-ids.json" };
 static const WCHAR *const kSigninFolders[] = { L"Network", L"Local Storage", L"Session Storage", L"IndexedDB", L"WebStorage" };
-/* config.json's members a restore of the settings carries over: none tied to an account. */
-static const char *const kAppearanceKeys[] = { "locale", "userThemeMode" };
+/* config.json's theme a restore of the appearance carries over; the language goes through the layout. */
+static const char *const kAppearanceKeys[] = { "userThemeMode" };
+
+#define PARTS_OPENED_SECTION L"BackupPartsOpened"
+
+#define BACKUP_GROUPS_MAX  16
+#define BACKUP_ITEMS_MAX   40
+#define BACKUP_GLYPHS_MAX  24
 
 typedef struct BackupDialog {
     const WCHAR *title, *text, *action;
-    BOOL         offered[PARTS], chosen[PARTS];
+    DWORD        offered, chosen;     /* the items offered and checked (BK_* and SYNC_ITEM_*) */
     int          sessions;            /* the sessions the profile lists, -1: not counted */
-    HWND         rows;
-    int          rowPart[PARTS], rowCount;
-    BOOL         filling;
+    CheckList    parts;
+    CheckGroup   groups[BACKUP_GROUPS_MAX];   /* what to sync's groups, Sessions and Account its own */
+    CheckItem    items[BACKUP_ITEMS_MAX];
+    int          groupCount, itemCount;
+    WCHAR        glyphs[BACKUP_GLYPHS_MAX];    /* what to sync's, a gold key added for the account */
+    ThemeTint    tints[BACKUP_GLYPHS_MAX];
+    int          images, keyImage;
+    WCHAR        label[256];          /* an item's text, as the list takes it */
 } BackupDialog;
+
+#define RESTORE_SOURCES 16   /* the backups one restore reads at most */
+
+/* A backup a restore reads: its archive, the parts it holds, when it was written. */
+typedef struct RestoreSource {
+    WCHAR     path[LONG_PATH_CCH];
+    WCHAR     name[MAX_PATH];     /* its file's, without ".zip" */
+    WCHAR     written[64];        /* when, as this user writes dates */
+    ULONGLONG time;
+    ZipIn    *zip;
+    DWORD     offered;           /* the items it holds (BK_* and SYNC_ITEM_*) */
+    int       version;           /* its backup format; 1: before the items were fine */
+} RestoreSource;
 
 static void *Alloc(size_t bytes) { return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes); }
 static void Free(void *memory) { if (memory) HeapFree(GetProcessHeap(), 0, memory); }
@@ -75,29 +150,104 @@ static size_t AppendA(char *buffer, size_t cch, size_t used, const char *format,
     return used + strlen(buffer + used);
 }
 
-static const WCHAR *PartLabel(BackupPart part, int sessions, WCHAR *text, size_t cch)
+static const WCHAR *PartLabel(DWORD bit, int sessions, WCHAR *text, size_t cch)
 {
-    switch (part) {
-    case PART_SESSIONS:
+    switch (bit) {
+    case BK_CONVERSATIONS:
         if (sessions >= 0) StringCchPrintfW(text, cch, TR(L"Code sessions and their conversations (%d)"), sessions);
         else StringCchCopyW(text, cch, TR(L"Code sessions and their conversations"));
         return text;
-    case PART_COWORK:   return TR(L"Cowork sessions");
-    case PART_SETTINGS: return TR(L"Settings: MCP servers, preferences, language and theme");
-    default:            return TR(L"Sign-in");
+    case BK_COWORK:    return TR(L"Cowork sessions");
+    case BK_APPCONFIG: return TR(L"MCP servers and app settings");
+    case BK_KEY:       return TR(L"Sign-in for any PC: its key, behind a password");
+    case BK_SIGNIN:    return TR(L"Sign-in on this PC: cookies and the app's storage");
+    default:           return NULL;
     }
+}
+
+/* The groups and items a backup's list shows: what to sync's, with Sessions
+ * and Account the backup's own content, and the Settings group holding the
+ * app config too; their glyphs are what to sync's, a gold key added. */
+static void BuildTables(BackupDialog *state)
+{
+    const CheckGroup *sg;
+    const CheckItem *si;
+    const WCHAR *glyphs;
+    const ThemeTint *tints;
+    int sgc = 0, sic = 0, images = 0, g, i;
+    glyphs = SyncUi_Glyphs(&tints, &images);
+    sg = SyncUi_Groups(&sgc);
+    si = SyncUi_Items(&sic);
+    for (i = 0; i < images && i < BACKUP_GLYPHS_MAX - 1; i++) {
+        state->glyphs[i] = glyphs[i];
+        state->tints[i] = tints[i];
+    }
+    state->keyImage = i;
+    state->glyphs[i] = 0xE8D7;             /* a gold key for the account, which what to sync has no image of */
+    state->tints[i] = THEME_TINT_GOLD;
+    state->images = i + 1;
+    /* Sessions (the backup's content), then what to sync's layout groups, the Settings one given the app config, then Account. */
+    state->groups[0] = sg[0];
+    state->groups[0].mask = BK_CONVERSATIONS | BK_COWORK;
+    for (g = 1; g < sgc; g++) {
+        state->groups[g] = sg[g];
+        if (sg[g].mask & SYNC_ITEM_SETTINGS) state->groups[g].mask |= BK_APPCONFIG;
+    }
+    state->groups[g].mask = BK_SIGNIN | BK_KEY;
+    state->groups[g].heading = L"Account";
+    state->groups[g].image = state->keyImage;
+    state->groups[g].name = L"account";
+    state->groupCount = g + 1;
+    i = 0;
+    state->items[i].bit = BK_CONVERSATIONS; state->items[i].label = NULL; state->items[i++].image = sg[0].image;
+    state->items[i].bit = BK_COWORK;        state->items[i].label = NULL; state->items[i++].image = sg[0].image;
+    for (g = 0; g < sic && i < BACKUP_ITEMS_MAX - 3; g++)
+        if (si[g].bit & BK_LAYOUT) state->items[i++] = si[g];   /* the app config comes after, last in Settings */
+    state->items[i].bit = BK_APPCONFIG; state->items[i].label = NULL; state->items[i++].image = state->groups[6].image;
+    state->items[i].bit = BK_SIGNIN;    state->items[i].label = NULL; state->items[i++].image = state->keyImage;
+    state->items[i].bit = BK_KEY;       state->items[i].label = NULL; state->items[i++].image = state->keyImage;
+    state->itemCount = i;
 }
 
 /* ------------------------------------------------------------ the dialog */
 
+static const WCHAR *BackupItemLabel(const CheckItem *item, void *context)
+{
+    BackupDialog *state = (BackupDialog *)context;
+    return PartLabel(item->bit, state->sessions, state->label, ARRAYSIZE(state->label));   /* NULL for a layout item: its own label */
+}
+
+/* The parts offered in the checked list, those chosen checked. */
+static void SetupParts(BackupDialog *state, HWND list)
+{
+    BuildTables(state);
+    ZeroMemory(&state->parts, sizeof state->parts);
+    state->parts.groups = state->groups;
+    state->parts.groupCount = state->groupCount;
+    state->parts.items = state->items;
+    state->parts.itemCount = state->itemCount;
+    state->parts.openedSection = PARTS_OPENED_SECTION;
+    state->parts.label = BackupItemLabel;
+    state->parts.context = state;
+    state->parts.offered = state->offered;
+    state->parts.checked = state->chosen & state->offered;
+    CheckList_Setup(&state->parts, list, state->glyphs, state->tints, state->images);
+}
+
+void Backup_FillPartsList(HWND list, int sessions)
+{
+    static BackupDialog shown;   /* a list alone, as the tests show it */
+    ZeroMemory(&shown, sizeof shown);
+    shown.sessions = sessions;
+    shown.offered = BK_ALL;
+    shown.chosen = (BK_CONTENT | BK_LAYOUT) & ~(BK_SIGNIN | BK_KEY);   /* sign-in only when asked for, as Backup_Create offers it */
+    SetupParts(&shown, list);
+}
+
 static void ReadChosen(HWND dialog, BackupDialog *state)
 {
-    BOOL any = FALSE;
-    int i;
-    for (i = 0; i < PARTS; i++) state->chosen[i] = FALSE;
-    for (i = 0; i < state->rowCount; i++)
-        if (ListView_GetCheckState(state->rows, i)) any = state->chosen[state->rowPart[i]] = TRUE;
-    EnableWindow(GetDlgItem(dialog, IDOK), any);
+    state->chosen = state->parts.checked;
+    EnableWindow(GetDlgItem(dialog, IDOK), state->chosen != 0);
 }
 
 static INT_PTR CALLBACK BackupProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
@@ -105,33 +255,15 @@ static INT_PTR CALLBACK BackupProc(HWND dialog, UINT message, WPARAM wp, LPARAM 
     BackupDialog *state = (BackupDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
     switch (message) {
     case WM_INITDIALOG: {
-        LVCOLUMNW column;
-        LVITEMW item;
-        WCHAR text[256];
-        int part;
+        HWND list = GetDlgItem(dialog, IDC_B_LIST);
         state = (BackupDialog *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
         SetWindowTextW(dialog, state->title);
         SetDlgItemTextW(dialog, IDC_B_TEXT, state->text);
         SetDlgItemTextW(dialog, IDOK, state->action);
-        if (!state->offered[PART_SIGNIN]) ShowWindow(GetDlgItem(dialog, IDC_B_NOTE), SW_HIDE);   /* its warning is about sign-in */
-        state->rows = GetDlgItem(dialog, IDC_B_LIST);
-        ListView_SetExtendedListViewStyle(state->rows, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        ZeroMemory(&column, sizeof column);
-        ListView_InsertColumn(state->rows, 0, &column);   /* the view it scrolls in gives it the list's width */
-        state->filling = TRUE;
-        for (part = 0; part < PARTS; part++) {
-            if (!state->offered[part]) continue;
-            ZeroMemory(&item, sizeof item);
-            item.mask = LVIF_TEXT;
-            item.iItem = state->rowCount;
-            item.pszText = (LPWSTR)PartLabel((BackupPart)part, state->sessions, text, ARRAYSIZE(text));
-            ListView_InsertItem(state->rows, &item);
-            ListView_SetCheckState(state->rows, state->rowCount, state->chosen[part]);
-            state->rowPart[state->rowCount++] = part;
-        }
-        state->filling = FALSE;
-        Theme_SmoothView(state->rows);
+        if (!(state->offered & BK_SIGNIN)) ShowWindow(GetDlgItem(dialog, IDC_B_NOTE), SW_HIDE);   /* its warning is about sign-in */
+        SetupParts(state, list);
+        Theme_SmoothView(list);
         ReadChosen(dialog, state);
         return TRUE;
     }
@@ -139,14 +271,24 @@ static INT_PTR CALLBACK BackupProc(HWND dialog, UINT message, WPARAM wp, LPARAM 
     case WM_CTLCOLORSTATIC:
         return Theme_CtlColor(message, wp, lp, IDC_B_NOTE);
 
-    case WM_NOTIFY:
-        if (state && ((const NMHDR *)lp)->hwndFrom == state->rows && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
-            const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
-            if (!state->filling && (change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK))
-                ReadChosen(dialog, state);
+    case WM_NOTIFY: {
+        LRESULT result;
+        if (state && CheckList_Notify(&state->parts, dialog, (const NMHDR *)lp, &result)) {
+            SetWindowLongPtrW(dialog, DWLP_MSGRESULT, result);
             return TRUE;
         }
         break;
+    }
+
+    case WM_CHECKLIST_BOX:
+    case WM_CONTEXTMENU: {
+        BOOL toggled;
+        if (state && CheckList_Message(&state->parts, dialog, message, wp, lp, &toggled)) {
+            if (toggled) ReadChosen(dialog, state);
+            return TRUE;
+        }
+        break;
+    }
 
     case WM_COMMAND:
         if (!state) break;
@@ -164,6 +306,143 @@ static INT_PTR CALLBACK BackupProc(HWND dialog, UINT message, WPARAM wp, LPARAM 
     return FALSE;
 }
 
+/* ------------------------------------------------------------ a password */
+
+typedef struct PasswordDialog {
+    const WCHAR *title, *text;
+    BOOL         twice;               /* a new password: typed twice, PASSWORD_MIN characters at least */
+    WCHAR        password[256];
+} PasswordDialog;
+
+static INT_PTR CALLBACK PasswordProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    PasswordDialog *state = (PasswordDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    switch (message) {
+    case WM_INITDIALOG:
+        state = (PasswordDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetWindowTextW(dialog, state->title);
+        SetDlgItemTextW(dialog, IDC_K_TEXT, state->text);
+        SendDlgItemMessageW(dialog, IDC_K_PASSWORD, EM_LIMITTEXT, ARRAYSIZE(state->password) - 1, 0);
+        SendDlgItemMessageW(dialog, IDC_K_AGAIN, EM_LIMITTEXT, ARRAYSIZE(state->password) - 1, 0);
+        if (!state->twice) {
+            ShowWindow(GetDlgItem(dialog, IDC_K_AGAIN_LABEL), SW_HIDE);
+            ShowWindow(GetDlgItem(dialog, IDC_K_AGAIN), SW_HIDE);
+        }
+        SetFocus(GetDlgItem(dialog, IDC_K_PASSWORD));
+        return FALSE;
+
+    case WM_COMMAND:
+        if (!state) break;
+        if (LOWORD(wp) == IDOK) {
+            WCHAR again[ARRAYSIZE(state->password)];
+            const WCHAR *problem = NULL;
+            GetDlgItemTextW(dialog, IDC_K_PASSWORD, state->password, ARRAYSIZE(state->password));
+            GetDlgItemTextW(dialog, IDC_K_AGAIN, again, ARRAYSIZE(again));
+            if (!state->password[0]) problem = TR(L"Enter the password.");
+            else if (state->twice && wcslen(state->password) < PASSWORD_MIN) problem = TR(L"Use at least %d characters.");
+            else if (state->twice && wcscmp(state->password, again) != 0) problem = TR(L"The two passwords differ.");
+            SecureZeroMemory(again, sizeof again);
+            if (!problem) {
+                EndDialog(dialog, IDOK);
+                return TRUE;
+            }
+            SecureZeroMemory(state->password, sizeof state->password);
+            Ui_Message(dialog, MB_ICONINFORMATION, problem, PASSWORD_MIN);
+            SendMessageW(dialog, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(dialog, IDC_K_PASSWORD), TRUE);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+/* `result`, the password forgotten first. */
+static BOOL ForgetPassword(PasswordDialog *password, BOOL result)
+{
+    SecureZeroMemory(password->password, sizeof password->password);
+    return result;
+}
+
+/* ------------------------------------------------------------ the sign-in's key */
+
+/* Local State's os_crypt key, the AES key of the cookies and the app's
+ * storage, opened with DPAPI: FALSE when this Windows user cannot open it
+ * (another PC or user) or there is none. */
+BOOL Backup_ReadAppKey(const WCHAR *storage, BYTE *key, size_t cap, size_t *length)
+{
+    WCHAR path[LONG_PATH_CCH];
+    DWORD size = 0;
+    char *json;
+    const char *crypt, *value;
+    size_t cryptLength, valueLength, blobLength;
+    BYTE blob[1024];
+    DATA_BLOB in, out;
+    BOOL ok = FALSE;
+    *length = 0;
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" LOCAL_STATE, storage)) || (json = Util_ReadFile(path, JSON_MAX, FALSE, &size)) == NULL)
+        return FALSE;
+    if (Core_JsonMember(json, size, "os_crypt", &crypt, &cryptLength) && Core_JsonMember(crypt, cryptLength, "encrypted_key", &value, &valueLength) &&
+        valueLength > 2 && value[0] == '"' && (blobLength = Core_Base64Decode(value + 1, valueLength - 2, blob, sizeof blob)) != (size_t)-1 &&
+        blobLength > 5 && memcmp(blob, "DPAPI", 5) == 0) {
+        in.pbData = blob + 5;
+        in.cbData = (DWORD)(blobLength - 5);
+        if (CryptUnprotectData(&in, NULL, NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+            if (out.cbData <= cap) {
+                memcpy(key, out.pbData, out.cbData);
+                *length = out.cbData;
+                ok = TRUE;
+            }
+            SecureZeroMemory(out.pbData, out.cbData);
+            LocalFree(out.pbData);
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, json);
+    return ok;
+}
+
+/* `key` protected again with DPAPI for this Windows user, as Local State's os_crypt key. */
+BOOL Backup_WriteAppKey(const WCHAR *storage, const BYTE *key, size_t length)
+{
+    static const char *const kKeyPath[] = { "os_crypt", "encrypted_key" };
+    WCHAR path[LONG_PATH_CCH];
+    DWORD size = 0, done = 0;
+    char *json, *changed = NULL, quoted[1024];
+    BYTE blob[1024];
+    DATA_BLOB in, out;
+    size_t changedLength = 0;
+    HANDLE file;
+    BOOL ok = FALSE;
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" LOCAL_STATE, storage)) || (json = Util_ReadFile(path, JSON_MAX, FALSE, &size)) == NULL)
+        return FALSE;
+    in.pbData = (BYTE *)key;
+    in.cbData = (DWORD)length;
+    if (CryptProtectData(&in, L"Claude Desktop Profiles Manager", NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        if (out.cbData + 5 <= sizeof blob) {
+            memcpy(blob, "DPAPI", 5);
+            memcpy(blob + 5, out.pbData, out.cbData);
+            quoted[0] = '"';
+            if (Core_Base64Encode(blob, out.cbData + 5, quoted + 1, sizeof quoted - 2)) {
+                StringCchCatA(quoted, ARRAYSIZE(quoted), "\"");
+                changed = Core_JsonSetNested(json, size, kKeyPath, 2, quoted, &changedLength);
+            }
+        }
+        LocalFree(out.pbData);
+    }
+    if (changed) {
+        file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        ok = file != INVALID_HANDLE_VALUE && WriteFile(file, changed, (DWORD)changedLength, &done, NULL) && done == changedLength;
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        HeapFree(GetProcessHeap(), 0, changed);
+    }
+    HeapFree(GetProcessHeap(), 0, json);
+    return ok;
+}
+
 typedef enum ArchiveChoice { ARCHIVE_SAVE, ARCHIVE_OPEN, ARCHIVE_FOLDER } ArchiveChoice;
 
 /* "<profile> <date>.zip", without the characters a file name cannot hold. */
@@ -177,21 +456,19 @@ static void ArchiveName(const WCHAR *profileName, WCHAR *name, size_t cch)
         if (wcschr(L"\\/:*?\"<>|", name[i])) name[i] = L'_';
 }
 
-/* The archive the user chose to write (named after the profile) or read, or
- * the folder the archives of several profiles go to. */
-static BOOL ChooseArchive(HWND owner, ArchiveChoice choice, const WCHAR *title, const WCHAR *profileName, WCHAR *path, size_t cch)
+/* The file dialog that chooses the archive to write (named after the
+ * profile), the backups to read, one or several, or the folder the archives
+ * of several profiles go to; NULL, said, when it could not be made. */
+static IFileDialog *ArchiveDialog(HWND owner, ArchiveChoice choice, const WCHAR *title, const WCHAR *profileName)
 {
     IFileDialog *dialog = NULL;
-    IShellItem *result = NULL;
     COMDLG_FILTERSPEC filter;
     FILEOPENDIALOGOPTIONS options = 0, extra;
-    PWSTR chosen = NULL;
-    BOOL ok = FALSE, save = choice == ARCHIVE_SAVE;
-    HRESULT hr = CoCreateInstance(save ? &CLSID_FileSaveDialog : &CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileDialog,
+    HRESULT hr = CoCreateInstance(choice == ARCHIVE_SAVE ? &CLSID_FileSaveDialog : &CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileDialog,
                                   (void **)&dialog);
     if (FAILED(hr)) {
         Ui_Message(owner, MB_ICONERROR, TR(L"The file could not be chosen (error 0x%08lX)."), (unsigned long)hr);
-        return FALSE;
+        return NULL;
     }
     IFileDialog_SetTitle(dialog, title);
     if (choice != ARCHIVE_FOLDER) {
@@ -200,14 +477,33 @@ static BOOL ChooseArchive(HWND owner, ArchiveChoice choice, const WCHAR *title, 
         IFileDialog_SetFileTypes(dialog, 1, &filter);
         IFileDialog_SetDefaultExtension(dialog, ARCHIVE_EXTENSION);
     }
-    if (save) {
+    if (choice == ARCHIVE_SAVE) {
         WCHAR name[MAX_PATH];
         ArchiveName(profileName, name, ARRAYSIZE(name));
         IFileDialog_SetFileName(dialog, name);
     }
-    extra = choice == ARCHIVE_SAVE ? FOS_OVERWRITEPROMPT : choice == ARCHIVE_OPEN ? FOS_FILEMUSTEXIST : FOS_PICKFOLDERS;
+    extra = choice == ARCHIVE_SAVE ? FOS_OVERWRITEPROMPT : choice == ARCHIVE_OPEN ? FOS_FILEMUSTEXIST | FOS_ALLOWMULTISELECT : FOS_PICKFOLDERS;
     if (SUCCEEDED(IFileDialog_GetOptions(dialog, &options)))
         IFileDialog_SetOptions(dialog, options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | extra);
+    return dialog;
+}
+
+/* The dialog's failure said, unless the person cancelled it. */
+static void ChoiceFailed(HWND owner, HRESULT hr)
+{
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        Ui_Message(owner, MB_ICONERROR, TR(L"The file could not be chosen (error 0x%08lX)."), (unsigned long)hr);
+}
+
+/* The archive the user chose to write, or the folder the archives of several profiles go to. */
+static BOOL ChooseArchive(HWND owner, ArchiveChoice choice, const WCHAR *title, const WCHAR *profileName, WCHAR *path, size_t cch)
+{
+    IFileDialog *dialog = ArchiveDialog(owner, choice, title, profileName);
+    IShellItem *result = NULL;
+    PWSTR chosen = NULL;
+    BOOL ok = FALSE, save = choice == ARCHIVE_SAVE;
+    HRESULT hr;
+    if (!dialog) return FALSE;
     hr = IFileDialog_Show(dialog, owner);
     if (SUCCEEDED(hr) && SUCCEEDED(hr = IFileDialog_GetResult(dialog, &result))) {
         if (SUCCEEDED(hr = IShellItem_GetDisplayName(result, SIGDN_FILESYSPATH, &chosen))) {
@@ -218,10 +514,100 @@ static BOOL ChooseArchive(HWND owner, ArchiveChoice choice, const WCHAR *title, 
         }
         IShellItem_Release(result);
     }
-    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
-        Ui_Message(owner, MB_ICONERROR, TR(L"The file could not be chosen (error 0x%08lX)."), (unsigned long)hr);
+    ChoiceFailed(owner, hr);
     IFileDialog_Release(dialog);
     return ok;
+}
+
+/* The backups the user chose to restore from, RESTORE_SOURCES at most,
+ * their paths in `sources`: how many, 0 for none. */
+static int ChooseBackups(HWND owner, const WCHAR *title, const WCHAR *profileName, RestoreSource *sources)
+{
+    IFileDialog *dialog = ArchiveDialog(owner, ARCHIVE_OPEN, title, profileName);
+    IFileOpenDialog *open = NULL;
+    IShellItemArray *results = NULL;
+    DWORD count = 0, i;
+    int chosen = 0;
+    BOOL tooLong = FALSE;
+    HRESULT hr;
+    if (!dialog) return 0;
+    hr = IFileDialog_Show(dialog, owner);
+    if (SUCCEEDED(hr)) hr = IFileDialog_QueryInterface(dialog, &IID_IFileOpenDialog, (void **)&open);
+    if (SUCCEEDED(hr)) hr = IFileOpenDialog_GetResults(open, &results);
+    if (SUCCEEDED(hr)) hr = IShellItemArray_GetCount(results, &count);
+    if (SUCCEEDED(hr) && count > RESTORE_SOURCES) {
+        Ui_Message(owner, MB_ICONWARNING, TR(L"Choose %d backups at most."), RESTORE_SOURCES);
+        count = 0;
+    }
+    for (i = 0; SUCCEEDED(hr) && !tooLong && i < count; i++) {
+        IShellItem *item = NULL;
+        PWSTR path = NULL;
+        if (SUCCEEDED(hr = IShellItemArray_GetItemAt(results, i, &item)) && SUCCEEDED(hr = IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &path))) {
+            tooLong = FAILED(StringCchCopyW(sources[chosen].path, ARRAYSIZE(sources[chosen].path), path));
+            if (!tooLong) chosen++;
+            CoTaskMemFree(path);
+        }
+        if (item) IShellItem_Release(item);
+    }
+    if (tooLong) Ui_Message(owner, MB_ICONERROR, TR(L"The path is too long."));
+    else ChoiceFailed(owner, hr);
+    if (results) IShellItemArray_Release(results);
+    if (open) IFileOpenDialog_Release(open);
+    IFileDialog_Release(dialog);
+    return tooLong || FAILED(hr) ? 0 : chosen;
+}
+
+/* Backup `source` opened: the parts it holds, its name, when it was written.
+ * FALSE when it is not a backup of ours. */
+static BOOL OpenSource(RestoreSource *source)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    SYSTEMTIME utc, local;
+    WCHAR date[32], hour[32];
+    const WCHAR *leaf = wcsrchr(source->path, L'\\');
+    const char *value;
+    size_t valueLength, i;
+    DWORD length = 0;
+    char *manifest;
+    int item, part;
+    StringCchCopyW(source->name, ARRAYSIZE(source->name), leaf ? leaf + 1 : source->path);
+    if (Core_EndsWithI(source->name, L"." ARCHIVE_EXTENSION)) source->name[wcslen(source->name) - ARRAYSIZE(L"." ARCHIVE_EXTENSION) + 1] = 0;
+    source->zip = Zip_Open(source->path);
+    item = source->zip ? Zip_Find(source->zip, MANIFEST_NAME) : -1;
+    manifest = item >= 0 ? (char *)Zip_Read(source->zip, item, MANIFEST_MAX, &length) : NULL;
+    if (!manifest || !Core_JsonMember(manifest, length, "format", &value, &valueLength) || valueLength != sizeof(BACKUP_FORMAT) + 1 ||
+        memcmp(value + 1, BACKUP_FORMAT, sizeof(BACKUP_FORMAT) - 1) != 0) {
+        Free(manifest);
+        return FALSE;
+    }
+    if (Core_JsonMember(manifest, length, "version", &value, &valueLength)) {
+        ULONGLONG n = 0;
+        Core_JsonNumber(value, valueLength, &n);
+        source->version = (int)n;
+    }
+    if (Core_JsonMember(manifest, length, "items", &value, &valueLength)) {
+        ULONGLONG n = 0;
+        Core_JsonNumber(value, valueLength, &n);
+        source->offered = (DWORD)n;
+    } else if (Core_JsonMember(manifest, length, "parts", &value, &valueLength)) {
+        /* A backup from before the items were fine: its coarse parts become bits (its settings held the whole config and the layout). */
+        static const DWORD kPartBits[PARTS] = { BK_CONVERSATIONS, BK_COWORK, BK_APPCONFIG | BK_LAYOUT, BK_SIGNIN, BK_KEY };
+        for (part = 0; part < PARTS; part++) {
+            char needle[32];
+            StringCchPrintfA(needle, ARRAYSIZE(needle), "\"%s\"", kPartNames[part]);
+            for (i = 0; i + strlen(needle) <= valueLength; i++)
+                if (memcmp(value + i, needle, strlen(needle)) == 0) source->offered |= kPartBits[part];
+        }
+    }
+    Free(manifest);
+    if (GetFileAttributesExW(source->path, GetFileExInfoStandard, &data)) {
+        source->time = ((ULONGLONG)data.ftLastWriteTime.dwHighDateTime << 32) | data.ftLastWriteTime.dwLowDateTime;
+        if (FileTimeToSystemTime(&data.ftLastWriteTime, &utc) && SystemTimeToTzSpecificLocalTime(NULL, &utc, &local) &&
+            GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local, NULL, date, ARRAYSIZE(date), NULL) &&
+            GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &local, NULL, hour, ARRAYSIZE(hour)))
+            StringCchPrintfW(source->written, ARRAYSIZE(source->written), L"%s %s", date, hour);
+    }
+    return TRUE;
 }
 
 /* ------------------------------------------------------------- writing */
@@ -343,38 +729,81 @@ static int CountSessions(const ProfileList *list, DWORD profiles)
     return n;
 }
 
+/* The profile's settings side (sidebar, details, appearance, language, model,
+ * settings, permissions), member by member, as the sync reads it, filtered to
+ * the items chosen: one JSON in the archive a restore applies part by part. */
+static BOOL AddLayout(ZipOut *zip, const ProfileList *list, int index, DWORD items)
+{
+    WCHAR dir[LONG_PATH_CCH];
+    char *layout, *filtered;
+    size_t length = 0, filteredLength = 0;
+    BOOL ok = TRUE;
+    if (!SessionStore_EntriesDir(&list->items[index], dir, ARRAYSIZE(dir), NULL)) return TRUE;   /* not signed in: no layout */
+    if ((layout = SessionSync_ReadLayout(&list->items[index], dir, &length, NULL)) == NULL) return TRUE;
+    if ((filtered = SessionSync_FilterLayout(layout, length, items, &filteredLength)) != NULL && filteredLength > 2)
+        ok = Zip_AddData(zip, LAYOUT_NAME, filtered, filteredLength);
+    Free(layout);
+    Free(filtered);
+    return ok;
+}
+
+/* Just the MCP servers of config.json, so a restore of the app config leaves
+ * the rest of config.json (which the layout keeps) alone. */
+static BOOL AddMcp(ZipOut *zip, const WCHAR *storage)
+{
+    WCHAR path[LONG_PATH_CCH];
+    char *json, *out;
+    const char *value;
+    size_t valueLength;
+    DWORD length = 0;
+    BOOL ok = TRUE;
+    static const char head[] = "{\"mcpServers\":";
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, storage)) ||
+        (json = Util_ReadFile(path, JSON_MAX, FALSE, &length)) == NULL)
+        return TRUE;
+    if (Core_JsonMember(json, length, "mcpServers", &value, &valueLength) && (out = (char *)Alloc(sizeof head + valueLength + 1)) != NULL) {
+        memcpy(out, head, sizeof head - 1);
+        memcpy(out + sizeof head - 1, value, valueLength);
+        out[sizeof head - 1 + valueLength] = '}';
+        ok = Zip_AddData(zip, MCP_NAME, out, sizeof head - 1 + valueLength + 1);
+        Free(out);
+    }
+    Free(json);
+    return ok;
+}
+
 /* Profile `index`'s parts `chosen` written to the archive `path`; FALSE with what went wrong in `error`. */
-static BOOL WriteBackup(const ProfileList *list, int index, const BOOL *chosen, const WCHAR *path, WCHAR *error, size_t errorCch)
+static BOOL WriteBackup(const ProfileList *list, int index, DWORD items, const WCHAR *password, const WCHAR *path, WCHAR *error, size_t errorCch)
 {
     const Profile *p = &list->items[index];
     WCHAR cowork[LONG_PATH_CCH];
     char manifest[1024], quoted[3 * LABEL_CCH + 8];
     ZipOut *zip;
     DWORD code = 0;
-    int part, sessions = 0;
+    BOOL chosen[PARTS];
+    int sessions = 0;
     size_t used;
     BOOL ok;
     error[0] = 0;
+    BitsToParts(items, chosen);
     if ((zip = Zip_Create(path, &code)) == NULL) {
         StringCchPrintfW(error, errorCch, TR(L"The backup could not be written (error %lu)."), code);
         return FALSE;
     }
     StringCchPrintfW(cowork, ARRAYSIZE(cowork), L"%s\\" COWORK_DIR, p->storageDir);
     if (!Core_JsonQuote(p->name, quoted, sizeof quoted)) StringCchCopyA(quoted, ARRAYSIZE(quoted), "\"\"");
-    used = AppendA(manifest, sizeof manifest, 0, "{\"format\":\"" BACKUP_FORMAT "\",\"version\":%d,\"profile\":%s,\"parts\":[", BACKUP_VERSION, quoted);
-    for (part = 0; part < PARTS; part++) {
-        if (!chosen[part]) continue;
-        used = AppendA(manifest, sizeof manifest, used, "%s\"%s\"", manifest[used - 1] == '[' ? "" : ",", kPartNames[part]);
-    }
-    used = AppendA(manifest, sizeof manifest, used, "]}");
+    used = AppendA(manifest, sizeof manifest, 0, "{\"format\":\"" BACKUP_FORMAT "\",\"version\":%d,\"profile\":%s,\"items\":%lu}",
+                   BACKUP_VERSION, quoted, (unsigned long)items);
     ok = Zip_AddData(zip, MANIFEST_NAME, manifest, used);
     if (ok && chosen[PART_SESSIONS]) ok = AddSessions(zip, list, index, &sessions, error, errorCch);
     if (ok && chosen[PART_COWORK]) ok = AddTree(zip, cowork, L"cowork");
+    if (ok && (items & BK_LAYOUT)) ok = AddLayout(zip, list, index, items & BK_LAYOUT);
     if (ok && chosen[PART_SETTINGS]) {
         size_t i;
+        ok = AddMcp(zip, p->storageDir);
         for (i = 0; ok && i < ARRAYSIZE(kSettingsFiles); i++) ok = AddIfThere(zip, p->storageDir, kSettingsFiles[i], L"settings");
-        ok = ok && AddAppearance(zip, p->storageDir);
     }
+    if (ok && (items & SYNC_ITEM_APPEARANCE)) ok = AddAppearance(zip, p->storageDir);
     if (ok && chosen[PART_SIGNIN]) {
         size_t i;
         WCHAR dir[LONG_PATH_CCH], prefix[MAX_PATH];
@@ -384,6 +813,19 @@ static BOOL WriteBackup(const ProfileList *list, int index, const BOOL *chosen, 
             StringCchPrintfW(prefix, ARRAYSIZE(prefix), L"signin/%s", kSigninFolders[i]);
             ok = AddTree(zip, dir, prefix);
         }
+    }
+    if (ok && chosen[PART_KEY]) {
+        BYTE key[64];
+        size_t keyLength = 0;
+        char sealed[1024];
+        if (password && Backup_ReadAppKey(p->storageDir, key, sizeof key, &keyLength) && Core_SealSecret(key, keyLength, password, KEY_ITERATIONS, sealed, sizeof sealed)) {
+            ok = Zip_AddData(zip, KEY_NAME, sealed, strlen(sealed));
+        } else {
+            StringCchPrintfW(error, errorCch, TR(L"The sign-in's key of \x201C%s\x201D could not be read: the backup was not written."), p->name);
+            ok = FALSE;
+        }
+        SecureZeroMemory(key, sizeof key);
+        SecureZeroMemory(sealed, sizeof sealed);
     }
     code = Zip_Error(zip);
     ok = Zip_Close(zip, ok) && ok;
@@ -412,9 +854,11 @@ BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list
     WCHAR error[LONG_PATH_CCH + 256], line[LABEL_CCH + LONG_PATH_CCH + 300], report[8 * (LONG_PATH_CCH + 300)], text[9 * (LONG_PATH_CCH + 300)];
     const Profile *first = NULL;
     BackupDialog dialog;
+    PasswordDialog password;
     HCURSOR old;
     int i, count = 0, saved = 0;
     (void)pkg;
+    ZeroMemory(&password, sizeof password);
     for (i = 0; i < list->count; i++) {
         if (!(profiles & (1u << i))) continue;
         if (!list->items[i].storageDir[0]) {   /* no folder of its own to back up */
@@ -433,35 +877,42 @@ BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list
     old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
     dialog.sessions = CountSessions(list, profiles);
     SetCursor(old);
+    dialog.offered = dialog.chosen = BK_APPCONFIG | BK_LAYOUT;   /* the settings side, checked by default */
+    dialog.offered |= BK_SIGNIN | BK_KEY;                       /* the account, left unchecked: the user asks for it */
     for (i = 0; i < list->count; i++)
         if ((profiles & (1u << i)) && SUCCEEDED(StringCchPrintfW(cowork, ARRAYSIZE(cowork), L"%s\\" COWORK_DIR, list->items[i].storageDir)) &&
             Util_DirExists(cowork))
-            dialog.offered[PART_COWORK] = dialog.chosen[PART_COWORK] = TRUE;
-    dialog.offered[PART_SESSIONS] = dialog.chosen[PART_SESSIONS] = dialog.sessions != 0;
-    dialog.offered[PART_SETTINGS] = dialog.chosen[PART_SETTINGS] = TRUE;
-    dialog.offered[PART_SIGNIN] = TRUE;   /* left unchecked: the user asks for it */
+            dialog.offered |= BK_COWORK, dialog.chosen |= BK_COWORK;
+    if (dialog.sessions != 0) dialog.offered |= BK_CONVERSATIONS, dialog.chosen |= BK_CONVERSATIONS;
     if (Ui_Dialog(owner, IDD_BACKUP, BackupProc, (LPARAM)&dialog) != IDOK) return FALSE;
-    for (i = 0; dialog.chosen[PART_SIGNIN] && i < list->count; i++)
+    if (dialog.chosen & BK_KEY) {
+        dialog.chosen |= BK_SIGNIN;   /* the key opens the sign-in: it goes with it */
+        password.title = title;
+        password.text = TR(L"Choose the password that opens the sign-in on another PC. Without it, the backup's sign-in restores on this PC only.");
+        password.twice = TRUE;
+        if (Ui_Dialog(owner, IDD_PASSWORD, PasswordProc, (LPARAM)&password) != IDOK) return ForgetPassword(&password, FALSE);
+    }
+    for (i = 0; (dialog.chosen & BK_SIGNIN) && i < list->count; i++)
         if ((profiles & (1u << i)) && Claude_IsRunning(&list->items[i])) {
             Ui_Message(owner, MB_ICONINFORMATION, TR(L"Close \x201C%s\x201D first: its sign-in files are in use."), list->items[i].name);
-            return FALSE;
+            return ForgetPassword(&password, FALSE);
         }
     if (count == 1) {
-        if (!ChooseArchive(owner, ARCHIVE_SAVE, title, first->name, path, ARRAYSIZE(path))) return FALSE;
+        if (!ChooseArchive(owner, ARCHIVE_SAVE, title, first->name, path, ARRAYSIZE(path))) return ForgetPassword(&password, FALSE);
         old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
         i = (int)(first - list->items);
-        if (!WriteBackup(list, i, dialog.chosen, path, error, ARRAYSIZE(error))) {
+        if (!WriteBackup(list, i, dialog.chosen, password.password, path, error, ARRAYSIZE(error))) {
             SetCursor(old);
             Ui_Message(owner, MB_ICONERROR, L"%s", error);
-            return FALSE;
+            return ForgetPassword(&password, FALSE);
         }
         SetCursor(old);
         StringCchPrintfW(report, ARRAYSIZE(report), TR(L"Backup saved:\n%s"), path);
         Ui_Message(owner, MB_ICONINFORMATION, L"%s", report);
-        return TRUE;
+        return ForgetPassword(&password, TRUE);
     }
     /* Several: one archive each, named after its profile, in the folder chosen. */
-    if (!ChooseArchive(owner, ARCHIVE_FOLDER, TR(L"Choose the folder of the backups"), NULL, folder, ARRAYSIZE(folder))) return FALSE;
+    if (!ChooseArchive(owner, ARCHIVE_FOLDER, TR(L"Choose the folder of the backups"), NULL, folder, ARRAYSIZE(folder))) return ForgetPassword(&password, FALSE);
     old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
     report[0] = 0;
     for (i = 0; i < list->count; i++) {
@@ -469,7 +920,7 @@ BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list
         ArchiveName(list->items[i].name, name, ARRAYSIZE(name));
         if (!FreeArchivePath(folder, name, path, ARRAYSIZE(path)))
             StringCchPrintfW(error, ARRAYSIZE(error), TR(L"The backup could not be written (error %lu)."), (unsigned long)ERROR_FILE_EXISTS);
-        else if (WriteBackup(list, i, dialog.chosen, path, error, ARRAYSIZE(error))) {
+        else if (WriteBackup(list, i, dialog.chosen, password.password, path, error, ARRAYSIZE(error))) {
             saved++;
             continue;
         }
@@ -484,7 +935,7 @@ BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list
         StringCchCatW(text, ARRAYSIZE(text), report);
     }
     Ui_Message(owner, saved == count ? MB_ICONINFORMATION : MB_ICONWARNING, L"%s", text);
-    return saved == count;
+    return ForgetPassword(&password, saved == count);
 }
 
 /* ------------------------------------------------------------ restoring */
@@ -621,8 +1072,45 @@ static BOOL RestoreAppearance(const ZipIn *zip, const WCHAR *storage)
     return ok;
 }
 
-/* The backup's Code sessions sent to the profile through their archive's import. */
-static BOOL RestoreSessions(const ZipIn *zip, const ProfileList *list, int index, int *sessions, BOOL *signedOut, WCHAR *error, size_t errorCch)
+/* The backup's scheduled tasks joined to the profile's (`path`): the
+ * backup's own as it has them, the profile's others kept, the profile's
+ * file kept in `backup` before the restore's first change to it. */
+static BOOL RestoreTasks(const ZipIn *zip, int item, const WCHAR *path, const WCHAR *backup)
+{
+    WCHAR kept[LONG_PATH_CCH];
+    DWORD length = 0, currentLength = 0, done = 0;
+    char *restored = (char *)Zip_Read(zip, item, JSON_MAX, &length), *current, *joined = NULL;
+    size_t joinedLength = 0;
+    const char *out;
+    HANDLE file;
+    BOOL ok;
+    if (!restored) return FALSE;
+    out = restored;
+    joinedLength = length;
+    if ((current = Util_ReadFile(path, JSON_MAX, FALSE, &currentLength)) != NULL) {
+        if (SUCCEEDED(StringCchPrintfW(kept, ARRAYSIZE(kept), L"%s\\" SCHEDULED_TASKS, backup)) && !Util_FileExists(kept) &&
+            !CopyFileW(path, kept, TRUE)) {
+            Free(current);
+            Free(restored);
+            return FALSE;
+        }
+        /* One the profile cannot read: the backup's, whole. */
+        if ((joined = Core_JsonArrayUnion(restored, length, current, currentLength, "scheduledTasks", "id", &joinedLength)) != NULL) out = joined;
+        else joinedLength = length;
+        Free(current);
+    }
+    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    ok = file != INVALID_HANDLE_VALUE && WriteFile(file, out, (DWORD)joinedLength, &done, NULL) && done == joinedLength;
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    Free(joined);
+    Free(restored);
+    return ok;
+}
+
+/* The backup's Code sessions sent to the profile through their archive's
+ * import, its scheduled tasks joined to the profile's. */
+static BOOL RestoreSessions(const ZipIn *zip, const ProfileList *list, int index, const WCHAR *backup, int *sessions, BOOL *signedOut, WCHAR *error,
+                            size_t errorCch)
 {
     WCHAR folder[MAX_PATH], temporary[MAX_PATH], dir[LONG_PATH_CCH], tasks[LONG_PATH_CCH];
     SessionSet set;
@@ -631,10 +1119,7 @@ static BOOL RestoreSessions(const ZipIn *zip, const ProfileList *list, int index
     BOOL ok = TRUE, signedIn = FALSE;
     *sessions = 0;
     *signedOut = !SessionStore_EntriesDir(&list->items[index], dir, ARRAYSIZE(dir), &signedIn);
-    if (*signedOut) {
-        *signedOut = TRUE;
-        return TRUE;
-    }
+    if (*signedOut) return TRUE;
     if (item >= 0) {
         ok = GetTempPathW(ARRAYSIZE(folder), folder) && GetTempFileNameW(folder, L"cdm", 0, temporary) && Zip_Extract(zip, item, temporary);
         if (ok && SessionStore_LoadProfiles(&set, list)) {
@@ -649,33 +1134,376 @@ static BOOL RestoreSessions(const ZipIn *zip, const ProfileList *list, int index
         DeleteFileW(temporary);
     }
     if (ok && taskItem >= 0 && SUCCEEDED(StringCchPrintfW(tasks, ARRAYSIZE(tasks), L"%s\\" SCHEDULED_TASKS, dir)))
-        ok = Zip_Extract(zip, taskItem, tasks);
+        ok = RestoreTasks(zip, taskItem, tasks, backup);
     return ok;
 }
 
-/* A restore, asked first: the profile and the archive. */
-static BOOL ConfirmRestore(HWND owner, const Profile *p, const WCHAR *archive)
+/* The backup's MCP servers set into config.json, the rest of it left as it
+ * is (the layout keeps those members). */
+static BOOL RestoreMcp(const ZipIn *zip, const WCHAR *storage)
+{
+    WCHAR path[LONG_PATH_CCH];
+    int item = Zip_Find(zip, MCP_NAME);
+    char *mcp, *json, *raw, *out;
+    const char *value;
+    size_t valueLength, outLength = 0, cap;
+    DWORD mcpLength = 0, length = 0, done = 0;
+    BOOL ok = TRUE, freeJson = FALSE;
+    if (item < 0 || (mcp = (char *)Zip_Read(zip, item, JSON_MAX, &mcpLength)) == NULL) return TRUE;
+    if (!Core_JsonMember(mcp, mcpLength, "mcpServers", &value, &valueLength) ||
+        FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" CLAUDE_DESKTOP_SETTINGS, storage))) {
+        Free(mcp);
+        return item < 0 ? TRUE : FALSE;
+    }
+    if ((json = Util_ReadFile(path, JSON_MAX, FALSE, &length)) != NULL) freeJson = TRUE;
+    else { json = (char *)"{}"; length = 2; }
+    cap = (size_t)length + valueLength + 32;
+    raw = (char *)Alloc(valueLength + 1);
+    out = (char *)Alloc(cap);
+    if (raw && out) {
+        HANDLE file;
+        memcpy(raw, value, valueLength);
+        raw[valueLength] = 0;
+        if (Core_JsonSetMember(json, length, "mcpServers", raw, out, cap, &outLength)) {
+            file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            ok = file != INVALID_HANDLE_VALUE && WriteFile(file, out, (DWORD)outLength, &done, NULL) && done == outLength;
+            if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        } else {
+            ok = FALSE;
+        }
+    } else {
+        ok = FALSE;
+    }
+    Free(raw);
+    Free(out);
+    if (freeJson) Free(json);
+    Free(mcp);
+    return ok;
+}
+
+/* The restored sign-in's key, opened on this PC: as it is when DPAPI opens it
+ * (the PC and Windows user it was backed up on), else from the backup's key
+ * behind a password, protected again for this Windows user. A line for the
+ * report, NULL when there is nothing to say. */
+static const WCHAR *OpenSignInKey(HWND owner, const ZipIn *zip, const Profile *p, const WCHAR *title, BOOL hasKey)
+{
+    PasswordDialog password;
+    BYTE key[64];
+    size_t keyLength = 0;
+    DWORD length = 0;
+    char *sealed;
+    int item;
+    const WCHAR *note = NULL;
+    if (Backup_ReadAppKey(p->storageDir, key, sizeof key, &keyLength)) {
+        SecureZeroMemory(key, sizeof key);
+        return NULL;   /* this PC and Windows user open it */
+    }
+    if (!hasKey || (item = Zip_Find(zip, KEY_NAME)) < 0 || (sealed = (char *)Zip_Read(zip, item, MANIFEST_MAX, &length)) == NULL)
+        return TR(L"The sign-in was backed up on another PC or for another Windows user: sign in again in this profile.");
+    ZeroMemory(&password, sizeof password);
+    password.title = title;
+    password.text = TR(L"The sign-in was backed up on another PC. Enter the password chosen for it then:");
+    for (;;) {
+        HCURSOR old;
+        BOOL opened;
+        if (Ui_Dialog(owner, IDD_PASSWORD, PasswordProc, (LPARAM)&password) != IDOK) {
+            note = TR(L"The sign-in's key stays closed: sign in again in this profile.");
+            break;
+        }
+        old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+        opened = Core_OpenSecret(sealed, length, password.password, key, sizeof key, &keyLength);
+        SetCursor(old);
+        ForgetPassword(&password, TRUE);
+        if (opened) {
+            if (!Backup_WriteAppKey(p->storageDir, key, keyLength)) note = TR(L"The sign-in's key could not be kept for this Windows user: sign in again in this profile.");
+            break;
+        }
+        Ui_Message(owner, MB_ICONWARNING, TR(L"This password does not open the sign-in's key."));
+    }
+    SecureZeroMemory(key, sizeof key);
+    SecureZeroMemory(sealed, length);
+    Free(sealed);
+    return note;
+}
+
+/* A restore, asked first: the profile and the backups. */
+static BOOL ConfirmRestore(HWND owner, const Profile *p, const RestoreSource *sources, int count)
 {
     WCHAR question[LABEL_CCH + LONG_PATH_CCH + 128];
-    const WCHAR *name = wcsrchr(archive, L'\\');
-    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Restore \x201C%s\x201D from %s?"), p->name, name ? name + 1 : archive);
+    const WCHAR *name = wcsrchr(sources[0].path, L'\\');
+    if (count == 1)
+        StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Restore \x201C%s\x201D from %s?"), p->name, name ? name + 1 : sources[0].path);
+    else
+        StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Restore \x201C%s\x201D from %d backups?"), p->name, count);
     return SyncUi_Confirm(owner, IDI_WARNING, question, TRUE, TR(L"Restore"));
+}
+
+/* -------------------------------------------- several backups, one profile */
+
+/* The oldest first: restored in that order, the newest's copy of what several hold is the one kept. */
+static void SortSources(RestoreSource *sources, int count)
+{
+    int s, t;
+    for (s = 1; s < count; s++)
+        for (t = s; t > 0 && sources[t - 1].time > sources[t].time; t--) {
+            RestoreSource swap = sources[t];
+            sources[t] = sources[t - 1];
+            sources[t - 1] = swap;
+        }
+}
+
+/* The newest backup holding any of `mask`, -1 for none. */
+static int NewestWith(const RestoreSource *sources, int count, DWORD mask)
+{
+    int s;
+    for (s = count - 1; s >= 0; s--)
+        if (sources[s].offered & mask) return s;
+    return -1;
+}
+
+/* The restore conflicts' list, the sync conflicts' look: a row per unit that
+ * several of the backups hold and one only can give (the settings side, or
+ * the account), a column per backup, the one it comes from checked. */
+enum { PICK_UNIT_SETTINGS, PICK_UNIT_ACCOUNT, PICK_UNITS };
+static const DWORD kUnitMask[PICK_UNITS] = { BK_APPCONFIG | BK_LAYOUT, BK_SIGNIN | BK_KEY };
+enum { PICK_CHOSEN, PICK_CANDIDATE, PICK_SETTINGS, PICK_ACCOUNT, PICK_IMAGES };
+static const WCHAR kPickGlyphs[PICK_IMAGES] = { 0xEC61, 0xEA3A, 0xE713, 0xE8D7 };
+static const ThemeTint kPickTints[PICK_IMAGES] = { THEME_TINT_GREEN, THEME_TINT_NONE, THEME_TINT_BLUE, THEME_TINT_GOLD };
+
+typedef struct PickDialog {
+    const RestoreSource *sources;
+    int                  columns[RESTORE_SOURCES];   /* the backup of each column after the first */
+    int                  columnCount;
+    int                  rows[PICK_UNITS];   /* the units in conflict */
+    int                  rowCount;
+    int                 *from;                       /* by part: the backup it comes from */
+    HWND                 list;
+    HICON                icon;
+} PickDialog;
+
+/* Row `row`'s cells: the backup it comes from checked, the others that hold it ringed. */
+static void ShowPicks(const PickDialog *state, int row)
+{
+    int unit = state->rows[row], column;
+    for (column = 0; column < state->columnCount; column++) {
+        int s = state->columns[column];
+        LVITEMW item;
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_IMAGE;
+        item.iItem = row;
+        item.iSubItem = column + 1;
+        item.iImage = !(state->sources[s].offered & kUnitMask[unit]) ? I_IMAGENONE : state->from[unit] == s ? PICK_CHOSEN : PICK_CANDIDATE;
+        ListView_SetItem(state->list, &item);
+    }
+}
+
+/* The columns across `width`: each backup's as wide as its name and date, the parts' the rest, two fifths at least. */
+static void SizePickColumns(const PickDialog *state, int width)
+{
+    int wanted[RESTORE_SOURCES], total = 0, i, dpi = GetDpiForWindow(state->list), least = width * 2 / 5;
+    int image = GetSystemMetricsForDpi(SM_CXSMICON, dpi), room = MulDiv(20, dpi, 96);
+    for (i = 0; i < state->columnCount; i++) {
+        const RestoreSource *source = &state->sources[state->columns[i]];
+        wanted[i] = max(ListView_GetStringWidth(state->list, source->name) + room, ListView_GetStringWidth(state->list, source->written) + image + room);
+        total += wanted[i];
+    }
+    if (total > width - least) {
+        int shared = 0;
+        for (i = 0; i < state->columnCount; i++) shared += wanted[i] = MulDiv(wanted[i], width - least, total);
+        total = shared;
+    }
+    ListView_SetColumnWidth(state->list, 0, width - total);
+    for (i = 0; i < state->columnCount; i++) ListView_SetColumnWidth(state->list, i + 1, wanted[i]);
+}
+
+static void FillPicks(HWND dialog, PickDialog *state)
+{
+    LVCOLUMNW column;
+    LVITEMW item;
+    RECT client;
+    int i, row, width;
+    state->list = GetDlgItem(dialog, IDC_X_LIST);
+    ListView_SetExtendedListViewStyle(state->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_SUBITEMIMAGES);
+    ListView_SetImageList(state->list, Theme_GlyphImages(state->list, kPickGlyphs, kPickTints, PICK_IMAGES), LVSIL_SMALL);
+    GetClientRect(state->list, &client);
+    width = client.right - GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(state->list));
+    ZeroMemory(&column, sizeof column);
+    column.mask = LVCF_TEXT | LVCF_WIDTH;
+    column.pszText = (LPWSTR)TR(L"Restore");
+    column.cx = width * 2 / 5;
+    ListView_InsertColumn(state->list, 0, &column);
+    for (i = 0; i < state->columnCount; i++) {
+        column.pszText = (LPWSTR)state->sources[state->columns[i]].name;
+        column.cx = (width - width * 2 / 5) / state->columnCount;
+        ListView_InsertColumn(state->list, i + 1, &column);
+    }
+    for (row = 0; row < state->rowCount; row++) {
+        int unit = state->rows[row];
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
+        item.iItem = row;
+        item.pszText = (LPWSTR)(unit == PICK_UNIT_SETTINGS ? TR(L"Settings") : TR(L"Account"));
+        item.iImage = unit == PICK_UNIT_SETTINGS ? PICK_SETTINGS : PICK_ACCOUNT;
+        item.lParam = row;
+        ListView_InsertItem(state->list, &item);
+        for (i = 0; i < state->columnCount; i++) {
+            const RestoreSource *source = &state->sources[state->columns[i]];
+            ListView_SetItemText(state->list, row, i + 1, (source->offered & kUnitMask[unit]) ? (LPWSTR)source->written : (LPWSTR)L"\x2014");
+        }
+        ShowPicks(state, row);
+    }
+    SizePickColumns(state, width);
+    Theme_SmoothView(state->list);
+    ListView_SetItemState(state->list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);   /* the arrows choose from the start */
+}
+
+/* Row `row` given the next backup left or right (`step`) that holds its part. */
+static void StepPick(PickDialog *state, int row, int step)
+{
+    int unit, column, at = -1;
+    if (row < 0 || row >= state->rowCount) return;
+    unit = state->rows[row];
+    for (column = 0; column < state->columnCount; column++)
+        if (state->columns[column] == state->from[unit]) at = column;
+    for (column = at + step; column >= 0 && column < state->columnCount; column += step)
+        if (state->sources[state->columns[column]].offered & kUnitMask[unit]) {
+            state->from[unit] = state->columns[column];
+            ShowPicks(state, row);
+            return;
+        }
+}
+
+static INT_PTR CALLBACK PickProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    PickDialog *state = (PickDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    switch (message) {
+    case WM_INITDIALOG: {
+        int i;
+        state = (PickDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetWindowTextW(dialog, TR(L"Restore conflicts"));
+        SetDlgItemTextW(dialog, IDC_X_TEXT, TR(L"Several of these backups hold these, and only one can be restored. Choose the backup of each:"));
+        SetDlgItemTextW(dialog, IDC_X_NOTE, TR(L"Click the backup to restore from, or press Left and Right. Sessions come from every backup."));
+        SetDlgItemTextW(dialog, IDOK, TR(L"Restore"));
+        SetDlgItemTextW(dialog, IDCANCEL, TR(L"Cancel"));
+        if (SUCCEEDED(LoadIconWithScaleDown(NULL, IDI_INFORMATION, GetSystemMetricsForDpi(SM_CXICON, GetDpiForWindow(dialog)),
+                                            GetSystemMetricsForDpi(SM_CYICON, GetDpiForWindow(dialog)), &state->icon)))
+            SendDlgItemMessageW(dialog, IDC_X_ICON, STM_SETICON, (WPARAM)state->icon, 0);
+        Theme_SetGlyph(GetDlgItem(dialog, IDOK), 0xE73E, THEME_TINT_GREEN);
+        SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)TR(L"The newest of each"));
+        for (i = 0; i < state->columnCount; i++)
+            SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)state->sources[state->columns[i]].name);
+        SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_SETCURSEL, 0, 0);
+        FillPicks(dialog, state);
+        return TRUE;
+    }
+
+    case WM_CTLCOLORSTATIC:
+        return Theme_CtlColor(message, wp, lp, IDC_X_NOTE);
+
+    case WM_NOTIFY:
+        if (state && state->list && ((const NMHDR *)lp)->hwndFrom == state->list) {
+            const NMHDR *header = (const NMHDR *)lp;
+            if (header->code == NM_CLICK || header->code == NM_DBLCLK) {
+                /* A click on a backup's cell restores the part from it. */
+                LVHITTESTINFO hit;
+                ZeroMemory(&hit, sizeof hit);
+                hit.pt = ((const NMITEMACTIVATE *)lp)->ptAction;
+                if (ListView_SubItemHitTest(state->list, &hit) >= 0 && hit.iItem >= 0 && hit.iItem < state->rowCount && hit.iSubItem > 0 &&
+                    hit.iSubItem <= state->columnCount &&
+                    (state->sources[state->columns[hit.iSubItem - 1]].offered & kUnitMask[state->rows[hit.iItem]])) {
+                    state->from[state->rows[hit.iItem]] = state->columns[hit.iSubItem - 1];
+                    ShowPicks(state, hit.iItem);
+                }
+                return TRUE;
+            }
+            if (header->code == LVN_KEYDOWN) {
+                WORD key = ((const NMLVKEYDOWN *)lp)->wVKey;
+                if (key == VK_LEFT || key == VK_RIGHT) {
+                    StepPick(state, ListView_GetNextItem(state->list, -1, LVNI_FOCUSED), key == VK_LEFT ? -1 : 1);
+                    SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+                }
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_COMMAND:
+        if (!state) break;
+        switch (LOWORD(wp)) {
+        case IDC_X_PROFILE:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                /* Every part from the newest backup holding it, or from the one chosen where it holds it. */
+                LRESULT choice = SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_GETCURSEL, 0, 0);
+                int row;
+                for (row = 0; row < state->rowCount; row++) {
+                    int unit = state->rows[row], s, newest = -1;
+                    for (s = 0; s < state->columnCount; s++)
+                        if (state->sources[state->columns[s]].offered & kUnitMask[unit]) newest = state->columns[s];
+                    if (choice <= 0) state->from[unit] = newest;
+                    else if (choice - 1 < state->columnCount && (state->sources[state->columns[choice - 1]].offered & kUnitMask[unit]))
+                        state->from[unit] = state->columns[choice - 1];
+                    ShowPicks(state, row);
+                }
+            }
+            return TRUE;
+        case IDOK:
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        case IDCANCEL:
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+
+    case WM_DESTROY:
+        if (state && state->icon) DestroyIcon(state->icon);
+        break;
+    }
+    return FALSE;
+}
+
+/* The backup each part only one can give comes from (`from`, by part): the
+ * newest holding it, or the one the person chose where several of the
+ * chosen ones hold it. FALSE when the person cancelled. */
+static BOOL ChooseSources(HWND owner, const RestoreSource *sources, int count, DWORD chosen, int *from)
+{
+    PickDialog dialog;
+    int unit, s, row;
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.sources = sources;
+    dialog.from = from;
+    for (unit = 0; unit < PICK_UNITS; unit++) {
+        int holders = 0;
+        from[unit] = NewestWith(sources, count, kUnitMask[unit]);
+        if (!(chosen & kUnitMask[unit])) continue;
+        for (s = 0; s < count; s++)
+            if (sources[s].offered & kUnitMask[unit]) holders++;
+        if (holders > 1) dialog.rows[dialog.rowCount++] = unit;
+    }
+    if (!dialog.rowCount) return TRUE;
+    for (s = 0; s < count; s++)
+        for (row = 0; row < dialog.rowCount; row++)
+            if (sources[s].offered & kUnitMask[dialog.rows[row]]) {
+                dialog.columns[dialog.columnCount++] = s;
+                break;
+            }
+    return Ui_Dialog(owner, IDD_CONFLICTS, PickProc, (LPARAM)&dialog) == IDOK;
 }
 
 BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index)
 {
     const Profile *p = &list->items[index];
-    WCHAR title[LABEL_CCH + 64], text[LABEL_CCH + 256], path[LONG_PATH_CCH], backup[LONG_PATH_CCH], error[LONG_PATH_CCH + 256];
+    WCHAR title[LABEL_CCH + 64], text[LABEL_CCH + 256], backup[LONG_PATH_CCH], error[LONG_PATH_CCH + 256];
     WCHAR report[4 * LONG_PATH_CCH], line[LONG_PATH_CCH + 256];
+    RestoreSource *sources;
     BackupDialog dialog;
-    const char *value;
-    size_t valueLength, i;
-    DWORD length = 0, code = 0;
-    char *manifest;
-    ZipIn *zip;
+    DWORD code = 0;
     HCURSOR old;
-    int part, item, sessions = 0;
-    BOOL ok = TRUE, signedOut = FALSE;
+    int s, count, from[PICK_UNITS], sessions = 0;
+    size_t i;
+    BOOL ok = FALSE, signedOut = FALSE;
+    const WCHAR *keyNote = NULL;
     (void)pkg;
     if (!p->storageDir[0]) return FALSE;
     if (SessionLink_Busy(p)) {   /* said before the choices, checked again after them */
@@ -683,96 +1511,136 @@ BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *lis
         return FALSE;
     }
     StringCchPrintfW(title, ARRAYSIZE(title), TR(L"Restore \x201C%s\x201D from a backup"), p->name);
-    if (!ChooseArchive(owner, ARCHIVE_OPEN, title, p->name, path, ARRAYSIZE(path))) return FALSE;
-    zip = Zip_Open(path);
-    item = zip ? Zip_Find(zip, MANIFEST_NAME) : -1;
-    manifest = item >= 0 ? (char *)Zip_Read(zip, item, MANIFEST_MAX, &length) : NULL;
-    if (!manifest || !Core_JsonMember(manifest, length, "format", &value, &valueLength) || valueLength != sizeof(BACKUP_FORMAT) + 1 ||
-        memcmp(value + 1, BACKUP_FORMAT, sizeof(BACKUP_FORMAT) - 1) != 0) {
-        Free(manifest);
-        Zip_Free(zip);
-        Ui_Message(owner, MB_ICONWARNING, TR(L"This file is not a backup of " APP_NAME L"."));
-        return FALSE;
-    }
+    if ((sources = (RestoreSource *)Alloc(RESTORE_SOURCES * sizeof *sources)) == NULL) return FALSE;
+    if ((count = ChooseBackups(owner, title, p->name, sources)) == 0) goto done;
+    for (s = 0; s < count; s++)
+        if (!OpenSource(&sources[s])) {
+            if (count == 1) Ui_Message(owner, MB_ICONWARNING, TR(L"This file is not a backup of " APP_NAME L"."));
+            else Ui_Message(owner, MB_ICONWARNING, TR(L"\x201C%s\x201D is not a backup of " APP_NAME L"."), sources[s].name);
+            goto done;
+        }
+    SortSources(sources, count);
     ZeroMemory(&dialog, sizeof dialog);
-    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Choose what to restore into \x201C%s\x201D. What it replaces is kept in a backup first."), p->name);
+    if (count == 1)
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Choose what to restore into \x201C%s\x201D. What it replaces is kept in a backup first."), p->name);
+    else
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Choose what to restore into \x201C%s\x201D from these %d backups. What it replaces is kept in a backup first."),
+                         p->name, count);
     dialog.title = title;
     dialog.text = text;
     dialog.action = TR(L"Restore");
     dialog.sessions = -1;
-    if (Core_JsonMember(manifest, length, "parts", &value, &valueLength))
-        for (part = 0; part < PARTS; part++) {
-            char needle[32];
-            StringCchPrintfA(needle, ARRAYSIZE(needle), "\"%s\"", kPartNames[part]);
-            for (i = 0; i + strlen(needle) <= valueLength; i++)
-                if (memcmp(value + i, needle, strlen(needle)) == 0) dialog.offered[part] = TRUE;
-            dialog.chosen[part] = dialog.offered[part] && part != PART_SIGNIN;
-        }
-    Free(manifest);
-    if (Ui_Dialog(owner, IDD_BACKUP, BackupProc, (LPARAM)&dialog) != IDOK || !ConfirmRestore(owner, p, path)) {
-        Zip_Free(zip);
-        return FALSE;
-    }
+    for (s = 0; s < count; s++) dialog.offered |= sources[s].offered;
+    dialog.offered &= ~BK_KEY;   /* not a choice: it opens the sign-in when this PC cannot */
+    dialog.chosen = dialog.offered & ~(BK_SIGNIN | BK_KEY);
+    if (Ui_Dialog(owner, IDD_BACKUP, BackupProc, (LPARAM)&dialog) != IDOK || !ChooseSources(owner, sources, count, dialog.chosen, from) ||
+        !ConfirmRestore(owner, p, sources, count))
+        goto done;
     if (SessionLink_Busy(p)) {
-        Zip_Free(zip);
         Ui_Message(owner, MB_ICONINFORMATION, TR(L"Close \x201C%s\x201D first, and every profile that shares its session folder."), p->name);
-        return FALSE;
+        goto done;
     }
     old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
     error[0] = 0;
     ok = RestoreBackupDir(p, backup, ARRAYSIZE(backup));
     /* What the restore replaces, kept first. */
     if (!ok) code = GetLastError();
-    if (ok && dialog.chosen[PART_COWORK]) ok = KeepCopy(p->storageDir, COWORK_DIR, backup, TRUE, &code);
-    if (ok && dialog.chosen[PART_SETTINGS]) {
+    if (ok && (dialog.chosen & BK_COWORK)) ok = KeepCopy(p->storageDir, COWORK_DIR, backup, TRUE, &code);
+    if (ok && (dialog.chosen & (BK_APPCONFIG | BK_LAYOUT))) {
+        /* The settings side touches config.json, Preferences and the app files. */
         for (i = 0; ok && i < ARRAYSIZE(kSettingsFiles); i++) ok = KeepCopy(p->storageDir, kSettingsFiles[i], backup, FALSE, &code);
         ok = ok && KeepCopy(p->storageDir, CLAUDE_APP_SETTINGS, backup, FALSE, &code);
+        ok = ok && KeepCopy(p->storageDir, CLAUDE_DESKTOP_SETTINGS, backup, FALSE, &code);
+        ok = ok && KeepCopy(p->storageDir, L"Preferences", backup, FALSE, &code);
     }
-    if (ok && dialog.chosen[PART_SIGNIN]) {
+    if (ok && (dialog.chosen & BK_SIGNIN)) {
         for (i = 0; ok && i < ARRAYSIZE(kSigninFiles); i++) ok = KeepCopy(p->storageDir, kSigninFiles[i], backup, FALSE, &code);
         for (i = 0; ok && i < ARRAYSIZE(kSigninFolders); i++) ok = KeepCopy(p->storageDir, kSigninFolders[i], backup, TRUE, &code);
     }
     if (!ok) {
         SetCursor(old);
-        Zip_Free(zip);
         Ui_Message(owner, MB_ICONERROR, TR(L"What the restore would replace could not be backed up (error %lu): nothing was changed."), code);
-        return FALSE;
+        goto done;
     }
-    if (dialog.chosen[PART_SESSIONS]) ok = RestoreSessions(zip, list, index, &sessions, &signedOut, error, ARRAYSIZE(error)) && ok;
-    if (dialog.chosen[PART_COWORK]) {
-        WCHAR cowork[LONG_PATH_CCH];
-        ok = SUCCEEDED(StringCchPrintfW(cowork, ARRAYSIZE(cowork), L"%s\\" COWORK_DIR, p->storageDir)) && ExtractTree(zip, "cowork", cowork, &code) && ok;
+    /* Sessions and Cowork from every backup, the oldest first: what several hold, as the newest has it. */
+    for (s = 0; s < count; s++) {
+        int found = 0;
+        if ((dialog.chosen & BK_CONVERSATIONS) && (sources[s].offered & BK_CONVERSATIONS)) {
+            ok = RestoreSessions(sources[s].zip, list, index, backup, &found, &signedOut, error, ARRAYSIZE(error)) && ok;
+            sessions += found;
+        }
+        if ((dialog.chosen & BK_COWORK) && (sources[s].offered & BK_COWORK)) {
+            WCHAR cowork[LONG_PATH_CCH];
+            ok = SUCCEEDED(StringCchPrintfW(cowork, ARRAYSIZE(cowork), L"%s\\" COWORK_DIR, p->storageDir)) &&
+                 ExtractTree(sources[s].zip, "cowork", cowork, &code) && ok;
+        }
     }
-    if (dialog.chosen[PART_SETTINGS]) {
-        for (i = 0; i < ARRAYSIZE(kSettingsFiles); i++) {
-            char name[MAX_PATH];
-            WCHAR target[LONG_PATH_CCH];
-            int found;
-            WideCharToMultiByte(CP_UTF8, 0, kSettingsFiles[i], -1, name + 9, sizeof name - 9, NULL, NULL);
-            memcpy(name, "settings/", 9);
-            if ((found = Zip_Find(zip, name)) < 0 || FAILED(StringCchPrintfW(target, ARRAYSIZE(target), L"%s\\%s", p->storageDir, kSettingsFiles[i])))
-                continue;
-            if (!Zip_Extract(zip, found, target)) {
-                code = GetLastError();
-                ok = FALSE;
+    /* The settings side (app config, theme and the layout) from one backup. */
+    if ((dialog.chosen & (BK_APPCONFIG | BK_LAYOUT)) && from[PICK_UNIT_SETTINGS] >= 0) {
+        const RestoreSource *source = &sources[from[PICK_UNIT_SETTINGS]];
+        const ZipIn *zip = source->zip;
+        if ((dialog.chosen & BK_APPCONFIG) && (source->offered & BK_APPCONFIG)) {
+            if (source->version >= 2) {
+                ok = RestoreMcp(zip, p->storageDir) && ok;
+            } else {
+                /* A backup from before: its whole config.json. */
+                int found = Zip_Find(zip, "settings/" "claude_desktop_config.json");
+                WCHAR target[LONG_PATH_CCH];
+                if (found >= 0 && SUCCEEDED(StringCchPrintfW(target, ARRAYSIZE(target), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir)) &&
+                    !Zip_Extract(zip, found, target)) {
+                    code = GetLastError();
+                    ok = FALSE;
+                }
+            }
+            for (i = 0; i < ARRAYSIZE(kSettingsFiles); i++) {
+                char name[MAX_PATH];
+                WCHAR target[LONG_PATH_CCH];
+                int found;
+                WideCharToMultiByte(CP_UTF8, 0, kSettingsFiles[i], -1, name + 9, sizeof name - 9, NULL, NULL);
+                memcpy(name, "settings/", 9);
+                if ((found = Zip_Find(zip, name)) < 0 || FAILED(StringCchPrintfW(target, ARRAYSIZE(target), L"%s\\%s", p->storageDir, kSettingsFiles[i])))
+                    continue;
+                if (!Zip_Extract(zip, found, target)) {
+                    code = GetLastError();
+                    ok = FALSE;
+                }
             }
         }
-        ok = RestoreAppearance(zip, p->storageDir) && ok;
+        if (dialog.chosen & SYNC_ITEM_APPEARANCE) ok = RestoreAppearance(zip, p->storageDir) && ok;
+        if ((dialog.chosen & BK_LAYOUT) && (source->offered & BK_LAYOUT)) {
+            int found = Zip_Find(zip, LAYOUT_NAME);
+            WCHAR dir[LONG_PATH_CCH];
+            BOOL signedIn = FALSE;
+            char *layout, *filtered;
+            size_t filteredLength = 0;
+            DWORD rawLength = 0;
+            if (found >= 0 && SessionStore_EntriesDir(p, dir, ARRAYSIZE(dir), &signedIn) &&
+                (layout = (char *)Zip_Read(zip, found, JSON_MAX, &rawLength)) != NULL) {
+                if ((filtered = SessionSync_FilterLayout(layout, rawLength, dialog.chosen & BK_LAYOUT, &filteredLength)) != NULL && filteredLength > 2 &&
+                    !SessionSync_RestoreLayout(p, dir, filtered, filteredLength, NULL))
+                    ok = FALSE;
+                Free(filtered);
+                Free(layout);
+            }
+        }
     }
-    if (dialog.chosen[PART_SIGNIN]) {
+    if ((dialog.chosen & BK_SIGNIN) && from[PICK_UNIT_ACCOUNT] >= 0) {
+        const RestoreSource *source = &sources[from[PICK_UNIT_ACCOUNT]];
         /* Whole folders: a database never mixes the files of two times. */
         for (i = 0; i < ARRAYSIZE(kSigninFolders); i++) ok = RemoveFolder(p->storageDir, kSigninFolders[i], &code) && ok;
-        ok = ExtractTree(zip, "signin", p->storageDir, &code) && ok;
+        ok = ExtractTree(source->zip, "signin", p->storageDir, &code) && ok;
+        SetCursor(old);
+        if (ok) keyNote = OpenSignInKey(owner, source->zip, p, title, (source->offered & BK_KEY) != 0);
     }
-    Zip_Free(zip);
     SetCursor(old);
-    Util_Log(L"restored %s from %s%s", p->folder, path, ok ? L"" : L" (partly)");
+    for (s = 0; s < count; s++) Util_Log(L"restored %s from %s%s", p->folder, sources[s].path, ok ? L"" : L" (partly)");
     report[0] = 0;
     if (ok) StringCchPrintfW(report, ARRAYSIZE(report), TR(L"Restored into \x201C%s\x201D."), p->name);
     else if (error[0]) StringCchCopyW(report, ARRAYSIZE(report), error);
     else StringCchPrintfW(report, ARRAYSIZE(report), TR(L"Some files could not be restored (error %lu)."), code);
-    if (dialog.chosen[PART_SESSIONS] && !signedOut) {
-        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Sessions in the archive: %d"), sessions);
+    if ((dialog.chosen & BK_CONVERSATIONS) && !signedOut) {
+        if (count == 1) StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Sessions in the archive: %d"), sessions);
+        else StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Sessions in the backups: %d"), sessions);
         StringCchCatW(report, ARRAYSIZE(report), L"\n");
         StringCchCatW(report, ARRAYSIZE(report), line);
     }
@@ -781,10 +1649,17 @@ BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *lis
         StringCchCatW(report, ARRAYSIZE(report), L"\n");
         StringCchCatW(report, ARRAYSIZE(report), line);
     }
+    if (keyNote) {
+        StringCchCatW(report, ARRAYSIZE(report), L"\n");
+        StringCchCatW(report, ARRAYSIZE(report), keyNote);
+    }
     StringCchCatW(report, ARRAYSIZE(report), L"\n");
     StringCchCatW(report, ARRAYSIZE(report), TR(L"What was replaced or removed is kept in:"));
     StringCchCatW(report, ARRAYSIZE(report), L"\n");
     StringCchCatW(report, ARRAYSIZE(report), backup);
     Ui_Message(owner, ok ? MB_ICONINFORMATION : MB_ICONWARNING, L"%s", report);
+done:
+    for (s = 0; s < RESTORE_SOURCES; s++) Zip_Free(sources[s].zip);
+    Free(sources);
     return ok;
 }

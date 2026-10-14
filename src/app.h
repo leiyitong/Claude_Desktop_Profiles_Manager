@@ -87,6 +87,7 @@ C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
 #define MAX_LABEL          48   /* characters in a display name */
 #define FOLDER_CCH         64
 #define LABEL_CCH          64
+#define WINDOW_TITLE_CCH   128   /* a profile's own title for its windows */
 #define URL_CCH            4096
 /* A path that can pass MAX_PATH, as Claude writes some. A file of a session:
  * Claude Code's or a profile's folder (shorter than MAX_PATH), then at most a
@@ -148,6 +149,7 @@ typedef struct Profile {
     WCHAR storageDir[MAX_PATH]; /* file access outside the package; empty when unresolved */
     int   color;               /* palette index */
     WCHAR badge[BADGE_CCH];    /* the badge's own text; empty: the name's initial */
+    WCHAR windowTitle[WINDOW_TITLE_CCH];   /* its windows' title; empty: Claude's own, then its name ("Claude (<name>)") */
     DWORD picture;             /* the stamp of its own picture, which replaces the Claude icon; 0: none */
     BOOL  isStock;             /* the folder the regular Claude icon opens */
     int   syncGroup;           /* its sessions are kept the same as those of the profiles of this group (sessionvault.c); 0: none */
@@ -189,7 +191,7 @@ typedef struct LinkInfo {
 
 /* PENDING_TITLE_AUTO: a title Claude gave, put back (undone): titleSource "auto", so that Claude may name the
  * session again; an empty one takes the entry's title away. */
-typedef enum PendingOp { PENDING_TITLE, PENDING_STAR, PENDING_REMOVE, PENDING_TITLE_AUTO } PendingOp;
+typedef enum PendingOp { PENDING_TITLE, PENDING_STAR, PENDING_REMOVE, PENDING_TITLE_AUTO, PENDING_UNREMOTE } PendingOp;
 
 typedef struct PendingEdit {   /* a change to a session entry, waiting for its profile to close */
     PendingOp op;
@@ -367,6 +369,15 @@ typedef struct CoreRtfStyle {          /* how Core_MarkdownRtf writes: what the 
     COLORREF     text, muted, link, codeBack;
 } CoreRtfStyle;
 size_t       Core_MarkdownRtf(const WCHAR *markdown, const CoreRtfStyle *style, char *out, size_t cch);
+size_t       Core_Base64Encode(const BYTE *data, size_t length, char *out, size_t cch);   /* characters written, 0: does not fit */
+size_t       Core_Base64Decode(const char *text, size_t length, BYTE *out, size_t cap);   /* bytes, (size_t)-1: no base64 */
+/* What Chromium's OSCrypt (Electron's safeStorage) sealed on Windows, opened
+ * with Local State's key (Backup_ReadAppKey): "v10", a 12-byte nonce, the
+ * AES-256-GCM text and its 16-byte tag, checked. The plain bytes in `out`
+ * (`cap` at least `length` - 31); FALSE for anything else. */
+BOOL         Core_OpenSafeStorage(const BYTE *sealed, size_t length, const BYTE *key, size_t keyLength, BYTE *out, size_t cap, size_t *outLength);
+BOOL         Core_SealSecret(const BYTE *secret, size_t length, const WCHAR *password, ULONG iterations, char *out, size_t cch);
+BOOL         Core_OpenSecret(const char *json, size_t length, const WCHAR *password, BYTE *secret, size_t cap, size_t *secretLength);
 BOOL         Core_JsonSetMember(const char *json, size_t len, const char *key, const char *raw, char *out, size_t cap, size_t *outLen);
 BOOL         Core_JsonQuote(const WCHAR *text, char *out, size_t cap);
 BOOL         Core_ProjectDirName(const WCHAR *cwd, WCHAR *out, size_t cch);
@@ -399,6 +410,13 @@ BOOL         Core_CopyDay(const WCHAR *name, const WCHAR *copy, SYSTEMTIME *day,
 BOOL         Core_WeeklyCopyDue(const SYSTEMTIME *latest, const SYSTEMTIME *today);
 BOOL         Core_ScratchFolderName(const WCHAR *cwd, WCHAR *out, size_t cch);
 char        *Core_JsonSetNested(const char *json, size_t len, const char *const *keys, int depth, const char *raw, size_t *outLen);
+/* `base` (an object) with its array `key` given the elements of `other`'s
+ * that it lacks, after its own: an element whose member `idKey` none of
+ * its elements has the same, or one without it that none of them equals.
+ * A missing array is an empty one. A heap block with a NUL after it
+ * (HeapFree it); NULL when an array is not one, or without memory. */
+char        *Core_JsonArrayUnion(const char *base, size_t baseLen, const char *other, size_t otherLen, const char *key, const char *idKey,
+                                 size_t *outLen);
 typedef size_t (*CoreStringMap)(void *context, const char *text, size_t length, char *out, size_t cap);
 char        *Core_JsonMapStrings(const char *json, size_t len, CoreStringMap map, void *context, size_t *outLen);
 /* Three-way merge of a part's value in `n` profiles (`values[m]` NULL: it
@@ -563,6 +581,7 @@ BOOL         Profiles_Update(const WCHAR *folder, const WCHAR *label, int color,
 BOOL         Profiles_SetDefault(const WCHAR *folder);
 BOOL         Profiles_SetSyncGroup(const WCHAR *folder, int group);   /* 0: its sessions kept apart */
 BOOL         Profiles_SetSyncItems(const WCHAR *folder, DWORD items);  /* SYNC_ITEM_*; 0: the default */
+BOOL         Profiles_SetWindowTitle(const WCHAR *folder, const WCHAR *title);   /* empty: the default title */
 DWORD        Profiles_SyncItems(const Profile *p);                    /* what it keeps the same, the default for none chosen */
 void         Profiles_CopySettings(const Profile *from, const Profile *to);
 RemoveResult Profiles_Delete(HWND owner, const Profile *profile);
@@ -613,6 +632,10 @@ BOOL        Zip_Extract(const ZipIn *zip, int index, const WCHAR *path);
  * sessions, settings, sign-in), and restored from one into a closed profile. */
 BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list, DWORD profiles);   /* one bit per profile: an archive each */
 BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index);
+void Backup_FillPartsList(HWND list, int sessions);   /* the parts a backup keeps, as its dialog shows them (tests) */
+/* Local State's os_crypt key in `storage`, opened with DPAPI for this Windows user; written protected again for it. */
+BOOL Backup_ReadAppKey(const WCHAR *storage, BYTE *key, size_t cap, size_t *length);
+BOOL Backup_WriteAppKey(const WCHAR *storage, const BYTE *key, size_t length);
 
 /* --------------------------------------------------------------- icons.c */
 
@@ -928,6 +951,14 @@ DWORD        SessionSync_Takers(const SessionSet *set);   /* the profiles whose 
  * it), NULL when it has none. `written`: when they were last written, in ms
  * since 1970. */
 char        *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *length, ULONGLONG *written);
+/* A layout (SessionSync_ReadLayout) with only the parts whose item is in
+ * `items` (SYNC_ITEM_*): the others removed. A heap block (HeapFree it),
+ * NULL without memory. */
+char        *SessionSync_FilterLayout(const char *layout, size_t length, DWORD items, size_t *outLength);
+/* A layout applied to a closed profile `p` (whose entries are in
+ * `entriesDir`), member by member as a sync would: TRUE when it was made or
+ * was already so. For a backup's restore, so the profile stays closed. */
+BOOL         SessionSync_RestoreLayout(const Profile *p, const WCHAR *entriesDir, const char *layout, size_t length, SyncReport *report);
 /* Part `index` of a layout: its name, what it belongs to (SYNC_ITEM_*), and
  * whether it is made the same member by member (each session's own); FALSE
  * past the last. */
@@ -1090,6 +1121,7 @@ BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
 BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items);
 /* What to sync, as a list whose groups fold (Theme_SetFoldingRows), `items` checked: each group, its items under it. */
 void SyncUi_FillItemsList(HWND list, DWORD items);
+
 /* What a profile syncs, and with which, chosen in a dialog (IDD_SYNC_SETUP). */
 typedef struct SyncSetup {
     int   profile;    /* the profile set up */
@@ -1136,6 +1168,10 @@ void SessionUndo_Title(const Profile *p, const WCHAR *key, const WCHAR *before, 
  * `content`: its entry, as it is or as it was (a heap block the undo keeps,
  * NULL when it could not be read). */
 void SessionUndo_Listed(const Profile *p, const WCHAR *key, BOOL listed, char *content, size_t length);
+/* An entry's content changed in place, both sides listed (a conversion to a
+ * local session): undo writes `before`, redo `after`; both heap blocks are
+ * taken over. */
+void SessionUndo_Replaced(const Profile *p, const WCHAR *key, char *before, size_t beforeLength, char *after, size_t afterLength);
 BOOL SessionUndo_CanUndo(void);
 BOOL SessionUndo_CanRedo(void);
 /* The latest action undone, or the latest one undone made again, through the
@@ -1341,6 +1377,44 @@ void     Theme_FocusRow(HWND list, int row);                /* the keyboard's ro
 #define THEME_FOLD_MENU_EXPAND   1
 #define THEME_FOLD_MENU_COLLAPSE 2
 UINT     Theme_FoldMenu(HWND owner, HWND list, HWND from, LPARAM pos);   /* WM_CONTEXTMENU: Expand all, Collapse all, or 0 */
+
+/* ------------------------------------------------------------ checklist.c */
+
+/* A list whose groups fold, with check boxes (what to sync, what a backup keeps): each group a heading with its
+ * image and its items below, a group without item rows a heading alone; a group's box checks all of it, mixed
+ * when only some is. The groups opened are kept in settings.ini (`openedSection`, NULL: not kept). */
+#define CHECKLIST_GROUPS_MAX 16
+typedef struct CheckGroup { DWORD mask; const WCHAR *heading; int image; const WCHAR *name; } CheckGroup;   /* name: as kept opened */
+typedef struct CheckItem { DWORD bit; const WCHAR *label; int image; } CheckItem;
+typedef const WCHAR *(*CheckLabelProc)(const CheckItem *item, void *context);   /* an item's text; NULL: TR(label) */
+typedef struct CheckList {
+    const CheckGroup *groups;
+    int               groupCount;
+    const CheckItem  *items;
+    int               itemCount;
+    const WCHAR      *openedSection;
+    DWORD             offered, checked;   /* the bits shown, those checked */
+    CheckLabelProc    label;
+    void             *context;
+    HWND              list;               /* CheckList_Setup's */
+    BOOL              open[CHECKLIST_GROUPS_MAX];
+    BOOL              filling;
+} CheckList;
+#define WM_CHECKLIST_BOX (WM_APP + 0x100)   /* a box clicked: wParam its row; the dialog calls CheckList_Toggle */
+void CheckList_Setup(CheckList *checks, HWND list, const WCHAR *glyphs, const ThemeTint *tints, int images);
+void CheckList_Toggle(CheckList *checks, int row);
+void CheckList_FoldAll(CheckList *checks, BOOL open);
+BOOL CheckList_Notify(CheckList *checks, HWND dialog, const NMHDR *header, LRESULT *result);   /* TRUE: the dialog answers `result` */
+/* WM_CHECKLIST_BOX (a box turned over) and WM_CONTEXTMENU (Expand/Collapse
+ * all on the list) handled alike for every checked-list dialog: TRUE when it
+ * was this list's, `*toggled` then TRUE for a box, so the dialog refreshes
+ * what the choice drives. WM_NOTIFY stays the caller's (CheckList_Notify). */
+BOOL CheckList_Message(CheckList *checks, HWND dialog, UINT message, WPARAM wp, LPARAM lp, BOOL *toggled);
+/* The what-to-sync groups ([0] Sessions, then the layout groups), their
+ * items, and the glyph set they draw with: a backup's list builds on them. */
+const CheckGroup *SyncUi_Groups(int *count);
+const CheckItem  *SyncUi_Items(int *count);
+const WCHAR      *SyncUi_Glyphs(const ThemeTint **tints, int *images);
 HWND     Theme_SmoothView(HWND control);   /* a list or tree scrolled by the pixel; returns the view, which has its place */
 void     Theme_Follow(HWND dialog, UINT msg, WPARAM wp, LPARAM lp);
 void     Theme_Apply(HWND dialog);   /* what it keeps on the dialog goes with the dialog */

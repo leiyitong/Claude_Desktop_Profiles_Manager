@@ -114,8 +114,14 @@ src/sessionvault.c            the session vault (every list of sessions kept, it
 src/sessionpurge.c            conversations no profile lists, cleaned up or restored; Claude Code's folder copied beside it,
                               by hand or once a week
 src/sessionlink.c             session folders linked by earlier versions: read, and taken away
+src/backup.c                  a profile backed up to one archive and restored from it, an item at a time (the same list as
+                              what to sync, its content added); several backups restored into one profile, their
+                              conflicts chosen; the sign-in's key behind a password
+src/zip.c                     ZIP archives written and read (stored or deflated), for backups
+src/checklist.c               a list whose groups fold, with check boxes: what to sync, what a backup keeps
 src/syncui.c                  the dialog choosing the profiles that take part, and the summary of what was done; the
-                              recover, clean-up, sync settings and sync conflicts dialogs
+                              recover, clean-up, sync settings and sync conflicts dialogs; what to sync's groups and
+                              items, which a backup's list builds on
 src/settings.c                the Settings dialog: the interface language and the session vault's days
 src/about.c                   the About dialog: this version, help, and the changelog the program embeds
 src/sessions.c                the sessions view of the manager window: profiles, tree, filter menu and search, menus, several sessions

@@ -5058,7 +5058,7 @@ static LRESULT CALLBACK ProbeOwnMenu(HWND host, UINT message, WPARAM wp, LPARAM 
  * Language): a window of its own below its button, as wide at least, on the
  * field's color in a frame, the item the keyboard reached lit; arrows pass
  * separators and grayed items, Return chooses, Escape and a press outside
- * close it with nothing, an access key chooses its item. */
+ * close it with nothing, an access key chooses its item, typed alone too. */
 static void TestOwnMenu(void)
 {
     HWND host = ThemedHost(), button;
@@ -5109,6 +5109,8 @@ static void TestOwnMenu(void)
     PostMessageW(button, WM_CHAR, L'g', 0);
     PostMessageW(button, WM_KEYDOWN, VK_ESCAPE, 0);
     Check("own menu: a grayed item's access key chooses nothing", Theme_TrackMenu(button, menu, &probe.box) == 0);
+    PostMessageW(button, WM_KEYDOWN, 'T', (LPARAM)((MapVirtualKeyW('T', MAPVK_VK_TO_VSC) << 16) | 1));
+    Check("own menu: a letter typed alone, no Alt, chooses its item", Theme_TrackMenu(button, menu, &probe.box) == 3);
     probe.clickOutside = TRUE;
     PostMessageW(host, WM_MENU_PROBE, 0, 0);
     Check("own menu: a press outside closes it with nothing", Theme_TrackMenu(button, menu, &probe.box) == 0 && probe.found);
