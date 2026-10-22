@@ -26,6 +26,8 @@
  * (Core_ConversationFileName), and sends the entries to the profiles chosen.
  */
 #include "app.h"
+#include "presets.h"
+#include "vaulttools.h"
 #include <objbase.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -388,6 +390,83 @@ int SessionSync_Queued(const Profile *p, SyncOp **ops)
     return count;
 }
 
+static BOOL MemberText(const char *json, size_t length, const char *key, WCHAR *out, size_t cch);
+
+WCHAR *SessionSync_PendingText(const ProfileList *profiles)
+{
+    enum { TEXT_CCH = 65536 };
+    WCHAR *text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, TEXT_CCH * sizeof(WCHAR));
+    PendingEdit *edits = (PendingEdit *)HeapAlloc(GetProcessHeap(), 0, SESSION_PENDING_MAX * sizeof *edits);
+    WCHAR line[SESSION_TITLE_CCH + LABEL_CCH + 512], dir[MAX_PATH], path[LONG_PATH_CCH];
+    int p, i, j;
+    BOOL full = FALSE;
+    if (!text || !edits) { Free(text); Free(edits); return NULL; }
+    for (p = 0; p < profiles->count && !full; p++) {
+        const Profile *profile = &profiles->items[p];
+        SyncOp *ops = NULL;
+        int count = SessionSync_Queued(profile, &ops), n = SessionStore_LoadPending(profile, edits, SESSION_PENDING_MAX);
+        StringCchPrintfW(line, ARRAYSIZE(line), L"\r\n%s\r\n%s\r\n", profile->name,
+                         Claude_IsRunning(profile) ? TR(L"Waiting for this profile to close") : TR(L"Applied on the next session update when the profile is available"));
+        if (FAILED(StringCchCatW(text, TEXT_CCH, line))) full = TRUE;
+        if (count < 0 || n < 0) StringCchCatW(text, TEXT_CCH, TR(L"A queue could not be read; its changes are unknown.\r\n"));
+        if (!count && !n) StringCchCatW(text, TEXT_CCH, TR(L"No pending changes.\r\n"));
+        for (i = 0; i < count && !full; i++) {
+            WCHAR value[SESSION_TITLE_CCH] = L"";
+            const WCHAR *action;
+            for (j = i + 1; j < count; j++) if (Core_SyncOpReplaces(&ops[i], &ops[j])) break;
+            if (j < count) continue;
+            switch (ops[i].kind) {
+            case SYNC_PUT: action = TR(L"Add or update session"); break;
+            case SYNC_REMOVE: action = TR(L"Remove session"); break;
+            case SYNC_MARK: action = TR(L"Mark session deleted"); break;
+            case SYNC_UNMARK: action = TR(L"Clear deletion mark"); break;
+            case SYNC_INDEX: action = TR(L"Replace archived index"); break;
+            default: action = TR(L"Apply sidebar and settings"); break;
+            }
+            if (ops[i].content[0]) {
+                DWORD length = 0;
+                char *content = NULL;
+                if (PlanDir(profile, dir, ARRAYSIZE(dir)) &&
+                    SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", dir, ops[i].content)))
+                    content = Util_ReadFile(path, SESSION_ENTRY_MAX_BYTES, FALSE, &length);
+                if (!content) StringCchCopyW(value, ARRAYSIZE(value), TR(L"Content unavailable"));
+                else if (ops[i].kind == SYNC_PUT) {
+                    WCHAR title[SESSION_TITLE_CCH];
+                    const char *star, *archived;
+                    size_t starLength = 0, archivedLength = 0;
+                    MemberText(content, length, "title", title, ARRAYSIZE(title));
+                    Core_JsonMember(content, length, "isStarred", &star, &starLength);
+                    Core_JsonMember(content, length, "isArchived", &archived, &archivedLength);
+                    StringCchPrintfW(value, ARRAYSIZE(value), TR(L"Title: %s; starred=%d; archived=%d"), title,
+                                     starLength == 4 && memcmp(star, "true", 4) == 0, archivedLength == 4 && memcmp(archived, "true", 4) == 0);
+                }
+                Free(content);
+            }
+            StringCchPrintfW(line, ARRAYSIZE(line), L"1. %s | %s | %s\r\n", ops[i].key, action, value);
+            if (wcslen(text) + wcslen(line) + 256 >= TEXT_CCH) full = TRUE;
+            else StringCchCatW(text, TEXT_CCH, line);
+        }
+        for (i = 0; i < n && !full; i++) {
+            const WCHAR *action;
+            for (j = i + 1; j < n; j++) if (Core_PendingReplaces(&edits[i], &edits[j])) break;
+            if (j < n) continue;
+            switch (edits[i].op) {
+            case PENDING_TITLE: case PENDING_TITLE_AUTO: action = TR(L"Set title"); break;
+            case PENDING_STAR: action = TR(L"Set star"); break;
+            case PENDING_UNREMOTE: action = TR(L"Convert to local session"); break;
+            default: action = TR(L"Remove session after other edits"); break;
+            }
+            StringCchPrintfW(line, ARRAYSIZE(line), L"2. %s | %s | %s\r\n", edits[i].key, action, edits[i].value);
+            if (wcslen(text) + wcslen(line) + 256 >= TEXT_CCH) full = TRUE;
+            else StringCchCatW(text, TEXT_CCH, line);
+        }
+        Free(ops);
+    }
+    if (full) StringCchCatW(text, TEXT_CCH, TR(L"\r\nThe display limit was reached; more changes may be queued."));
+    Free(edits);
+    return text;
+}
+
 /* A content file's number: "<n>.json". */
 static int ContentNumber(const WCHAR *name)
 {
@@ -415,6 +494,14 @@ void SessionSync_OnEachSent(SyncSentProc sent, void *context)
     g_onSent.context = context;
 }
 
+static BOOL PlanKeepsContent(const Plan *plan, const SyncOp *op)
+{
+    int i;
+    for (i = 0; i < plan->count; i++)
+        if (Core_EqualsI(plan->ops[i].content, op->content)) return TRUE;
+    return FALSE;
+}
+
 /* What `sent` holds added to the plan of `p`, each change replacing the
  * queued ones it supersedes (Core_SyncOpReplaces), its entry kept in a file
  * of the plan's folder. */
@@ -423,7 +510,9 @@ static BOOL StageSent(const Profile *p, Sent *sent)
     WCHAR dir[MAX_PATH], path[MAX_PATH];
     HANDLE lock = NULL;
     Plan plan;
-    int next = 1, i, j, kept;
+    SyncOp *before = NULL;
+    int next = 1, i, j, kept, beforeCount, made = 0;
+    DWORD error;
     BOOL ok = FALSE;
     if (!sent->count) return TRUE;
     if (!PlanDir(p, dir, ARRAYSIZE(dir)) || (lock = SessionEdit_Lock(p)) == NULL) return FALSE;
@@ -432,13 +521,21 @@ static BOOL StageSent(const Profile *p, Sent *sent)
         SessionEdit_Unlock(lock);
         return FALSE;
     }
+    beforeCount = plan.count;
+    if (beforeCount) {
+        before = (SyncOp *)HeapAlloc(GetProcessHeap(), 0, (size_t)beforeCount * sizeof *before);
+        if (!before) {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            goto done;
+        }
+        memcpy(before, plan.ops, (size_t)beforeCount * sizeof *before);
+    }
     for (i = 0; i < plan.count; i++) next = max(next, ContentNumber(plan.ops[i].content) + 1);
     if (!Util_EnsureDir(dir)) goto done;
     for (i = 0; i < sent->count; i++) {
         SyncOp *op = &sent->ops[i], *grown;
         for (j = kept = 0; j < plan.count; j++) {
-            if (Core_SyncOpReplaces(&plan.ops[j], op)) DeleteContent(dir, &plan.ops[j]);
-            else plan.ops[kept++] = plan.ops[j];
+            if (!Core_SyncOpReplaces(&plan.ops[j], op)) plan.ops[kept++] = plan.ops[j];
         }
         plan.count = kept;
         op->content[0] = 0;
@@ -450,17 +547,27 @@ static BOOL StageSent(const Profile *p, Sent *sent)
                 goto done;
             }
         }
+        made = i + 1;
         if ((grown = (SyncOp *)Grow(plan.ops, &plan.capacity, plan.count + 1, sizeof *plan.ops)) == NULL) goto done;
         plan.ops = grown;
         plan.ops[plan.count++] = *op;
     }
     ok = SavePlan(p, plan.ops, plan.count);
 done:
+    error = GetLastError();
+    /* The committed plan owns its files. Old content survives every failed
+     * replacement; new content is discarded only when no committed plan names it. */
+    for (i = 0; ok && i < beforeCount; i++)
+        if (!PlanKeepsContent(&plan, &before[i])) DeleteContent(dir, &before[i]);
+    for (i = 0; i < made; i++)
+        if (!ok || !PlanKeepsContent(&plan, &sent->ops[i])) DeleteContent(dir, &sent->ops[i]);
     SessionEdit_Unlock(lock);
+    Free(before);
     Free(plan.ops);
     for (i = 0; ok && g_onSent.sent && i < sent->count; i++)
         if (sent->ops[i].kind == SYNC_PUT || sent->ops[i].kind == SYNC_REMOVE)
             g_onSent.sent(g_onSent.context, p, &sent->ops[i], sent->contents[i], sent->lengths[i]);
+    if (!ok) SetLastError(error);
     return ok;
 }
 
@@ -627,6 +734,11 @@ static OpResult ApplyPut(const Profile *p, const SessionSet *entries, const WCHA
     OpResult result = OP_FAILED;
     BOOL marked[2] = { FALSE, FALSE }, replacing = FALSE;
     int found = SessionStore_FindEntry(entries, 0, op->key, NULL), i;
+
+    if (Core_SessionEntryKind(content, contentLength) != ENTRY_LOCAL) {
+        CannotWrite(report, op->key, ERROR_INVALID_DATA);
+        return OP_FAILED;
+    }
 
     if (found >= 0) {
         const SessionEntry *entry = &entries->entries[found];
@@ -972,7 +1084,7 @@ static const struct { const char *part; const WCHAR *label; } kPartLabels[] = {
     { "paneLayout", L"Side pane layout" }, { "paneSizes", L"Side pane sizes" }, { "transcriptMode", L"Transcript view" },
     { "transcriptModeDefault", L"Transcript view by default" }, { "filesTree", L"Files tree" }, { "diffTree", L"Diff tree" },
     { "appLocale", L"App language" }, { "controlsZoom", L"Controls' zoom" }, { "pageZoom", L"Page zoom" },
-    { "spelling", L"Spelling languages" },
+    { "spelling", L"Spelling languages" }, { "sessionPresets", L"Session presets" },
 };
 
 static const WCHAR *PartLabel(const char *part)
@@ -997,11 +1109,32 @@ BOOL SessionSync_LayoutPart(int index, LayoutPart *part)
     } else if ((index -= (int)ARRAYSIZE(kWebParts)) < (int)ARRAYSIZE(kFileParts)) {
         part->name = kFileParts[index].part;
         part->item = kFileParts[index].item;
+        part->ownOnly = kFileParts[index].own;
+    } else if (index == (int)ARRAYSIZE(kFileParts)) {
+        part->name = "sessionPresets";
+        part->item = SYNC_ITEM_DETAILS_MODEL;
     } else {
         return FALSE;
     }
     part->label = PartLabel(part->name);
     return TRUE;
+}
+
+/* What ApplyLayout would make of `value` where the member shows `shown`:
+ * nothing over a value of the profile's own it does not have yet (ApplyFiles),
+ * and the presets merged into its own (ApplyPresets), which can hold more
+ * than `value`. Sent again, either would change nothing. */
+BOOL SessionSync_PartHolds(const LayoutPart *part, const char *shown, size_t shownLength, const char *value, size_t valueLength)
+{
+    char *merged;
+    size_t mergedLength = 0;
+    BOOL holds;
+    if (part->ownOnly && !shown) return TRUE;
+    if (!shown || !value || strcmp(part->name, "sessionPresets") != 0) return FALSE;
+    if ((merged = Presets_MergeAccount(shown, shownLength, value, valueLength, &mergedLength)) == NULL) return FALSE;
+    holds = mergedLength == shownLength && memcmp(merged, shown, shownLength) == 0;
+    Free(merged);
+    return holds;
 }
 
 /* The account and organization an entries folder is for (its last two
@@ -1308,6 +1441,18 @@ char *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *
     }
     if (layout) layout = ReadWebParts(p, scope, entriesDir, layout, &used, written);
     if (layout) layout = ReadFileParts(p, layout, &used, written);
+    if (layout && SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" SESSION_PRESETS_FILE, p->storageDir))) {
+        char *presets = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &size);
+        if (presets) {
+            size_t presetsLength = 0;
+            char *own = Presets_Account(presets, size, account, &presetsLength);
+            if (own) {
+                layout = SetRaw(layout, &used, "sessionPresets", own, presetsLength);
+                if (written) *written = max(*written, WrittenAt(path));
+            }
+            Free(own); Free(presets);
+        }
+    }
     if (layout && used <= 2) {
         Free(layout);
         layout = NULL;
@@ -1667,13 +1812,36 @@ static OpResult ApplyFiles(const Profile *p, const char *content, size_t content
     return result;
 }
 
+/* Presets carry only the source account's object. The destination account is
+ * selected from its entries path, never copied from the source's id. */
+static OpResult ApplyPresets(const Profile *p, const char *account, const char *content, size_t contentLength, SyncReport *report)
+{
+    const char *incoming;
+    size_t incomingLength = 0, mergedLength = 0;
+    DWORD currentLength = 0;
+    char *current, *merged;
+    WCHAR path[LONG_PATH_CCH];
+    OpResult result;
+    if (!Core_JsonMember(content, contentLength, "sessionPresets", &incoming, &incomingLength)) return OP_SAME;
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" SESSION_PRESETS_FILE, p->storageDir))) return OP_FAILED;
+    current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength);
+    if (!current && Util_QueryPath(path, NULL) != PATH_MISSING) {
+        CannotWrite(report, path, GetLastError()); return OP_FAILED;
+    }
+    merged = Presets_Merge(current ? current : "{}", current ? currentLength : 2, account, incoming, incomingLength, &mergedLength);
+    if (!merged) { Free(current); CannotWrite(report, path, ERROR_INVALID_DATA); return OP_FAILED; }
+    result = WriteLayoutFile(p, path, current, currentLength, merged, mergedLength, L"Session presets", report);
+    Free(merged); Free(current);
+    return result;
+}
+
 /* The layout `content` (a layout of ours) put in `p`, for the account and
  * organization of its entries folder `dir`: in its settings, its web storage
  * and its two files. What else they hold stays as it is. */
 static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *content, size_t contentLength, SyncReport *report)
 {
     char account[SESSION_ID_CCH * 3], scope[SESSION_ID_CCH * 6 + 2];
-    OpResult results[3];
+    OpResult results[4];
     int i;
     BOOL made = FALSE;
     if (!p->storageDir[0] || !LayoutScopeOf(dir, account, sizeof account, scope, sizeof scope)) {
@@ -1686,7 +1854,9 @@ static OpResult ApplyLayout(const Profile *p, const WCHAR *dir, const char *cont
     if (results[1] == OP_STOPPED || results[1] == OP_FAILED) return results[1];
     results[2] = ApplyFiles(p, content, contentLength, report);
     if (results[2] == OP_STOPPED || results[2] == OP_FAILED) return results[2];
-    for (i = 0; i < 3; i++) made |= results[i] == OP_MADE;
+    results[3] = ApplyPresets(p, account, content, contentLength, report);
+    if (results[3] == OP_STOPPED || results[3] == OP_FAILED) return results[3];
+    for (i = 0; i < 4; i++) made |= results[i] == OP_MADE;
     return made ? OP_MADE : OP_SAME;
 }
 
@@ -1812,26 +1982,93 @@ int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
 }
 
 /* Each profile's part to its plan, made at once where it is closed. */
+static BOOL OutOfMemory(SyncReport *report);
+
+static SyncProfileResult *ProfileResult(SyncReport *report, const Profile *profile)
+{
+    SyncProfileResult *detail;
+    int d;
+    for (d = 0; d < report->profileCount; d++)
+        if (Core_EqualsI(report->profiles[d].folder, profile->folder)) return &report->profiles[d];
+    if (report->profileCount >= MAX_PROFILES) return NULL;
+    detail = &report->profiles[report->profileCount++];
+    ZeroMemory(detail, sizeof *detail);
+    StringCchCopyW(detail->folder, ARRAYSIZE(detail->folder), profile->folder);
+    return detail;
+}
+
+static void ResultTargets(const SessionSet *set, DWORD targets, DWORD takers, SyncReport *report)
+{
+    int p;
+    for (p = 0; p < set->profiles.count; p++)
+        if (targets & (1u << p)) {
+            SyncProfileResult *detail = ProfileResult(report, &set->profiles.items[p]);
+            if (detail) detail->unavailable = !(takers & (1u << p));
+        }
+}
+
+static void ResultSkipped(const SessionSet *set, int p, SyncReport *report)
+{
+    SyncProfileResult *detail = ProfileResult(report, &set->profiles.items[p]);
+    report->skipped++;
+    if (detail) detail->skipped++;
+}
+
+static void ResultPart(const Profile *profile, const SyncReport *part, SyncReport *report)
+{
+    SyncProfileResult *detail = ProfileResult(report, profile);
+    report->added += part->added;
+    report->updated += part->updated;
+    report->removed += part->removed;
+    report->skipped += part->skipped;
+    report->failed += part->failed;
+    if (!report->error[0]) StringCchCopyW(report->error, ARRAYSIZE(report->error), part->error);
+    if (part->backup[0]) StringCchCopyW(report->backup, ARRAYSIZE(report->backup), part->backup);
+    if (detail) {
+        detail->added += part->added;
+        detail->updated += part->updated;
+        detail->removed += part->removed;
+        detail->skipped += part->skipped;
+        detail->failed += part->failed;
+        detail->waiting = part->waiting != 0;
+        if (!detail->error[0]) StringCchCopyNW(detail->error, ARRAYSIZE(detail->error), part->error, ARRAYSIZE(detail->error) - 1);
+    }
+}
+
 static void Send(Outbox *box, const SessionSet *set, SyncReport *report)
 {
     HANDLE lock = Util_SyncLock();
+    SyncReport *part = NULL;
     int p;
     if (!lock) {
         report->failed++;
         return;
     }
+    part = (SyncReport *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *part);
+    if (!part) {
+        OutOfMemory(report);
+        Util_SyncUnlock(lock);
+        return;
+    }
     for (p = 0; p < set->profiles.count; p++) {
         const Profile *profile = &set->profiles.items[p];
         if (!box->sent[p].count) continue;
+        ZeroMemory(part, sizeof *part);
+        StringCchCopyW(part->backup, ARRAYSIZE(part->backup), report->backup);
         if (!StageSent(profile, &box->sent[p])) {
             WCHAR path[MAX_PATH];
             if (!SessionSync_PlanPath(profile, path, ARRAYSIZE(path))) StringCchCopyW(path, ARRAYSIZE(path), profile->folder);
-            CannotWrite(report, path, GetLastError());
-            continue;
+            CannotWrite(part, path, GetLastError());
+        } else {
+            SessionSync_ApplyPending(profile, part);
+            if (SessionSync_PendingCount(profile) > 0) {
+                report->waiting |= 1u << p;
+                part->waiting = 1;
+            }
         }
-        SessionSync_ApplyPending(profile, report);
-        if (SessionSync_PendingCount(profile) > 0) report->waiting |= 1u << p;
+        ResultPart(profile, part, report);
     }
+    Free(part);
     Util_SyncUnlock(lock);
 }
 
@@ -1924,6 +2161,7 @@ BOOL SessionSync_Merge(const SessionSet *set, DWORD profiles, SyncReport *report
     profiles = ValidProfiles(set, profiles);
     takers = profiles & SessionSync_Takers(set);
     report->unavailable |= profiles & ~takers;
+    ResultTargets(set, profiles, takers, report);
     for (r = 0; r < set->rowCount; r++) {
         const SessionRow *row = &set->rows[r];
         int best = SourceOf(set, row, -1, profiles);
@@ -1962,6 +2200,7 @@ BOOL SessionSync_Send(const SessionSet *set, const SyncSend *changes, int count,
     for (i = 0; i < count; i++) {
         const SyncSend *change = &changes[i];
         if (change->profile < 0 || change->profile >= set->profiles.count) continue;
+        ResultTargets(set, 1u << change->profile, takers, report);
         if (!(takers & (1u << change->profile))) {
             report->unavailable |= 1u << change->profile;
             continue;
@@ -1989,6 +2228,7 @@ BOOL SessionSync_Remove(const SessionSet *set, DWORD profiles, const int *rows, 
     int i, p;
     ZeroMemory(&box, sizeof box);
     profiles = ValidProfiles(set, profiles);
+    ResultTargets(set, profiles, SessionSync_Takers(set), report);
     for (i = 0; i < rowCount; i++) {
         const SessionRow *row;
         if (rows[i] < 0 || rows[i] >= set->rowCount) continue;
@@ -2018,6 +2258,7 @@ BOOL SessionSync_Share(const SessionSet *set, int from, const int *rows, int row
     targets = ValidProfiles(set, targets) & ~(from >= 0 ? 1u << from : 0);
     takers = targets & SessionSync_Takers(set);
     report->unavailable |= targets & ~takers;
+    ResultTargets(set, targets, takers, report);
     for (i = 0; i < rowCount; i++) {
         const SessionRow *row;
         const char *content = NULL;
@@ -2036,7 +2277,7 @@ BOOL SessionSync_Share(const SessionSet *set, int from, const int *rows, int row
             SyncOp op;
             if (!(takers & (1u << t)) || (there && !there->pendingRemove)) continue;   /* it has it already */
             if (there) {   /* its removal waits there: it goes when that profile closes */
-                report->skipped++;
+                ResultSkipped(set, t, report);
                 continue;
             }
             if (!content && (content = ReadEntry(&box, set->entries[row->entry[source]].file, &length, report)) == NULL) break;
@@ -2106,10 +2347,13 @@ CopyResult SessionSync_Copy(HWND owner, const SessionSet *set, int from, const i
     WCHAR copyId[SESSION_ID_CCH], error[LONG_PATH_CCH], left[LONG_PATH_CCH];
     DWORD takers, sent = 0;
     CopyResult result = COPY_MADE;
+    SyncReport *part = (SyncReport *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *part);
     int i, t, p;
+    if (!part) { OutOfMemory(report); return COPY_FAILED; }
     targets = ValidProfiles(set, targets) & ~(from >= 0 ? 1u << from : 0);
     takers = targets & SessionSync_Takers(set);
     report->unavailable |= targets & ~takers;
+    ResultTargets(set, targets, takers, report);
     for (i = 0; i < rowCount && result != COPY_CANCELLED; i++) {
         const SessionRow *row;
         DWORD length = 0;
@@ -2133,7 +2377,7 @@ CopyResult SessionSync_Copy(HWND owner, const SessionSet *set, int from, const i
             CopyResult copied;
             if (!(takers & (1u << t))) continue;
             if (set->groups[row->group].scratchOf >= 0 && !set->source[t].scratchDir[0]) {
-                report->skipped++;
+                ResultSkipped(set, t, report);
                 continue;
             }
             copied = SessionEdit_CopyConversation(owner, set, rows[i], t, copyId, ARRAYSIZE(copyId), error, ARRAYSIZE(error));
@@ -2142,16 +2386,22 @@ CopyResult SessionSync_Copy(HWND owner, const SessionSet *set, int from, const i
                 break;
             }
             if (copied == COPY_FAILED) {
+                SyncProfileResult *detail = ProfileResult(report, &set->profiles.items[t]);
                 report->failed++;
                 if (!report->error[0]) StringCchCopyW(report->error, ARRAYSIZE(report->error), error);
+                if (detail) {
+                    detail->failed++;
+                    if (!detail->error[0]) StringCchCopyNW(detail->error, ARRAYSIZE(detail->error), error, ARRAYSIZE(detail->error) - 1);
+                }
                 continue;
             }
+            ZeroMemory(part, sizeof *part);
             ZeroMemory(&one, sizeof one);
             MakeOp(&op, SYNC_PUT, SYNC_UNDELETE, copyId, MemberNumber(original, length, "lastActivityAt"), 0);
             entry = CopyEntry(original, length, copyId, &entryLength);
             /* Not sent, the copy is listed nowhere: what it made goes again. */
             if (!entry || !AddSent(&one, &op, entry, entryLength) || !StageSent(&set->profiles.items[t], &one)) {
-                CannotWrite(report, set->profiles.items[t].folder, entry ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY);
+                CannotWrite(part, set->profiles.items[t].folder, entry ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY);
                 if (!SessionEdit_RemoveCopy(set, rows[i], t, copyId, left, ARRAYSIZE(left)) && left[0])
                     Util_Log(L"session copy %s: %s left behind", copyId, left);
             } else {
@@ -2159,14 +2409,22 @@ CopyResult SessionSync_Copy(HWND owner, const SessionSet *set, int from, const i
             }
             FreeSent(&one);
             Free(entry);
+            ResultPart(&set->profiles.items[t], part, report);
         }
         Free(original);
     }
     for (p = 0; p < set->profiles.count; p++) {
         if (!(sent & (1u << p))) continue;
-        SessionSync_ApplyPending(&set->profiles.items[p], report);
-        if (SessionSync_PendingCount(&set->profiles.items[p]) > 0) report->waiting |= 1u << p;
+        ZeroMemory(part, sizeof *part);
+        StringCchCopyW(part->backup, ARRAYSIZE(part->backup), report->backup);
+        SessionSync_ApplyPending(&set->profiles.items[p], part);
+        if (SessionSync_PendingCount(&set->profiles.items[p]) > 0) {
+            report->waiting |= 1u << p;
+            part->waiting = 1;
+        }
+        ResultPart(&set->profiles.items[p], part, report);
     }
+    Free(part);
     return result;
 }
 
@@ -2629,7 +2887,7 @@ static BOOL ZipExtract(const ZipReader *zip, const ZipItem *item, const WCHAR *p
     if ((buffer = (char *)HeapAlloc(GetProcessHeap(), 0, COPY_CHUNK)) == NULL) {
         CloseHandle(out);
         DeleteFileW(temporary);
-        return FALSE;
+        return OutOfMemory(report);
     }
     ok = TRUE;
     while (ok && left > 0) {
@@ -2684,6 +2942,108 @@ BOOL SessionSync_IsArchive(const WCHAR *archive)
     return ours;
 }
 
+WCHAR *SessionSync_ImportPreview(const SessionSet *set, const WCHAR *archive, DWORD targets, WCHAR *error, size_t errorCch)
+{
+    enum { PREVIEW_CCH = 65536 };
+    ZipReader zip;
+    WCHAR *text = NULL, line[SESSION_TITLE_CCH + LABEL_CCH + 256];
+    int i, p, counts[6] = { 0 }, shown = 0;
+    BOOL ok = TRUE, truncated = FALSE;
+    targets = ValidProfiles(set, targets);
+    error[0] = 0;
+    ZeroMemory(&zip, sizeof zip);
+    for (p = 0; p < set->profiles.count; p++)
+        if ((targets & (1u << p)) && !set->source[p].complete) {
+            StringCchCopyW(error, errorCch, TR(L"Sessions could not be loaded."));
+            return NULL;
+        }
+    if (!ZipOpen(&zip, archive) || !IsSessionArchive(&zip)) {
+        StringCchCopyW(error, errorCch, TR(L"The archive is damaged or its format is not supported."));
+        ZipClose(&zip);
+        return NULL;
+    }
+    text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, PREVIEW_CCH * sizeof(WCHAR));
+    if (!text) { ZipClose(&zip); return NULL; }
+    for (i = 0; i < zip.count && ok; i++) {
+        const ZipItem *item = &zip.items[i];
+        WCHAR key[SESSION_ID_CCH], own[SESSION_ID_CCH], title[SESSION_TITLE_CCH];
+        char *entry;
+        size_t c;
+        if (!ItemNamed(item, ARCHIVE_ENTRIES) || item->name[item->nameLength - 1] == '/') continue;
+        entry = ZipReadItem(&zip, item, SESSION_ENTRY_MAX_BYTES);
+        if (!entry || Core_SessionEntryKind(entry, item->size) != ENTRY_LOCAL ||
+            !MemberText(entry, item->size, "sessionId", own, ARRAYSIZE(own)) || !IsEntryId(own)) {
+            Free(entry);
+            ok = FALSE;
+            break;
+        }
+        if (!MemberText(entry, item->size, "cliSessionId", key, ARRAYSIZE(key)) || !key[0]) StringCchCopyW(key, ARRAYSIZE(key), own);
+        if (!Core_IsUuid(key) && !IsEntryId(key)) { Free(entry); ok = FALSE; break; }
+        if (!MemberText(entry, item->size, "title", title, ARRAYSIZE(title)) || !title[0]) StringCchCopyW(title, ARRAYSIZE(title), key);
+        for (c = 0; title[c]; c++)
+            if (title[c] < L' ') title[c] = L' ';
+        for (p = 0; p < set->profiles.count && ok; p++) {
+            const WCHAR *status;
+            int at, kind = 0;
+            if (!(targets & (1u << p))) continue;
+            at = SessionStore_FindEntry(set, p, key, NULL);
+            if (!set->source[p].entriesDir[0]) kind = 4;
+            else if (at >= 0) {
+                const SessionEntry *current = &set->entries[at];
+                DWORD size = 0;
+                size_t mappedSize = 0;
+                char *bytes = Util_ReadFile(current->file, SESSION_ENTRY_MAX_BYTES, FALSE, &size);
+                char *mapped = WithString(entry, item->size, "sessionId", current->localId, &mappedSize);
+                if (!bytes || !mapped) ok = FALSE;
+                else if (size == mappedSize && memcmp(bytes, mapped, size) == 0) kind = 1;
+                else kind = current->pendingRemove || current->lastActivity >= MemberNumber(entry, item->size, "lastActivityAt") ? 3 : 2;
+                Free(bytes);
+                Free(mapped);
+                if (!ok) break;
+            } else {
+                WCHAR path[LONG_PATH_CCH];
+                PathState state;
+                if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s.json", set->source[p].entriesDir, own))) {
+                    ok = FALSE;
+                    break;
+                }
+                state = Util_QueryPath(path, NULL);
+                if (state == PATH_UNREACHABLE) { ok = FALSE; break; }
+                if (state == PATH_PRESENT) kind = 5;
+            }
+            counts[kind]++;
+            switch (kind) {
+            case 0: status = TR(L"New session"); break;
+            case 1: status = TR(L"Duplicate; keep existing"); break;
+            case 2: status = TR(L"Update; archive is newer"); break;
+            case 3: status = TR(L"Conflict; keep newer or deleted target"); break;
+            case 5: status = TR(L"Conflict; keep existing entry with the same file name"); break;
+            default: status = TR(L"Unavailable; not signed in"); break;
+            }
+            StringCchPrintfW(line, ARRAYSIZE(line), L"%s | %s | %s\r\n", set->profiles.items[p].name, title, status);
+            if (!truncated && wcslen(text) + wcslen(line) + 512 < PREVIEW_CCH) {
+                StringCchCatW(text, PREVIEW_CCH, line);
+                shown++;
+            } else truncated = TRUE;
+        }
+        Free(entry);
+    }
+    ZipClose(&zip);
+    if (!ok) {
+        StringCchCopyW(error, errorCch, TR(L"The archive or a target entry could not be read. Nothing was imported."));
+        Free(text);
+        return NULL;
+    }
+    StringCchPrintfW(line, ARRAYSIZE(line), TR(L"\r\nNew: %d; duplicates: %d; updates: %d; conflicts kept: %d; unavailable: %d."),
+                     counts[0], counts[1], counts[2], counts[3] + counts[5], counts[4]);
+    StringCchCatW(text, PREVIEW_CCH, line);
+    if (truncated) {
+        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"\r\nOnly the first %d rows are shown; the totals include every row."), shown);
+        StringCchCatW(text, PREVIEW_CCH, line);
+    }
+    return text;
+}
+
 BOOL SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targets, int *sessions, SyncReport *report)
 {
     WCHAR root[LONG_PATH_CCH], path[LONG_PATH_CCH], relative[LONG_PATH_CCH];
@@ -2696,6 +3056,7 @@ BOOL SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targe
     targets = ValidProfiles(set, targets);
     takers = targets & SessionSync_Takers(set);
     report->unavailable |= targets & ~takers;
+    ResultTargets(set, targets, takers, report);
     if (!ClaudeCodeRoot(root, ARRAYSIZE(root))) {
         StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"The path is too long."));
         return FALSE;
@@ -2707,6 +3068,12 @@ BOOL SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targe
                                                 GetLastError());
         ZipClose(&zip);
         return FALSE;
+    }
+    {
+        int checked = 0;
+        if (!Zip_Validate(archive, NULL, &checked, report->error, ARRAYSIZE(report->error))) {
+            ZipClose(&zip); return FALSE;
+        }
     }
     /* The conversations first: an entry is sent only once they are there. */
     for (i = 0; i < zip.count; i++) {
@@ -2739,6 +3106,13 @@ BOOL SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targe
         }
         if (ZipExtract(&zip, item, path, report)) files++;
     }
+    /* A failed extraction must not leave entries pointing at conversations
+     * which never arrived. Successfully extracted files can be reused on retry. */
+    if (report->failed) {
+        ZipClose(&zip);
+        FreeOutbox(&box);
+        return FALSE;
+    }
     for (i = 0; i < zip.count; i++) {
         const ZipItem *item = &zip.items[i];
         WCHAR key[SESSION_ID_CCH], ownId[SESSION_ID_CCH];
@@ -2763,7 +3137,7 @@ BOOL SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targe
             SyncOp op;
             if (!(takers & (1u << t))) continue;
             if (there >= 0 && set->entries[there].pendingRemove) {
-                report->skipped++;
+                ResultSkipped(set, t, report);
                 continue;
             }
             MakeOp(&op, SYNC_PUT, SYNC_UNDELETE, key, MemberNumber(entry, length, "lastActivityAt"),

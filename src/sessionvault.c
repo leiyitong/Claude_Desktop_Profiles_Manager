@@ -37,6 +37,7 @@
  */
 #include "app.h"
 #include "resource.h"
+#include "vaulttools.h"
 #include <objbase.h>
 #include <stdlib.h>
 #include <string.h>
@@ -600,7 +601,8 @@ static int __cdecl CompareNamesDescending(const void *a, const void *b)
 }
 
 /* The version names of a list, newest first (a heap array of names without
- * their extension; NULL with none). */
+ * their extension; NULL with none). A failed read gives count -1, never a
+ * partial list that could make referenced objects look unused. */
 static WCHAR (*VersionNames(const WCHAR *listName, int *count))[MAX_PATH]
 {
     WCHAR dir[MAX_PATH], (*names)[MAX_PATH] = NULL;
@@ -608,18 +610,33 @@ static WCHAR (*VersionNames(const WCHAR *listName, int *count))[MAX_PATH]
     HANDLE find;
     int capacity = 0;
     *count = 0;
-    if (!ListDir(listName, dir, ARRAYSIZE(dir)) || (find = Util_FindFiles(dir, L"*" VERSION_EXTENSION, &found, FALSE)) == INVALID_HANDLE_VALUE)
+    if (!ListDir(listName, dir, ARRAYSIZE(dir))) {
+        *count = -1;
         return NULL;
+    }
+    if ((find = Util_FindFiles(dir, L"*" VERSION_EXTENSION, &found, FALSE)) == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) *count = -1;
+        return NULL;
+    }
     do {
         WCHAR (*grown)[MAX_PATH];
         size_t length = wcslen(found.cFileName);
         if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !Core_EndsWithI(found.cFileName, VERSION_EXTENSION)) continue;
-        if ((grown = (WCHAR (*)[MAX_PATH])Grow(names, &capacity, *count + 1, sizeof *names)) == NULL) break;
+        if ((grown = (WCHAR (*)[MAX_PATH])Grow(names, &capacity, *count + 1, sizeof *names)) == NULL) {
+            *count = -1;
+            break;
+        }
         names = grown;
         StringCchCopyNW(names[*count], MAX_PATH, found.cFileName, length - (ARRAYSIZE(VERSION_EXTENSION) - 1));
         (*count)++;
     } while (FindNextFileW(find, &found));
+    if (GetLastError() != ERROR_NO_MORE_FILES) *count = -1;
     FindClose(find);
+    if (*count < 0) {
+        Free(names);
+        return NULL;
+    }
     if (*count > 1) qsort(names, (size_t)*count, sizeof *names, CompareNamesDescending);
     return names;
 }
@@ -764,12 +781,14 @@ typedef struct Hashes {
     int        count, capacity;
 } Hashes;
 
-static void AddHash(Hashes *hashes, ULONGLONG hash)
+static BOOL AddHash(Hashes *hashes, ULONGLONG hash)
 {
     ULONGLONG *grown;
-    if (!hash || (grown = (ULONGLONG *)Grow(hashes->items, &hashes->capacity, hashes->count + 1, sizeof *grown)) == NULL) return;
+    if (!hash) return TRUE;
+    if ((grown = (ULONGLONG *)Grow(hashes->items, &hashes->capacity, hashes->count + 1, sizeof *grown)) == NULL) return FALSE;
     hashes->items = grown;
     hashes->items[hashes->count++] = hash;
+    return TRUE;
 }
 
 static int __cdecl CompareHashes(const void *a, const void *b)
@@ -792,19 +811,20 @@ static BOOL NamedObjects(Hashes *named)
     do {
         if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == L'.') continue;
         names = VersionNames(found.cFileName, &count);
+        if (count < 0) { ok = FALSE; break; }
         for (i = 0; i < count && ok; i++) {
             VaultList version;
             if (!LoadVersion(found.cFileName, names[i], &version)) {
                 ok = FALSE;
                 break;
             }
-            for (j = 0; j < version.count; j++) AddHash(named, version.items[j].hash);
-            AddHash(named, version.index);
-            AddHash(named, version.layout);
+            for (j = 0; j < version.count && ok; j++) ok = AddHash(named, version.items[j].hash);
+            ok = ok && AddHash(named, version.index) && AddHash(named, version.layout);
             FreeList(&version);
         }
         Free(names);
     } while (ok && FindNextFileW(find, &found));
+    if (ok && GetLastError() != ERROR_NO_MORE_FILES) ok = FALSE;
     FindClose(find);
     if (named->count > 1) qsort(named->items, (size_t)named->count, sizeof *named->items, CompareHashes);
     return ok;
@@ -1055,6 +1075,12 @@ static void AddToLedger(void *context, const WCHAR *id)
 static char *ReadEntry(const WCHAR *file, DWORD *length, ULONGLONG *written)
 {
     char *content = Util_ReadFile(file, SESSION_ENTRY_MAX_BYTES, FALSE, length);
+    /* The entry may have changed since the snapshot was read. */
+    if (content && Core_SessionEntryKind(content, *length) != ENTRY_LOCAL) {
+        Free(content);
+        content = NULL;
+        *length = 0;
+    }
     if (content && !FileTimes(file, written, NULL)) *written = 0;
     return content;
 }
@@ -1089,6 +1115,18 @@ static void CopyNewer(const WCHAR *from, const WCHAR *to, int depth)
     FindClose(find);
 }
 
+/* `cwd`, the scratch folder `name`, is in the "no folder" area of `source`:
+ * as Claude names it now, or below its former folder, as entries made before
+ * Claude moved it name it (where its files are now). */
+static BOOL InOwnArea(const SessionSource *source, const WCHAR *cwd, const WCHAR *name)
+{
+    WCHAR own[MAX_PATH];
+    return (source->scratchDir[0] && SUCCEEDED(StringCchPrintfW(own, ARRAYSIZE(own), L"%s\\%s", source->scratchDir, name)) &&
+            Core_PathEquals(cwd, own)) ||
+           (source->formerScratchDir[0] && SUCCEEDED(StringCchPrintfW(own, ARRAYSIZE(own), L"%s\\%s", source->formerScratchDir, name)) &&
+            Core_PathEquals(cwd, own));
+}
+
 char *SessionVault_ForProfile(const SessionSet *set, int target, const char *content, size_t length, size_t *outLength)
 {
     static const char *const kFolders[] = { "cwd", "originCwd" };
@@ -1099,7 +1137,8 @@ char *SessionVault_ForProfile(const SessionSet *set, int target, const char *con
     if (target < 0 || target >= set->profiles.count || !set->source[target].scratchDir[0]) return NULL;
     for (i = 0; i < ARRAYSIZE(kFolders); i++) {
         if (!MemberString(content, length, kFolders[i], cwd, ARRAYSIZE(cwd)) || !Core_ScratchFolderName(cwd, name, ARRAYSIZE(name)) ||
-            FAILED(StringCchPrintfW(mapped, ARRAYSIZE(mapped), L"%s\\%s", set->source[target].scratchDir, name)) || Core_PathEquals(cwd, mapped))
+            FAILED(StringCchPrintfW(mapped, ARRAYSIZE(mapped), L"%s\\%s", set->source[target].scratchDir, name)) ||
+            InOwnArea(&set->source[target], cwd, name))
             continue;
         if (!out && (out = CopyOf(content, length)) == NULL) return NULL;
         if ((out = SetString(out, &used, kFolders[i], mapped)) == NULL) return NULL;
@@ -1117,10 +1156,9 @@ char *SessionVault_ForProfile(const SessionSet *set, int target, const char *con
 /* Member `m`'s entry `content` works in a "no folder" area that is not its own. */
 static BOOL InOthersArea(const SessionSet *set, int m, const char *content, size_t length)
 {
-    WCHAR cwd[MAX_PATH], name[MAX_PATH], own[MAX_PATH];
+    WCHAR cwd[MAX_PATH], name[MAX_PATH];
     return content && set->source[m].scratchDir[0] && MemberString(content, length, "cwd", cwd, ARRAYSIZE(cwd)) &&
-           Core_ScratchFolderName(cwd, name, ARRAYSIZE(name)) &&
-           SUCCEEDED(StringCchPrintfW(own, ARRAYSIZE(own), L"%s\\%s", set->source[m].scratchDir, name)) && !Core_PathEquals(cwd, own);
+           Core_ScratchFolderName(cwd, name, ARRAYSIZE(name)) && !InOwnArea(&set->source[m], cwd, name);
 }
 
 /* `content` as member `m` gets it (SessionVault_ForProfile), owned by
@@ -1536,8 +1574,9 @@ static BOOL ResolveIndex(const SessionSet *set, const Member *members, const Vau
             continue;
         }
         if (!members[m].taker || FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" ARCHIVED_INDEX, set->source[m].entriesDir)) ||
-            (contents[m] = ReadEntry(path, &lengths[m], &sides[m].time)) == NULL)
+            (contents[m] = Util_ReadFile(path, SESSION_ENTRY_MAX_BYTES, FALSE, &lengths[m])) == NULL)
             continue;
+        if (!FileTimes(path, &sides[m].time, NULL)) sides[m].time = 0;
         sides[m].state = MIRROR_LISTED;
         sides[m].hash = Core_HashBytes(CORE_HASH_START, contents[m], lengths[m]);
         if (!sides[m].hash) sides[m].hash = 1;
@@ -2332,13 +2371,17 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
         BOOL holds = !waits[m];   /* a layout waiting for it is replaced by this one: the parts left to the person leave it */
         if (!members[m].taker) continue;
         for (p = 0; holds && p < LAYOUT_PARTS_MAX && SessionSync_LayoutPart(p, &part); p++) {
-            const char *shown;
-            size_t shownLength;
+            const char *shown = NULL, *value = NULL;
+            size_t shownLength = 0, valueLength = 0;
             ULONGLONG has;
             if (!hashes[p]) continue;
             has = PartOf(contents[m], lengths[m], part.name, &shown, &shownLength);
             if (has && part.byKey) has = KeyedHash(shown, shownLength);
-            if (has != hashes[p]) holds = FALSE;
+            if (has == hashes[p]) continue;
+            /* Sent again, it would leave there what is there: a change sent at every sync, made by none. */
+            if (!PartOf(layout, used, part.name, &value, &valueLength) ||
+                !SessionSync_PartHolds(&part, has ? shown : NULL, has ? shownLength : 0, value, valueLength))
+                holds = FALSE;
         }
         if (holds) continue;
         ids.set = set;
@@ -2761,12 +2804,156 @@ int SessionVault_Versions(const WCHAR *listName, VaultVersion *out, int capacity
     return count;
 }
 
-BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version, SyncReport *report)
+WCHAR *SessionVault_RestorePreview(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version)
+{
+    enum { PREVIEW_CCH = 65536 };
+    VaultList kept;
+    SessionSet set;
+    ProfileList single;
+    DatedSet ledger;
+    WCHAR *text, line[SESSION_TITLE_CCH + 256];
+    int i, counts[5] = { 0 };
+    BOOL truncated = FALSE;
+    if (index < 0 || index >= list->count || !LoadVersion(listName, version, &kept)) return NULL;
+    Subset(list, 1u << index, &single);
+    if (!SessionStore_LoadProfiles(&set, &single)) { FreeList(&kept); return NULL; }
+    if (!set.source[0].complete || !set.source[0].entriesDir[0]) {
+        SessionStore_Free(&set); FreeList(&kept); return NULL;
+    }
+    text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, PREVIEW_CCH * sizeof(WCHAR));
+    if (!text) { SessionStore_Free(&set); FreeList(&kept); return NULL; }
+    LoadLedger(&ledger);
+    for (i = 0; i < kept.count; i++) {
+        int entry = SessionStore_FindEntry(&set, 0, kept.items[i].key, NULL), kind = 0;
+        DWORD length = 0;
+        ULONGLONG written;
+        char *content = LoadObject(kept.items[i].hash, &length), *current = NULL;
+        const char *title;
+        size_t titleLength;
+        WCHAR name[SESSION_TITLE_CCH];
+        const WCHAR *status;
+        StringCchCopyW(name, ARRAYSIZE(name), kept.items[i].key);
+        if (content && Core_JsonMember(content, length, "title", &title, &titleLength)) Core_JsonString(title, titleLength, name, ARRAYSIZE(name));
+        if (FindDated(&ledger, kept.items[i].key) >= 0) kind = 3;
+        else if (!content) kind = 4;
+        else if (entry >= 0) {
+            DWORD currentLength = 0;
+            current = ReadEntry(set.entries[entry].file, &currentLength, &written);
+            kind = !current ? 4 : EntryHash(current, currentLength) == kept.items[i].hash ? 2 : 1;
+        }
+        switch (kind) {
+        case 0: status = TR(L"New session"); break;
+        case 1: status = TR(L"Replace session entry"); break;
+        case 2: status = TR(L"Unchanged"); break;
+        case 3: status = TR(L"Skip; session was deleted"); break;
+        default: status = TR(L"Content unavailable"); break;
+        }
+        counts[kind]++;
+        StringCchPrintfW(line, ARRAYSIZE(line), L"%s | %s\r\n", name, status);
+        if (wcslen(text) + wcslen(line) + 2048 < PREVIEW_CCH) StringCchCatW(text, PREVIEW_CCH, line);
+        else truncated = TRUE;
+        Free(content); Free(current);
+    }
+    StringCchPrintfW(line, ARRAYSIZE(line), TR(L"\r\nNew: %d; replaced: %d; unchanged: %d; deleted and skipped: %d; unreadable: %d.\r\n"),
+                     counts[0], counts[1], counts[2], counts[3], counts[4]);
+    StringCchCatW(text, PREVIEW_CCH, line);
+    if (kept.index) StringCchCatW(text, PREVIEW_CCH, TR(L"The archived index from this version is included.\r\n"));
+    if (kept.layout) StringCchCatW(text, PREVIEW_CCH, TR(L"Sidebar and settings from this version are included.\r\n"));
+    StringCchCatW(text, PREVIEW_CCH, TR(L"Deletion marks stay in effect. Existing sessions absent from the version are not removed. Transcript files are not recovered by this operation.\r\n"));
+    if (list->items[index].syncGroup) StringCchCatW(text, PREVIEW_CCH, TR(L"This profile belongs to a sync group; other members may follow the recovery.\r\n"));
+    if (truncated) StringCchCatW(text, PREVIEW_CCH, TR(L"The display limit was reached; totals include every session.\r\n"));
+    Free(ledger.items); FreeList(&kept); SessionStore_Free(&set);
+    return text;
+}
+
+static char *CopyBytes(const char *content, size_t length)
+{
+    char *copy = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1);
+    if (copy) { memcpy(copy, content, length); copy[length] = 0; }
+    return copy;
+}
+
+static BOOL RestoreKeyChosen(const WCHAR *key, const WCHAR *const *keys, int count)
+{
+    int i;
+    if (!keys) return TRUE;
+    for (i = 0; i < count; i++) if (Core_EqualsI(key, keys[i])) return TRUE;
+    return FALSE;
+}
+
+/* A closed profile may already hold Claude's deletion marker before the
+ * watcher has folded it into the vault ledger. Selection recovery never
+ * removes that marker, including an entry's own id in another profile. */
+static BOOL RestoreSelectionDeleted(const DatedSet *ledger, const DatedSet *marks, const SessionSet *set, const WCHAR *key,
+                                    const char *content, size_t length)
+{
+    int entry = SessionStore_FindEntry(set, 0, key, NULL);
+    const char *value; size_t valueLength;
+    WCHAR own[SESSION_ID_CCH];
+    if (MarkTime(ledger, key) || MarkTime(marks, key)) return TRUE;
+    for (; entry >= 0; entry = set->entries[entry].duplicate)
+        if (MarkTime(ledger, set->entries[entry].localId) || MarkTime(marks, set->entries[entry].localId)) return TRUE;
+    return content && Core_JsonMember(content, length, "sessionId", &value, &valueLength) &&
+           Core_JsonString(value, valueLength, own, ARRAYSIZE(own)) && (MarkTime(ledger, own) || MarkTime(marks, own));
+}
+
+int SessionVault_RestoreItems(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version, VaultRestoreItem **items)
+{
+    VaultList kept;
+    ProfileList single;
+    SessionSet set;
+    DatedSet ledger, marks;
+    int i, count;
+    *items = NULL;
+    if (index < 0 || index >= list->count || !LoadVersion(listName, version, &kept)) return -1;
+    Subset(list, 1u << index, &single);
+    if (!SessionStore_LoadProfiles(&set, &single)) { FreeList(&kept); return -1; }
+    if (!set.source[0].complete || !set.source[0].entriesDir[0]) { SessionStore_Free(&set); FreeList(&kept); return -1; }
+    *items = (VaultRestoreItem *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)max(kept.count, 1) * sizeof **items);
+    if (!*items) { SessionStore_Free(&set); FreeList(&kept); return -1; }
+    LoadLedger(&ledger);
+    ZeroMemory(&marks, sizeof marks);
+    ReadMarks(set.source[0].entriesDir, &marks);
+    for (i = 0; i < kept.count; i++) {
+        VaultRestoreItem *item = &(*items)[i];
+        int entry = SessionStore_FindEntry(&set, 0, kept.items[i].key, NULL);
+        DWORD length = 0, currentLength = 0;
+        ULONGLONG written;
+        char *content = LoadObject(kept.items[i].hash, &length), *current = NULL;
+        const char *title; size_t titleLength;
+        StringCchCopyW(item->key, ARRAYSIZE(item->key), kept.items[i].key);
+        StringCchCopyW(item->title, ARRAYSIZE(item->title), item->key);
+        if (content && Core_JsonMember(content, length, "title", &title, &titleLength)) Core_JsonString(title, titleLength, item->title, ARRAYSIZE(item->title));
+        if (RestoreSelectionDeleted(&ledger, &marks, &set, item->key, content, length)) item->status = 3;
+        else if (!content) item->status = 4;
+        else if (entry >= 0) {
+            current = ReadEntry(set.entries[entry].file, &currentLength, &written);
+            item->status = !current ? 4 : EntryHash(current, currentLength) == kept.items[i].hash ? 2 : 1;
+        }
+        Free(content); Free(current);
+    }
+    count = kept.count;
+    Free(marks.items); Free(ledger.items); FreeList(&kept); SessionStore_Free(&set);
+    return count;
+}
+
+typedef struct ArchiveContains { const WCHAR *id; BOOL found; } ArchiveContains;
+static BOOL ContainsArchived(void *context, const char *value, size_t length)
+{
+    ArchiveContains *contains = (ArchiveContains *)context;
+    WCHAR id[SESSION_ID_CCH];
+    if (!Core_JsonString(value, length, id, ARRAYSIZE(id))) return FALSE;
+    if (Core_EqualsI(id, contains->id)) contains->found = TRUE;
+    return TRUE;
+}
+
+static BOOL RestoreVersion(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version,
+                           const WCHAR *const *keys, int keyCount, SyncReport *report)
 {
     ProfileList single;
     SessionSet set;
     VaultList kept;
-    DatedSet ledger;
+    DatedSet ledger, marks;
     Changes changes;
     WCHAR path[LONG_PATH_CCH];
     int i;
@@ -2777,20 +2964,24 @@ BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listN
         FreeList(&kept);
         return FALSE;
     }
-    if (!set.source[0].entriesDir[0]) {
+    if (!set.source[0].complete || !set.source[0].entriesDir[0]) {
         report->unavailable |= 1;
         SessionStore_Free(&set);
         FreeList(&kept);
         return FALSE;
     }
     LoadLedger(&ledger);
+    ZeroMemory(&marks, sizeof marks);
+    if (keys) ReadMarks(set.source[0].entriesDir, &marks);
     ZeroMemory(&changes, sizeof changes);
     for (i = 0; i < kept.count && ok; i++) {
         int entry = SessionStore_FindEntry(&set, 0, kept.items[i].key, NULL);
         ULONGLONG written;
         DWORD length = 0, currentLength = 0;
         char *content, *current = NULL;
-        if (FindDated(&ledger, kept.items[i].key) >= 0) continue;   /* deleted since: it stays deleted */
+        if (!RestoreKeyChosen(kept.items[i].key, keys, keyCount)) continue;
+        if (FindDated(&ledger, kept.items[i].key) >= 0 ||
+            (keys && RestoreSelectionDeleted(&ledger, &marks, &set, kept.items[i].key, NULL, 0))) continue;
         if (entry >= 0 && (current = ReadEntry(set.entries[entry].file, &currentLength, &written)) != NULL &&
             EntryHash(current, currentLength) == kept.items[i].hash) {
             Free(current);
@@ -2802,14 +2993,15 @@ BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listN
             if (!report->error[0]) StringCchPrintfW(report->error, ARRAYSIZE(report->error), TR(L"%s could not be read (error %lu)."), kept.items[i].key, (DWORD)ERROR_FILE_NOT_FOUND);
             continue;
         }
+        if (keys && RestoreSelectionDeleted(&ledger, &marks, &set, kept.items[i].key, content, length)) continue;
         {
             size_t mappedLength = 0;
             const char *mapped = ContentFor(&set, 0, content, length, &changes, &mappedLength);
-            ok = mapped && AddChange(&changes, 0, SYNC_PUT, SYNC_UNDELETE | SYNC_REPLACE, kept.items[i].key, EntryActivity(content, length),
+            ok = mapped && AddChange(&changes, 0, SYNC_PUT, SYNC_REPLACE | (keys ? 0u : SYNC_UNDELETE), kept.items[i].key, EntryActivity(content, length),
                                      entry >= 0 ? set.entries[entry].lastActivity : 0, mapped, mappedLength);
         }
     }
-    if (ok && kept.index && SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" ARCHIVED_INDEX, set.source[0].entriesDir))) {
+    if (ok && !keys && kept.index && SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" ARCHIVED_INDEX, set.source[0].entriesDir))) {
         DWORD length = 0, currentLength = 0;
         char *current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength), *content;
         ULONGLONG hash = current ? Core_HashBytes(CORE_HASH_START, current, currentLength) : 0;
@@ -2817,8 +3009,49 @@ BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listN
         if (hash != kept.index && (content = Own(&changes, LoadObject(kept.index, &length))) != NULL)
             ok = AddChange(&changes, 0, SYNC_INDEX, 0, ARCHIVED_INDEX, 0, 0, content, length);
     }
+    /* A selection changes only its own archive bits, mapped to this profile's
+     * entry ids. Unselected entries and all unknown index members stay intact. */
+    if (ok && keys && SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" ARCHIVED_INDEX, set.source[0].entriesDir))) {
+        DWORD currentLength = 0, historicalLength = 0;
+        char *current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength);
+        char *historical = kept.index ? LoadObject(kept.index, &historicalLength) : NULL;
+        char *merged = current ? CopyBytes(current, currentLength) : CopyBytes("{\"v\":1,\"archived\":[]}", sizeof "{\"v\":1,\"archived\":[]}" - 1);
+        size_t mergedLength = current ? currentLength : sizeof "{\"v\":1,\"archived\":[]}" - 1;
+        BOOL selectedArchive = FALSE;
+        if ((kept.index && !historical) || (!current && Util_QueryPath(path, NULL) != PATH_MISSING) || !merged) ok = FALSE;
+        for (i = 0; i < kept.count && ok; i++) {
+            DWORD contentLength = 0;
+            char *content, *next;
+            const char *value; size_t valueLength;
+            WCHAR own[SESSION_ID_CCH];
+            int entry;
+            BOOL archived = FALSE;
+            if (!RestoreKeyChosen(kept.items[i].key, keys, keyCount) || FindDated(&ledger, kept.items[i].key) >= 0) continue;
+            content = LoadObject(kept.items[i].hash, &contentLength);
+            if (content && RestoreSelectionDeleted(&ledger, &marks, &set, kept.items[i].key, content, contentLength)) { Free(content); continue; }
+            if (!content || !Core_JsonMember(content, contentLength, "sessionId", &value, &valueLength) ||
+                !Core_JsonString(value, valueLength, own, ARRAYSIZE(own))) { Free(content); ok = FALSE; break; }
+            if (historical) {
+                ArchiveContains contains; contains.id = own; contains.found = FALSE;
+                if (!Core_JsonMember(historical, historicalLength, "archived", &value, &valueLength) ||
+                    !Core_JsonEachElement(value, valueLength, ContainsArchived, &contains)) { Free(content); ok = FALSE; break; }
+                archived = contains.found;
+            } else if (Core_JsonMember(content, contentLength, "isArchived", &value, &valueLength)) archived = Core_JsonTrue(value, valueLength);
+            entry = SessionStore_FindEntry(&set, 0, kept.items[i].key, NULL);
+            if (entry >= 0) StringCchCopyW(own, ARRAYSIZE(own), set.entries[entry].localId);
+            selectedArchive = TRUE;
+            next = VaultTools_ArchiveSet(merged, mergedLength, own, archived, &valueLength);
+            Free(content); Free(merged); merged = next; mergedLength = valueLength;
+            if (!merged) ok = FALSE;
+        }
+        if (ok && selectedArchive && (!current || currentLength != mergedLength || memcmp(current, merged, mergedLength) != 0)) {
+            char *owned = Own(&changes, merged); merged = NULL;
+            ok = owned && AddChange(&changes, 0, SYNC_INDEX, 0, ARCHIVED_INDEX, 0, 0, owned, mergedLength);
+        }
+        Free(merged); Free(current); Free(historical);
+    }
     /* The pins and groups of the sidebar as they were then. */
-    if (ok && kept.layout) {
+    if (ok && !keys && kept.layout) {
         size_t currentLength = 0, mappedLength = 0;
         char *current = LayoutOf(&set, 0, &currentLength, NULL), *content, *mapped;
         DWORD length = 0;
@@ -2832,11 +3065,12 @@ BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listN
             ok = AddChange(&changes, 0, SYNC_LAYOUT, 0, LAYOUT_KEY, 0, 0, mapped, mappedLength);
     }
     /* Claude's marks of the sessions deleted: its own import of Claude Code's sessions leaves them out. */
-    for (i = 0; i < ledger.count && ok; i++)
+    for (i = 0; !keys && i < ledger.count && ok; i++)
         if (FindItem(&kept, ledger.items[i].id) < 0)
             ok = AddChange(&changes, 0, SYNC_MARK, 0, ledger.items[i].id, ledger.items[i].time, 0, NULL, 0);
     if (ok && changes.count) ok = SessionSync_Send(&set, changes.items, changes.count, report);
     Util_Log(L"session vault: %s version %s restored to %s%s", listName, version, single.items[0].folder, ok ? L"" : L" FAILED");
+    Free(marks.items);
     Free(ledger.items);
     FreeChanges(&changes);
     FreeList(&kept);
@@ -2846,13 +3080,32 @@ BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listN
     return ok;
 }
 
+BOOL SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version, SyncReport *report)
+{
+    return RestoreVersion(list, index, listName, version, NULL, 0, report);
+}
+BOOL SessionVault_RestoreSelected(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version,
+                                  const WCHAR *const *keys, int count, SyncReport *report)
+{
+    if (!keys || count <= 0 || index < 0 || index >= list->count) return FALSE;
+    if (SessionLink_Busy(&list->items[index])) {
+        report->failed++;
+        StringCchPrintfW(report->error, ARRAYSIZE(report->error), TR(L"Close \x201C%s\x201D first: while it runs, Claude keeps its list of sessions and would write it back."), list->items[index].name);
+        return FALSE;
+    }
+    return RestoreVersion(list, index, listName, version, keys, count, report);
+}
+
 /* ------------------------------------------------------------ known sessions */
 
 static BOOL AddId(VaultIds *ids, const WCHAR *id)
 {
     WCHAR (*grown)[SESSION_ID_CCH];
     if (!id[0] || SessionVault_HasId(ids, id)) return TRUE;
-    if ((grown = (WCHAR (*)[SESSION_ID_CCH])Grow(ids->ids, &ids->capacity, ids->count + 1, sizeof *ids->ids)) == NULL) return FALSE;
+    if ((grown = (WCHAR (*)[SESSION_ID_CCH])Grow(ids->ids, &ids->capacity, ids->count + 1, sizeof *ids->ids)) == NULL) {
+        ids->failed = TRUE;
+        return FALSE;
+    }
     ids->ids = grown;
     StringCchCopyW(ids->ids[ids->count++], SESSION_ID_CCH, id);
     return TRUE;
@@ -2884,39 +3137,54 @@ BOOL SessionVault_Ids(VaultIds *listed, VaultIds *deleted)
     HANDLE find;
     DatedSet ledger;
     int i;
+    BOOL ok = TRUE;
     ZeroMemory(listed, sizeof *listed);
     ZeroMemory(deleted, sizeof *deleted);
     LoadLedger(&ledger);
     for (i = 0; i < ledger.count; i++) AddId(deleted, ledger.items[i].id);
     Free(ledger.items);
-    if (!VaultPath(LISTS_DIR, dir, ARRAYSIZE(dir)) || (find = Util_FindFiles(dir, L"*", &found, TRUE)) == INVALID_HANDLE_VALUE) return TRUE;
+    if (!VaultPath(LISTS_DIR, dir, ARRAYSIZE(dir))) return FALSE;
+    if ((find = Util_FindFiles(dir, L"*", &found, TRUE)) == INVALID_HANDLE_VALUE)
+        return !deleted->failed && (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND);
     do {
         VaultList latest;
+        WCHAR (*names)[MAX_PATH];
+        int count;
         if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == L'.') continue;
-        LoadLatest(found.cFileName, &latest, NULL, 0);
-        for (i = 0; i < latest.count; i++) {
+        names = VersionNames(found.cFileName, &count);
+        ok = count >= 0;
+        if (count > 0) ok = LoadVersion(found.cFileName, names[0], &latest);
+        else ZeroMemory(&latest, sizeof latest);
+        Free(names);
+        for (i = 0; ok && i < latest.count; i++) {
             DWORD length = 0;
             char *content = LoadObject(latest.items[i].hash, &length);
-            AddId(listed, latest.items[i].key);
+            ok = content != NULL && AddId(listed, latest.items[i].key);
             if (content) EntryIds(content, length, AddIdTo, listed);
             Free(content);
         }
         FreeList(&latest);
+        if (!ok) break;
     } while (FindNextFileW(find, &found));
+    if (ok && GetLastError() != ERROR_NO_MORE_FILES) ok = FALSE;
     FindClose(find);
-    return TRUE;
+    return ok && !listed->failed && !deleted->failed;
 }
 
 BOOL SessionVault_AddDeleted(const WCHAR *const *ids, int count)
 {
     DatedSet ledger;
+    HANDLE lock = Util_SyncLock();
     ULONGLONG now = NowMs();
     BOOL ok;
     int i;
+    if (!lock) return FALSE;
     LoadLedger(&ledger);
-    for (i = 0; i < count; i++) AddDated(&ledger, ids[i], now);
-    ok = SaveLedger(&ledger);
+    ok = TRUE;
+    for (i = 0; ok && i < count; i++) ok = AddDated(&ledger, ids[i], now);
+    if (ok) ok = SaveLedger(&ledger);
     Free(ledger.items);
+    Util_SyncUnlock(lock);
     return ok;
 }
 
@@ -3011,7 +3279,12 @@ int SessionVault_Undelete(const ProfileList *list, const WCHAR *const *keys, int
     Changes changes;
     int restored = 0, k, m;
     BOOL ok = TRUE;
-    if (!SessionStore_LoadProfiles(&set, list)) return -1;
+    HANDLE lock = Util_SyncLock();
+    if (!lock) return -1;
+    if (!SessionStore_LoadProfiles(&set, list)) {
+        Util_SyncUnlock(lock);
+        return -1;
+    }
     LoadLedger(&ledger);
     ZeroMemory(&changes, sizeof changes);
     for (k = 0; k < count && ok; k++) {
@@ -3072,6 +3345,7 @@ int SessionVault_Undelete(const ProfileList *list, const WCHAR *const *keys, int
     Free(ledger.items);
     FreeChanges(&changes);
     SessionStore_Free(&set);
+    Util_SyncUnlock(lock);
     if (ok && restored) SessionVault_KeepAll(list);
     return ok ? restored : -1;
 }

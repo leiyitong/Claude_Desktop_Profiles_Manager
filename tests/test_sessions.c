@@ -25,6 +25,7 @@
 static int g_checks, g_failures;
 static WCHAR g_root[MAX_PATH];
 static DWORD g_fixtureTag;
+static BOOL FileHas(const WCHAR *path, const char *text);
 static const WCHAR *const g_family = L"Fixture_package";
 static const WCHAR *const g_scratchId = L"11111111-1111-4111-8111-111111111111";
 static const WCHAR *const g_projectId = L"22222222-2222-4222-8222-222222222222";
@@ -365,7 +366,42 @@ static int FixtureFileOperation(LPSHFILEOPSTRUCTW operation)
 #undef Util_Recycle
 #undef SHFileOperationW
 
+/* Backup operations use the same private fixtures, without the file chooser. */
+#define Backup_Create        TestedBackup_Create
+#define Backup_Restore       TestedBackup_Restore
+#define Backup_ReadAppKey    TestedBackup_ReadAppKey
+#define Backup_WriteAppKey   TestedBackup_WriteAppKey
+#define Backup_FillPartsList TestedBackup_FillPartsList
+#define Backup_ValidateArchive TestedBackup_ValidateArchive
+#define Backup_CheckArchive TestedBackup_CheckArchive
+#include "../src/backup.c"
+
+static DWORD g_searchReads;
+static char *ReadSearchFixture(const WCHAR *path, DWORD maximum, BOOL tail, DWORD *length)
+{
+    g_searchReads++;
+    return Util_ReadFile(path, maximum, tail, length);
+}
+#define SessionSearch_Locate     TestedSessionSearch_Locate
+#define SessionSearch_Start      TestedSessionSearch_Start
+#define SessionSearch_Stop       TestedSessionSearch_Stop
+#define SessionSearch_Invalidate TestedSessionSearch_Invalidate
+#define Util_ReadFile            ReadSearchFixture
+#include "../src/sessionsearch.c"
+#undef Util_ReadFile
+
 /* ------------------------------------------------------------------ fixtures */
+
+/* An empty DACL denies enumeration; the owner can always restore it. */
+static BOOL DenyDirectory(const WCHAR *dir, BOOL deny)
+{
+    SECURITY_DESCRIPTOR descriptor;
+    ACL acl;
+    return InFixture(dir) && InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) &&
+           InitializeAcl(&acl, sizeof acl, ACL_REVISION) &&
+           SetSecurityDescriptorDacl(&descriptor, TRUE, deny ? &acl : NULL, FALSE) &&
+           SetFileSecurityW(dir, DACL_SECURITY_INFORMATION, &descriptor);
+}
 
 static BOOL SetProfile(Profile *p, const WCHAR *label, const WCHAR *leaf, BOOL stock)
 {
@@ -526,6 +562,36 @@ static BOOL PrepareProfiles(ProfileList *profiles, WCHAR *local, WCHAR *projects
     return SetEnvironmentVariableW(L"CLAUDE_CONFIG_DIR", code);
 }
 
+/* Claude moved the stock folder out of its package, to %LOCALAPPDATA%\
+ * Claude-Data\<family in lower case>: the profile is there from then on, and
+ * its folder as it was named stays its former one. */
+static void TestMovedStock(void)
+{
+    Profile p;
+    WCHAR local[MAX_PATH], moved[MAX_PATH], roaming[MAX_PATH], logical[MAX_PATH], packaged[MAX_PATH];
+    BOOL ready = SetProfile(&p, L"Moved", L"MR\\Claude", TRUE) && FixturePath(L"ML", local, ARRAYSIZE(local)) &&
+                 FixturePath(L"MR", roaming, ARRAYSIZE(roaming)) && MakeDir(roaming) &&
+                 SUCCEEDED(StringCchCopyW(logical, ARRAYSIZE(logical), p.dataDir)) &&
+                 SUCCEEDED(StringCchPrintfW(moved, ARRAYSIZE(moved), L"%s\\Claude-Data\\fixture_package", local)) && MakeDir(moved) &&
+                 SUCCEEDED(StringCchPrintfW(packaged, ARRAYSIZE(packaged), L"%s\\Packages\\%s\\LocalCache\\Roaming\\Claude", local, g_family));
+    Check("moved stock fixture", ready);
+    if (!ready) return;
+    Check("moved stock: storage resolves", Profiles_ResolveStorage(&p, local, g_family));
+    Check("moved stock: storage is the moved folder", Core_PathEquals(p.storageDir, moved));
+    Check("moved stock: Claude names it there, as its window's title does", Core_PathEquals(p.dataDir, moved));
+    Check("moved stock: the folder as it was is its former one", Core_PathEquals(p.formerDir, logical));
+    Check("moved stock: resolved again, the same", Profiles_ResolveStorage(&p, local, g_family) && Core_PathEquals(p.storageDir, moved) &&
+          Core_PathEquals(p.dataDir, moved) && Core_PathEquals(p.formerDir, logical));
+    Check("moved stock: wins over a real %APPDATA%\\Claude", MakeDir(logical) && Profiles_ResolveStorage(&p, local, g_family) &&
+          Core_PathEquals(p.storageDir, moved));
+    Check("moved stock: a secondary profile never moves", SetProfile(&p, L"MovedSecondary", L"MR\\Claude-Secondary", FALSE) &&
+          Profiles_ResolveStorage(&p, local, g_family) && Core_PathEquals(p.storageDir, p.dataDir) && !p.formerDir[0]);
+    Check("moved stock: gone, the package's copy again", SetProfile(&p, L"Moved", L"MR\\Claude", TRUE) &&
+          Profiles_ResolveStorage(&p, local, g_family) && RemoveDirectoryW(moved) && RemoveDirectoryW(logical) &&
+          Profiles_ResolveStorage(&p, local, g_family) && Core_PathEquals(p.storageDir, packaged) &&
+          Core_PathEquals(p.dataDir, logical) && !p.formerDir[0]);
+}
+
 static void TestResolution(const WCHAR *local)
 {
     Profile p;
@@ -551,6 +617,7 @@ static void TestResolution(const WCHAR *local)
     Check("watch: sessions fixture created", Join(p.storageDir, L"claude-code-sessions", expected, ARRAYSIZE(expected)) && MakeDir(expected));
     Check("watch: existing sessions directory is watched", SessionStore_WatchDir(&p, watched, ARRAYSIZE(watched)) &&
           Core_PathEquals(watched, expected));
+    TestMovedStock();
 }
 
 static int FindRow(const SessionSet *s, const WCHAR *id)
@@ -1429,6 +1496,11 @@ static void TestReadonlyPending(const ProfileList *profiles)
             SetFileAttributesW(path, FILE_ATTRIBUTE_READONLY);
     Check("readonly pending intent fixture is durable", ready);
     if (ready) {
+        WCHAR *preview = SessionSync_PendingText(profiles);
+        Check("pending details display intent without applying it", preview && wcsstr(preview, L"Old queued intent") &&
+              ReadString(set.entries[set.rows[row].entry[0]].file, "title", title, ARRAYSIZE(title)) && wcscmp(title, original) == 0 &&
+              SessionStore_LoadPending(profile, queued, ARRAYSIZE(queued)) == 1);
+        if (preview) HeapFree(GetProcessHeap(), 0, preview);
         newer = oldEdit;
         StringCchCopyW(newer.value, ARRAYSIZE(newer.value), L"Newest chosen intent");
         Check("a blocked intent commit returns failure before changing the entry",
@@ -2455,6 +2527,17 @@ static void TestSessionSync(const WCHAR *projects)
     Check("merging three profiles succeeds", loaded && SessionSync_Merge(&set, 0x7, &report));
     Check("merging adds each missing entry", report.added == 5 && report.failed == 0 && report.waiting == 0);
     Check("merging brings an older entry up to date", report.updated == 1 && EntryTitled(entries[1], g_syncIds[2], L"A three"));
+    {
+        int detail, added = 0, updated = 0;
+        BOOL keyed = report.profileCount == 3;
+        for (detail = 0; detail < report.profileCount; detail++) {
+            const SyncProfileResult *result = &report.profiles[detail];
+            keyed = keyed && Profiles_Find(&profiles, result->folder) >= 0 && !result->waiting && !result->failed;
+            added += result->added;
+            updated += result->updated;
+        }
+        Check("merge results identify each recipient with matching totals", keyed && added == report.added && updated == report.updated);
+    }
     Check("a merged entry replaced is kept in the backup",
           BackedUp(&report, &profiles.items[1], g_syncIds[2], path, ARRAYSIZE(path)) && TitledAs(path, L"B three"));
     SessionStore_Free(&set);
@@ -2493,7 +2576,30 @@ static void TestSessionSync(const WCHAR *projects)
         Check("a shared session keeps its archived state",
               EntryPath(entries[2], g_syncIds[5], path, ARRAYSIZE(path)) && ReadTrue(path, "isArchived"));
         Check("a running profile's entries are not written", (report.waiting & 0x2) && !EntryThere(entries[1], g_syncIds[5]));
+        {
+            int detail;
+            BOOL waiting = FALSE, applied = FALSE;
+            for (detail = 0; detail < report.profileCount; detail++) {
+                const SyncProfileResult *result = &report.profiles[detail];
+                if (Core_EqualsI(result->folder, profiles.items[1].folder)) waiting = result->waiting && result->added == 0;
+                if (Core_EqualsI(result->folder, profiles.items[2].folder)) applied = !result->waiting && result->added == 1;
+            }
+            Check("per-profile results distinguish pending from applied changes", waiting && applied);
+        }
         Check("the session waits in the running profile's plan", SessionSync_PendingCount(&profiles.items[1]) == 1);
+        {
+            WCHAR blocked[MAX_PATH + 16];
+            HANDLE file = INVALID_HANDLE_VALUE;
+            ready = SessionSync_PlanPath(&profiles.items[1], path, ARRAYSIZE(path)) &&
+                    SUCCEEDED(StringCchPrintfW(blocked, ARRAYSIZE(blocked), L"%s.cdm-new", path)) &&
+                    (file = CreateFileW(blocked, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)) != INVALID_HANDLE_VALUE;
+            ZeroMemory(&report, sizeof report);
+            Check("a replacement whose plan cannot commit reports failure",
+                  ready && SessionSync_Share(&set, 0, rows, 1, 0x2, &report) && report.failed > 0);
+            if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+            if (ready) DeleteFileW(blocked);
+            Check("the committed plan survives its failed replacement", SessionSync_PendingCount(&profiles.items[1]) == 1);
+        }
         Check("the waiting session is not made while its Claude runs", SessionEdit_ApplyPending(NULL, &profiles.items[1]) == 0);
         StopFakeClaude(window);
         Check("the waiting session is made once its Claude closed",
@@ -2517,10 +2623,93 @@ static void TestSessionSync(const WCHAR *projects)
         Check("the export is a session archive", SessionSync_IsArchive(archive));
         Check("another file is not a session archive", !SessionSync_IsArchive(transcript));
         Check("a conversation of the fixture is taken away", DeleteFileW(transcript));
+        {
+            WCHAR *preview = SessionSync_ImportPreview(&set, archive, 0x9, error, ARRAYSIZE(error));
+            Check("import preview distinguishes duplicate and new entries",
+                  preview && wcsstr(preview, TR(L"Duplicate; keep existing")) && wcsstr(preview, TR(L"New session")));
+            Check("preview does not extract transcripts or create target entries", preview && !FileThere(transcript) &&
+                  !EntryThere(entries[3], g_syncIds[0]) && !EntryThere(entries[3], g_syncIds[2]));
+            if (preview) HeapFree(GetProcessHeap(), 0, preview);
+            set.source[3].complete = FALSE;
+            preview = SessionSync_ImportPreview(&set, archive, 0x8, error, ARRAYSIZE(error));
+            Check("preview rejects an incomplete target snapshot", !preview && error[0]);
+            if (preview) HeapFree(GetProcessHeap(), 0, preview);
+            set.source[3].complete = TRUE;
+            {
+                WCHAR collision[MAX_PATH];
+                char json[512];
+                BOOL made = EntryPath(entries[3], g_syncIds[0], collision, ARRAYSIZE(collision)) &&
+                            SUCCEEDED(StringCchPrintfA(json, sizeof json,
+                                "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"lastActivityAt\":1}", g_syncIds[0], g_syncIds[4])) &&
+                            Save(collision, json);
+                preview = made ? SessionSync_ImportPreview(&set, archive, 0x8, error, ARRAYSIZE(error)) : NULL;
+                Check("preview reports an existing destination file as a conflict",
+                      preview && wcsstr(preview, TR(L"Conflict; keep existing entry with the same file name")));
+                if (preview) HeapFree(GetProcessHeap(), 0, preview);
+                if (made) DeleteFileW(collision);
+            }
+            {
+                int at = SessionStore_FindEntry(&set, 0, g_syncIds[2], NULL);
+                if (at >= 0) {
+                    set.entries[at].pendingRemove = TRUE;
+                    ZeroMemory(&report, sizeof report);
+                    Check("an import skipped by a pending removal still has a profile result",
+                          SessionSync_Import(&set, archive, 0x1, &sessions, &report) && report.skipped > 0 &&
+                          report.profileCount == 1 && report.profiles[0].skipped == report.skipped &&
+                          Core_EqualsI(report.profiles[0].folder, profiles.items[0].folder));
+                    set.entries[at].pendingRemove = FALSE;
+                    /* Keep the extraction-failure fixture below after this import. */
+                    if (FileThere(transcript)) DeleteFileW(transcript);
+                }
+            }
+        }
+        /* No entry may be sent until every conversation was extracted. */
+        {
+            WCHAR blocked[MAX_PATH + 16];
+            HANDLE file = INVALID_HANDLE_VALUE;
+            ready = ready && SUCCEEDED(StringCchPrintfW(blocked, ARRAYSIZE(blocked), L"%s.cdm-new", transcript)) &&
+                    (file = CreateFileW(blocked, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)) != INVALID_HANDLE_VALUE;
+            ZeroMemory(&report, sizeof report);
+            Check("failed conversation extraction prevents importing entries",
+                  ready && !SessionSync_Import(&set, archive, 0x8, &sessions, &report) && report.failed > 0 &&
+                  !EntryThere(entries[3], g_syncIds[0]) && !EntryThere(entries[3], g_syncIds[2]));
+            if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+            if (ready) DeleteFileW(blocked);
+        }
     }
     if (loaded) SessionStore_Free(&set);
     loaded = ready && SessionStore_LoadProfiles(&set, &profiles);
     if (loaded) {
+        WCHAR blocked[2][MAX_PATH + 16], wrapped[MAX_PATH];
+        HANDLE held[2] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
+        ZipOut *out = NULL;
+        ZipIn *zip = NULL;
+        DWORD code = 0;
+        int i;
+        BOOL signedOut = FALSE;
+        for (i = 0; i < 2 && ready; i++) {
+            ready = EntryPath(entries[3], g_syncIds[i == 0 ? 0 : 2], path, ARRAYSIZE(path)) &&
+                    SUCCEEDED(StringCchPrintfW(blocked[i], ARRAYSIZE(blocked[i]), L"%s.cdm-new", path)) &&
+                    (held[i] = CreateFileW(blocked[i], GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)) != INVALID_HANDLE_VALUE;
+        }
+        ZeroMemory(&report, sizeof report);
+        Check("an import can return a report containing failed entry writes",
+              ready && SessionSync_Import(&set, archive, 0x8, &sessions, &report) && report.failed == 2);
+        ready = ready && FixturePath(L"wrapped-backup.zip", wrapped, ARRAYSIZE(wrapped)) && (out = Zip_Create(wrapped, &code)) != NULL;
+        if (out) {
+            BOOL added = Zip_AddFile(out, SESSIONS_ARCHIVE, archive);
+            ready = Zip_Close(out, added) && added && ready;
+        }
+        if (ready) zip = Zip_Open(wrapped);
+        error[0] = 0;
+        Check("backup restore rejects an import report with failed entry writes",
+              zip && !RestoreSessions(zip, &profiles, 3, g_root, &sessions, &signedOut, error, ARRAYSIZE(error)) && error[0]);
+        Zip_Free(zip);
+        for (i = 0; i < 2; i++)
+            if (held[i] != INVALID_HANDLE_VALUE) {
+                CloseHandle(held[i]);
+                DeleteFileW(blocked[i]);
+            }
         ZeroMemory(&report, sizeof report);
         Check("importing the archive succeeds",
               SessionSync_Import(&set, archive, 0x8, &sessions, &report) && sessions == 2 && report.added == 2 && report.failed == 0);
@@ -2906,9 +3095,30 @@ static void TestVault(const WCHAR *projects)
     Check("a profile outside the group is left alone", !EntryThere(entries[2], g_vaultIds[0]) && !EntryThere(entries[2], g_vaultIds[1]));
     Check("a version of the group's list is kept",
           SessionVault_Versions(VAULT_GROUP_LIST, versions, ARRAYSIZE(versions)) == 1 && versions[0].sessions == 2 && versions[0].time > 0);
+    {
+        WCHAR *preview = SessionVault_RestorePreview(&profiles, 2, VAULT_GROUP_LIST, versions[0].name);
+        Check("recovery preview lists new sessions without writing entries", preview && wcsstr(preview, L"A one") &&
+              !EntryThere(entries[2], g_vaultIds[0]) && !EntryThere(entries[2], g_vaultIds[1]));
+        if (preview) HeapFree(GetProcessHeap(), 0, preview);
+    }
     Check("syncing again changes nothing and keeps no other version",
           KeepGroup(&profiles, 0x3, &report) && report.added + report.updated + report.removed == 0 &&
           SessionVault_Versions(VAULT_GROUP_LIST, versions, ARRAYSIZE(versions)) == 1);
+    {
+        static const char index[] = "{\"v\":1,\"archived\":[\"local_11111111-1111-4111-8111-111111111111\"]}";
+        Sleep(20);
+        ready = SaveIn(entries[0], L"archived-sessions.idx", index);
+        Check("the archived index is synced without requiring a sessionId member",
+              ready && KeepGroup(&profiles, 0x3, &report) && Join(entries[1], L"archived-sessions.idx", path, ARRAYSIZE(path)) &&
+              FileHas(path, "\"archived\":[\"local_11111111"));
+        count = SessionVault_Versions(VAULT_GROUP_LIST, versions, ARRAYSIZE(versions));
+        Check("a kept version restores the archived index",
+              count > 0 && SessionVault_Restore(&profiles, 2, VAULT_GROUP_LIST, versions[0].name, &report) &&
+              Join(entries[2], L"archived-sessions.idx", path, ARRAYSIZE(path)) && FileHas(path, "\"archived\":[\"local_11111111"));
+        /* The later checks start with the outside profile empty. */
+        RemoveEntry(entries[2], g_vaultIds[0]);
+        RemoveEntry(entries[2], g_vaultIds[1]);
+    }
 
     /* A rename in one, a star in the other, no message sent: both go across. */
     Sleep(20);
@@ -2997,14 +3207,19 @@ static void TestVault(const WCHAR *projects)
     Check("a deleted session a kept list had can be restored, one no list had cannot",
           gone && gone->restorable && unknown && !unknown->restorable);
     Check("it shows under the profiles whose lists had it, the other in no list", gone && gone->profiles != 0 && unknown && unknown->profiles == 0);
-    if (items) HeapFree(GetProcessHeap(), 0, items);
-
     /* Restored: back in each profile of the group, as the list last had it, Claude's mark gone, no longer deleted. */
     ids[0] = g_vaultIds[1];
     ZeroMemory(&report, sizeof report);
     Check("a deleted session is restored", SessionVault_Undelete(&profiles, ids, 1, &report) == 1 && report.failed == 0);
     Check("it is back in both profiles of the group, as it was",
           EntryTitled(entries[0], g_vaultIds[1], L"B two") && EntryTitled(entries[1], g_vaultIds[1], L"B two"));
+    if (gone) {
+        int chosen = (int)(gone - items), removed = -1;
+        Check("cleanup rechecks a session restored while the old list was open",
+              SessionPurge_Delete(NULL, &profiles, items, &chosen, 1, &removed, error, ARRAYSIZE(error)) == REMOVE_DONE &&
+              removed == 0 && FileThere(transcripts[0]));
+    }
+    if (items) HeapFree(GetProcessHeap(), 0, items);
     Check("Claude's mark of its deletion is gone", MarkPath(entries[0], g_vaultIds[1], path, ARRAYSIZE(path)) && !FileThere(path));
     Check("a profile whose list never had it does not get it, but loses Claude's mark of it",
           !EntryThere(entries[2], g_vaultIds[1]) && MarkPath(entries[2], g_vaultIds[1], path, ARRAYSIZE(path)) && !FileThere(path));
@@ -3090,6 +3305,28 @@ static void TestVault(const WCHAR *projects)
         Check("an entry no version names, written long ago, goes", ready && !FileThere(stray));
         Check("the entries the versions name stay", ready && EntryTitled(entries[1], g_vaultIds[0], L"A one pruned") &&
               SessionVault_Restore(&profiles, 2, VAULT_GROUP_LIST, many[0].name, &report) && report.failed == 0);
+        {
+            WCHAR blocked[MAX_PATH], version[MAX_PATH];
+            BOOL denied;
+            ready = SUCCEEDED(StringCchPrintfW(blocked, ARRAYSIZE(blocked), L"%s\\vault\\lists\\blocked", state)) && MakeDir(blocked) &&
+                    Join(blocked, L"20200101-000000-000.txt", version, ARRAYSIZE(version)) &&
+                    Save(version, "claude-desktop-profiles-manager-vault 1\nlisted\tabababab-0000-4000-8000-000000000001\t00000000000abcde\t1\n") &&
+                    Save(stray, "{}") && SetModified(stray, 132000000000000000ULL);
+            denied = ready && DenyDirectory(blocked, TRUE);
+            Sleep(20);
+            Check("vault collection stops when another list cannot be enumerated",
+                  denied && WriteVaultEntry(entries[0], g_vaultIds[0], "A one guarded", 700, FALSE) &&
+                  KeepGroup(&profiles, 0x3, &report) && FileThere(stray));
+            if (denied) Check("the private list's access is restored", DenyDirectory(blocked, FALSE));
+            if (ready) {
+                DeleteFileW(version);
+                RemoveDirectoryW(blocked);
+            }
+            Sleep(20);
+            Check("vault collection resumes once every list can be read",
+                  ready && WriteVaultEntry(entries[0], g_vaultIds[0], "A one recovered", 800, FALSE) &&
+                  KeepGroup(&profiles, 0x3, &report) && !FileThere(stray));
+        }
     }
 
     /* Claude Code's folder copied beside it, as <name>_<date>. */
@@ -3977,6 +4214,83 @@ static void TestReliableSync(void)
     ZeroMemory(&report, sizeof report);
     Check("reliable sync: kept again, nothing changes", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
           report.added + report.updated + report.removed == 0);
+    {
+        DWORD length = 0;
+        char *whole = NULL;
+        SessionSet partial;
+        ZeroMemory(&partial, sizeof partial);
+        ready = EntryPath(entries[1], g_keptIds[0], path, ARRAYSIZE(path)) &&
+                (whole = Util_ReadFile(path, SESSION_ENTRY_MAX_BYTES, FALSE, &length)) != NULL &&
+                Save(path, "{\"sessionId\":\"local_partial\",\"cliSessionId\":\"unfinished");
+        Check("an interrupted entry is recorded as an unreadable snapshot",
+              ready && SessionStore_LoadProfiles(&partial, &profiles) && partial.source[1].unreadable == 1 && !partial.source[1].complete);
+        SessionStore_Free(&partial);
+        ZeroMemory(&report, sizeof report);
+        Check("an interrupted entry cannot delete the sound copy in another profile",
+              ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.removed == 0 && EntryThere(entries[0], g_keptIds[0]));
+        if (whole) {
+            Check("the complete private entry is put back", WriteWholeFile(path, whole));
+            HeapFree(GetProcessHeap(), 0, whole);
+        }
+    }
+}
+
+typedef struct LedgerProbe {
+    HANDLE entered, done;
+    const WCHAR *id;
+    BOOL undelete;
+    int result;
+} LedgerProbe;
+
+static DWORD WINAPI ChangeLedger(void *context)
+{
+    LedgerProbe *probe = (LedgerProbe *)context;
+    ProfileList profiles;
+    SyncReport report;
+    ZeroMemory(&profiles, sizeof profiles);
+    ZeroMemory(&report, sizeof report);
+    SetEvent(probe->entered);
+    probe->result = probe->undelete ? SessionVault_Undelete(&profiles, &probe->id, 1, &report)
+                                   : (int)SessionVault_AddDeleted(&probe->id, 1);
+    SetEvent(probe->done);
+    return 0;
+}
+
+static void TestLedgerTransactions(void)
+{
+    static const WCHAR *const first = L"abababab-0000-4000-8000-00000000f001";
+    LedgerProbe probe;
+    HANDLE lock, thread;
+    VaultIds listed, deleted;
+    int i;
+    ZeroMemory(&probe, sizeof probe);
+    probe.id = L"abababab-0000-4000-8000-00000000f002";
+    probe.entered = CreateEventW(NULL, TRUE, FALSE, NULL);
+    probe.done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    for (i = 0; i < 2 && probe.entered && probe.done; i++) {
+        probe.undelete = i == 1;
+        ResetEvent(probe.entered);
+        ResetEvent(probe.done);
+        lock = Util_SyncLock();
+        thread = lock ? CreateThread(NULL, 0, ChangeLedger, &probe, 0, NULL) : NULL;
+        if (thread) WaitForSingleObject(probe.entered, 10000);
+        Sleep(300);
+        Check("a deleted-ledger transaction waits for another sync's commit",
+              lock && thread && WaitForSingleObject(probe.done, 0) == WAIT_TIMEOUT);
+        Check("the first ledger change commits under the held sync lock", lock && SessionVault_AddDeleted(&first, 1));
+        Util_SyncUnlock(lock);
+        if (thread) {
+            WaitForSingleObject(thread, 10000);
+            CloseHandle(thread);
+        }
+        Check("the waiting ledger transaction finishes after the lock is released", probe.result == (i == 0 ? 1 : 0));
+    }
+    Check("serialized deleted-ledger changes preserve both ids", SessionVault_Ids(&listed, &deleted) &&
+          SessionVault_HasId(&deleted, first) && SessionVault_HasId(&deleted, probe.id));
+    SessionVault_FreeIds(&listed);
+    SessionVault_FreeIds(&deleted);
+    if (probe.entered) CloseHandle(probe.entered);
+    if (probe.done) CloseHandle(probe.done);
 }
 
 /* Environment variable `name` kept to be put back: `*kept` NULL when it is
@@ -4033,6 +4347,272 @@ static void TestAccountKey(void)
           WriteWholeFile(localState, "{\"os_crypt\":{\"encrypted_key\":\"RFBBUElub3QgYSBibG9i\"}}") && !Backup_ReadAppKey(storage, read, sizeof read, &length) && length == 0);
     Check("account key: no Local State, none", DeleteFileW(localState) && !Backup_ReadAppKey(storage, read, sizeof read, &length));
 }
+
+static void TestCleanupReferences(const WCHAR *projects)
+{
+    static const WCHAR *const id = L"abababab-0000-4000-8000-00000000c001";
+    ProfileList profiles;
+    SessionSet set;
+    SyncSend change;
+    SyncReport report;
+    WCHAR entries[2][MAX_PATH], transcript[MAX_PATH], account[MAX_PATH], error[LONG_PATH_CCH];
+    PurgeItem *items = NULL;
+    const PurgeItem *item;
+    char json[512];
+    int count, chosen, removed = -1;
+    BOOL ready, denied;
+    HWND window;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 3;
+    ready = PrepareProfile(&profiles.items[0], L"Purge-A", L"purge\\A", L"purge-a", L"organization", entries[0], ARRAYSIZE(entries[0])) &&
+            PrepareProfile(&profiles.items[1], L"Purge-B", L"purge\\B", L"purge-b", L"organization", entries[1], ARRAYSIZE(entries[1])) &&
+            SetProfile(&profiles.items[2], L"Uninitialized", L"purge\\unused", TRUE) &&
+            SUCCEEDED(StringCchPrintfW(transcript, ARRAYSIZE(transcript), L"%s\\fixture\\%s.jsonl", projects, id)) &&
+            Save(transcript, "{\"type\":\"user\"}\n") && SetModified(transcript, 132000000000000000ULL);
+    count = ready ? SessionPurge_List(&profiles, &items, error, ARRAYSIZE(error)) : -1;
+    ZeroMemory(&set, sizeof set);
+    Check("an absent entries directory is not a completed edit snapshot",
+          ready && !SessionStore_LoadEntries(&set, &profiles.items[2]) && set.source[0].complete);
+    SessionStore_Free(&set);
+    item = count > 0 ? FindPurged(items, count, id) : NULL;
+    Check("an uninitialized stock profile does not prevent listing unused conversations", item != NULL);
+    if (!item) {
+        if (items) HeapFree(GetProcessHeap(), 0, items);
+        return;
+    }
+    chosen = (int)(item - items);
+    ready = WriteSyncEntry(entries[0], id, "Restored", 1) && SUCCEEDED(StringCchCopyW(account, ARRAYSIZE(account), entries[0]));
+    if (ready) *wcsrchr(account, L'\\') = 0;
+    denied = ready && DenyDirectory(account, TRUE);
+    Check("cleanup stops when an account directory can no longer be resolved",
+          denied && SessionPurge_Delete(NULL, &profiles, items, &chosen, 1, &removed, error, ARRAYSIZE(error)) == REMOVE_FAILED &&
+          removed == 0 && FileThere(transcript));
+    {
+        WCHAR old[MAX_PATH], config[MAX_PATH];
+        HANDLE held = INVALID_HANDLE_VALUE;
+        BOOL prepared = Join(profiles.items[0].storageDir, L"claude-code-sessions\\old\\organization", old, ARRAYSIZE(old)) && MakeDir(old) &&
+                        Join(profiles.items[0].storageDir, L"config.json", config, ARRAYSIZE(config)) &&
+                        (held = CreateFileW(config, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)) != INVALID_HANDLE_VALUE;
+        Check("a visible empty old account cannot hide failed reads of the real account",
+              denied && prepared && !SessionStore_LoadEntries(&set, &profiles.items[0]) && !set.source[0].complete && set.source[0].entriesDir[0]);
+        SessionStore_Free(&set);
+        if (held != INVALID_HANDLE_VALUE) CloseHandle(held);
+    }
+    if (denied) Check("the private account's access is restored", DenyDirectory(account, FALSE));
+    if (ready) RemoveEntry(entries[0], id);
+
+    ready = SessionStore_LoadProfiles(&set, &profiles);
+    window = ready ? StartFakeClaude(&profiles.items[1]) : NULL;
+    ZeroMemory(&change, sizeof change);
+    change.profile = 1;
+    change.op.kind = SYNC_PUT;
+    change.op.flags = SYNC_UNDELETE;
+    StringCchCopyW(change.op.key, ARRAYSIZE(change.op.key), id);
+    StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"cwd\":\"C:\\\\Fixture\",\"title\":\"Waiting\"}", id, id);
+    change.content = json;
+    change.length = strlen(json);
+    ZeroMemory(&report, sizeof report);
+    Check("a session restored to a running profile waits in its plan", window && SessionSync_Send(&set, &change, 1, &report) && report.waiting == 0x2);
+    Check("cleanup protects transcripts of queued session entries",
+          window && SessionPurge_Delete(NULL, &profiles, items, &chosen, 1, &removed, error, ARRAYSIZE(error)) == REMOVE_FAILED &&
+          removed == 0 && FileThere(transcript));
+    StopFakeClaude(window);
+    if (ready) SessionStore_Free(&set);
+    Check("the queued entry can still be applied with its conversation intact",
+          SessionEdit_ApplyPending(NULL, &profiles.items[1]) == 1 && EntryThere(entries[1], id) && FileThere(transcript));
+    HeapFree(GetProcessHeap(), 0, items);
+}
+
+static void TestSearchCache(void)
+{
+    SessionSearch search;
+    WCHAR path[MAX_PATH], *message;
+    WIN32_FILE_ATTRIBUTE_DATA stamp;
+    HANDLE file;
+    volatile LONG stop = 0;
+    BOOL ready;
+    ULONGLONG hitOffset = 0;
+    size_t hitEnd = 0;
+    ZeroMemory(&search, sizeof search);
+    search.stop = &stop;
+    search.matchCase = TRUE;
+    StringCchCopyW(search.text, ARRAYSIZE(search.text), L"Alpha");
+    message = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, SEARCH_LINE_CCH * sizeof(WCHAR));
+    ready = message && FixturePath(L"search-cache.jsonl", path, ARRAYSIZE(path)) &&
+            Save(path, "{\"type\":\"user\",\"message\":{\"content\":\"Alpha\"}}\n");
+    Check("search cache fixture created", ready);
+    if (!ready) { if (message) HeapFree(GetProcessHeap(), 0, message); return; }
+    SessionSearch_Invalidate();
+    g_searchReads = 0;
+    Check("the initial search reads decoded conversation text", TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 1);
+    Check("an unchanged file reuses its search result", TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 1);
+    Check("a different query has its own cache entry", StringCchCopyW(search.text, ARRAYSIZE(search.text), L"Beta") == S_OK &&
+          !TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 2);
+    ready = Save(path, "{\"type\":\"user\",\"message\":{\"content\":\"Beta Beta\"}}\n");
+    Check("changing file size invalidates cached results", ready && TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 3);
+    ready = FileStamp(path, &stamp) && Save(path, "{\"type\":\"user\",\"message\":{\"content\":\"Zeta Zeta\"}}\n");
+    file = ready ? CreateFileW(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
+    if (file != INVALID_HANDLE_VALUE) {
+        ready = SetFileTime(file, NULL, NULL, &stamp.ftLastWriteTime);
+        CloseHandle(file);
+    } else ready = FALSE;
+    SessionSearch_Invalidate();
+    Check("a file notification invalidates even equal-size equal-time replacements",
+          ready && !TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 4);
+    StringCchCopyW(search.text, ARRAYSIZE(search.text), L"zeta");
+    search.matchCase = TRUE;
+    Check("case-sensitive searches remain separate", !TranscriptMatches(&search, path, message, &hitOffset, &hitEnd));
+    search.matchCase = FALSE;
+    Check("case-insensitive searches remain separate", TranscriptMatches(&search, path, message, &hitOffset, &hitEnd));
+    search.regex = TRUE;
+    StringCchCopyW(search.text, ARRAYSIZE(search.text), L"Zeta.*Zeta");
+    Check("regular-expression searches retain message semantics", Core_RegexCompile(&search.compiled, search.text, FALSE) &&
+          TranscriptMatches(&search, path, message, &hitOffset, &hitEnd));
+    HeapFree(GetProcessHeap(), 0, message);
+}
+
+static void TestPrivateDiagnostics(void)
+{
+    ProfileList profiles;
+    ClaudePackage pkg;
+    WCHAR text[2048];
+    ZeroMemory(&profiles, sizeof profiles);
+    ZeroMemory(&pkg, sizeof pkg);
+    profiles.count = 1;
+    profiles.items[0].running = TRUE;
+    StringCchCopyW(profiles.items[0].name, ARRAYSIZE(profiles.items[0].name), L"private@example.test");
+    StringCchCopyW(profiles.items[0].folder, ARRAYSIZE(profiles.items[0].folder), L"Claude-SecretAccount");
+    StringCchCopyW(profiles.items[0].storageDir, ARRAYSIZE(profiles.items[0].storageDir), L"C:\\Users\\SecretName\\Claude");
+    StringCchCopyW(profiles.items[0].note, ARRAYSIZE(profiles.items[0].note), L"secret note");
+    pkg.found = TRUE;
+    StringCchCopyW(pkg.version, ARRAYSIZE(pkg.version), L"2.12345.0");
+    Check("diagnostics include the installed version and numeric profile state",
+          Diagnostics_Text(&pkg, &profiles, text, ARRAYSIZE(text)) && wcsstr(text, L"2.12345.0") && wcsstr(text, L"running=1"));
+    Check("shared diagnostics exclude names, paths, notes and account identifiers",
+          !wcsstr(text, L"private@example") && !wcsstr(text, L"Secret") && !wcsstr(text, L"secret note"));
+    Check("diagnostics reject an undersized output buffer", !Diagnostics_Text(&pkg, &profiles, text, 4));
+}
+
+static void TestBackupFailures(void)
+{
+    static const WCHAR *const id = L"abababab-0000-4000-8000-00000000b001";
+    ProfileList profiles;
+    WCHAR entries[2][MAX_PATH], targetEntries[MAX_PATH], archive[MAX_PATH], settings[MAX_PATH], path[MAX_PATH], to[MAX_PATH];
+    WCHAR error[LONG_PATH_CCH];
+    ZipOut *out = NULL;
+    ZipIn *zip = NULL, *appearance = NULL;
+    DWORD code = 0;
+    int sessions = 0;
+    BOOL signedOut = FALSE, ready, denied;
+    RestoreSource sources[2];
+    RestoreResult result;
+    int from[PICK_UNITS];
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    ready = PrepareProfile(&profiles.items[0], L"Backup-A", L"backup\\A", L"backup-a", L"organization", entries[0], ARRAYSIZE(entries[0])) &&
+            PrepareProfile(&profiles.items[1], L"Backup-B", L"backup\\B", L"backup-b", L"organization", entries[1], ARRAYSIZE(entries[1])) &&
+            WriteSyncEntry(entries[0], id, "Backed up", 123) &&
+            SaveIn(profiles.items[0].storageDir, L"config.json", "{\"lastKnownAccountUuid\":\"backup-a\",\"userThemeMode\":\"dark\"}") &&
+            Join(profiles.items[1].storageDir, L"claude-code-sessions\\backup-a\\organization", targetEntries, ARRAYSIZE(targetEntries)) &&
+            MakeDir(targetEntries) && FixturePath(L"account-backup.zip", archive, ARRAYSIZE(archive)) &&
+            WriteBackup(&profiles, 0, BK_SIGNIN | BK_CONVERSATIONS, NULL, archive, error, ARRAYSIZE(error));
+    Check("cross-account backup fixtures created", ready);
+    if (ready) zip = Zip_Open(archive);
+    ready = ready && FixturePath(L"appearance-backup.zip", settings, ARRAYSIZE(settings)) && (out = Zip_Create(settings, &code)) != NULL;
+    if (ready) {
+        static const char json[] = "{\"userThemeMode\":\"light\"}";
+        BOOL added = Zip_AddData(out, APPEARANCE_NAME, json, sizeof json - 1);
+        ready = Zip_Close(out, added) && added;
+        if (ready) appearance = Zip_Open(settings);
+    }
+    ZeroMemory(sources, sizeof sources);
+    sources[0].zip = zip;
+    sources[0].offered = BK_SIGNIN | BK_CONVERSATIONS;
+    sources[0].version = 2;
+    sources[1].zip = appearance;
+    sources[1].offered = SYNC_ITEM_APPEARANCE;
+    sources[1].version = 2;
+    from[PICK_UNIT_ACCOUNT] = 0;
+    from[PICK_UNIT_SETTINGS] = 1;
+    Check("account restore selects that account before importing its sessions",
+          zip && appearance && RestoreChosen(NULL, &profiles, 1, sources, 2, BK_SIGNIN | BK_CONVERSATIONS | SYNC_ITEM_APPEARANCE,
+                                             from, g_root, L"Fixture restore", &result) && result.sessions == 1 &&
+          EntryThere(targetEntries, id) && !EntryThere(entries[1], id));
+    Check("settings from the separately chosen backup survive the sign-in restore",
+          appearance &&
+          Join(profiles.items[1].storageDir, L"config.json", path, ARRAYSIZE(path)) && FileHas(path, "\"backup-a\"") &&
+          FileHas(path, "\"light\""));
+    Check("an account without an initialized folder cannot restore into the old account",
+          zip && SaveIn(profiles.items[1].storageDir, L"config.json", "{\"lastKnownAccountUuid\":\"not-initialized\"}") &&
+          !RestoreSessions(zip, &profiles, 1, g_root, &sessions, &signedOut, error, ARRAYSIZE(error)) && error[0] &&
+          !EntryThere(entries[1], id));
+    Zip_Free(appearance);
+    Zip_Free(zip);
+
+    /* Both backup paths must distinguish an unreadable folder from an empty one. */
+    ready = FixturePath(L"denied-backup", path, ARRAYSIZE(path)) && MakeDir(path) && SaveIn(path, L"content.txt", "kept") &&
+            FixturePath(L"denied-copy", to, ARRAYSIZE(to)) && FixturePath(L"denied-backup.zip", archive, ARRAYSIZE(archive));
+    denied = ready && DenyDirectory(path, TRUE);
+    Check("copying an unreadable tree fails", denied && !Util_CopyTree(path, to, FALSE, &code) && code == ERROR_ACCESS_DENIED);
+    out = ready ? Zip_Create(archive, &code) : NULL;
+    Check("archiving an unreadable tree fails", denied && out && !AddTree(out, path, L"data"));
+    if (out) Zip_Close(out, FALSE);
+    if (denied) Check("the private backup folder's access is restored", DenyDirectory(path, FALSE));
+}
+
+static void TestArchiveValidation(void)
+{
+    static const char manifest[] = "{\"format\":\"claude-desktop-profiles-manager-sessions\",\"version\":1,\"sessions\":1}";
+    static const char entry[] = "{\"sessionId\":\"local_11111111-1111-4111-8111-111111111111\",\"cliSessionId\":\"11111111-1111-4111-8111-111111111111\",\"title\":\"Fixture\"}";
+    static const char outer[] = "{\"format\":\"claude-desktop-profiles-manager-backup\",\"version\":2,\"items\":67108864}";
+    WCHAR archive[MAX_PATH], wrapped[MAX_PATH], error[1024];
+    ZipOut *zip;
+    DWORD code = 0;
+    int files = 0;
+    BOOL ok;
+    HANDLE cancel = CreateEventW(NULL, TRUE, TRUE, NULL), file;
+    FixturePath(L"validation-session.zip", archive, ARRAYSIZE(archive));
+    FixturePath(L"validation-profile.zip", wrapped, ARRAYSIZE(wrapped));
+    zip = Zip_Create(archive, &code);
+    ok = zip && Zip_AddData(zip, "manifest.json", manifest, sizeof manifest - 1) && Zip_AddData(zip, "entries/1.json", entry, sizeof entry - 1);
+    if (zip) ok = Zip_Close(zip, ok) && ok;
+    Check("archive validation reads all session items", ok && Zip_Validate(archive, NULL, &files, error, ARRAYSIZE(error)) && files == 2);
+    Check("archive validation can be cancelled", cancel && !Zip_Validate(archive, cancel, &files, error, ARRAYSIZE(error)) && error[0]);
+    if (cancel) CloseHandle(cancel);
+    zip = Zip_Create(wrapped, &code);
+    ok = zip && Zip_AddData(zip, "manifest.json", outer, sizeof outer - 1) && Zip_AddFile(zip, "sessions/archive.zip", archive);
+    if (zip) ok = Zip_Close(zip, ok) && ok;
+    Check("archive validation descends into the session archive", ok && Zip_Validate(wrapped, NULL, &files, error, ARRAYSIZE(error)) && files == 4);
+    file = CreateFileW(archive, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        BYTE broken = 0;
+        DWORD wrote = 0;
+        WriteFile(file, &broken, 1, &wrote, NULL);
+        CloseHandle(file);
+    }
+    zip = Zip_Create(wrapped, &code);
+    ok = zip && Zip_AddData(zip, "manifest.json", outer, sizeof outer - 1) && Zip_AddFile(zip, "sessions/archive.zip", archive);
+    if (zip) ok = Zip_Close(zip, ok) && ok;
+    Check("valid outer CRC does not hide a damaged nested archive", ok && !Zip_Validate(wrapped, NULL, &files, error, ARRAYSIZE(error)));
+    zip = Zip_Create(archive, &code);
+    ok = zip && Zip_AddData(zip, "manifest.json", manifest, sizeof manifest - 1);
+    if (zip) ok = Zip_Close(zip, ok) && ok;
+    Check("a missing declared session fails validation", ok && !Zip_Validate(archive, NULL, &files, error, ARRAYSIZE(error)));
+    zip = Zip_Create(archive, &code);
+    ok = zip && Zip_AddData(zip, "manifest.json", manifest, sizeof manifest - 1) && Zip_AddData(zip, "manifest.json", manifest, sizeof manifest - 1);
+    if (zip) ok = Zip_Close(zip, ok) && ok;
+    Check("duplicate archive paths fail validation", ok && !Zip_Validate(archive, NULL, &files, error, ARRAYSIZE(error)));
+    {
+        static const char truncated[] = "{\"format\":\"claude-desktop-profiles-manager-sessions\",\"version\":1,\"sessions\":0,";
+        zip = Zip_Create(archive, &code);
+        ok = zip && Zip_AddData(zip, "manifest.json", truncated, sizeof truncated - 1);
+        if (zip) ok = Zip_Close(zip, ok) && ok;
+        Check("a truncated manifest with valid CRC fails validation", ok && !Zip_Validate(archive, NULL, &files, error, ARRAYSIZE(error)));
+    }
+}
+
+#include "test_backupfeatures.inc"
 
 int wmain(int argc, WCHAR **argv)
 {
@@ -4099,6 +4679,13 @@ int wmain(int argc, WCHAR **argv)
             TestSyncItems();
             TestReliableSync();
             TestAccountKey();
+            TestSearchCache();
+            TestPrivateDiagnostics();
+            TestBackupFailures();
+            TestArchiveValidation();
+            TestBackupFeatures(projects);
+            TestCleanupReferences(projects);
+            TestLedgerTransactions();
         }
         Check("nothing outside the fixture was given to the Recycle Bin", !g_recycle.escaped);
         StopStartedClaude();

@@ -305,6 +305,14 @@ static INT_PTR CALLBACK AboutProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     }
     case WM_COMMAND:
+        if (LOWORD(wp) == IDC_W_LOGS) {
+            Diagnostics_OpenLogs(dialog);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDC_W_DIAGNOSTICS) {
+            Diagnostics_Show(dialog);
+            return TRUE;
+        }
         if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) EndDialog(dialog, LOWORD(wp));
         return TRUE;
     }

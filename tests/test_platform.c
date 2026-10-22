@@ -1071,6 +1071,14 @@ static BOOL FixtureRefuseDefaultProfile(const WCHAR *folder)
     return FALSE;
 }
 
+static BOOL FixtureRefuseProfileNote(const WCHAR *folder, const WCHAR *note)
+{
+    (void)folder; (void)note;
+    return FALSE;
+}
+
+static void FixtureNoPrivateSignIn(HWND owner, const Profile *profile) { (void)owner; (void)profile; }
+
 static void FixtureNoSettingsCopy(const Profile *from, const Profile *to) { (void)from; (void)to; }
 
 static RemoveResult FixtureRefuseProfileRemoval(HWND owner, const Profile *profile)
@@ -3346,6 +3354,12 @@ static void CheckWatcherLife(void)
 /* ------------------------------------------------------------------ gui.c */
 
 static int g_downloadStarts, g_downloadDeletions, g_captionChanges, g_guiWarnings, g_guiQuestions, g_guiNotices, g_pagesOpened;
+static BOOL g_guiControlDown;
+
+static SHORT WINAPI FixtureGuiKeyState(int key)
+{
+    return key == VK_CONTROL && g_guiControlDown ? (SHORT)-32768 : 0;
+}
 static int g_startupCalls, g_uninstallDialogs;
 static UpdateResult g_downloadStartResult = UPDATE_STARTED;
 static DWORD g_downloadStartError;
@@ -3396,7 +3410,7 @@ static BOOL FixtureOpenPage(const WCHAR *url)
 
 static UINT WINAPI FixtureCaption(HWND window, int id, LPWSTR text, int cch)
 {
-    (void)window; (void)id;
+    if (id == IDC_P_BADGE) return GetDlgItemTextW(window, id, text, cch);
     if (cch > 0) text[0] = 0;
     return 0;
 }
@@ -3455,6 +3469,8 @@ static INT_PTR FixtureUninstallDialog(HWND owner, int id, DLGPROC procedure, LPA
 #define Icons_DeleteStale FixtureKeepIcons
 #define Profiles_Create FixtureRefuseProfileCreation
 #define Profiles_Update FixtureRefuseProfileChange
+#define Profiles_SetNote FixtureRefuseProfileNote
+#define SignIn_Open FixtureNoPrivateSignIn
 #define Profiles_SetDefault FixtureRefuseDefaultProfile
 #define Profiles_CopySettings FixtureNoSettingsCopy
 #define Profiles_Delete FixtureRefuseProfileRemoval
@@ -3485,12 +3501,15 @@ static INT_PTR FixtureUninstallDialog(HWND owner, int id, DLGPROC procedure, LPA
 #define SessionVault_KeepAll FixtureGuiKeepSessions
 #define Handler_UserChoice FixtureGuiChoice
 #define Install_Uninstall FixtureGuiUninstall
+#define Gui_ProfileTools Fixture_Gui_ProfileTools
 #define Gui_Run TestedGui_Run
 #define Gui_ShowSessions TestedGui_ShowSessions
 #define Gui_LayoutProfileColumns TestedGui_LayoutProfileColumns
 #define Gui_OrderProfileColumns TestedGui_OrderProfileColumns
 #define Gui_MainWindowGeometry TestedGui_MainWindowGeometry
+#define GetKeyState FixtureGuiKeyState
 #include "../src/gui.c"
+#undef GetKeyState
 #undef Update_Run
 #undef Update_RemoveDownload
 #undef Update_Available
@@ -3509,6 +3528,8 @@ static INT_PTR FixtureUninstallDialog(HWND owner, int id, DLGPROC procedure, LPA
 #undef Icons_DeleteStale
 #undef Profiles_Create
 #undef Profiles_Update
+#undef Profiles_SetNote
+#undef SignIn_Open
 #undef Profiles_SetDefault
 #undef Profiles_CopySettings
 #undef Profiles_Delete
@@ -3551,6 +3572,155 @@ static void ResetManagerRecords(void)
     g_downloadStarts = g_downloadDeletions = g_captionChanges = g_guiWarnings = g_guiQuestions = g_guiNotices = g_pagesOpened = 0;
     g_uninstallDialogs = 0;
     g_footer[0] = g_openedPage[0] = 0;
+}
+
+static void CheckProfileSearchMapping(void)
+{
+    INITCOMMONCONTROLSEX controls = { sizeof controls, ICC_LISTVIEW_CLASSES };
+    HWND list;
+    LVITEMW item;
+    ListSelection kept;
+    InitCommonControlsEx(&controls);
+    list = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_POPUP | LVS_REPORT | LVS_SHOWSELALWAYS,
+                           0, 0, 400, 200, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    ResetManagerRecords();
+    Check("profile search fixture list exists", list != NULL);
+    if (!list) return;
+    g_manager.list = list;
+    g_manager.profiles.count = 5;
+    StringCchCopyW(g_manager.profiles.items[1].folder, FOLDER_CCH, L"Claude-Hidden");
+    StringCchCopyW(g_manager.profiles.items[2].name, LABEL_CCH, L"Work");
+    StringCchCopyW(g_manager.profiles.items[2].folder, FOLDER_CCH, L"Claude-Work");
+    StringCchCopyW(g_manager.profiles.items[2].note, ARRAYSIZE(g_manager.profiles.items[2].note), L"Client Alpha");
+    StringCchCopyW(g_manager.profiles.items[4].name, LABEL_CCH, L"Personal");
+    StringCchCopyW(g_manager.profiles.items[4].folder, FOLDER_CCH, L"Claude-Home");
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_TEXT | LVIF_PARAM;
+    item.pszText = L"Work";
+    item.lParam = 3;
+    ListView_InsertItem(list, &item);
+    item.iItem = 1;
+    item.pszText = L"Personal";
+    item.lParam = 5;
+    ListView_InsertItem(list, &item);
+    ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    Check("filtered first row selects its original profile", SelectedProfile() == &g_manager.profiles.items[2] &&
+          FocusedProfile() == &g_manager.profiles.items[2] && SelectedProfiles() == (1u << 2));
+    ListView_SetItemState(list, 1, LVIS_SELECTED, LVIS_SELECTED);
+    Check("filtered multiple selection keeps original profile bits", SelectedProfiles() == ((1u << 2) | (1u << 4)) && !SelectedProfile());
+    Check("selection by folder finds a filtered row", SetSelectedRow(L"Claude-Home") == 1 && SelectedProfile() == &g_manager.profiles.items[4]);
+    ZeroMemory(&kept, sizeof kept);
+    StringCchCopyW(kept.focused, ARRAYSIZE(kept.focused), L"Claude-Hidden");
+    StringCchCopyW(kept.folders[kept.count++], FOLDER_CCH, L"Claude-Hidden");
+    StringCchCopyW(kept.folders[kept.count++], FOLDER_CCH, L"Claude-Home");
+    Check("filtering the focused item retains a visible old selection without adding the first row",
+          SetSelectedRow(VisibleSelectionFolder(&kept)) == 1 && SelectedProfiles() == (1u << 4));
+    StringCchCopyW(g_manager.profileSearch, ARRAYSIZE(g_manager.profileSearch), L"alpha");
+    Check("profile search matches notes without case", ProfileMatchesSearch(&g_manager.profiles.items[2]) &&
+          !ProfileMatchesSearch(&g_manager.profiles.items[4]));
+    StringCchCopyW(g_manager.profileSearch, ARRAYSIZE(g_manager.profileSearch), L"claude-home");
+    Check("profile search matches a stable folder", ProfileMatchesSearch(&g_manager.profiles.items[4]));
+    g_manager.profileSearch[0] = 0;
+    Check("an empty profile search matches all profiles", ProfileMatchesSearch(&g_manager.profiles.items[2]) &&
+          ProfileMatchesSearch(&g_manager.profiles.items[4]));
+    ListView_DeleteAllItems(list);
+    Check("no visible rows cannot select hidden profiles", !SelectedProfile() && !FocusedProfile() && !SelectedProfiles() &&
+          SetSelectedRow(L"Claude-Home") == -1);
+    DestroyWindow(list);
+    ResetManagerRecords();
+}
+
+static void CheckBadgeWithPicture(void)
+{
+    HWND window = CreateWindowExW(0, L"STATIC", L"Private badge fixture", WS_POPUP, 0, 0, 300, 100, NULL, NULL, g_hInst, NULL);
+    HWND edit = window ? CreateWindowExW(0, L"EDIT", L"X2", WS_CHILD | WS_DISABLED, 0, 0, 100, 24, window,
+                                        (HMENU)(INT_PTR)IDC_P_BADGE, g_hInst, NULL) : NULL;
+    HWND remove = window ? CreateWindowExW(0, L"BUTTON", L"Remove", WS_CHILD | WS_DISABLED, 110, 0, 100, 24, window,
+                                          (HMENU)(INT_PTR)IDC_P_NO_PICTURE, g_hInst, NULL) : NULL;
+    ProfileDialog state = { 0 };
+    DWORD picture = 0;
+    WCHAR badge[BADGE_CCH];
+    Check("private picture and badge fixture created", window && edit && remove);
+    if (window && edit && remove) {
+        state.picture = &picture;
+        state.badgeOwn = TRUE;
+        ShowPictureState(window, &state);
+        Check("a profile with a picture can edit its badge and remove its picture", IsWindowEnabled(edit) && IsWindowEnabled(remove));
+        SetWindowTextW(edit, L"Q7");
+        ChosenBadge(window, &state, L"Work", badge, ARRAYSIZE(badge));
+        Check("a badge edited while the picture shows is kept for saving", wcscmp(badge, L"Q7") == 0 && state.picture == &picture);
+        state.picture = NULL;
+        ShowPictureState(window, &state);
+        ChosenBadge(window, &state, L"Work", badge, ARRAYSIZE(badge));
+        Check("removing a picture retains the edited badge", IsWindowEnabled(edit) && !IsWindowEnabled(remove) && wcscmp(badge, L"Q7") == 0);
+    }
+    if (window) DestroyWindow(window);
+}
+
+static void CheckProfileSearchShortcut(void)
+{
+    HWND window = CreateWindowExW(0, L"STATIC", L"Private search fixture", WS_POPUP, 0, 0, 400, 200, NULL, NULL, g_hInst, NULL);
+    HWND edit = window ? CreateWindowExW(0, L"EDIT", L"", WS_CHILD, 0, 0, 200, 24, window,
+                                        (HMENU)(INT_PTR)IDC_PROFILE_SEARCH, g_hInst, NULL) : NULL;
+    MSG message = { 0 };
+    ResetManagerRecords();
+    Check("private Ctrl+F fixture created", window && edit);
+    if (window && edit) {
+        g_manager.dlg = window;
+        g_guiControlDown = TRUE;
+        message.hwnd = edit;
+        message.message = WM_KEYDOWN;
+        message.wParam = 'F';
+        Check("Ctrl+F from a child reveals profile search", SearchShortcut(MSGF_DIALOGBOX, 0, (LPARAM)&message) == 1 &&
+              g_manager.profileSearchShown && (GetWindowLongW(edit, GWL_STYLE) & WS_VISIBLE));
+        Check("a repeated Ctrl+F keeps search open", SearchShortcut(MSGF_DIALOGBOX, 0, (LPARAM)&message) == 1 && g_manager.profileSearchShown);
+        g_guiControlDown = FALSE;
+        ShowProfileSearch(window, FALSE);
+        Check("closing search hides its edit", !g_manager.profileSearchShown && !(GetWindowLongW(edit, GWL_STYLE) & WS_VISIBLE));
+    }
+    if (window) DestroyWindow(window);
+    ResetManagerRecords();
+}
+
+static void CheckProfileJobResults(void)
+{
+    Job *job = (Job *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *job);
+    WCHAR first[512], second[512];
+    Check("profile job result fixture allocated", job != NULL);
+    if (!job) return;
+    job->kind = JOB_RESTART;
+    job->results[0].quitTried = TRUE;
+    job->results[0].quitError = ERROR_ACCESS_DENIED;
+    job->results[1].quitTried = TRUE;
+    job->results[1].openTried = TRUE;
+    job->results[1].openError = E_OUTOFMEMORY;
+    FormatJobResult(job, 0, first, ARRAYSIZE(first));
+    FormatJobResult(job, 1, second, ARRAYSIZE(second));
+    Check("each profile keeps its own failure code and phase", wcsstr(first, L"80070005") && wcsstr(second, L"8007000E") &&
+          !wcsstr(first, L"8007000E") && !wcsstr(second, L"80070005"));
+    job->kind = JOB_OPEN;
+    job->results[0].openTried = TRUE;
+    job->results[0].openError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    FormatJobResult(job, 0, first, ARRAYSIZE(first));
+    Check("an open cancellation is identified", wcsstr(first, TR(L"Open: cancelled")) != NULL);
+    job->results[0].openError = S_OK;
+    job->results[0].alreadyRunning = TRUE;
+    FormatJobResult(job, 0, first, ARRAYSIZE(first));
+    Check("opening an existing process is identified", wcsstr(first, TR(L"Open: already running, brought forward")) != NULL);
+    ResetManagerRecords();
+    job->profiles.count = 2;
+    job->chosen = 0x3;
+    job->results[0].quitError = 0;
+    job->results[1].openError = S_OK;
+    ShowJobFailure(job);
+    Check("successful profile actions have no result dialog", g_uninstallDialogs == 0 && g_guiWarnings == 0 && g_guiNotices == 0);
+    job->results[1].openError = E_ACCESSDENIED;
+    ShowJobFailure(job);
+    Check("failed profile action uses one compact warning", g_uninstallDialogs == 0 && g_guiWarnings == 1);
+    job->results[1].openError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    ShowJobFailure(job);
+    Check("cancelled profile action is quiet", g_uninstallDialogs == 0 && g_guiWarnings == 1);
+    HeapFree(GetProcessHeap(), 0, job);
 }
 
 static void CheckLateDownloads(void)
@@ -4227,6 +4397,7 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #define Util_RegDeleteTree TestedUtil_RegDeleteTree
 #define Util_LocalNowTicks TestedUtil_LocalNowTicks
 #define Util_Log TestedUtil_Log
+#define Util_LogDirectory TestedUtil_LogDirectory
 #define Util_SyncLock TestedUtil_SyncLock
 #define Util_SyncUnlock TestedUtil_SyncUnlock
 #define Util_OpenUrl TestedUtil_OpenUrl
@@ -4284,6 +4455,7 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #undef Util_RegDeleteTree
 #undef Util_LocalNowTicks
 #undef Util_Log
+#undef Util_LogDirectory
 #undef Util_SyncLock
 #undef Util_SyncUnlock
 #undef Util_OpenUrl
@@ -4465,6 +4637,32 @@ static RemoveResult g_failingLocationResult;
 static int g_locationRemovals, g_failingLocation, g_localAppDataLength;
 static int g_profileStartsAfterLocations = -1;
 static BOOL g_claudePackageInstalled, g_roamingMissing, g_localMissing;
+static WCHAR g_noteRegistryKey[MAX_PATH], g_noteRegistryValue[256];
+static int g_noteWrites, g_noteDeletes;
+
+static BOOL FixtureNoteWrite(HKEY root, const WCHAR *key, const WCHAR *value, const WCHAR *data, BOOL *changed)
+{
+    if (root != HKEY_CURRENT_USER || wcscmp(value, L"Note") != 0) return FixtureRefuseRegistryString(root, key, value, data);
+    if (changed) *changed = TRUE;
+    g_noteWrites++;
+    return SUCCEEDED(StringCchCopyW(g_noteRegistryKey, ARRAYSIZE(g_noteRegistryKey), key)) &&
+           SUCCEEDED(StringCchCopyW(g_noteRegistryValue, ARRAYSIZE(g_noteRegistryValue), data));
+}
+
+static BOOL FixtureNoteRead(HKEY root, const WCHAR *key, const WCHAR *value, WCHAR *out, size_t cch)
+{
+    if (root == HKEY_CURRENT_USER && wcscmp(value, L"Note") == 0 && wcscmp(key, g_noteRegistryKey) == 0)
+        return SUCCEEDED(StringCchCopyW(out, cch, g_noteRegistryValue));
+    return FixtureNoRegistryString(root, key, value, out, cch);
+}
+
+static LSTATUS FixtureNoteDelete(HKEY root, const WCHAR *key, const WCHAR *value)
+{
+    if (root != HKEY_CURRENT_USER || wcscmp(value, L"Note") != 0) return FixtureRefuseRegistryValueRemoval(root, key, value);
+    g_noteDeletes++;
+    g_noteRegistryValue[0] = 0;
+    return ERROR_SUCCESS;
+}
 
 static BOOL FixtureProfileStartsRunning(const Profile *profile)
 {
@@ -4524,12 +4722,13 @@ static RemoveResult FixtureRecycleLocation(HWND owner, const WCHAR *const *paths
 #define Util_Log FixtureLog
 #define Claude_FindPackage FixtureProfilePackage
 #define Claude_IsRunning FixtureProfileStartsRunning
-#define Util_RegGetString FixtureNoRegistryString
+#define Util_RegGetString FixtureNoteRead
 #define Util_RegGetDword FixtureNoRegistryNumber
 #define Util_RegSetString FixtureRefuseRegistryString
+#define Util_RegSetStringIfDifferent FixtureNoteWrite
 #define Util_RegSetDword FixtureRefuseRegistryNumber
 #define Util_RegDeleteTree FixtureRefuseRegistryTreeRemoval
-#define Util_RegDeleteValue FixtureRefuseRegistryValueRemoval
+#define Util_RegDeleteValue FixtureNoteDelete
 #define Util_RegKeyExists FixtureNoRegistryKey
 #define RegOpenKeyExW FixtureRefuseKeyOpen
 #define Install_IsRegistered FixtureNotRegistered
@@ -4553,6 +4752,7 @@ static RemoveResult FixtureRecycleLocation(HWND owner, const WCHAR *const *paths
 #define Profiles_SetSyncItems TestedProfiles_SetSyncItems
 #define Profiles_SyncItems TestedProfiles_SyncItems
 #define Profiles_SetWindowTitle TestedProfiles_SetWindowTitle
+#define Profiles_SetNote TestedProfiles_SetNote
 /* Profiles_Load calls it before its definition. */
 int TestedProfiles_Find(const ProfileList *list, const WCHAR *folder);
 #include "../src/profiles.c"
@@ -4567,6 +4767,7 @@ int TestedProfiles_Find(const ProfileList *list, const WCHAR *folder);
 #undef Util_RegGetString
 #undef Util_RegGetDword
 #undef Util_RegSetString
+#undef Util_RegSetStringIfDifferent
 #undef Util_RegSetDword
 #undef Util_RegDeleteTree
 #undef Util_RegDeleteValue
@@ -4589,6 +4790,25 @@ int TestedProfiles_Find(const ProfileList *list, const WCHAR *folder);
 #undef Profiles_LinkTarget
 #undef Profiles_RecycleData
 #undef Profiles_Delete
+#undef Profiles_SetNote
+
+static void CheckProfileNotes(void)
+{
+    Profile profile;
+    ClaudePackage package = { 0 };
+    WCHAR longNote[300], expected[MAX_PATH];
+    g_noteWrites = g_noteDeletes = 0;
+    g_noteRegistryKey[0] = g_noteRegistryValue[0] = 0;
+    StringCchPrintfW(expected, ARRAYSIZE(expected), REG_PROFILES L"\\Claude-Work");
+    Check("profile notes use the stable folder key and clean line breaks", TestedProfiles_SetNote(L"Claude-Work", L"  Client\nAlpha\t ") &&
+          g_noteWrites == 1 && wcscmp(g_noteRegistryKey, expected) == 0 && wcscmp(g_noteRegistryValue, L"Client Alpha") == 0);
+    Fill(&profile, L"C:\\private-fixture\\roaming", L"Claude-Work", FALSE, &package);
+    Check("profile notes load with their profile", wcscmp(profile.note, L"Client Alpha") == 0);
+    wmemset(longNote, L'x', ARRAYSIZE(longNote) - 1);
+    longNote[ARRAYSIZE(longNote) - 1] = 0;
+    Check("oversized notes fail without replacing saved notes", !TestedProfiles_SetNote(L"Claude-Work", longNote) && g_noteWrites == 1);
+    Check("clearing profile notes removes their value", TestedProfiles_SetNote(L"Claude-Work", L" \t ") && g_noteDeletes == 1 && !g_noteRegistryValue[0]);
+}
 
 /* The locations of a profile's data, removed in turn: its folder and "<folder>-Data" in
  * %LOCALAPPDATA%, then the data folder; with Claude installed, each of the first two
@@ -4717,6 +4937,11 @@ int wmain(int argc, WCHAR **argv)
     CheckLateDownloads();
     CheckDownloadOutcomes();
     CheckStartupResults();
+    CheckProfileSearchMapping();
+    CheckProfileJobResults();
+    CheckProfileSearchShortcut();
+    CheckBadgeWithPicture();
+    CheckProfileNotes();
     CheckLauncherWatchers();
     CheckRouteTargets();
     CheckRouteFailures();

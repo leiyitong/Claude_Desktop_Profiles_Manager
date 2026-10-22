@@ -7,7 +7,9 @@
  * name only once complete, so a failure leaves no half archive.
  */
 #include "app.h"
+#include "vaulttools_tasks.h"
 #include <string.h>
+#include <stdlib.h>
 
 #define ZIP_LOCAL_SIGNATURE   0x04034B50u
 #define ZIP_CENTRAL_SIGNATURE 0x02014B50u
@@ -420,4 +422,149 @@ BOOL Zip_Extract(const ZipIn *zip, int index, const WCHAR *path)
     Free(data);
     if (!ok) DeleteFileW(longPath);
     return ok;
+}
+
+static BOOL ArchiveWideName(const char *name, WCHAR *out, size_t cch)
+{
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, out, (int)cch);
+    if (n <= 1) return FALSE;
+    if (out[n - 2] == L'/') out[n - 2] = 0;
+    return TRUE;
+}
+static BOOL DevicePart(const WCHAR *name)
+{
+    WCHAR stem[16]; size_t n = 0;
+    while (name[n] && name[n] != L'/' && name[n] != L'.') n++;
+    while (n && name[n - 1] == L' ') n--;
+    if (n >= ARRAYSIZE(stem)) return FALSE;
+    StringCchCopyNW(stem, ARRAYSIZE(stem), name, n);
+    return Core_EqualsI(stem, L"CON") || Core_EqualsI(stem, L"PRN") || Core_EqualsI(stem, L"AUX") || Core_EqualsI(stem, L"NUL") ||
+        (n == 4 && (_wcsnicmp(stem, L"COM", 3) == 0 || _wcsnicmp(stem, L"LPT", 3) == 0) &&
+         ((stem[3] >= L'1' && stem[3] <= L'9') || stem[3] == 0x00B9 || stem[3] == 0x00B2 || stem[3] == 0x00B3));
+}
+static int CompareArchiveNames(const void *a, const void *b)
+{
+    const char *left = *(const char *const *)a, *right = *(const char *const *)b;
+    WCHAR x[ZIP_NAME_MAX], y[ZIP_NAME_MAX];
+    if (!ArchiveWideName(left, x, ARRAYSIZE(x)) || !ArchiveWideName(right, y, ARRAYSIZE(y))) return strcmp(left, right);
+    return CompareStringOrdinal(x, -1, y, -1, TRUE) - CSTR_EQUAL;
+}
+
+/* General integrity check on the caller's stable read handle. No manifest
+ * interpretation and no extraction: migration/snapshot readers validate the
+ * same ZipIn they later read. Inflation uses the existing bounded item buffer;
+ * cancellation is checked between items, not in Core_Inflate. */
+BOOL Zip_ValidateAll(const ZipIn *zip, HANDLE cancel, WCHAR *error, size_t cch)
+{
+    const char **names = NULL; BOOL ok = FALSE; int i;
+    error[0] = 0;
+    if (!zip || (names = (const char **)Alloc((size_t)max(Zip_Count(zip), 1) * sizeof *names)) == NULL) goto done;
+    for (i = 0; i < Zip_Count(zip); i++) {
+        const char *name = Zip_Name(zip, i); size_t length = strlen(name), at;
+        WCHAR wide[ZIP_NAME_MAX];
+        if (length >= ZIP_NAME_MAX || !Core_ArchiveNameSafe(name, length && name[length - 1] == '/' ? length - 1 : length) ||
+            !ArchiveWideName(name, wide, ARRAYSIZE(wide))) goto done;
+        if (DevicePart(wide)) goto done;
+        for (at = 0; wide[at]; at++) if (wide[at] == L'/' && DevicePart(wide + at + 1)) goto done;
+        names[i] = name;
+    }
+    qsort(names, (size_t)Zip_Count(zip), sizeof *names, CompareArchiveNames);
+    for (i = 1; i < Zip_Count(zip); i++) {
+        WCHAR before[ZIP_NAME_MAX], after[ZIP_NAME_MAX]; size_t n;
+        if (CompareArchiveNames(&names[i - 1], &names[i]) == 0 || !ArchiveWideName(names[i - 1], before, ARRAYSIZE(before)) ||
+            !ArchiveWideName(names[i], after, ARRAYSIZE(after))) goto done;
+        n = wcslen(before);
+        if (names[i - 1][strlen(names[i - 1]) - 1] != '/' && wcslen(after) > n && after[n] == L'/' &&
+            CompareStringOrdinal(before, (int)n, after, (int)n, TRUE) == CSTR_EQUAL) goto done;
+    }
+    /* An unrelated sibling may sort between a file and its descendant, so
+     * check every ancestor by binary search rather than adjacent names only. */
+    for (i = 0; i < Zip_Count(zip); i++) {
+        char prefix[ZIP_NAME_MAX]; size_t at, length = strlen(Zip_Name(zip, i));
+        StringCchCopyA(prefix, ARRAYSIZE(prefix), Zip_Name(zip, i));
+        for (at = 0; at < length; at++) if (prefix[at] == '/') {
+            const char *key = prefix; const char *const *parent;
+            prefix[at] = 0;
+            parent = (const char *const *)bsearch(&key, names, (size_t)Zip_Count(zip), sizeof *names, CompareArchiveNames);
+            prefix[at] = '/';
+            if (parent && (*parent)[strlen(*parent) - 1] != '/') goto done;
+        }
+    }
+    for (i = 0; i < Zip_Count(zip); i++) {
+        const char *name = Zip_Name(zip, i); size_t length = strlen(name);
+        BYTE local[ZIP_LOCAL_BYTES]; char localName[ZIP_NAME_MAX]; DWORD size = 0; void *data;
+        if (cancel && WaitForSingleObject(cancel, 0) == WAIT_OBJECT_0) { StringCchCopyW(error, cch, TR(L"Validation cancelled.")); goto done; }
+        if (!ReadAt(zip->file, zip->items[i].offset, local, sizeof local) || Get32(local) != ZIP_LOCAL_SIGNATURE ||
+            (Get16(local + 6) & ZIP_ENCRYPTED) || Get16(local + 8) != zip->items[i].method || Get16(local + 26) != length ||
+            !ReadAt(zip->file, (ULONGLONG)zip->items[i].offset + ZIP_LOCAL_BYTES, localName, (DWORD)length) || memcmp(name, localName, length) != 0 ||
+            (!(Get16(local + 6) & 8) && (Get32(local + 14) != zip->items[i].crc || Get32(local + 18) != zip->items[i].packed || Get32(local + 22) != zip->items[i].size))) goto done;
+        data = Zip_Read(zip, i, ZIP_MAX_FILE, &size);
+        if (!data) {
+            WCHAR bad[512]; int wide = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, bad, ARRAYSIZE(bad));
+            StringCchPrintfW(error, cch, TR(L"Unreadable or corrupt archive item: %s"), wide ? bad : L"?"); goto done;
+        }
+        Free(data);
+    }
+    if (cancel && WaitForSingleObject(cancel, 0) == WAIT_OBJECT_0) { StringCchCopyW(error, cch, TR(L"Validation cancelled.")); goto done; }
+    ok = TRUE;
+done:
+    Free(names);
+    if (!ok && !error[0]) StringCchCopyW(error, cch, TR(L"The archive is incomplete, damaged, unsupported or exceeds the read limits."));
+    return ok;
+}
+
+static BOOL ValidateArchive(const WCHAR *path, HANDLE cancel, int *files, WCHAR *error, size_t cch, int depth)
+{
+    ZipIn *zip = Zip_Open(path);
+    DWORD size = 0;
+    char *manifest = NULL;
+    const char *value;
+    size_t n;
+    WCHAR format[80], temporary[MAX_PATH] = L"", folder[MAX_PATH];
+    ULONGLONG version = 0, expected = 0;
+    BOOL session = FALSE, ok = FALSE;
+    int i, entries = 0, at = zip ? Zip_Find(zip, "manifest.json") : -1;
+    if (!Zip_ValidateAll(zip, cancel, error, cch) || at < 0 || !(manifest = (char *)Zip_Read(zip, at, 65536, &size)) ||
+        !Core_JsonIsValue(manifest, size) ||
+        !Core_JsonMember(manifest, size, "format", &value, &n) || !Core_JsonString(value, n, format, ARRAYSIZE(format)) ||
+        !Core_JsonMember(manifest, size, "version", &value, &n) || !Core_JsonNumber(value, n, &version)) goto done;
+    session = wcscmp(format, L"claude-desktop-profiles-manager-sessions") == 0;
+    if (depth && !session) goto done;
+    if ((!session && wcscmp(format, L"claude-desktop-profiles-manager-backup") != 0) || !version || version > (session ? 1u : 2u)) goto done;
+    if (session && (!Core_JsonMember(manifest, size, "sessions", &value, &n) || !Core_JsonNumber(value, n, &expected))) goto done;
+    for (i = 0; i < Zip_Count(zip); i++) {
+        const char *name = Zip_Name(zip, i);
+        size_t length = strlen(name);
+        if (cancel && WaitForSingleObject(cancel, 0) == WAIT_OBJECT_0) {
+            StringCchCopyW(error, cch, TR(L"Validation cancelled.")); goto done;
+        }
+        if (session && strncmp(name, "entries/", 8) == 0 && name[length - 1] != '/') {
+            void *data = Zip_Read(zip, i, ZIP_MAX_FILE, &size);
+            if (!data || !Core_JsonIsValue((const char *)data, size) || Core_SessionEntryKind((const char *)data, size) != ENTRY_LOCAL) { Free(data); goto done; }
+            entries++; Free(data);
+        }
+        if (!session && VaultTasks_IsCoverage(name) && !VaultTasks_ValidateCoverage(zip, name)) goto done;
+        (*files)++;
+        if (!session && strcmp(name, "sessions/archive.zip") == 0) {
+            if (depth || !GetTempPathW(ARRAYSIZE(folder), folder) || !GetTempFileNameW(folder, L"cdv", 0, temporary) ||
+                !Zip_Extract(zip, i, temporary) || !ValidateArchive(temporary, cancel, files, error, cch, depth + 1)) goto done;
+            DeleteFileW(temporary);
+            temporary[0] = 0;
+        }
+    }
+    if (session && expected != (ULONGLONG)entries) goto done;
+    ok = TRUE;
+done:
+    if (temporary[0]) DeleteFileW(temporary);
+    if (!ok && !error[0]) StringCchCopyW(error, cch, TR(L"The archive is incomplete, damaged, unsupported or exceeds the read limits."));
+    Free(manifest);
+    Zip_Free(zip);
+    return ok;
+}
+
+BOOL Zip_Validate(const WCHAR *path, HANDLE cancel, int *files, WCHAR *error, size_t cch)
+{
+    *files = 0;
+    error[0] = 0;
+    return ValidateArchive(path, cancel, files, error, cch, 0);
 }

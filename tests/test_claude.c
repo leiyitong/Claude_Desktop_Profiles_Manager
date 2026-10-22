@@ -226,6 +226,37 @@ static void CheckTrayIcons(const ClaudePackage *pkg)
     }
 }
 
+/* Claude moves the stock folder out of its package to %LOCALAPPDATA%\
+ * Claude-Data\<family in lower case>, and marks the copy it left in the
+ * package ".user-data-left.<family in lower case>". Only reads. */
+static void CheckMovedStock(const ClaudePackage *pkg)
+{
+    WCHAR appData[MAX_PATH], localAppData[MAX_PATH], moved[MAX_PATH], left[MAX_PATH], lower[ARRAYSIZE(pkg->family)];
+    Profile stock;
+    BOOL marked, there;
+    if (!Util_AppData(appData, ARRAYSIZE(appData)) || !Util_LocalAppData(localAppData, ARRAYSIZE(localAppData)) ||
+        !Core_MovedStockDir(localAppData, pkg->family, moved, ARRAYSIZE(moved)) ||
+        FAILED(StringCchCopyW(lower, ARRAYSIZE(lower), pkg->family)) || _wcslwr_s(lower, ARRAYSIZE(lower)) != 0 ||
+        FAILED(StringCchPrintfW(left, ARRAYSIZE(left), L"%s\\Packages\\%s\\LocalCache\\Roaming\\" STOCK_FOLDER L"\\.user-data-left.%s",
+                                localAppData, pkg->family, lower))) {
+        ReportCheck(FALSE, L"the stock folder's place outside the package can be named", NULL);
+        return;
+    }
+    marked = Util_FileExists(left);
+    there = Util_DirExists(moved);
+    if (!marked && !there) {
+        wprintf(L"  skip  stock folder moved checks: Claude has not moved it out of its package here\n");
+        return;
+    }
+    if (marked) ReportCheck(there, L"the stock folder Claude marks as left is in %LOCALAPPDATA%\\Claude-Data\\<family in lower case>",
+                            L"%s not found", moved);
+    ZeroMemory(&stock, sizeof stock);
+    stock.isStock = TRUE;
+    StringCchPrintfW(stock.dataDir, ARRAYSIZE(stock.dataDir), L"%s\\" STOCK_FOLDER, appData);
+    ReportCheck(there && Profiles_ResolveStorage(&stock, localAppData, pkg->family) && Core_PathEquals(stock.storageDir, moved),
+                L"the stock profile resolves to the folder Claude moved it to", L"%s resolved, not %s", stock.storageDir, moved);
+}
+
 /* A running profile's Claude holds "lockfile" in its data folder, created
  * right before its Chrome_MessageWindow: without the process, the watcher sees
  * the profile start that way. Only reads. */
@@ -309,7 +340,7 @@ static BOOL FindClaudeCode(const ClaudePackage *pkg, WCHAR *out, size_t cch)
     return found;
 }
 
-int wmain(void)
+int wmain(int argc, WCHAR **argv)
 {
     Fact app[] = {
         { "claude://resume?session=<id> imports that transcript into the running profile",
@@ -317,6 +348,15 @@ int wmain(void)
         { "the link host is \"resume\"", ".Resume=\"resume\"" },
         { "the import creates the profile's entry itself", "Imported CLI session " },
         { "Claude logs when its data folder is virtualized by MSIX", "Filesystem virtualization active" },
+        /* Measured on 3.1623 (the move itself on 2026-10-21): profiles.c resolves the stock folder there. */
+        { "Claude moves the stock folder out of its package to %LOCALAPPDATA%\\<name>-Data", ".join(\x01.LOCALAPPDATA,`${\x01}${\x01}`)", "=\"-Data\"" },
+        { "... into a folder named after the package family in lower case", "\"[a-z0-9.-]+_[a-z0-9]+\"", "`.user-data-${\x01}.${\x01.toLowerCase()}`" },
+        { "... joined below it", "===null?null:\x01.join(\x01,\x01)}", "\"lockfile\"" },
+        { "... and uses it there whenever it is a folder", ".isDirectory()?\"moved\":" },
+        { "... (\"use_moved\")", "===\"moved\"){if(", "{action:\"use_moved\"}" },
+        { "a profile started with its own --user-data-dir is not moved", "chosen:\x01.app.commandLine.getSwitchValue(\"user-data-dir\")!==\"\"",
+          "getPath(\"appData\"),\"Claude\").toLowerCase()" },
+        { "... it stays in the folder chosen", ".chosen&&!\x01.movedOut())return \x01(\"chosen_folder\")" },
         { "Claude's updater logs its quit for an update", "beforeQuitForUpdate handler fired" },
         /* The reasons are Electron's: "close-app" (exe[]) when Windows closes Claude to update it. */
         { "a close by Windows logs \"Windows session ending (<reasons>)\"", "Windows session ending (%s) - quitting the app",
@@ -339,6 +379,32 @@ int wmain(void)
         { "a star is isStarred in the entry", "isStarred" },
         { "an archived session is isArchived in the entry", "isArchived" },
         { "entries keep lastActivityAt", "lastActivityAt" },
+        /* Local-format facts measured in app.asar 2.42304.2.0. These are
+         * saved history and definitions, never a license to run a task. */
+        { "entry previousTitles is an array of strings", "previousTitles.every((\x01=>typeof \x01==\"string\"))" },
+        /* 3.1623 puts lastTurnEdgeAt between lastActivityAt and model: the saved fields are found together, not by their neighbor. */
+        { "session metadata exposes saved model and effort beside lastActivityAt", "model:\x01.model,effort:\x01.effort,ultracode:\x01.sessionSettings?.ultracode", "lastActivityAt:\x01.lastActivityAt" },
+        { "entry serialization retains saved model, effort and sessionSettings", "model:\x01.model,effort:\x01.effort,effortInherited:\x01.effortInherited,btwLoweredFrom:\x01.btwLoweredFrom,sessionSettings:\x01.sessionSettings", "lastActivityAt:\x01.lastActivityAt" },
+        { "entry permissionMode is an optional string", "permissionMode!==void 0&&typeof \x01.permissionMode!=\"string\"" },
+        { "sessionSettings retains the saved ultracode choice", "sessionSettings?.ultracode", "isArchived:" },
+        { "rewindEdges names parent and child transcript references", "rewindEdges??[]", ".parent,\x01.child" },
+        { "entry publishedArtifacts is an array", "Array.isArray(\x01.publishedArtifacts)", "publishedArtifacts.every" },
+        { "artifact metadata holds a URL and optional sourcePath", "typeof \x01.url!=\"string\"", "sourcePath!==void 0" },
+        { "session presets use the ccd-session-presets store keyed byAccount", "name:\"ccd-session-presets\"", "\"byAccount\"" },
+        { "each account preset catalog has presets and optional builtIns", "Array.isArray(\x01.presets)&&\x01.presets.every", "builtIns===void 0" },
+        { "plan-usage-history.json maps five-hour and seven-day utilization to fh and sd", "plan-usage-history.json", "five_hour:\"fh\",seven_day:\"sd\"" },
+        { "usage history version 2 stores samples with timestamp, nullable organization and utilization map", "t:\x01(),org:\x01().nullable(),u:\x01(\x01(),\x01())", "version:\x01(2),samples:" },
+        { "window-state.json follows window move, resize and maximize events", "window-state.json", "\"resize\",\"move\",\"maximize\"" },
+        { "window-state reads saved width and height", "[window-state] ignoring unreadable saved state", "width:\x01.width,height:\x01.height" },
+        { "developer_settings.json accepts allowDevTools", "developer_settings.json", "allowDevTools:" },
+        { "the scheduled task registry is scheduled-tasks.json", "scheduled-tasks.json" },
+        { "scheduled task definitions keep enabled state and an external filePath", "enabled:\x01(),filePath:\x01(),model:\x01().optional(),createdAt:" },
+        { "Code scheduled tasks use the Claude config scheduled-tasks directory and SKILL.md", ".join)(\x01(),\"scheduled-tasks\")", "\"SKILL.md\"" },
+        { "a task definition is stored in the task id's SKILL.md", ".join)(\x01,\x01,\"SKILL.md\")", "Invalid file path: path traversal detected" },
+        { "Cowork tasks use a Scheduled directory distinct from Code scheduled-tasks", ".join)(\x01(),\"Scheduled\")", ".join)(\x01(),\"scheduled-tasks\")" },
+        { "Cowork recognizes an absolute coworkUserFilesPath", "coworkUserFilesPath;return typeof", "isAbsolute" },
+        { "Cowork recognizes the cowork-managed migration marker", "\"cowork-managed\"", "\".migrated.json\"" },
+        { "scheduled task artifact grants are kept in a separate artifact-publish-grants.json", "\"scheduled-task-grants\"", "\"artifact-publish-grants.json\"" },
         { "entries name their transcript (cliSessionId)", "cliSessionId" },
         { "entries keep originCwd", "originCwd" },
         { "entries keep titleSource", "titleSource" },
@@ -404,6 +470,17 @@ int wmain(void)
 
     /* Paths keep their non-ASCII letters, on the console as in a redirected file (UTF-8). */
     _setmode(_fileno(stdout), _O_U8TEXT);
+    if (argc == 3 && Core_EqualsI(argv[1], L"--asar")) {
+        wprintf(L"Claude ASAR %s\n", argv[2]);
+        if (ScanFileForFacts(argv[2], app, ARRAYSIZE(app))) ReportFacts(argv[2], app, ARRAYSIZE(app));
+        else ReportUnreadable(argv[2]);
+        wprintf(L"Claude ASAR tests: %d checks, %d failure(s).\n", g_checks, g_failures);
+        return g_failures ? 1 : 0;
+    }
+    if (argc != 1) {
+        ReportCheck(FALSE, L"usage: test_claude.exe [--asar <app.asar>]", NULL);
+        return 1;
+    }
     if (!Claude_FindPackage(&pkg)) {
         wprintf(L"Claude tests: skipped, Claude Desktop is not installed.\n");
         return 0;
@@ -417,6 +494,7 @@ int wmain(void)
     if (ScanFileForFacts(pkg.exe, exe, ARRAYSIZE(exe))) ReportFacts(pkg.exe, exe, ARRAYSIZE(exe));
     else ReportUnreadable(pkg.exe);
     CheckTrayIcons(&pkg);
+    CheckMovedStock(&pkg);
     CheckLockFiles(&pkg);
     if (FindClaudeCode(&pkg, code, ARRAYSIZE(code))) {
         wprintf(L"Claude Code %s\n", code);

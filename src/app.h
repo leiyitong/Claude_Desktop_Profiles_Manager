@@ -80,6 +80,7 @@
 #define CLAUDE_ENTRIES_DIR  L"claude-code-sessions"             /* ...its Claude Code sessions' entries */
 #define CLAUDE_SCRATCH_DIR  L"scratch-workspaces"               /* ...the working folders of its sessions without a folder */
 #define CLAUDE_WEB_STORAGE  L"Local Storage\\leveldb"           /* ...its web UI's storage (webstore.c) */
+#define CLAUDE_MOVED_DATA   L"Claude-Data"   /* in %LOCALAPPDATA%: where Claude moves the stock folder out of its package */
 
 #define MAX_PROFILES       32
 C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
@@ -145,8 +146,11 @@ C_ASSERT(MAX_PROFILES <= 32);   /* sets of profiles are DWORD bit masks */
 typedef struct Profile {
     WCHAR folder[FOLDER_CCH];  /* "Claude" (stock) or "Claude-<name>": the stable id */
     WCHAR name[LABEL_CCH];     /* display name, editable */
+    WCHAR note[256];           /* the person's note, kept by the manager */
     WCHAR dataDir[MAX_PATH];   /* %APPDATA%\<folder>, as Claude sees it */
     WCHAR storageDir[MAX_PATH]; /* file access outside the package; empty when unresolved */
+    WCHAR formerDir[MAX_PATH]; /* where the stock folder was before Claude moved it out of its package
+                                  (%APPDATA%\Claude), which earlier entries still name; empty otherwise */
     int   color;               /* palette index */
     WCHAR badge[BADGE_CCH];    /* the badge's own text; empty: the name's initial */
     WCHAR windowTitle[WINDOW_TITLE_CCH];   /* its windows' title; empty: Claude's own, then its name ("Claude (<name>)") */
@@ -226,6 +230,13 @@ typedef struct SyncOp {
     WCHAR      content[SYNC_CONTENT_CCH];   /* put, index, layout: the file of ours holding what is written */
 } SyncOp;
 
+typedef struct SyncProfileResult {
+    WCHAR folder[FOLDER_CCH];
+    int added, updated, removed, skipped, failed;
+    BOOL waiting, unavailable;
+    WCHAR error[384];
+} SyncProfileResult;
+
 typedef struct SyncReport {             /* what sending sessions to profiles did */
     int   added, updated, removed, skipped, failed;
     int   forked;                       /* sessions two profiles went on with apart, kept as two */
@@ -234,6 +245,8 @@ typedef struct SyncReport {             /* what sending sessions to profiles did
     int   conflicts;                    /* parts of a sidebar changed in two profiles each their own way: left to the person */
     WCHAR backup[MAX_PATH];             /* where what was replaced or removed went; "" for nowhere */
     WCHAR error[LONG_PATH_CCH];         /* the first failure, "" for none */
+    int profileCount;
+    SyncProfileResult profiles[MAX_PROFILES];   /* stable folder keys, including reports from subset syncs */
 } SyncReport;
 
 typedef enum RemoveResult { REMOVE_DONE, REMOVE_CANCELLED, REMOVE_FAILED } RemoveResult;
@@ -272,6 +285,8 @@ BOOL         Core_CleanBadge(const WCHAR *raw, WCHAR *badge, size_t cch);
 BOOL         Core_IsProfileFolder(const WCHAR *folder);
 BOOL         Core_SanitizeUrl(const WCHAR *in, WCHAR *out, size_t cch);
 BOOL         Core_IsSignInUrl(const WCHAR *url);
+BOOL         Core_PrivateSignInUrl(const WCHAR *raw, WCHAR *out, size_t cch);
+BOOL         Core_PrivateBrowserArgs(BOOL edge, const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch);
 BOOL         Core_BuildLaunchArgs(const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch);
 BOOL         Core_LatestSignInStart(const char *text, size_t len, SYSTEMTIME *latest);
 BOOL         Core_LastQuit(const char *text, size_t len, SYSTEMTIME *when, BOOL *forUpdate);
@@ -312,6 +327,8 @@ BOOL         Core_PathUnder(const WCHAR *path, const WCHAR *dir);
 BOOL         Core_ProfileFilePath(const Profile *p, const WCHAR *path, WCHAR *out, size_t cch);
 BOOL         Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *family, const WCHAR *area, const WCHAR *name,
                                    WCHAR *out, size_t cch);
+BOOL         Core_MovedStockDir(const WCHAR *localAppData, const WCHAR *family, WCHAR *out, size_t cch);
+BOOL         Core_ProfileHoldsPath(const Profile *p, const WCHAR *path);
 BOOL         Core_SameFatTime(const FILETIME *a, const FILETIME *b);
 BOOL         Core_JsonMember(const char *json, size_t len, const char *key, const char **value, size_t *valueLen);
 /* Each member of the JSON object `json`, in order: its key's raw text (between
@@ -325,6 +342,8 @@ typedef BOOL (*CoreJsonElement)(void *context, const char *value, size_t valueLe
 BOOL         Core_JsonEachElement(const char *json, size_t len, CoreJsonElement each, void *context);
 BOOL         Core_JsonIsValue(const char *text, size_t len);   /* one JSON value, whole (spaces around it aside) */
 BOOL         Core_JsonString(const char *raw, size_t len, WCHAR *out, size_t cch);
+WCHAR       *Core_JsonStringList(const char *raw, size_t len); /* MULTI_SZ; HeapFree, NULL when absent/invalid */
+BOOL         Core_SafeHttpsUrl(const WCHAR *url); /* explicit HTTPS authority, no credentials/control/quotes */
 BOOL         Core_JsonNumber(const char *raw, size_t len, ULONGLONG *value);
 BOOL         Core_JsonTrue(const char *raw, size_t len);
 SessionEntryKind Core_SessionEntryKind(const char *json, size_t len);
@@ -354,6 +373,7 @@ typedef struct CoreRegex {
 } CoreRegex;
 BOOL         Core_RegexCompile(CoreRegex *rx, const WCHAR *pattern, BOOL ignoreCase);   /* FALSE: not a pattern it takes */
 BOOL         Core_RegexSearch(const CoreRegex *rx, const WCHAR *text, size_t length);   /* a match anywhere in the text */
+BOOL Core_RegexSearchEnd(const CoreRegex *rx, const WCHAR *text, size_t length, size_t *end);
 typedef enum TranscriptRole { TRANSCRIPT_NONE, TRANSCRIPT_USER, TRANSCRIPT_CLAUDE } TranscriptRole;
 TranscriptRole Core_TranscriptLine(const char *line, size_t len, WCHAR *out, size_t cch);   /* one line of a .jsonl, for the preview */
 #define CHANGELOG_NAME_CCH 24
@@ -541,6 +561,7 @@ LSTATUS   Util_RegDeleteValue(HKEY root, const WCHAR *key, const WCHAR *value);
 LSTATUS   Util_RegDeleteTree(HKEY root, const WCHAR *key);
 ULONGLONG Util_LocalNowTicks(void);
 void      Util_Log(const WCHAR *fmt, ...);
+BOOL      Util_LogDirectory(WCHAR *out, size_t cch);
 BOOL      Util_OpenUrl(const WCHAR *url);
 BOOL      Util_Spawn(const WCHAR *exe, const WCHAR *args, DWORD *pid);
 BOOL      Util_IsDirectoryLink(const WCHAR *path);     /* a junction or directory symlink */
@@ -551,6 +572,12 @@ BOOL      Util_ExtendedPath(const WCHAR *path, WCHAR *out, size_t cch);   /* the
 HANDLE    Util_FindFiles(const WCHAR *dir, const WCHAR *pattern, WIN32_FIND_DATAW *found, BOOL foldersOnly);
 BOOL      Util_CopyTree(const WCHAR *from, const WCHAR *to, BOOL replace, DWORD *error);
 BOOL      Util_DeleteTree(const WCHAR *path, DWORD *error);
+BOOL      Ui_ReviewText(HWND owner, const WCHAR *title, const WCHAR *note, const WCHAR *text, const WCHAR *action);
+void      Diagnostics_Show(HWND owner);
+void      Diagnostics_OpenLogs(HWND owner);
+BOOL      Diagnostics_Text(const ClaudePackage *pkg, const ProfileList *profiles, WCHAR *out, size_t cch);
+void      BackupHistory_Record(const Profile *profile, const WCHAR *path);
+void      BackupHistory_Show(HWND owner);
 
 /* -------------------------------------------------------------- claude.c */
 
@@ -582,6 +609,8 @@ BOOL         Profiles_SetDefault(const WCHAR *folder);
 BOOL         Profiles_SetSyncGroup(const WCHAR *folder, int group);   /* 0: its sessions kept apart */
 BOOL         Profiles_SetSyncItems(const WCHAR *folder, DWORD items);  /* SYNC_ITEM_*; 0: the default */
 BOOL         Profiles_SetWindowTitle(const WCHAR *folder, const WCHAR *title);   /* empty: the default title */
+BOOL         Profiles_SetNote(const WCHAR *folder, const WCHAR *note);
+void         SignIn_Open(HWND owner, const Profile *profile);
 DWORD        Profiles_SyncItems(const Profile *p);                    /* what it keeps the same, the default for none chosen */
 void         Profiles_CopySettings(const Profile *from, const Profile *to);
 RemoveResult Profiles_Delete(HWND owner, const Profile *profile);
@@ -626,6 +655,9 @@ DWORD       Zip_Size(const ZipIn *zip, int index);
 int         Zip_Find(const ZipIn *zip, const char *name);
 void       *Zip_Read(const ZipIn *zip, int index, DWORD maxBytes, DWORD *size);   /* checked by its CRC; HeapFree it, NUL after it */
 BOOL        Zip_Extract(const ZipIn *zip, int index, const WCHAR *path);
+BOOL        Zip_Validate(const WCHAR *path, HANDLE cancel, int *files, WCHAR *error, size_t cch);
+BOOL        Zip_ValidateAll(const ZipIn *zip, HANDLE cancel, WCHAR *error, size_t cch);
+void        Backup_ValidateArchive(HWND owner, const WCHAR *path); /* NULL: choose archives */
 
 /* -------------------------------------------------------------- backup.c */
 /* A profile backed up to one archive, parts chosen (Code sessions, Cowork
@@ -799,10 +831,16 @@ int  Taskbar_WatchRun(const WCHAR *folder, DWORD pid, void (*claudeClosed)(const
 
 #define SESSION_ENTRY_MAX_BYTES (4u * 1024u * 1024u)   /* larger, a file is not one of Claude's small JSON files */
 
+typedef enum SessionResult { RESULT_UNKNOWN, RESULT_COMPLETED, RESULT_BLOCKED, RESULT_REVIEW, RESULT_ACTION, SESSION_RESULTS } SessionResult;
+SessionResult Core_SessionResult(const char *json, size_t length, WCHAR *detail, size_t cch);
+int Core_CompareSessionOrder(const WCHAR *nameA, ULONGLONG timeA, const WCHAR *nameB, ULONGLONG timeB, BOOL byName, BOOL descending);
+
 typedef struct SessionEntry {          /* one profile's entry for a session */
     WCHAR     localId[SESSION_ID_CCH]; /* the entry's own id, its session's key until the first message */
     WCHAR     file[LONG_PATH_CCH];     /* its local_*.json */
     WCHAR     title[SESSION_TITLE_CCH];
+    WCHAR    *previousTitles;         /* decoded MULTI_SZ, owned by SessionSet */
+    WCHAR     model[128], effort[64], permissionMode[64];
     BOOL      userTitle;               /* named by someone, not by Claude */
     BOOL      autoTitle;               /* named by Claude itself (titleSource "auto"): it may name it again */
     BOOL      starred;
@@ -813,6 +851,8 @@ typedef struct SessionEntry {          /* one profile's entry for a session */
     DWORD     environment;             /* SESSION_ENV_*: where it runs */
     PullRequestState pullRequest;      /* its pull request as Claude shows it */
     int       pullRequestNumber;
+    SessionResult result;
+    WCHAR     resultDetail[512];       /* a summary tied to the last assistant message, not live task state */
     /* Changes made here while the profile runs, waiting for it to close. */
     BOOL      pending;
     WCHAR     pendingTitle[SESSION_TITLE_CCH];   /* "" when unchanged */
@@ -843,11 +883,13 @@ typedef struct SessionGroup {          /* a project folder, or one profile's "no
 
 typedef struct SessionSource {         /* what reading one profile's entries found */
     BOOL      signedIn;                /* its config.json names an account */
+    BOOL      complete;                /* every entry was read, or the folder is known absent */
     int       unreadable;              /* entries that are not a session entry */
     int       elsewhere;               /* SSH, WSL or cloud sessions: their conversation is not on this PC */
     int       pending;                 /* waiting changes its entries can take once it is closed */
     WCHAR     entriesDir[MAX_PATH];    /* claude-code-sessions\<account>\<organization>; empty when it has none */
     WCHAR     scratchDir[MAX_PATH];    /* logical scratch-workspaces\<account>\<organization>: its "no folder" */
+    WCHAR     formerScratchDir[MAX_PATH]; /* the same below its formerDir, named by earlier entries; empty without one */
 } SessionSource;
 
 typedef struct SessionRowIndex SessionRowIndex;
@@ -888,6 +930,14 @@ BOOL         SessionStore_PendingPath(const Profile *p, WCHAR *out, size_t cch);
 int          SessionStore_LoadPending(const Profile *p, PendingEdit *edits, int capacity);   /* -1: unreadable */
 const WCHAR *SessionStore_RowTitle(const SessionSet *set, const SessionRow *row);           /* "": untitled */
 void         SessionStore_GroupName(const SessionSet *set, int group, WCHAR *out, size_t cch);
+
+/* ---------------------------------------------------------- sessiontools.c */
+BOOL SessionTools_OpenArtifact(HWND owner, const WCHAR *url, const WCHAR *title, const WCHAR *source);
+void SessionTools_Details(HWND owner, const WCHAR *file, int page);
+void SessionTools_Catalog(HWND owner, const Profile *profile, BOOL historical);
+void SessionTools_Export(HWND owner, const SessionSet *set, int row);
+WCHAR        *SessionTools_Context(const WCHAR *path, ULONGLONG offset, const WCHAR *query, BOOL regex, BOOL matchCase);
+BOOL SessionTools_ExportFile(const WCHAR *source, const WCHAR *target, BOOL markdown, DWORD *messages, DWORD *omitted);
 
 /* ---------------------------------------------------------- sessionedit.c */
 
@@ -967,8 +1017,12 @@ typedef struct LayoutPart {
     const WCHAR *label;   /* as the person sees it (a catalog key), NULL for none */
     DWORD        item;
     BOOL         byKey;
+    BOOL         ownOnly;   /* written only over a value of the profile's own: one that shows none cannot take it */
 } LayoutPart;
 BOOL         SessionSync_LayoutPart(int index, LayoutPart *part);
+/* A member showing `shown` of a part (NULL: none) already holds what `value`,
+ * sent to it, would leave there. */
+BOOL         SessionSync_PartHolds(const LayoutPart *part, const char *shown, size_t shownLength, const char *value, size_t valueLength);
 /* From now on, each change this thread makes in a profile calls `step` (a
  * progress bar's); NULL for none. */
 void         SessionSync_OnEachChange(void (*step)(void *context), void *context);
@@ -990,10 +1044,14 @@ CopyResult   SessionSync_Copy(HWND owner, const SessionSet *set, int from, const
 int          SessionSync_ApplyPending(const Profile *p, SyncReport *report);   /* report may be NULL */
 int          SessionSync_PendingCount(const Profile *p);
 int          SessionSync_Queued(const Profile *p, SyncOp **ops);   /* its changes waiting, a heap block in *ops; -1 unreadable */
+WCHAR       *SessionSync_PendingText(const ProfileList *profiles); /* read-only, HeapFree */
+void         SyncUi_Pending(HWND owner, const ProfileList *profiles);
 BOOL         SessionSync_PlanPath(const Profile *p, WCHAR *out, size_t cch);
 BOOL         SessionSync_Export(const SessionSet *set, int profile, const int *rows, int rowCount, const WCHAR *archive,
                                 int *exported, WCHAR *error, size_t errorCch);
 BOOL         SessionSync_IsArchive(const WCHAR *archive);   /* a session archive this version reads */
+/* A read-only preview of each selected target; a heap string, freed by the caller. */
+WCHAR       *SessionSync_ImportPreview(const SessionSet *set, const WCHAR *archive, DWORD targets, WCHAR *error, size_t errorCch);
 BOOL         SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targets, int *sessions, SyncReport *report);
 
 /* --------------------------------------------------------- sessionvault.c */
@@ -1014,6 +1072,7 @@ typedef struct VaultVersion {
 typedef struct VaultIds {        /* session ids, each once */
     WCHAR (*ids)[SESSION_ID_CCH];
     int    count, capacity;
+    BOOL   failed;              /* an incomplete collection must not authorize deletion */
 } VaultIds;
 
 /* How far a sync is: `done` of `total` steps; the total grows as the work is known. */
@@ -1059,6 +1118,7 @@ void  SessionVault_AfterClose(const WCHAR *folder);   /* the watcher's call each
 char *SessionVault_ForProfile(const SessionSet *set, int target, const char *content, size_t length, size_t *outLength);
 int   SessionVault_Versions(const WCHAR *listName, VaultVersion *out, int capacity);   /* newest first */
 BOOL  SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version, SyncReport *report);
+WCHAR *SessionVault_RestorePreview(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version);
 /* The ids of the sessions some kept list names (their transcripts too), and
  * of those deleted, which only undeleting them brings back. */
 BOOL  SessionVault_Ids(VaultIds *listed, VaultIds *deleted);
@@ -1151,7 +1211,9 @@ BOOL SyncUi_ConfirmSessions(HWND owner, const WCHAR *question, const WCHAR *butt
  * stops first. FALSE when it cannot start (a pattern it does not take). */
 BOOL SessionSearch_Start(HWND window, ULONG generation, const WCHAR *text, BOOL regex, BOOL matchCase,
                          WCHAR (*paths)[LONG_PATH_CCH], int count);
+BOOL SessionSearch_Locate(const WCHAR *path, const WCHAR *text, BOOL regex, BOOL matchCase, ULONGLONG *offset, size_t *messageEnd);
 void SessionSearch_Stop(void);   /* the search under way, stopped and gone */
+void SessionSearch_Invalidate(void);   /* a watched file changed; cached matches are no longer current */
 
 /* -------------------------------------------------------- sessionundo.c */
 /* What the manager changes in sessions, undone and redone (Ctrl+Z, Ctrl+Y in
@@ -1205,7 +1267,8 @@ void         SessionsView_Init(HWND dlg);
 void         SessionsView_Warm(const ProfileList *profiles);
 void         SessionsView_SetProfiles(const ProfileList *profiles);
 void         SessionsView_Ready(BOOL allowChanges);
-void         SessionsView_SearchFound(WPARAM search, LPARAM index);   /* WM_APP_SESSION_SEARCH */
+BOOL         SessionsView_SearchFound(WPARAM search, LPARAM index);   /* WM_APP_SESSION_SEARCH; FALSE for stale messages */
+void         SessionsView_SearchAll(void);
 void         SessionsView_Enter(const ClaudePackage *pkg, const WCHAR *folder);   /* pkg: the manager's, kept current, read at each use */
 void         SessionsView_Leave(void);
 BOOL         SessionsView_Shown(void);

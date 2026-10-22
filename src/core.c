@@ -10,6 +10,40 @@
 #include <stdlib.h>
 #include <bcrypt.h>
 
+SessionResult Core_SessionResult(const char *json, size_t length, WCHAR *detail, size_t cch)
+{
+    const char *summary, *value;
+    size_t summaryLength, n;
+    WCHAR last[80], summarized[80], category[48];
+    SessionResult result = RESULT_UNKNOWN;
+    if (cch) detail[0] = 0;
+    if (!Core_JsonMember(json, length, "lastAssistantUuid", &value, &n) ||
+        !Core_JsonString(value, n, last, ARRAYSIZE(last)) || !last[0] ||
+        !Core_JsonMember(json, length, "postTurnSummary", &summary, &summaryLength) ||
+        !Core_JsonMember(summary, summaryLength, "summarizes_uuid", &value, &n) ||
+        !Core_JsonString(value, n, summarized, ARRAYSIZE(summarized)) || wcscmp(last, summarized) != 0)
+        return result;
+    if (Core_JsonMember(json, length, "postTurnSummaryFor", &value, &n) &&
+        (!Core_JsonString(value, n, summarized, ARRAYSIZE(summarized)) || wcscmp(last, summarized) != 0)) return result;
+    if (!Core_JsonMember(summary, summaryLength, "status_category", &value, &n) ||
+        !Core_JsonString(value, n, category, ARRAYSIZE(category))) return result;
+    if (wcscmp(category, L"completed") == 0) result = RESULT_COMPLETED;
+    else if (wcscmp(category, L"blocked") == 0) result = RESULT_BLOCKED;
+    else if (wcscmp(category, L"review_ready") == 0) result = RESULT_REVIEW;
+    else if (wcscmp(category, L"needs_action") == 0) result = RESULT_ACTION;
+    if (result != RESULT_UNKNOWN && cch && Core_JsonMember(summary, summaryLength, "status_detail", &value, &n) && n <= SESSION_ENTRY_MAX_BYTES) {
+        WCHAR *decoded = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (n + 1) * sizeof(WCHAR));
+        if (decoded) {
+            if (Core_JsonString(value, n, decoded, n + 1)) {
+                size_t take = min(wcslen(decoded), cch - 1);
+                if (take && decoded[take - 1] >= 0xD800 && decoded[take - 1] <= 0xDBFF) take--;
+                StringCchCopyNW(detail, cch, decoded, take);
+            }
+            HeapFree(GetProcessHeap(), 0, decoded);
+        }
+    }
+    return result;
+}
 /* ---------------------------------------------------------------- strings */
 
 /* A space of any kind: the ASCII ones and every one Windows classes as a
@@ -329,6 +363,50 @@ BOOL Core_BuildLaunchArgs(const WCHAR *dataDir, const WCHAR *url, WCHAR *out, si
     return TRUE;
 }
 
+/* Only Claude's observed web entry points; this is not the claude:// callback.
+ * Preserve the query in memory, but never repair an untrusted host or argument. */
+BOOL Core_PrivateSignInUrl(const WCHAR *raw, WCHAR *out, size_t cch)
+{
+    static const WCHAR origin[] = L"https://claude.ai";
+    const WCHAR *start, *path;
+    size_t n, i, originLength = ARRAYSIZE(origin) - 1, pathLength;
+    if (!out || !cch) return FALSE;
+    out[0] = 0;
+    if (!raw) return FALSE;
+    n = TrimmedSpan(raw, &start);
+    if (n < originLength || n >= URL_CCH || n >= cch || !EqualsI(start, (int)originLength, origin, (int)originLength)) return FALSE;
+    for (i = 0; i < n; i++)
+        if (IsSpace(start[i]) || IsControl(start[i]) || start[i] == L'"' || start[i] == L'\\') return FALSE;
+    path = start + originLength;
+    if (n > originLength && *path != L'/' && *path != L'?' && *path != L'#') return FALSE;
+    pathLength = 0;
+    while (originLength + pathLength < n && path[pathLength] != L'?' && path[pathLength] != L'#') pathLength++;
+    if (pathLength > 1 && !(pathLength >= 6 && wcsncmp(path, L"/login", 6) == 0 &&
+                           (pathLength == 6 || path[6] == L'/'))) return FALSE;
+    return SUCCEEDED(StringCchCopyNW(out, cch, start, n));
+}
+
+/* A fresh directory makes each browser process independent even when another
+ * private window exists. No shell interprets this command line. */
+BOOL Core_PrivateBrowserArgs(BOOL edge, const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch)
+{
+    WCHAR checked[URL_CCH];
+    size_t i, n;
+    if (!out || !cch) return FALSE;
+    out[0] = 0;
+    if (!dataDir || !*dataDir || !Core_PrivateSignInUrl(url, checked, ARRAYSIZE(checked))) return FALSE;
+    n = Core_TrimmedPathLength(dataDir);
+    /* A drive-absolute directory, without a trailing slash that could quote-escape. */
+    if (n < 4 || n >= LONG_PATH_CCH ||
+        !((dataDir[0] >= L'A' && dataDir[0] <= L'Z') || (dataDir[0] >= L'a' && dataDir[0] <= L'z')) ||
+        dataDir[1] != L':' || dataDir[2] != L'\\') return FALSE;
+    for (i = 0; dataDir[i]; i++)
+        if (IsControl(dataDir[i]) || dataDir[i] == L'"') return FALSE;
+    return SUCCEEDED(StringCchPrintfW(out, cch,
+        L"--user-data-dir=\"%.*s\" %s --new-window --no-first-run --no-default-browser-check \"%s\"",
+        (int)n, dataDir, edge ? L"--inprivate" : L"--incognito", checked));
+}
+
 /* ------------------------------------------------------------ log parsing */
 
 static BOOL IsDigit(char c) { return c >= '0' && c <= '9'; }
@@ -596,24 +674,67 @@ BOOL Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *family, const
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\Packages\\%s\\LocalCache\\%s\\%s", localAppData, family, area, name));
 }
 
-/* Stored working directories use the profile's logical path. File access
- * outside its package uses the same suffix below the resolved storage. */
+/* Where Claude moves the stock profile's folder out of its package:
+ * %LOCALAPPDATA%\Claude-Data\<family in lower case>. Claude does it only for
+ * a %LOCALAPPDATA% on a drive and a family of the form <name>_<publisher>
+ * (letters, digits, '.' and '-' before the '_', letters and digits after). */
+BOOL Core_MovedStockDir(const WCHAR *localAppData, const WCHAR *family, WCHAR *out, size_t cch)
+{
+    WCHAR lower[128];
+    size_t i, underscore = 0;
+    BOOL seen = FALSE;
+    if (!out || !cch) return FALSE;
+    out[0] = 0;
+    if (!localAppData || !family || !((localAppData[0] >= L'A' && localAppData[0] <= L'Z') ||
+                                      (localAppData[0] >= L'a' && localAppData[0] <= L'z')) ||
+        localAppData[1] != L':' || (localAppData[2] != L'\\' && localAppData[2] != L'/'))
+        return FALSE;
+    for (i = 0; family[i]; i++) {
+        WCHAR c = family[i];
+        if (i + 1 >= ARRAYSIZE(lower)) return FALSE;
+        if (c >= L'A' && c <= L'Z') c = (WCHAR)(c - L'A' + L'a');
+        if (c == L'_') {
+            if (seen || i == 0) return FALSE;
+            seen = TRUE;
+            underscore = i;
+        } else if (!((c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9') || (!seen && (c == L'.' || c == L'-')))) {
+            return FALSE;
+        }
+        lower[i] = c;
+    }
+    lower[i] = 0;
+    if (!seen || underscore + 1 == i) return FALSE;
+    return SUCCEEDED(StringCchPrintfW(out, cch, L"%.*s\\" CLAUDE_MOVED_DATA L"\\%s", (int)Core_TrimmedPathLength(localAppData),
+                                      localAppData, lower));
+}
+
+/* `path` is in the profile's folder, as Claude names it now or named it
+ * before it moved it (formerDir). */
+BOOL Core_ProfileHoldsPath(const Profile *p, const WCHAR *path)
+{
+    return p && path && (Core_PathUnder(path, p->dataDir) || (p->formerDir[0] && Core_PathUnder(path, p->formerDir)));
+}
+
+/* Stored working directories use the profile's logical path, or the one it
+ * had before Claude moved it. File access outside its package uses the same
+ * suffix below the resolved storage. */
 BOOL Core_ProfileFilePath(const Profile *p, const WCHAR *path, WCHAR *out, size_t cch)
 {
     WCHAR resolved[MAX_PATH];
-    const WCHAR *result = path;
+    const WCHAR *result = path, *named;
     size_t logical, physical;
     if (!out || !cch) return FALSE;
     if (!p || !path || !*path) {
         out[0] = 0;
         return FALSE;
     }
-    if (Core_PathUnder(path, p->dataDir)) {
+    if (Core_ProfileHoldsPath(p, path)) {
         if (!p->storageDir[0]) {
             out[0] = 0;
             return FALSE;
         }
-        logical = Core_TrimmedPathLength(p->dataDir);
+        named = Core_PathUnder(path, p->dataDir) ? p->dataDir : p->formerDir;
+        logical = Core_TrimmedPathLength(named);
         physical = Core_TrimmedPathLength(p->storageDir);
         if (FAILED(StringCchPrintfW(resolved, ARRAYSIZE(resolved), L"%.*s%s",
                                     (int)physical, p->storageDir, path + logical))) {
@@ -760,7 +881,7 @@ BOOL Core_JsonEachMember(const char *json, size_t len, CoreJsonMember each, void
 
 BOOL Core_JsonIsValue(const char *text, size_t len)
 {
-    size_t start = SkipSpace(text, len, 0), end;
+    size_t start = SkipSpace(text, len, SkipByteOrderMark(text, len)), end;
     if (start >= len || (end = ValueEnd(text, len, start)) == 0 || end == start) return FALSE;
     return SkipSpace(text, len, end) == len;
 }
@@ -919,7 +1040,8 @@ SessionEntryKind Core_SessionEntryKind(const char *json, size_t len)
 {
     const char *value;
     size_t valueLength;
-    if (!json || !Core_JsonMember(json, len, "sessionId", &value, &valueLength) || valueLength < 3 || value[0] != '"')
+    if (!json || !Core_JsonIsValue(json, len) ||
+        !Core_JsonMember(json, len, "sessionId", &value, &valueLength) || valueLength < 3 || value[0] != '"')
         return ENTRY_NOT_SESSION;
     if (JsonIsSet(json, len, "sshConfig") || JsonIsSet(json, len, "wslConfig") || JsonIsSet(json, len, "cloudSessionId") ||
         JsonIsSet(json, len, "movedToCloud"))
@@ -940,6 +1062,19 @@ BOOL Core_JsonEachElement(const char *json, size_t len, CoreJsonElement each, vo
         if ((end = ValueEnd(json, len, i)) == 0 || !each(context, json + i, end - i)) return FALSE;
     }
     return FALSE;
+}
+
+/* Natural names and chronological times share the selected direction. */
+int Core_CompareSessionOrder(const WCHAR *nameA, ULONGLONG timeA, const WCHAR *nameB, ULONGLONG timeB, BOOL byName, BOOL descending)
+{
+    int order = 0;
+    if (byName) {
+        order = CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE | SORT_DIGITSASNUMBERS, nameA, -1, nameB, -1, NULL, NULL, 0);
+        order = order ? order - CSTR_EQUAL : wcscmp(nameA, nameB);
+        order = (order > 0) - (order < 0);
+    }
+    if (!order && timeA != timeB) order = timeA > timeB ? 1 : -1;
+    return descending ? -order : order;
 }
 
 DWORD Core_SessionEnvironment(const char *json, size_t len)
@@ -1367,7 +1502,7 @@ static void RegexThread(RegexRun *run, int *list, int *count, int pc, size_t at)
     list[(*count)++] = pc;
 }
 
-BOOL Core_RegexSearch(const CoreRegex *rx, const WCHAR *text, size_t length)
+BOOL Core_RegexSearchEnd(const CoreRegex *rx, const WCHAR *text, size_t length, size_t *end)
 {
     int lists[2][CORE_REGEX_CODE], mark[CORE_REGEX_CODE], counts[2] = { 0, 0 }, current = 0, i;
     RegexRun run;
@@ -1400,7 +1535,13 @@ BOOL Core_RegexSearch(const CoreRegex *rx, const WCHAR *text, size_t length)
         RegexThread(&run, lists[next], &counts[next], 0, at + 1);   /* a match may start anywhere */
         current = next;
     }
+    if (end) *end = at;
     return run.matched;
+}
+
+BOOL Core_RegexSearch(const CoreRegex *rx, const WCHAR *text, size_t length)
+{
+    return Core_RegexSearchEnd(rx, text, length, NULL);
 }
 
 /* ------------------------------------------------------------ transcripts */
@@ -3437,8 +3578,14 @@ BOOL Core_LevelLogRecords(const BYTE *log, size_t length, CoreLevelRecord each, 
             continue;
         }
         if (size > left - LEVEL_HEADER || at + LEVEL_HEADER + size > length ||
-            Core_LevelMask(Core_Crc32c(0, log + at + 6, 1 + size)) != stored)
-            break;   /* a record cut short, or garbage: what follows is not read */
+            Core_LevelMask(Core_Crc32c(0, log + at + 6, 1 + size)) != stored) {
+            /* Recovery can append in the next block after a torn write.
+             * Discard this block and any unfinished logical record only. */
+            at += left;
+            inRecord = FALSE;
+            used = 0;
+            continue;
+        }
         if (type == LEVEL_FULL) {
             if (!each(context, log + at + LEVEL_HEADER, size)) ok = FALSE;
             inRecord = FALSE;
@@ -4231,4 +4378,45 @@ char *Core_JsonMerge(const char *base, size_t baseLen, const char *const *values
     }
     *outLen = job.out.len;
     return job.out.data;
+}
+
+/* An entry's old titles are independent strings, not one regex across titles. */
+typedef struct JsonStringList { WCHAR *text; size_t used, capacity; } JsonStringList;
+static BOOL AddJsonListString(void *context, const char *value, size_t length)
+{
+    JsonStringList *list = (JsonStringList *)context;
+    size_t n;
+    if (!Core_JsonString(value, length, list->text + list->used, list->capacity - list->used)) return FALSE;
+    n = wcslen(list->text + list->used);
+    if (n) list->used += n + 1;
+    return TRUE;
+}
+WCHAR *Core_JsonStringList(const char *raw, size_t len)
+{
+    JsonStringList list;
+    if (!raw || len > SESSION_ENTRY_MAX_BYTES || !Core_JsonIsValue(raw, len)) return NULL;
+    list.capacity = len + 2;
+    list.used = 0;
+    list.text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, list.capacity * sizeof(WCHAR));
+    if (list.text && !Core_JsonEachElement(raw, len, AddJsonListString, &list)) {
+        HeapFree(GetProcessHeap(), 0, list.text);
+        return NULL;
+    }
+    return list.text;
+}
+
+BOOL Core_SafeHttpsUrl(const WCHAR *url)
+{
+    const WCHAR *p, *end;
+    if (!url || _wcsnicmp(url, L"https://", 8) != 0 || !url[8]) return FALSE;
+    for (p = url; *p; p++)
+        if (*p <= 0x20 || *p == 0x7F || wcschr(L"\\\"<>`", *p)) return FALSE;
+    end = url + 8;
+    while (*end && *end != L'/' && *end != L'?' && *end != L'#') end++;
+    if (end == url + 8 || url[8] == L'.' || end[-1] == L'.') return FALSE;
+    for (p = url + 8; p < end; p++) {
+        if (*p == L'@' || *p == L'%') return FALSE;
+        if (!(iswalnum(*p) || wcschr(L".-:[]", *p))) return FALSE;
+    }
+    return TRUE;
 }

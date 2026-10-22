@@ -64,6 +64,53 @@ static void TestLaunchArgs(void)
     Check("too small a buffer fails", !Core_BuildLaunchArgs(spacey, url, out, 20));
 }
 
+static void TestPrivateSignIn(void)
+{
+    static const WCHAR *const refused[] = {
+        L"", L"http://claude.ai/login", L"https://claude.ai.evil.example/login",
+        L"https://claude.ai@evil.example/login", L"https://user:password@claude.ai/login",
+        L"https://claude.ai:443/login", L"https://www.claude.ai/login", L"claude://login/code",
+        L"https://claude.ai/settings", L"https://claude.ai/login-extra", L"https://claude.ai/Login",
+        L"https://claude.ai/login\" --load-extension=x", L"https://claude.ai/login\\x",
+        L"https://claude.ai/login?x=a b", L"https://claude.ai/login?x=a\nb",
+        L"https://claude.ai/login?x=a\x00A0" L"b", L"https://claude.ai/login?x=a\x3000" L"b"
+    };
+    WCHAR url[URL_CCH], args[URL_CCH + MAX_PATH + 160], longUrl[URL_CCH + 16];
+    const WCHAR *folder = L"C:\\Users\\Example User\\Private Sign In\\{test}";
+    size_t i;
+    Check("private sign-in: official home", Core_PrivateSignInUrl(L"https://claude.ai/", url, ARRAYSIZE(url)));
+    Check("private sign-in: bare origin", Core_PrivateSignInUrl(L"https://claude.ai", url, ARRAYSIZE(url)));
+    Check("private sign-in: trims outer space and keeps the complete query",
+          Core_PrivateSignInUrl(L"  HTTPS://CLAUDE.AI/login/desktop?state=a%2Fb&code=x%22y#finish  ", url, ARRAYSIZE(url)));
+    CheckStr("private sign-in: query unchanged", L"HTTPS://CLAUDE.AI/login/desktop?state=a%2Fb&code=x%22y#finish", url);
+    for (i = 0; i < ARRAYSIZE(refused); i++) {
+        Check("private sign-in: unsafe or unobserved entry refused", !Core_PrivateSignInUrl(refused[i], url, ARRAYSIZE(url)));
+        CheckStr("private sign-in: refusal leaves no URL", L"", url);
+    }
+    Check("private sign-in: no output or no space", !Core_PrivateSignInUrl(L"https://claude.ai/login", NULL, 1) &&
+          !Core_PrivateSignInUrl(L"https://claude.ai/login", url, 0));
+    Check("private sign-in: short output refused", !Core_PrivateSignInUrl(L"https://claude.ai/login", url, 8));
+    StringCchCopyW(longUrl, ARRAYSIZE(longUrl), L"https://claude.ai/login?state=");
+    for (i = wcslen(longUrl); i < ARRAYSIZE(longUrl) - 1; i++) longUrl[i] = L'a';
+    longUrl[ARRAYSIZE(longUrl) - 1] = 0;
+    Check("private sign-in: overlong URL refused", !Core_PrivateSignInUrl(longUrl, url, ARRAYSIZE(url)));
+    Check("private browser: Edge arguments", Core_PrivateBrowserArgs(TRUE, folder, L"https://claude.ai/login?state=x%22y", args, ARRAYSIZE(args)));
+    CheckStr("private browser: isolated Edge path and URL each quoted",
+        L"--user-data-dir=\"C:\\Users\\Example User\\Private Sign In\\{test}\" --inprivate --new-window --no-first-run --no-default-browser-check \"https://claude.ai/login?state=x%22y\"", args);
+    Check("private browser: Chrome arguments", Core_PrivateBrowserArgs(FALSE, L"C:\\private\\", L"https://claude.ai/login", args, ARRAYSIZE(args)));
+    CheckStr("private browser: Chrome uses incognito and strips the path's trailing slash",
+        L"--user-data-dir=\"C:\\private\" --incognito --new-window --no-first-run --no-default-browser-check \"https://claude.ai/login\"", args);
+    Check("private browser: untrusted URL refused", !Core_PrivateBrowserArgs(TRUE, folder, L"https://example.com", args, ARRAYSIZE(args)));
+    Check("private browser: quoted directory refused", !Core_PrivateBrowserArgs(TRUE, L"C:\\private\" --foo", L"https://claude.ai/login", args, ARRAYSIZE(args)));
+    Check("private browser: control in directory refused", !Core_PrivateBrowserArgs(TRUE, L"C:\\private\n", L"https://claude.ai/login", args, ARRAYSIZE(args)));
+    Check("private browser: only a drive-absolute private directory",
+        !Core_PrivateBrowserArgs(TRUE, NULL, L"https://claude.ai/login", args, ARRAYSIZE(args)) &&
+        !Core_PrivateBrowserArgs(TRUE, L"private", L"https://claude.ai/login", args, ARRAYSIZE(args)) &&
+        !Core_PrivateBrowserArgs(TRUE, L"C:\\", L"https://claude.ai/login", args, ARRAYSIZE(args)) &&
+        !Core_PrivateBrowserArgs(TRUE, L"1:\\private", L"https://claude.ai/login", args, ARRAYSIZE(args)));
+    Check("private browser: small command buffer refused", !Core_PrivateBrowserArgs(TRUE, folder, L"https://claude.ai/login", args, 20));
+}
+
 static void TestSanitizeUrl(void)
 {
     WCHAR out[URL_CCH], big[URL_CCH + 16];
@@ -609,6 +656,38 @@ static void TestProfileFilePaths(void)
     Check("profile path: an empty input fails empty", !Core_ProfileFilePath(&p, L"", out, ARRAYSIZE(out)) && !out[0]);
     Check("profile path: a missing profile fails empty", !Core_ProfileFilePath(NULL, logical, out, ARRAYSIZE(out)) && !out[0]);
     Check("profile path: a missing output is refused", !Core_ProfileFilePath(&p, logical, NULL, ARRAYSIZE(out)));
+
+    /* The stock folder Claude moved out of its package: it names it there now, and earlier entries name it as it was. */
+    ZeroMemory(&p, sizeof p);
+    StringCchCopyW(p.formerDir, ARRAYSIZE(p.formerDir), logical);
+    StringCchCopyW(p.dataDir, ARRAYSIZE(p.dataDir), L"C:\\Users\\X\\AppData\\Local\\Claude-Data\\claude_test");
+    StringCchCopyW(p.storageDir, ARRAYSIZE(p.storageDir), p.dataDir);
+    Check("moved profile: holds its folder", Core_ProfileHoldsPath(&p, L"C:\\Users\\X\\AppData\\Local\\Claude-Data\\claude_test\\a"));
+    Check("moved profile: holds its former folder", Core_ProfileHoldsPath(&p, L"C:\\Users\\X\\AppData\\Roaming\\Claude\\a"));
+    Check("moved profile: not a sibling of its former folder", !Core_ProfileHoldsPath(&p, L"C:\\Users\\X\\AppData\\Roaming\\Claude-Work"));
+    Check("moved profile: its own path stays", Core_ProfileFilePath(&p,
+          L"C:\\Users\\X\\AppData\\Local\\Claude-Data\\claude_test\\scratch-workspaces\\a\\b\\work", out, ARRAYSIZE(out)) &&
+          wcscmp(out, L"C:\\Users\\X\\AppData\\Local\\Claude-Data\\claude_test\\scratch-workspaces\\a\\b\\work") == 0);
+    Check("moved profile: a former path leads into its folder now", Core_ProfileFilePath(&p,
+          L"C:\\Users\\X\\AppData\\Roaming\\Claude\\scratch-workspaces\\a\\b\\work", out, ARRAYSIZE(out)) &&
+          wcscmp(out, L"C:\\Users\\X\\AppData\\Local\\Claude-Data\\claude_test\\scratch-workspaces\\a\\b\\work") == 0);
+    p.formerDir[0] = 0;
+    Check("unmoved profile: no former folder", !Core_ProfileHoldsPath(&p, L"C:\\Users\\X\\AppData\\Roaming\\Claude\\a"));
+
+    Check("moved stock folder: Claude-Data, the family in lower case",
+          Core_MovedStockDir(L"C:\\Users\\X\\AppData\\Local", L"Claude_pzs8sxrjxfjjc", out, ARRAYSIZE(out)) &&
+          wcscmp(out, L"C:\\Users\\X\\AppData\\Local\\Claude-Data\\claude_pzs8sxrjxfjjc") == 0);
+    Check("moved stock folder: a trailing separator is not doubled",
+          Core_MovedStockDir(L"C:\\L\\", L"AnthropicPBC.Claude_fnn82j28hfe8t", out, ARRAYSIZE(out)) &&
+          wcscmp(out, L"C:\\L\\Claude-Data\\anthropicpbc.claude_fnn82j28hfe8t") == 0);
+    Check("moved stock folder: none for a network %LOCALAPPDATA%", !Core_MovedStockDir(L"\\\\server\\share", L"Claude_x", out, ARRAYSIZE(out)) && !out[0]);
+    Check("moved stock folder: none without a package", !Core_MovedStockDir(L"C:\\L", L"", out, ARRAYSIZE(out)) &&
+          !Core_MovedStockDir(L"C:\\L", NULL, out, ARRAYSIZE(out)) && !Core_MovedStockDir(NULL, L"Claude_x", out, ARRAYSIZE(out)));
+    Check("moved stock folder: none for a family not of the form name_publisher",
+          !Core_MovedStockDir(L"C:\\L", L"Claude", out, ARRAYSIZE(out)) && !Core_MovedStockDir(L"C:\\L", L"_x", out, ARRAYSIZE(out)) &&
+          !Core_MovedStockDir(L"C:\\L", L"Claude_", out, ARRAYSIZE(out)) && !Core_MovedStockDir(L"C:\\L", L"a_b_c", out, ARRAYSIZE(out)) &&
+          !Core_MovedStockDir(L"C:\\L", L"a_b.c", out, ARRAYSIZE(out)) && !Core_MovedStockDir(L"C:\\L", L"a\\b_c", out, ARRAYSIZE(out)));
+    Check("moved stock folder: a small output fails", !Core_MovedStockDir(L"C:\\L", L"Claude_x", out, 8));
     Check("profile path: an empty output buffer is refused", !Core_ProfileFilePath(&p, logical, out, 0));
     StringCchCopyW(p.storageDir, ARRAYSIZE(p.storageDir), p.dataDir);
     Check("profile path: a physical profile preserves its path", Core_ProfileFilePath(&p,
@@ -762,6 +841,10 @@ static void TestSessionEntries(void)
     Check("entry: no sessionId", EntryKindIs("{\"title\":\"x\"}", ENTRY_NOT_SESSION));
     Check("entry: sessionId not a string", EntryKindIs("{\"sessionId\":12}", ENTRY_NOT_SESSION));
     Check("entry: empty sessionId", EntryKindIs("{\"sessionId\":\"\"}", ENTRY_NOT_SESSION));
+    Check("entry: an interrupted write is not a session",
+          EntryKindIs("{\"sessionId\":\"local_1\",\"cliSessionId\":\"unfinished", ENTRY_NOT_SESSION) &&
+          EntryKindIs("{\"sessionId\":\"local_1\"", ENTRY_NOT_SESSION));
+    Check("entry: a byte order mark is accepted", EntryKindIs("\xef\xbb\xbf{\"sessionId\":\"local_1\"}", ENTRY_LOCAL));
     Check("entry: not JSON", EntryKindIs("local_1", ENTRY_NOT_SESSION) && Core_SessionEntryKind(NULL, 0) == ENTRY_NOT_SESSION);
 }
 
@@ -1998,7 +2081,16 @@ static void TestLevelDb(void)
     log[7 + 3] ^= 1;
     ZeroMemory(&seen, sizeof seen);
     Core_LevelLogRecords(log, n + appended, SeeRecord, &seen, &cleanEnd);
-    Check("a record that does not match its checksum is not read", seen.records == 0 && cleanEnd == 0);
+    Check("a bad checksum skips its block, a later block still reads", seen.records == 1 && cleanEnd == n + appended &&
+          seen.lastLength == batchLength && memcmp(seen.last, batch, batchLength) == 0);
+    if (seen.last) HeapFree(GetProcessHeap(), 0, seen.last);
+    /* A writer can pad an interrupted tail and append in the next block. */
+    memset(log + n + appended + 20, 0, 65536 - (n + appended + 20));
+    appended = Core_LevelLogAppend(65536, batch, batchLength, log + 65536, 2 * 32768);
+    ZeroMemory(&seen, sizeof seen);
+    Check("a good record appended after a corrupt tail survives reopening",
+          Core_LevelLogRecords(log, 65536 + appended, SeeRecord, &seen, &cleanEnd) && seen.records == 2 && cleanEnd == 65536 + appended);
+    if (seen.last) HeapFree(GetProcessHeap(), 0, seen.last);
     HeapFree(GetProcessHeap(), 0, log);
     HeapFree(GetProcessHeap(), 0, big);
 
@@ -2114,14 +2206,60 @@ static void TestSessionSearch(void)
                                             Core_SessionEnvironment(JSON_ARG("{\"movedToCloud\":true}")) == SESSION_ENV_CLOUD);
 }
 
+static void TestSessionMetadataHelpers(void)
+{
+    static const char titles[] = "[\"Old title\",\"\",\"\\u4e2d\\u6587\"]";
+    WCHAR *list = Core_JsonStringList(titles, sizeof titles - 1);
+    CoreRegex regex;
+    size_t end = 0;
+    Check("old titles decode as separate complete strings", list && wcscmp(list, L"Old title") == 0 &&
+          wcscmp(list + wcslen(list) + 1, L"\x4e2d\x6587") == 0);
+    if (list) HeapFree(GetProcessHeap(), 0, list);
+    list = Core_JsonStringList("[\"a\",3]", 7);
+    Check("non-string old titles rejected", list == NULL);
+    if (list) HeapFree(GetProcessHeap(), 0, list);
+    Check("https artifact accepted", Core_SafeHttpsUrl(L"https://claude.ai/public/artifacts/abc?view=1#part"));
+    Check("http artifact rejected", !Core_SafeHttpsUrl(L"http://example.invalid/a"));
+    Check("file artifact rejected", !Core_SafeHttpsUrl(L"file:///C:/sample.txt"));
+    Check("javascript artifact rejected", !Core_SafeHttpsUrl(L"javascript:alert(1)"));
+    Check("artifact credentials rejected", !Core_SafeHttpsUrl(L"https://user@example.invalid/a"));
+    Check("artifact command switches rejected", !Core_SafeHttpsUrl(L"https://example.invalid/\" --argument"));
+    Check("artifact controls rejected", !Core_SafeHttpsUrl(L"https://example.invalid/a\nnext"));
+    Check("artifact backslash rejected", !Core_SafeHttpsUrl(L"https://example.invalid\\a"));
+    Check("artifact empty authority rejected", !Core_SafeHttpsUrl(L"https:///a"));
+    Check("regex first match end preserved", Core_RegexCompile(&regex, L"Beta[0-9]+", FALSE) &&
+          Core_RegexSearchEnd(&regex, L"Alpha Beta12 later", 18, &end) && end >= 11 && end <= 12);
+}
+
 int wmain(void)
 {
+    Check("session order: natural names ascend", Core_CompareSessionOrder(L"Chat 2", 100, L"Chat 10", 200, TRUE, FALSE) < 0);
+    Check("session order: natural names descend", Core_CompareSessionOrder(L"Chat 2", 100, L"Chat 10", 200, TRUE, TRUE) > 0);
+    Check("session order: times ascend", Core_CompareSessionOrder(L"Z", 100, L"A", 200, FALSE, FALSE) < 0);
+    Check("session order: times descend", Core_CompareSessionOrder(L"Z", 100, L"A", 200, FALSE, TRUE) > 0);
+    Check("session order: equal names follow the chosen time direction", Core_CompareSessionOrder(L"Chat", 100, L"chat", 200, TRUE, FALSE) < 0);
+    Check("session order: identical keys are equal", Core_CompareSessionOrder(L"Chat", 100, L"chat", 100, TRUE, TRUE) == 0);
+    {
+        WCHAR detail[32];
+        Check("last result is tied to the latest assistant", Core_SessionResult(JSON_ARG("{\"lastAssistantUuid\":\"a\",\"postTurnSummaryFor\":\"a\",\"postTurnSummary\":{\"summarizes_uuid\":\"a\",\"status_category\":\"completed\",\"status_detail\":\"Done\"}}"), detail, ARRAYSIZE(detail)) == RESULT_COMPLETED && wcscmp(detail, L"Done") == 0);
+        Check("stale summaries are unknown", Core_SessionResult(JSON_ARG("{\"lastAssistantUuid\":\"b\",\"postTurnSummary\":{\"summarizes_uuid\":\"a\",\"status_category\":\"completed\"}}"), detail, ARRAYSIZE(detail)) == RESULT_UNKNOWN && !detail[0]);
+        Check("conflicting summary association is unknown", Core_SessionResult(JSON_ARG("{\"lastAssistantUuid\":\"a\",\"postTurnSummaryFor\":\"b\",\"postTurnSummary\":{\"summarizes_uuid\":\"a\",\"status_category\":\"completed\"}}"), detail, ARRAYSIZE(detail)) == RESULT_UNKNOWN);
+        Check("a blocked result is recognized", Core_SessionResult(JSON_ARG("{\"lastAssistantUuid\":\"a\",\"postTurnSummary\":{\"summarizes_uuid\":\"a\",\"status_category\":\"blocked\"}}"), detail, ARRAYSIZE(detail)) == RESULT_BLOCKED);
+        Check("unknown result categories stay unknown", Core_SessionResult(JSON_ARG("{\"lastAssistantUuid\":\"a\",\"postTurnSummary\":{\"summarizes_uuid\":\"a\",\"status_category\":\"future\"}}"), detail, ARRAYSIZE(detail)) == RESULT_UNKNOWN);
+        Check("missing summaries stay unknown", Core_SessionResult(JSON_ARG("{}"), detail, ARRAYSIZE(detail)) == RESULT_UNKNOWN);
+        {
+            static const char summary[] = "{\"lastAssistantUuid\":\"a\",\"postTurnSummary\":{\"summarizes_uuid\":\"a\",\"status_category\":\"completed\",\"status_detail\":\"A long summary that exceeds the destination buffer without disappearing\"}}";
+            Check("long summaries retain a bounded prefix", Core_SessionResult(summary, sizeof summary - 1, detail, ARRAYSIZE(detail)) == RESULT_COMPLETED &&
+                  wcsncmp(detail, L"A long summary", 14) == 0 && wcslen(detail) == ARRAYSIZE(detail) - 1);
+        }
+    }
     TestSessionSearch();
     TestJsonMerge();
     TestJsonArrayUnion();
     TestSafeStorage();
     TestLevelDb();
     TestSessionEntries();
+    TestSessionMetadataHelpers();
     TestTranscriptLines();
     TestChangelogRead();
     TestMarkdownRtf();
@@ -2134,6 +2272,7 @@ int wmain(void)
     TestDeflate();
     TestProcessTree();
     TestLaunchArgs();
+    TestPrivateSignIn();
     TestSanitizeUrl();
     TestNames();
     TestLogParsing();

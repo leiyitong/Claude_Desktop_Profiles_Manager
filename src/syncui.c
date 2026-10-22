@@ -10,6 +10,8 @@
  */
 #include "app.h"
 #include "resource.h"
+#include "vaulttools.h"
+#include "operationhistory.h"
 #include <commctrl.h>
 #include <shlobj.h>
 #include <windowsx.h>
@@ -227,42 +229,80 @@ static void AddCount(WCHAR *text, size_t cch, const WCHAR *format, int count)
 /* What was done, and what was not: added, updated, removed, left as it
  * was, waiting for its profile to close, left out, failed; `first`, when
  * given, opens it. */
-void SyncUi_ShowReport(HWND owner, const ProfileList *profiles, const SyncReport *report, const WCHAR *first)
+static void ShowReport(OperationKind kind, HWND owner, const ProfileList *profiles, const SyncReport *report, const WCHAR *first)
 {
-    WCHAR text[REPORT_CCH], line[LONG_PATH_CCH + 256], names[NAMES_CCH];
+    const size_t reportCch = 32768;
+    OperationHistory_RecordReport(kind, profiles, report);
+    WCHAR *text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, reportCch * sizeof(WCHAR));
+    WCHAR line[LONG_PATH_CCH + 256], names[NAMES_CCH];
+    int d;
+    if (!text) {
+        Ui_Message(owner, MB_ICONERROR, TR(L"The operation finished, but its results could not be displayed."));
+        return;
+    }
     text[0] = 0;
-    if (first) StringCchCopyW(text, ARRAYSIZE(text), first);
-    AddCount(text, ARRAYSIZE(text), TR(L"Sessions added: %d"), report->added);
-    AddCount(text, ARRAYSIZE(text), TR(L"Sessions updated: %d"), report->updated);
-    AddCount(text, ARRAYSIZE(text), TR(L"Sessions removed: %d"), report->removed);
-    AddCount(text, ARRAYSIZE(text), TR(L"Sessions two profiles went on with apart, now kept as two: %d"), report->forked);
-    AddCount(text, ARRAYSIZE(text), TR(L"Left as they were (newer or deleted there): %d"), report->skipped);
+    if (first) StringCchCopyW(text, reportCch, first);
+    AddCount(text, reportCch, TR(L"Sessions added: %d"), report->added);
+    AddCount(text, reportCch, TR(L"Sessions updated: %d"), report->updated);
+    AddCount(text, reportCch, TR(L"Sessions removed: %d"), report->removed);
+    AddCount(text, reportCch, TR(L"Sessions two profiles went on with apart, now kept as two: %d"), report->forked);
+    AddCount(text, reportCch, TR(L"Left as they were (newer or deleted there): %d"), report->skipped);
     if (report->waiting) {
-        NamesOf(profiles, report->waiting, names, ARRAYSIZE(names));
-        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Waiting for %s to close: the rest is done then."), names);
-        AddLine(text, ARRAYSIZE(text), line);
+        if (report->profileCount) {
+            names[0] = 0;
+            for (d = 0; d < report->profileCount; d++)
+                if (report->profiles[d].waiting) {
+                    int p = Profiles_Find(profiles, report->profiles[d].folder);
+                    if (names[0]) StringCchCatW(names, ARRAYSIZE(names), L", ");
+                    StringCchCatW(names, ARRAYSIZE(names), p >= 0 ? profiles->items[p].name : report->profiles[d].folder);
+                }
+        } else NamesOf(profiles, report->waiting, names, ARRAYSIZE(names));
+        if (names[0]) {
+            StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Waiting for %s to close: the rest is done then."), names);
+            AddLine(text, reportCch, line);
+        }
     }
     if (report->unavailable) {
-        NamesOf(profiles, report->unavailable, names, ARRAYSIZE(names));
-        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Left out, not signed in to Claude yet: %s"), names);
-        AddLine(text, ARRAYSIZE(text), line);
+        StringCchCopyW(line, ARRAYSIZE(line), TR(L"Some selected profiles were left out because they are not signed in to Claude yet."));
+        AddLine(text, reportCch, line);
     }
     if (report->failed) {
         StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Changes that could not be made: %d. The first:"), report->failed);
-        AddLine(text, ARRAYSIZE(text), line);
-        AddLine(text, ARRAYSIZE(text), report->error);
+        AddLine(text, reportCch, line);
+        AddLine(text, reportCch, report->error);
     }
     if (report->backup[0]) {
-        AddLine(text, ARRAYSIZE(text), TR(L"What was replaced or removed is kept in:"));
-        AddLine(text, ARRAYSIZE(text), report->backup);
+        AddLine(text, reportCch, TR(L"What was replaced or removed is kept in:"));
+        AddLine(text, reportCch, report->backup);
     }
     if (!report->added && !report->updated && !report->removed && !report->skipped && !report->failed && !report->waiting &&
         !report->unavailable && !report->forked)
-        AddLine(text, ARRAYSIZE(text), TR(L"Nothing needed changing."));
-    Ui_Message(owner, report->failed ? MB_ICONWARNING : MB_ICONINFORMATION, L"%s", text);
+        AddLine(text, reportCch, TR(L"Nothing needed changing."));
+    for (d = 0; d < report->profileCount; d++) {
+        const SyncProfileResult *detail = &report->profiles[d];
+        int p = Profiles_Find(profiles, detail->folder);
+        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"%s: added %d, updated %d, removed %d, kept %d, failed %d%s"),
+                         p >= 0 ? profiles->items[p].name : detail->folder, detail->added, detail->updated, detail->removed,
+                         detail->skipped, detail->failed, detail->waiting ? TR(L"; waiting for this profile to close") : L"");
+        AddLine(text, reportCch, line);
+        if (detail->unavailable) AddLine(text, reportCch, TR(L"Not signed in"));
+        if (detail->error[0]) AddLine(text, reportCch, detail->error);
+    }
+    Ui_ReviewText(owner, TR(L"Operation results"), TR(L"Results are listed separately for each profile that received changes."), text, NULL);
+    HeapFree(GetProcessHeap(), 0, text);
 }
 
 /* ----------------------------------------------------------- confirming */
+
+void SyncUi_Pending(HWND owner, const ProfileList *profiles)
+{
+    WCHAR *text = SessionSync_PendingText(profiles);
+    if (!text) { Ui_Message(owner, MB_ICONERROR, TR(L"Sessions could not be loaded.")); return; }
+    Ui_ReviewText(owner, TR(L"Pending changes"),
+                  TR(L"Stage 1 sends sessions and settings. Stage 2 applies local edits, with removals last. Newer target changes can prevent replacement. This is a snapshot, not an audit history."),
+                  text, NULL);
+    HeapFree(GetProcessHeap(), 0, text);
+}
 
 BOOL SyncUi_Confirm(HWND owner, LPCWSTR icon, const WCHAR *question, BOOL backedUp, const WCHAR *button)
 {
@@ -300,6 +340,11 @@ static BOOL EnoughTakers(HWND owner, const SessionSet *set, DWORD *takers)
     Ui_Message(owner, MB_ICONINFORMATION, TR(L"This needs at least two profiles signed in to Claude: "
                                              L"a profile keeps sessions only once it is signed in."));
     return FALSE;
+}
+
+void SyncUi_ShowReport(HWND owner, const ProfileList *profiles, const SyncReport *report, const WCHAR *first)
+{
+    ShowReport(OPERATION_SYNC, owner, profiles, report, first);
 }
 
 BOOL SyncUi_Merge(HWND owner, const ProfileList *profiles)
@@ -556,7 +601,7 @@ BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen
 
 BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
 {
-    WCHAR path[LONG_PATH_CCH], first[256], names[NAMES_CCH], question[NAMES_CCH + LONG_PATH_CCH + 128];
+    WCHAR path[LONG_PATH_CCH], first[256];
     const WCHAR *name;
     SessionSet set;
     SyncDialog dialog;
@@ -565,6 +610,9 @@ BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
     HCURSOR old;
     int sessions = 0;
     BOOL ok;
+    WCHAR previewError[LONG_PATH_CCH], *preview;
+    WCHAR lockedPath[LONG_PATH_CCH];
+    HANDLE archiveLock;
     if (!ChooseArchive(owner, FALSE, path, ARRAYSIZE(path))) return FALSE;
     if (!SessionSync_IsArchive(path)) {
         Ui_Message(owner, MB_ICONWARNING, TR(L"This file is not a session archive of " APP_NAME L"."));
@@ -585,21 +633,42 @@ BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen)
     dialog.chosen = (chosen & takers) ? chosen & takers : takers;
     dialog.archive = name ? name + 1 : path;
     if (!ChooseProfiles(owner, &dialog)) return FALSE;
-    NamesOf(profiles, dialog.chosen, names, ARRAYSIZE(names));
-    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Import the sessions of %s into %s?"), dialog.archive, names);
-    if (!SyncUi_ConfirmSessions(owner, question, TR(L"Import")) || !LoadSessions(owner, profiles, &set))
+    /* Keep the previewed archive immutable through confirmation and import.
+     * Additional readers are allowed; replacement and writing are not. */
+    archiveLock = Util_ExtendedPath(path, lockedPath, ARRAYSIZE(lockedPath))
+                    ? CreateFileW(lockedPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)
+                    : INVALID_HANDLE_VALUE;
+    if (archiveLock == INVALID_HANDLE_VALUE) {
+        Ui_Message(owner, MB_ICONERROR, TR(L"The archive could not be held open for a consistent preview. Close other programs using it and try again."));
         return FALSE;
+    }
+    if (!Backup_CheckArchive(owner, path)) { CloseHandle(archiveLock); return FALSE; }
+    if (!LoadSessions(owner, profiles, &set)) { CloseHandle(archiveLock); return FALSE; }
+    preview = SessionSync_ImportPreview(&set, path, dialog.chosen, previewError, ARRAYSIZE(previewError));
+    SessionStore_Free(&set);
+    if (!preview) {
+        CloseHandle(archiveLock);
+        Ui_Message(owner, MB_ICONERROR, TR(L"The import could not be previewed. %s"), previewError);
+        return FALSE;
+    }
+    ok = Ui_ReviewText(owner, TR(L"Import preview"),
+                       TR(L"Newer target entries are kept. Changes to running profiles wait until they close. Replaced entries are backed up."),
+                       preview, TR(L"Import"));
+    HeapFree(GetProcessHeap(), 0, preview);
+    if (!ok || !LoadSessions(owner, profiles, &set)) { CloseHandle(archiveLock); return FALSE; }
     ZeroMemory(&report, sizeof report);
     old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
     ok = SessionSync_Import(&set, path, dialog.chosen, &sessions, &report);
+    CloseHandle(archiveLock);
     SetCursor(old);
     SessionStore_Free(&set);
     if (!ok) {
+        OperationHistory_RecordReport(OPERATION_IMPORT, profiles, &report);
         Ui_Message(owner, MB_ICONERROR, TR(L"The sessions could not be imported. %s"), report.error);
         return FALSE;
     }
     StringCchPrintfW(first, ARRAYSIZE(first), TR(L"Sessions in the archive: %d"), sessions);
-    SyncUi_ShowReport(owner, profiles, &report, first);
+    ShowReport(OPERATION_IMPORT, owner, profiles, &report, first);
     return TRUE;
 }
 
@@ -667,8 +736,7 @@ static INT_PTR CALLBACK RestoreProc(HWND dialog, UINT message, WPARAM wp, LPARAM
     case WM_INITDIALOG:
         state = (RestoreDialog *)lp;
         SetWindowLongPtrW(dialog, DWLP_USER, lp);
-        SetDlgItemTextW(dialog, IDC_R_TEXT, TR(L"The sessions this version lists come back in the profile, as they were then. "
-                                               L"Sessions deleted in Claude stay deleted."));
+        SetDlgItemTextW(dialog, IDC_R_TEXT, TR(L"Choose a saved version, then search and select sessions to recover. Sessions deleted in Claude stay deleted."));
         for (p = 0; p < state->profiles->count; p++) {
             SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_ADDSTRING, 0, (LPARAM)state->profiles->items[p].name);
             if (p == state->profile) SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_SETCURSEL, (WPARAM)p, 0);
@@ -718,7 +786,6 @@ static INT_PTR CALLBACK RestoreProc(HWND dialog, UINT message, WPARAM wp, LPARAM
 
 BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *selected)
 {
-    WCHAR when[64], question[LABEL_CCH + 256];
     RestoreDialog dialog;
     SyncReport report;
     const Profile *p;
@@ -740,25 +807,35 @@ BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *select
         HeapFree(GetProcessHeap(), 0, dialog.versions);
         return FALSE;
     }
-    FormatWhen(dialog.versions[dialog.chosen].time, when, ARRAYSIZE(when));
-    StringCchPrintfW(question, ARRAYSIZE(question), TR(L"Recover the sessions of %s in \x201C%s\x201D?\n\nSessions deleted since stay deleted."),
-                     when, p->name);
-    if (!SyncUi_ConfirmSessions(owner, question, TR(L"Recover"))) {
-        HeapFree(GetProcessHeap(), 0, dialog.versions);
-        return FALSE;
+    {
+        VaultRestoreItem *items = NULL;
+        int count = SessionVault_RestoreItems(profiles, dialog.profile, dialog.list, dialog.versions[dialog.chosen].name, &items), i, n = 0;
+        BOOL *checked = count >= 0 ? (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)max(count, 1) * sizeof *checked) : NULL;
+        const WCHAR **keys = count >= 0 ? (const WCHAR **)HeapAlloc(GetProcessHeap(), 0, (size_t)max(count, 1) * sizeof *keys) : NULL;
+        BOOL accepted = FALSE;
+        if (items && checked && keys) {
+            accepted = VaultTools_Choose(owner, items, count, p->syncGroup != 0, checked);
+            if (accepted) for (i = 0; i < count; i++) if (checked[i] && items[i].status < 3) keys[n++] = items[i].key;
+        } else Ui_Message(owner, MB_ICONERROR, TR(L"Sessions could not be loaded."));
+        ZeroMemory(&report, sizeof report);
+        ok = accepted && n > 0 && SessionVault_RestoreSelected(profiles, dialog.profile, dialog.list, dialog.versions[dialog.chosen].name, keys, n, &report);
+        if (items) HeapFree(GetProcessHeap(), 0, items);
+        if (keys) HeapFree(GetProcessHeap(), 0, (void *)keys);
+        if (checked) HeapFree(GetProcessHeap(), 0, checked);
+        if (!accepted || !n) { HeapFree(GetProcessHeap(), 0, dialog.versions); return FALSE; }
     }
-    ZeroMemory(&report, sizeof report);
-    ok = SessionVault_Restore(profiles, dialog.profile, dialog.list, dialog.versions[dialog.chosen].name, &report);
     HeapFree(GetProcessHeap(), 0, dialog.versions);
     if (!ok && report.unavailable) {
+        OperationHistory_RecordReport(OPERATION_RESTORE, profiles, &report);
         Ui_Message(owner, MB_ICONINFORMATION, TR(L"\x201C%s\x201D is not signed in to Claude yet: sign in there first."), p->name);
         return FALSE;
     }
     if (!ok && !report.failed) {
+        OperationHistory_RecordReport(OPERATION_RESTORE, profiles, &report);
         Ui_Message(owner, MB_ICONERROR, TR(L"Sessions could not be loaded."));
         return FALSE;
     }
-    SyncUi_ShowReport(owner, profiles, &report, NULL);
+    ShowReport(OPERATION_RESTORE, owner, profiles, &report, NULL);
     return TRUE;
 }
 
@@ -801,7 +878,7 @@ static const CheckItem kSyncItemRows[] = {
     { SYNC_ITEM_SIDEBAR_ORDER, L"Project order", IMAGE_SECTION },
     { SYNC_ITEM_SIDEBAR_FILTERS, L"Filters, grouping and sorting", IMAGE_SECTION },
     { SYNC_ITEM_SIDEBAR_LAYOUT, L"Width and the place of Routines", IMAGE_LAYOUT },
-    { SYNC_ITEM_DETAILS_MODEL, L"Model and effort", IMAGE_SESSION },
+    { SYNC_ITEM_DETAILS_MODEL, L"Model, effort and session presets", IMAGE_SESSION },
     { SYNC_ITEM_DETAILS_PANE, L"Side pane", IMAGE_LAYOUT },
     { SYNC_ITEM_DETAILS_UNREAD, L"Unread marks", IMAGE_LAYOUT },
     { SYNC_ITEM_DETAILS_COST, L"Cost", IMAGE_LAYOUT },
@@ -1516,7 +1593,7 @@ static BOOL PurgeShown(const PurgeDialog *state, const PurgeItem *item)
  * Select all is checked while every row shown is. */
 static void ReadChecked(HWND dialog, PurgeDialog *state)
 {
-    int i, rows = ListView_GetItemCount(state->rows), chosen = 0, restorable = 0;
+    int i, rows = ListView_GetItemCount(state->rows), chosen = 0, restorable = 0, openable = 0;
     for (i = 0; i < rows; i++) {
         LVITEMW item;
         ZeroMemory(&item, sizeof item);
@@ -1526,10 +1603,12 @@ static void ReadChecked(HWND dialog, PurgeDialog *state)
         if ((state->checked[item.lParam] = ListView_GetCheckState(state->rows, i)) != FALSE) {
             chosen++;
             if (state->items[item.lParam].restorable) restorable++;
+            if (SessionPurge_CanOpen(&state->items[item.lParam])) openable++;
         }
     }
     EnableWindow(GetDlgItem(dialog, IDOK), chosen > 0);
     EnableWindow(GetDlgItem(dialog, IDC_C_RESTORE), restorable > 0);
+    EnableWindow(GetDlgItem(dialog, IDC_PURGE_OPEN), openable > 0 && openable == chosen);
     EnableWindow(GetDlgItem(dialog, IDC_C_ALL), rows > 0);
     CheckDlgButton(dialog, IDC_C_ALL, rows > 0 && chosen == rows ? BST_CHECKED : BST_UNCHECKED);
 }
@@ -1635,6 +1714,7 @@ static INT_PTR CALLBACK PurgeProc(HWND dialog, UINT message, WPARAM wp, LPARAM l
             return TRUE;
         case IDOK:
         case IDC_C_RESTORE:
+        case IDC_PURGE_OPEN:
             ReadChecked(dialog, state);
             state->backUp = IsDlgButtonChecked(dialog, IDC_C_BACKUP) == BST_CHECKED;
             EndDialog(dialog, LOWORD(wp));
@@ -1675,7 +1755,7 @@ static BOOL RestoreChosen(HWND owner, const ProfileList *profiles, const PurgeIt
         StringCchCatW(first, ARRAYSIZE(first), L"\n");
         StringCchCatW(first, ARRAYSIZE(first), line);
     }
-    SyncUi_ShowReport(owner, profiles, &report, first);
+    ShowReport(OPERATION_RESTORE, owner, profiles, &report, first);
     return restored > 0;
 }
 
@@ -1688,6 +1768,45 @@ static BOOL ConfirmPurge(HWND owner, int n, BOOL backUp)
                      backUp ? TR(L"Move %d conversations to the Recycle Bin?\n\n.claude is copied first.") : TR(L"Move %d conversations to the Recycle Bin?"),
                      n);
     return SyncUi_Confirm(owner, IDI_WARNING, question, FALSE, TR(L"Move to the Recycle Bin"));
+}
+
+typedef struct OpenOrphanDialog { const ProfileList *profiles; int chosen, count; int map[MAX_PROFILES]; } OpenOrphanDialog;
+static INT_PTR CALLBACK OpenOrphanProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    OpenOrphanDialog *state = (OpenOrphanDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
+    if (message == WM_INITDIALOG) {
+        int i; WCHAR entries[LONG_PATH_CCH];
+        state = (OpenOrphanDialog *)lp; SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetDlgItemTextW(dialog, IDC_PURGE_EXPLAIN, TR(L"Claude opens the checked local conversations through Resume and adds them to its own list. Claude may connect to its service. No entry is written by the manager."));
+        for (i = 0; i < state->profiles->count; i++) if (SessionStore_EntriesDir(&state->profiles->items[i], entries, ARRAYSIZE(entries), NULL)) {
+            SendDlgItemMessageW(dialog, IDC_PURGE_TARGET, CB_ADDSTRING, 0, (LPARAM)state->profiles->items[i].name);
+            state->map[state->count++] = i;
+        }
+        SendDlgItemMessageW(dialog, IDC_PURGE_TARGET, CB_SETCURSEL, 0, 0);
+        EnableWindow(GetDlgItem(dialog, IDOK), state->count > 0); return TRUE;
+    }
+    if (state && message == WM_COMMAND && LOWORD(wp) == IDOK) {
+        LRESULT at = SendDlgItemMessageW(dialog, IDC_PURGE_TARGET, CB_GETCURSEL, 0, 0);
+        if (at >= 0 && at < state->count) { state->chosen = state->map[at]; EndDialog(dialog, IDOK); } return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wp) == IDCANCEL) { EndDialog(dialog, IDCANCEL); return TRUE; }
+    return FALSE;
+}
+static BOOL OpenOrphans(HWND owner, const ProfileList *profiles, const PurgeItem *items, const int *chosen, int count)
+{
+    OpenOrphanDialog dialog; ClaudePackage package;
+    int i, opened = 0; HRESULT hr = S_OK;
+    ZeroMemory(&dialog, sizeof dialog); dialog.profiles = profiles; dialog.chosen = -1;
+    if (!Claude_FindPackage(&package)) { Ui_Message(owner, MB_ICONWARNING, TR(L"Claude could not be found.")); return FALSE; }
+    if (Ui_Dialog(owner, IDD_PURGE_OPEN, OpenOrphanProc, (LPARAM)&dialog) != IDOK || dialog.chosen < 0) return FALSE;
+    for (i = 0; i < count; i++) {
+        if (!SessionPurge_CanOpen(&items[chosen[i]])) { hr = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND); break; }
+        hr = SessionEdit_Open(&package, &profiles->items[dialog.chosen], items[chosen[i]].id);
+        if (FAILED(hr)) break;
+        opened++;
+    }
+    if (FAILED(hr)) Ui_Message(owner, MB_ICONWARNING, TR(L"Some conversations could not be opened (error 0x%08lX)."), (DWORD)hr);
+    return opened > 0;
 }
 
 BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
@@ -1718,10 +1837,12 @@ BOOL SyncUi_Purge(HWND owner, const ProfileList *profiles)
     dialog.checked = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *dialog.checked);
     chosen = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof *chosen);
     if (dialog.checked && chosen) action = Ui_Dialog(owner, IDD_PURGE, PurgeProc, (LPARAM)&dialog);
-    if (action == IDOK || action == IDC_C_RESTORE)
+    if (action == IDOK || action == IDC_C_RESTORE || action == IDC_PURGE_OPEN)
         for (i = 0; i < count; i++)
             if (dialog.checked[i]) chosen[n++] = i;
-    if (action == IDC_C_RESTORE && n) {
+    if (action == IDC_PURGE_OPEN && n) {
+        changed = OpenOrphans(owner, profiles, items, chosen, n);
+    } else if (action == IDC_C_RESTORE && n) {
         changed = RestoreChosen(owner, profiles, items, chosen, n);
     } else if (action == IDOK && n && ConfirmPurge(owner, n, dialog.backUp) && (!dialog.backUp || CopyCodeFolder(owner, FALSE))) {
         result = SessionPurge_Delete(owner, profiles, items, chosen, n, &deleted, error, ARRAYSIZE(error));

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 
 #define VALUE_NAME            L"Name"             /* under the profile's key */
+#define VALUE_NOTE            L"Note"
 #define VALUE_COLOR           L"Color"
 #define VALUE_BADGE           L"Badge"            /* the badge's own text, absent for the initial */
 #define VALUE_WINDOW_TITLE    L"WindowTitle"      /* its windows' title, absent for the default */
@@ -26,18 +27,36 @@ static void ProfileKey(const WCHAR *folder, WCHAR *out, size_t cch)
     StringCchPrintfW(out, cch, REG_PROFILES L"\\%s", folder);
 }
 
-/* A missing stock folder is virtualized by the package. An inaccessible
- * Roaming folder is not evidence of that absence, so it cannot select a
- * different data store. Resolving a path never creates a profile folder. */
+/* Claude moves the stock folder out of its package, to %LOCALAPPDATA%\
+ * Claude-Data\<family>, and uses it there whenever that is a folder: then it
+ * is the profile's folder, and %APPDATA%\Claude, which its earlier entries
+ * name, its former one. Otherwise a missing stock folder is virtualized by
+ * the package. An inaccessible Roaming folder is not evidence of that
+ * absence, so it cannot select a different data store. Resolving a path
+ * never creates a profile folder. */
 BOOL Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, const WCHAR *family)
 {
-    WCHAR parent[MAX_PATH], *slash;
+    WCHAR parent[MAX_PATH], moved[MAX_PATH], *slash;
     DWORD attributes;
     if (!p) return FALSE;
     p->storageDir[0] = 0;
+    if (p->formerDir[0]) {   /* resolved again: from the folder as it was named */
+        if (FAILED(StringCchCopyW(p->dataDir, ARRAYSIZE(p->dataDir), p->formerDir))) p->dataDir[0] = 0;
+        p->formerDir[0] = 0;
+    }
     if (!p->dataDir[0]) return FALSE;
     if (!p->isStock)
         return SUCCEEDED(StringCchCopyW(p->storageDir, ARRAYSIZE(p->storageDir), p->dataDir));
+    if (Core_MovedStockDir(localAppData, family, moved, ARRAYSIZE(moved)) && Util_QueryPath(moved, &attributes) == PATH_PRESENT &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (FAILED(StringCchCopyW(p->formerDir, ARRAYSIZE(p->formerDir), p->dataDir)) ||
+            FAILED(StringCchCopyW(p->dataDir, ARRAYSIZE(p->dataDir), moved)) ||
+            FAILED(StringCchCopyW(p->storageDir, ARRAYSIZE(p->storageDir), moved))) {
+            p->storageDir[0] = 0;
+            return FALSE;
+        }
+        return TRUE;
+    }
     switch (Util_QueryPath(p->dataDir, &attributes)) {
     case PATH_PRESENT:
         return (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
@@ -80,6 +99,7 @@ static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isS
     if (Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_BADGE, badge, ARRAYSIZE(badge))) Core_CleanBadge(badge, p->badge, ARRAYSIZE(p->badge));
     if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_PICTURE, &picture)) p->picture = picture;
     Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_WINDOW_TITLE, p->windowTitle, ARRAYSIZE(p->windowTitle));
+    Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_NOTE, p->note, ARRAYSIZE(p->note));
     p->syncGroup = Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_SESSIONS, &sync) && sync >= 1 && sync <= MAX_PROFILES ? (int)sync : 0;
     if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_PARTS, &items)) p->syncItems = items & SYNC_ITEMS_ALL;
     else if (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_SYNC_ITEMS, &items)) p->syncItems = Core_SyncItemsOfGroups(items);
@@ -364,6 +384,21 @@ BOOL Profiles_SetWindowTitle(const WCHAR *folder, const WCHAR *title)
     ProfileKey(folder, key, ARRAYSIZE(key));
     return WriteOrDelete(key, VALUE_WINDOW_TITLE, clean[start] != 0,
                          clean[start] && Util_RegSetString(HKEY_CURRENT_USER, key, VALUE_WINDOW_TITLE, clean + start));
+}
+
+BOOL Profiles_SetNote(const WCHAR *folder, const WCHAR *note)
+{
+    WCHAR key[MAX_PATH], clean[256];
+    size_t start = 0, end;
+    if (FAILED(StringCchCopyW(clean, ARRAYSIZE(clean), note ? note : L""))) return FALSE;
+    for (end = 0; clean[end]; end++)
+        if (clean[end] < L' ') clean[end] = L' ';
+    while (clean[start] == L' ') start++;
+    while (end > start && clean[end - 1] == L' ') end--;
+    clean[end] = 0;
+    ProfileKey(folder, key, ARRAYSIZE(key));
+    return WriteOrDelete(key, VALUE_NOTE, clean[start] != 0,
+                         clean[start] && Util_RegSetStringIfDifferent(HKEY_CURRENT_USER, key, VALUE_NOTE, clean + start, NULL));
 }
 
 BOOL Profiles_SetDefault(const WCHAR *folder)

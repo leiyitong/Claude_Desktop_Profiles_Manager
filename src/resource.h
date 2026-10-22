@@ -25,6 +25,33 @@
 #define IDD_SETTINGS      115
 #define IDD_ABOUT         116
 #define IDD_PASSWORD      117
+#define IDD_HISTORY       119
+#define IDD_TEXTVIEW      120
+#define IDC_W_LOGS        2900
+#define IDC_W_DIAGNOSTICS 2901
+#define IDC_T_NOTE        2910
+#define IDC_T_TEXT        2911
+#define IDC_T_COPY        2912
+#define IDC_HISTORY_LIST  2920
+#define IDC_HISTORY_NOTE  2921
+#define IDC_HISTORY_OPEN  2922
+#define IDC_HISTORY_REFRESH 2923
+#define IDC_H_HISTORY     2412
+#define IDC_H_VALIDATE    2413
+#define IDC_HISTORY_VALIDATE 2924
+#define IDD_SIGNIN        118
+
+/* Private sign-in helper (ids are local to this dialog). */
+#define IDC_SIGNIN_URL           2800
+#define IDC_SIGNIN_BROWSER       2801
+#define IDC_SIGNIN_OPEN          2802
+#define IDC_SIGNIN_PROFILE       2803
+#define IDC_SIGNIN_HELP          2804
+#define IDC_SIGNIN_URL_LABEL     2805
+#define IDC_SIGNIN_BROWSER_LABEL 2806
+#define IDC_SIGNIN_STATUS        2807
+#define IDC_SIGNIN_FOLDERS       2808
+#define IDC_SIGNIN_CLEANUP       2809
 
 /* the changelogs, embedded (RCDATA): CHANGELOG.md and CHANGELOG.zh-CN.md */
 #define IDR_CHANGELOG_EN  200
@@ -60,6 +87,10 @@
 #define IDC_SYNC_NOW       1041   /* the list's menu */
 #define IDC_SETTINGS       1042   /* the gear at the toolbar's end */
 #define IDC_ABOUT          1043   /* About, right of it */
+#define IDC_PROFILE_SEARCH 1044
+#define IDC_PROFILE_SEARCH_LABEL 1045
+#define IDC_PROFILE_FIND   1047
+#define IDC_PRIVATE_SIGNIN 1046   /* the profile list's menu */
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -92,6 +123,8 @@
 #define IDC_P_SYNC_ITEMS  1116
 #define IDC_P_TITLE_LABEL 1117
 #define IDC_P_TITLE       1118
+#define IDC_P_NOTE_LABEL  1119
+#define IDC_P_NOTE        1120
 
 /* uninstall dialog */
 #define IDC_U_KEEP        1200

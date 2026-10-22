@@ -1206,17 +1206,23 @@ static BOOL AddStagedTranscript(WCHAR (**paths)[LONG_PATH_CCH], int *count, int 
 BOOL SessionEdit_RemovesWorkingFolder(const SessionSet *set, int row, WCHAR *physical, size_t cch)
 {
     const SessionRow *session = &set->rows[row];
-    WCHAR area[MAX_PATH], *slash;
+    WCHAR area[MAX_PATH], other[MAX_PATH], *slash;
+    const SessionSource *source;
     int owner, r;
     if (!set->groups || session->group < 0 || session->group >= set->groupCount ||
         (owner = set->groups[session->group].scratchOf) < 0 || !set->source[owner].scratchDir[0] ||
         FAILED(StringCchCopyW(area, ARRAYSIZE(area), session->cwd)) || (slash = wcsrchr(area, L'\\')) == NULL)
         return FALSE;
     *slash = 0;
-    if (!Core_PathEquals(area, set->source[owner].scratchDir)) return FALSE;
+    source = &set->source[owner];
+    /* The area as Claude names it now, or below the folder it moved, where the same files are. */
+    if (!Core_PathEquals(area, source->scratchDir) && !(source->formerScratchDir[0] && Core_PathEquals(area, source->formerScratchDir)))
+        return FALSE;
+    if (!SessionStore_WorkingDir(set, session->cwd, physical, cch) || !Util_DirExists(physical)) return FALSE;
     for (r = 0; r < set->rowCount; r++)
-        if (r != row && Core_PathUnder(set->rows[r].cwd, session->cwd)) return FALSE;
-    return SessionStore_WorkingDir(set, session->cwd, physical, cch) && Util_DirExists(physical);
+        if (r != row && SessionStore_WorkingDir(set, set->rows[r].cwd, other, ARRAYSIZE(other)) && Core_PathUnder(other, physical))
+            return FALSE;
+    return TRUE;
 }
 
 /* The complete removal, listed before any file moves: the session's entries

@@ -13,6 +13,24 @@
 
 #define SEARCH_FILE_MAX   (256u * 1024u * 1024u)   /* a transcript larger than this is not read */
 #define SEARCH_LINE_CCH   (64u * 1024u)            /* what one message is searched in at most */
+#define SEARCH_CACHE_MAX  256
+
+typedef struct SearchCacheEntry {
+    WCHAR *path;
+    WCHAR query[SESSION_SEARCH_CCH];
+    WIN32_FILE_ATTRIBUTE_DATA file;
+    LONG epoch;
+    BOOL regex, matchCase, found;
+    ULONGLONG offset;
+    size_t messageEnd;
+} SearchCacheEntry;
+
+/* Only the one search worker uses the bounded cache. Notification callbacks
+ * invalidate it by generation, without racing its strings or file reads. */
+static SRWLOCK g_cacheLock = SRWLOCK_INIT;
+static SearchCacheEntry g_cache[SEARCH_CACHE_MAX];
+static unsigned g_cacheNext;
+static volatile LONG g_cacheEpoch;
 
 typedef struct SessionSearch {
     HWND           window;
@@ -32,27 +50,101 @@ static HANDLE g_thread;
 static volatile LONG g_stop;
 
 /* A message's text holds the search. */
-static BOOL TextMatches(const SessionSearch *search, const WCHAR *text)
+static BOOL TextMatches(const SessionSearch *search, const WCHAR *text, size_t *messageEnd)
 {
-    if (search->regex) return Core_RegexSearch(&search->compiled, text, wcslen(text));
-    return search->matchCase ? wcsstr(text, search->text) != NULL : Core_ContainsI(text, search->text);
+    size_t at, length = wcslen(text), n = wcslen(search->text);
+    if (search->regex) return Core_RegexSearchEnd(&search->compiled, text, length, messageEnd);
+    for (at = 0; at + n <= length; at++)
+        if (search->matchCase ? wcsncmp(text + at, search->text, n) == 0 :
+            CompareStringOrdinal(text + at, (int)n, search->text, (int)n, TRUE) == CSTR_EQUAL) {
+            *messageEnd = at + n;
+            return TRUE;
+        }
+    return FALSE;
 }
 
 /* One transcript holds the search in one of its messages. */
-static BOOL TranscriptMatches(const SessionSearch *search, const WCHAR *path, WCHAR *message)
+static BOOL ReadMatches(const SessionSearch *search, const WCHAR *path, WCHAR *message, BOOL *complete, ULONGLONG *offset, size_t *messageEnd)
 {
     DWORD length = 0;
     char *content = Util_ReadFile(path, SEARCH_FILE_MAX, FALSE, &length), *line, *end;
     BOOL found = FALSE;
+    *complete = FALSE;
     if (!content) return FALSE;
     if (!search->prefilter || Core_ContainsUtf8(content, length, search->bytes, search->byteLength, search->matchCase)) {
         for (line = content; *line && !found && !InterlockedCompareExchange(search->stop, 0, 0); line = *end ? end + 1 : end) {
             if ((end = strchr(line, '\n')) == NULL) end = line + strlen(line);
-            if (Core_TranscriptLine(line, (size_t)(end - line), message, SEARCH_LINE_CCH) != TRANSCRIPT_NONE) found = TextMatches(search, message);
+            {
+                size_t capacity = (size_t)(end - line) + 8;
+                WCHAR *decoded = capacity > SEARCH_LINE_CCH ? (WCHAR *)HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(WCHAR)) : message;
+                if (decoded && Core_TranscriptLine(line, (size_t)(end - line), decoded, capacity > SEARCH_LINE_CCH ? capacity : SEARCH_LINE_CCH) != TRANSCRIPT_NONE)
+                    found = TextMatches(search, decoded, messageEnd);
+                if (decoded && decoded != message) HeapFree(GetProcessHeap(), 0, decoded);
+                if (found) *offset = (ULONGLONG)(line - content);
+            }
         }
     }
     HeapFree(GetProcessHeap(), 0, content);
+    *complete = !InterlockedCompareExchange(search->stop, 0, 0);
     return found;
+}
+
+static BOOL FileStamp(const WCHAR *path, WIN32_FILE_ATTRIBUTE_DATA *data)
+{
+    WCHAR extended[LONG_PATH_CCH];
+    return Util_ExtendedPath(path, extended, ARRAYSIZE(extended)) && GetFileAttributesExW(extended, GetFileExInfoStandard, data) &&
+           !(data->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL SameStamp(const WIN32_FILE_ATTRIBUTE_DATA *a, const WIN32_FILE_ATTRIBUTE_DATA *b)
+{
+    return a->nFileSizeHigh == b->nFileSizeHigh && a->nFileSizeLow == b->nFileSizeLow &&
+           CompareFileTime(&a->ftLastWriteTime, &b->ftLastWriteTime) == 0 && CompareFileTime(&a->ftCreationTime, &b->ftCreationTime) == 0;
+}
+
+static BOOL TranscriptMatches(const SessionSearch *search, const WCHAR *path, WCHAR *message, ULONGLONG *offset, size_t *messageEnd)
+{
+    WIN32_FILE_ATTRIBUTE_DATA before, after;
+    LONG epoch = InterlockedCompareExchange(&g_cacheEpoch, 0, 0);
+    BOOL stamped = FileStamp(path, &before), complete = FALSE, found;
+    unsigned i;
+    for (i = 0; stamped && i < ARRAYSIZE(g_cache); i++) {
+        const SearchCacheEntry *entry = &g_cache[i];
+        if (entry->path && entry->epoch == epoch && entry->regex == search->regex && entry->matchCase == search->matchCase &&
+            wcscmp(entry->query, search->text) == 0 && Core_PathEquals(entry->path, path) && SameStamp(&entry->file, &before) &&
+            epoch == InterlockedCompareExchange(&g_cacheEpoch, 0, 0))
+            {
+                *offset = entry->offset;
+                *messageEnd = entry->messageEnd;
+                return entry->found;
+            }
+    }
+    found = ReadMatches(search, path, message, &complete, offset, messageEnd);
+    if (stamped && complete && FileStamp(path, &after) && SameStamp(&before, &after) &&
+        epoch == InterlockedCompareExchange(&g_cacheEpoch, 0, 0)) {
+        size_t bytes = (wcslen(path) + 1) * sizeof(WCHAR);
+        WCHAR *copy = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, bytes);
+        if (copy) {
+            SearchCacheEntry *entry = &g_cache[g_cacheNext++ % ARRAYSIZE(g_cache)];
+            if (entry->path) HeapFree(GetProcessHeap(), 0, entry->path);
+            CopyMemory(copy, path, bytes);
+            entry->path = copy;
+            StringCchCopyW(entry->query, ARRAYSIZE(entry->query), search->text);
+            entry->file = after;
+            entry->epoch = epoch;
+            entry->regex = search->regex;
+            entry->matchCase = search->matchCase;
+            entry->found = found;
+            entry->offset = *offset;
+            entry->messageEnd = *messageEnd;
+        }
+    }
+    return found;
+}
+
+void SessionSearch_Invalidate(void)
+{
+    InterlockedIncrement(&g_cacheEpoch);
 }
 
 static DWORD WINAPI SearchProc(void *param)
@@ -60,9 +152,15 @@ static DWORD WINAPI SearchProc(void *param)
     SessionSearch *search = (SessionSearch *)param;
     WCHAR *message = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, SEARCH_LINE_CCH * sizeof(WCHAR));
     int i;
-    for (i = 0; message && i < search->count && !InterlockedCompareExchange(search->stop, 0, 0); i++)
-        if (search->paths[i][0] && TranscriptMatches(search, search->paths[i], message))
-            PostMessageW(search->window, WM_APP_SESSION_SEARCH, (WPARAM)search->generation, (LPARAM)i);
+    for (i = 0; message && i < search->count && !InterlockedCompareExchange(search->stop, 0, 0); i++) {
+        ULONGLONG offset = 0;
+        size_t messageEnd = 0;
+        BOOL found;
+        AcquireSRWLockExclusive(&g_cacheLock);
+        found = search->paths[i][0] && TranscriptMatches(search, search->paths[i], message, &offset, &messageEnd);
+        ReleaseSRWLockExclusive(&g_cacheLock);
+        if (found) PostMessageW(search->window, WM_APP_SESSION_SEARCH, (WPARAM)search->generation, (LPARAM)i);
+    }
     if (!InterlockedCompareExchange(search->stop, 0, 0)) PostMessageW(search->window, WM_APP_SESSION_SEARCH, (WPARAM)search->generation, (LPARAM)-1);
     if (message) HeapFree(GetProcessHeap(), 0, message);
     HeapFree(GetProcessHeap(), 0, search->paths);
@@ -121,4 +219,28 @@ BOOL SessionSearch_Start(HWND window, ULONG generation, const WCHAR *text, BOOL 
         return FALSE;
     }
     return TRUE;
+}
+
+/* A cached hit includes its line offset and its decoded match end. Re-read
+ * stale/evicted files using exactly the worker's message semantics. */
+BOOL SessionSearch_Locate(const WCHAR *path, const WCHAR *text, BOOL regex, BOOL matchCase, ULONGLONG *offset, size_t *messageEnd)
+{
+    SessionSearch *search = (SessionSearch *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *search);
+    WCHAR *message = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, SEARCH_LINE_CCH * sizeof(WCHAR));
+    volatile LONG stop = 0;
+    BOOL found = FALSE;
+    *offset = 0;
+    *messageEnd = 0;
+    if (search && message && SUCCEEDED(StringCchCopyW(search->text, ARRAYSIZE(search->text), text)) &&
+        (!regex || Core_RegexCompile(&search->compiled, text, !matchCase))) {
+        search->regex = regex;
+        search->matchCase = matchCase;
+        search->stop = &stop;
+        AcquireSRWLockExclusive(&g_cacheLock);
+        found = TranscriptMatches(search, path, message, offset, messageEnd);
+        ReleaseSRWLockExclusive(&g_cacheLock);
+    }
+    if (message) HeapFree(GetProcessHeap(), 0, message);
+    if (search) HeapFree(GetProcessHeap(), 0, search);
+    return found;
 }

@@ -29,6 +29,9 @@
  */
 #include "../src/app.h"
 #include "../src/resource.h"
+#include "../src/profiletools.h"
+#include "../src/sessiontools.h"
+#include "../src/vaulttools.h"
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <vssym32.h>
@@ -65,7 +68,11 @@ typedef struct LayoutFixture {
     LinkStatus links;
     MainVersion version;
     /* What sessions.c did through the window. */
-    int reloadRequests, openPrompts;
+    int reloadRequests, openPrompts, searchCompletions, snapshots;
+    WPARAM searchGeneration;
+    BOOL holdSearch;
+    struct { WPARAM generation; LPARAM index; } heldSearch[64];
+    int heldSearchCount;
     HWND lastPrompt;
     WCHAR promptText[512];
 } LayoutFixture;
@@ -466,8 +473,7 @@ static void RestoreCaptions(HWND dialog, const WCHAR *name, BOOL fill)
     LVCOLUMNW column;
     LVITEMW item;
     int i;
-    SetDlgItemTextW(dialog, IDC_R_TEXT, TR(L"The sessions this version lists come back in the profile, as they were then. "
-                                           L"Sessions deleted in Claude stay deleted."));
+    SetDlgItemTextW(dialog, IDC_R_TEXT, TR(L"Choose a saved version, then search and select sessions to recover. Sessions deleted in Claude stay deleted."));
     if (!fill) return;
     SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_ADDSTRING, 0, (LPARAM)name);
     SendDlgItemMessageW(dialog, IDC_R_PROFILE, CB_SETCURSEL, 0, 0);
@@ -620,6 +626,36 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         SetDlgItemTextW(dialog, IDC_V_TITLE, L"A private mock session title that remains user data in every language");
         SetDlgItemTextW(dialog, IDC_V_TEXT, L"\x25B6  You\r\nPrivate user text\r\n\r\n\x25C6  Claude\r\nPrivate reply\r\n[Bash] Build it");
         break;
+    case IDD_SIGNIN:
+        SetDlgItemTextW(dialog, IDC_SIGNIN_PROFILE, L"Private profile");
+        SendDlgItemMessageW(dialog, IDC_SIGNIN_BROWSER, CB_ADDSTRING, 0, (LPARAM)L"Microsoft Edge");
+        SendDlgItemMessageW(dialog, IDC_SIGNIN_BROWSER, CB_SETCURSEL, 0, 0);
+        SetDlgItemTextW(dialog, IDC_SIGNIN_URL, L"https://claude.ai/login");
+        SetDlgItemTextW(dialog, IDC_SIGNIN_STATUS,
+            TR(L"A separate private browser was started. Complete registration or sign-in yourself. If this is a Desktop sign-in, allow the claude:// link and choose this profile."));
+        break;
+    case IDD_PROFILE_TOOLS:
+        SendDlgItemMessageW(dialog, IDC_PT_PROFILE, CB_ADDSTRING, 0, (LPARAM)name);
+        SendDlgItemMessageW(dialog, IDC_PT_PROFILE, CB_SETCURSEL, 0, 0);
+        break;
+    case IDD_PT_MAPPING:
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Source profile: %s (%s)\r\nChoose an existing destination. Its data directory will not be renamed or moved. Skip leaves it unmapped."), name, L"Claude-private-fixture");
+        SetDlgItemTextW(dialog, IDC_PT_MAP_NOTE, text);
+        SendDlgItemMessageW(dialog, IDC_PT_MAP_TARGET, CB_ADDSTRING, 0, (LPARAM)name);
+        SendDlgItemMessageW(dialog, IDC_PT_MAP_TARGET, CB_SETCURSEL, 0, 0);
+        break;
+    case IDD_PT_SNAPSHOTS:
+        SendDlgItemMessageW(dialog, IDC_PT_SNAPSHOT_LIST, LB_ADDSTRING, 0, (LPARAM)L"20261020-235959-999-00000001-12345678.zip");
+        break;
+    case IDD_SESSIONTOOLS:
+        SetDlgItemTextW(dialog, IDC_ST_NOTE, L"Private fixture session details");
+        SendDlgItemMessageW(dialog, IDC_ST_LIST, LB_ADDSTRING, 0, (LPARAM)L"Private fixture metadata");
+        SetDlgItemTextW(dialog, IDC_ST_DETAIL, L"Private details\r\nSecond row");
+        break;
+    case IDD_TEXTVIEW:
+        SetDlgItemTextW(dialog, IDC_T_NOTE, TR(L"Only versions and profile status are included. Account names, paths, links and log contents are omitted."));
+        SetDlgItemTextW(dialog, IDC_T_TEXT, L"Private fixture details\r\nSecond row");
+        break;
     case IDD_MESSAGE:
         StringCchPrintfW(text, ARRAYSIZE(text),
             TR(L"Copy \x201C%s\x201D to \x201C%s\x201D?\n\nThe copy goes on separately."), L"A private conversation", name);
@@ -747,7 +783,7 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_BACKUP, IDC_REPAIR, IDC_NOTE };
+    static const int kProfileControls[] = { IDC_PROFILE_SEARCH_LABEL, IDC_PROFILE_SEARCH, IDC_PROFILE_FIND, IDC_LIST, IDC_SYNC, IDC_BACKUP, IDC_REPAIR, IDC_NOTE };
     static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_FIND, IDC_S_FILTER, IDC_S_TREE };
     static const int kFootControls[] = { IDC_STATUS, IDC_PROGRESS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE };   /* the view has no column */
     size_t i;
@@ -778,9 +814,15 @@ static void InitializeFixture(HWND dialog, LayoutFixture *fixture, void (*fill)(
         PrepareMainWindow(dialog, fixture);
     }
     SetWindowSubclass(dialog, ScaledResourceFont, SCALED_FONT_SUBCLASS, (DWORD_PTR)fixture->font);
-    Theme_Apply(dialog);
-    if (fixture->resource == IDD_MAIN) Theme_RememberLayout(dialog);
-    Theme_FitDialog(dialog);
+    if (fixture->resource == IDD_MAIN) {
+        Theme_Apply(dialog);
+        Theme_RememberLayout(dialog);
+        Theme_FitDialog(dialog);
+    } else {
+        /* Ui_Dialog fits before applying the final control theme. */
+        Theme_FitDialog(dialog);
+        Theme_Apply(dialog);
+    }
     RemoveWindowSubclass(dialog, ScaledResourceFont, SCALED_FONT_SUBCLASS);
     if (fixture->resource == IDD_MAIN) {
         Gui_LayoutProfileColumns(fixture->table);
@@ -799,6 +841,13 @@ static void ClosePrompt(LayoutFixture *fixture, HWND prompt)
     fixture->openPrompts++;
     GetDlgItemTextW(prompt, IDC_M_TEXT, fixture->promptText, ARRAYSIZE(fixture->promptText));
     PostMessageW(prompt, WM_COMMAND, IDOK, 0);
+}
+
+static void DeliverSearchResult(LayoutFixture *fixture, WPARAM generation, LPARAM index)
+{
+    if (!SessionsView_SearchFound(generation, index)) return;
+    fixture->searchGeneration = generation;
+    if (index < 0) fixture->searchCompletions++;
 }
 
 static INT_PTR CALLBACK FixtureProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
@@ -824,6 +873,13 @@ static INT_PTR CALLBACK FixtureProc(HWND dialog, UINT message, WPARAM wp, LPARAM
             return TRUE;
         case WM_APP_SESSIONS_READY:
             SessionsView_Ready(TRUE);
+            fixture->snapshots++;
+            return TRUE;
+        case WM_APP_SESSION_SEARCH:
+            if (fixture->holdSearch && fixture->heldSearchCount < (int)ARRAYSIZE(fixture->heldSearch)) {
+                fixture->heldSearch[fixture->heldSearchCount].generation = wp;
+                fixture->heldSearch[fixture->heldSearchCount++].index = lp;
+            } else DeliverSearchResult(fixture, wp, lp);
             return TRUE;
         case WM_NOTIFY:
             if (!SessionsView_Notify((const NMHDR *)lp, &result)) break;
@@ -1262,11 +1318,40 @@ static void CheckMainBands(HWND dialog, const LayoutFixture *fixture)
               !IsWindowVisible(GetDlgItem(dialog, IDC_STATUS)) && !IsWindowVisible(GetDlgItem(dialog, IDC_VERSION)) && !IsWindowVisible(update));
         return;
     }
-    Check(fixture, GetDlgItem(dialog, IDC_SESSIONS), "the view's button tops the column, level with the body",
-          view.top == body.top && view.left > body.right);
+    {
+        RECT search = RelativeRect(dialog, GetDlgItem(dialog, IDC_PROFILE_SEARCH));
+        RECT label = RelativeRect(dialog, GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL));
+        if (GetWindowLongW(GetDlgItem(dialog, IDC_PROFILE_SEARCH), GWL_STYLE) & WS_VISIBLE) {
+            Check(fixture, GetDlgItem(dialog, IDC_SESSIONS), "the view's button is level with the requested search row",
+                  view.top == search.top && search.bottom < body.top && view.left > body.right);
+            Check(fixture, GetDlgItem(dialog, IDC_PROFILE_SEARCH), "search label is vertically centered beside the edit",
+                  label.left == body.left && label.right < search.left && search.right == body.right &&
+                  abs(label.top + label.bottom - search.top - search.bottom) <= 1 && label.bottom < body.top);
+        } else Check(fixture, GetDlgItem(dialog, IDC_LIST), "hidden search takes no row above the table",
+                     view.top == body.top && !(GetWindowLongW(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), GWL_STYLE) & WS_VISIBLE));
+    }
     Check(fixture, GetDlgItem(dialog, IDC_STATUS), "the status sits above the version, in the column",
           status.bottom <= version.top && status.left == view.left && version.left == view.left && version.right == view.right);
     Check(fixture, GetDlgItem(dialog, IDC_VERSION), "the column's foot ends on the body's bottom", last.bottom == body.bottom);
+}
+
+static void CheckFieldCaption(HWND dialog, const LayoutFixture *fixture, int captionId, int fieldId)
+{
+    HWND caption = GetDlgItem(dialog, captionId), field = GetDlgItem(dialog, fieldId);
+    RECT label, box;
+    if (!(GetWindowLongW(caption, GWL_STYLE) & WS_VISIBLE) || !(GetWindowLongW(field, GWL_STYLE) & WS_VISIBLE)) return;
+    label = RelativeRect(dialog, caption);
+    box = RelativeRect(dialog, field);
+    Check(fixture, caption, "caption is vertically centered on its field", abs(label.top + label.bottom - box.top - box.bottom) <= 1);
+    if (IsClass(caption, WC_STATICW)) {
+        HDC dc = GetDC(caption);
+        HGDIOBJ old = SelectObject(dc, (HFONT)SendMessageW(caption, WM_GETFONT, 0, 0));
+        TEXTMETRICW metrics;
+        GetTextMetricsW(dc, &metrics);
+        Check(fixture, caption, "short field caption has no extra blank text row", label.bottom - label.top <= metrics.tmHeight + 2);
+        SelectObject(dc, old);
+        ReleaseDC(caption, dc);
+    }
 }
 
 /* Every visible control inside the client, captioned whole and apart from
@@ -1297,6 +1382,67 @@ static void CheckGeometry(HWND dialog, const LayoutFixture *fixture)
         }
     }
     if (fixture->resource == IDD_MAIN) CheckMainBands(dialog, fixture);
+    switch (fixture->resource) {
+    case IDD_PROFILE:
+        CheckFieldCaption(dialog, fixture, IDC_P_NAME_LABEL, IDC_P_NAME);
+        CheckFieldCaption(dialog, fixture, IDC_P_COLOR_LABEL, IDC_P_COLOR);
+        CheckFieldCaption(dialog, fixture, IDC_P_BADGE_LABEL, IDC_P_BADGE);
+        CheckFieldCaption(dialog, fixture, IDC_P_TITLE_LABEL, IDC_P_TITLE);
+        CheckFieldCaption(dialog, fixture, IDC_P_NOTE_LABEL, IDC_P_NOTE);
+        CheckFieldCaption(dialog, fixture, IDC_P_SYNC_LABEL, IDC_P_SYNC);
+        break;
+    case IDD_RESTORE: CheckFieldCaption(dialog, fixture, IDC_R_PROFILE_LABEL, IDC_R_PROFILE); break;
+    case IDD_PURGE:
+        CheckFieldCaption(dialog, fixture, IDC_C_SHOW_LABEL, IDC_C_PROFILE);
+        CheckFieldCaption(dialog, fixture, IDC_C_ALL, IDC_C_PROFILE);
+        break;
+    case IDD_CONFLICTS: CheckFieldCaption(dialog, fixture, IDC_X_LABEL, IDC_X_PROFILE); break;
+    case IDD_SETTINGS:
+        CheckFieldCaption(dialog, fixture, IDC_G_DAYS_LABEL, IDC_G_DAYS);
+        CheckFieldCaption(dialog, fixture, IDC_G_DAYS_UNIT, IDC_G_DAYS);
+        break;
+    case IDD_PASSWORD:
+        CheckFieldCaption(dialog, fixture, IDC_K_LABEL, IDC_K_PASSWORD);
+        CheckFieldCaption(dialog, fixture, IDC_K_AGAIN_LABEL, IDC_K_AGAIN);
+        break;
+    case IDD_SIGNIN: CheckFieldCaption(dialog, fixture, IDC_SIGNIN_BROWSER_LABEL, IDC_SIGNIN_BROWSER); break;
+    case IDD_BACKUP_HUB: CheckFieldCaption(dialog, fixture, IDC_H_WEEKLY, IDC_H_CODE); break;
+    }
+    if (fixture->resource == IDD_PROFILE && (GetWindowLongW(GetDlgItem(dialog, IDC_P_SYNC), GWL_STYLE) & WS_VISIBLE)) {
+        RECT combo = RelativeRect(dialog, GetDlgItem(dialog, IDC_P_SYNC));
+        RECT action = RelativeRect(dialog, GetDlgItem(dialog, IDC_P_SYNC_ITEMS));
+        RECT label = RelativeRect(dialog, GetDlgItem(dialog, IDC_P_SYNC_LABEL));
+        Check(fixture, GetDlgItem(dialog, IDC_P_SYNC), "sync choice and action have the same top and bottom",
+              combo.top == action.top && combo.bottom == action.bottom);
+        Check(fixture, GetDlgItem(dialog, IDC_P_SYNC_LABEL), "sync label is vertically centered on its controls",
+              abs(label.top + label.bottom - combo.top - combo.bottom) <= 1);
+    }
+}
+
+static void CheckProfileSearchLayout(void)
+{
+    size_t scale;
+    int language;
+    for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) if (g_scaleFits[scale])
+        for (language = 0; language < Localize_LanguageCount(); language++) {
+            LayoutFixture fixture = MainFixture(language, kFontScales[scale], FALSE);
+            HWND dialog = CreateFixture(&fixture);
+            Check(&fixture, NULL, "profile search layout fixture created", dialog != NULL);
+            if (dialog) {
+                Check(&fixture, GetDlgItem(dialog, IDC_PROFILE_SEARCH), "profile search starts hidden",
+                      !(GetWindowLongW(GetDlgItem(dialog, IDC_PROFILE_SEARCH), GWL_STYLE) & WS_VISIBLE));
+                CheckGeometry(dialog, &fixture);
+                ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), SW_SHOW);
+                ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH), SW_SHOW);
+                Theme_LayoutMain(dialog);
+                CheckGeometry(dialog, &fixture);
+                ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), SW_HIDE);
+                ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH), SW_HIDE);
+                Theme_LayoutMain(dialog);
+                CheckGeometry(dialog, &fixture);
+            }
+            DestroyFixture(dialog, &fixture);
+        }
 }
 
 /* The table's columns as gui.c sizes them by default, and every Role
@@ -1568,7 +1714,13 @@ static INT_PTR CALLBACK ModalCaptureProc(HWND dialog, UINT message, WPARAM wp, L
     }
     if (message == WM_MODAL_CAPTURE && capture) {
         int dpi = (int)GetDpiForWindow(dialog);
+        CheckGeometry(dialog, &capture->fixture);
+        Theme_Apply(dialog);
+        CheckGeometry(dialog, &capture->fixture);
         ReadLayout(dialog, capture->state);
+        Theme_FitDialog(dialog);
+        Theme_Apply(dialog);
+        CompareLayout(dialog, &capture->fixture, capture->state);
         Check(&capture->fixture, NULL, "shared modal shell retains its own native resource font size",
               capture->state->dialogFont.available && ResourceFontPoints(IDD_PROFILE) > 0 &&
               capture->state->dialogFont.logical.lfHeight == -MulDiv(ResourceFontPoints(IDD_PROFILE), dpi, 72));
@@ -1623,7 +1775,7 @@ static void CheckLanguageRoundTrips(void)
 {
     static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
                                       IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS,
-                                      IDD_ABOUT, IDD_PASSWORD };
+                                      IDD_ABOUT, IDD_PASSWORD, IDD_SIGNIN, IDD_HISTORY, IDD_TEXTVIEW, IDD_PROFILE_TOOLS, IDD_PT_PROGRESS, IDD_PT_MAPPING, IDD_PT_SNAPSHOTS, IDD_SESSIONTOOLS, IDD_SESSIONFILTER, IDD_SESSIONSEARCH, IDD_VAULT_PICK, IDD_PURGE_OPEN };
     static const WCHAR *const kVisited[] = { L"zh-CN" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"en");
@@ -1718,7 +1870,7 @@ static void CheckHiddenRows(void)
         { IDD_PROFILE, IDC_P_COPY, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
         { IDD_UNINSTALL, IDC_U_KEEP, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
         /* The label is centered on the drop-down list: at some scales it ends below it. */
-        { IDD_PROFILE, IDC_P_TITLE, { IDC_P_SYNC_LABEL, IDC_P_SYNC, IDC_P_SYNC_ITEMS }, 3, "the profile dialog without its sessions" },
+        { IDD_PROFILE, IDC_P_NOTE, { IDC_P_SYNC_LABEL, IDC_P_SYNC, IDC_P_SYNC_ITEMS }, 3, "the profile dialog without its sessions" },
     };
     size_t i, scale;
     for (i = 0; i < ARRAYSIZE(kCases); i++) for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) {
@@ -1767,6 +1919,9 @@ static void CheckHiddenRows(void)
             Check(&closed, NULL, name, band > 0 && moved > 0 && kept > 0 && rowsFollow);
             StringCchPrintfA(name, ARRAYSIZE(name), "%s is shorter by that band", kCases[i].name);
             Check(&closed, NULL, name, clientWhole.bottom - clientClosed.bottom == band);
+            if (!rowsFollow || clientWhole.bottom - clientClosed.bottom != band)
+                printf("        hidden-row band=%d client-delta=%ld above-bottom=%ld lowest=%d\n", band,
+                       clientWhole.bottom - clientClosed.bottom, aboveWhole.bottom, lowest);
             ReadLayout(closedDialog, &before);
             Theme_FitDialog(closedDialog);
             ReadLayout(closedDialog, &after);
@@ -1870,7 +2025,8 @@ static void CheckSharedItemLists(void)
 static void CheckDialogs(void)
 {
     static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE,
-                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS, IDD_ABOUT, IDD_PASSWORD };
+                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS, IDD_ABOUT, IDD_PASSWORD,
+                                      IDD_SIGNIN, IDD_HISTORY, IDD_TEXTVIEW, IDD_PROFILE_TOOLS, IDD_PT_PROGRESS, IDD_PT_MAPPING, IDD_PT_SNAPSHOTS, IDD_SESSIONTOOLS, IDD_SESSIONFILTER, IDD_SESSIONSEARCH, IDD_VAULT_PICK, IDD_PURGE_OPEN };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)
@@ -3338,6 +3494,317 @@ static void CheckSessionsFocus(SessionsFixture *sessions)
 /* The sessions view of a real manager layout, filled by sessions.c from
  * private profiles: resizes in three languages, and in one of them its
  * refills, watcher and double-clicks. */
+typedef struct SearchTreeWait {
+    SessionsFixture *sessions;
+    const WCHAR *present, *absent;
+    int after;
+} SearchTreeWait;
+
+static BOOL SearchTreeShows(const void *context)
+{
+    const SearchTreeWait *wait = (const SearchTreeWait *)context;
+    HWND tree = wait->sessions->tree;
+    return wait->sessions->layout.searchCompletions > wait->after &&
+           (!wait->present || FindTitle(tree, TreeView_GetRoot(tree), wait->present)) &&
+           (!wait->absent || !FindTitle(tree, TreeView_GetRoot(tree), wait->absent));
+}
+
+static BOOL WriteSearchTranscript(SessionsFixture *sessions, int index, const char *content)
+{
+    WCHAR id[SESSION_ID_CCH], path[MAX_PATH];
+    char line[2048], cwd[MAX_PATH * 6 + 4];
+    SessionId(index, id, ARRAYSIZE(id));
+    if (!Core_JsonQuote(sessions->folders[0], cwd, sizeof cwd)) return FALSE;
+    StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s.jsonl", sessions->transcripts, id);
+    StringCchPrintfA(line, sizeof line, "{\"sessionId\":\"%ls\",\"cwd\":%s,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\n",
+                     id, cwd, content);
+    return SaveFixtureFile(sessions->root.path, path, line, TRUE);
+}
+
+static BOOL HeldSearchDone(const void *context)
+{
+    const LayoutFixture *fixture = (const LayoutFixture *)context;
+    int i;
+    for (i = 0; i < fixture->heldSearchCount; i++)
+        if (fixture->heldSearch[i].index < 0) return TRUE;
+    return FALSE;
+}
+
+static void ReleaseHeldSearch(LayoutFixture *fixture)
+{
+    int i, count = fixture->heldSearchCount;
+    fixture->heldSearchCount = 0;
+    for (i = 0; i < count; i++)
+        DeliverSearchResult(fixture, fixture->heldSearch[i].generation, fixture->heldSearch[i].index);
+}
+
+/* Holding worker messages makes the UI's search stay in flight while each
+ * notification publishes a new snapshot. Release its late hit and completion
+ * together, before the 150 ms refill, then hold the following pass as well. */
+static void CheckPendingSearchPasses(SessionsFixture *sessions)
+{
+    LayoutFixture *fixture = &sessions->layout;
+    WCHAR title[64];
+    int pass;
+    PumpUntil(NULL, NULL, 700);   /* settle the previous query's file notifications */
+    fixture->holdSearch = TRUE;
+    fixture->heldSearchCount = 0;
+    RowTitle(0, title, ARRAYSIZE(title));
+    Check(fixture, NULL, "a gated search transcript is prepared", WriteSearchTranscript(sessions, 0, "gated-search-needle"));
+    SetDlgItemTextW(sessions->dialog, IDC_S_SEARCH, L"gated-search-needle");
+    for (pass = 0; pass < 3; pass++) {
+        CountWait snapshot;
+        int notified, completed;
+        char content[64];
+        BOOL held = PumpUntil(HeldSearchDone, fixture, SNAPSHOT_TIMEOUT_MS);
+        Check(fixture, sessions->tree, "a search pass is held in flight until its late hit and completion", held);
+        if (!held) break;
+        if (pass) Check(fixture, sessions->tree, "a slow following pass retains the completed pass on screen",
+                        FindTitle(sessions->tree, TreeView_GetRoot(sessions->tree), title) != NULL);
+        notified = fixture->reloadRequests;
+        snapshot.counter = &fixture->snapshots;
+        snapshot.above = fixture->snapshots;
+        StringCchPrintfA(content, sizeof content, "gated-search-needle-%d", pass);
+        Check(fixture, NULL, "another transcript write arrives during the held search", WriteSearchTranscript(sessions, 0, content));
+        Check(fixture, sessions->tree, "a snapshot arrives while that search is still in flight",
+              AwaitReloadRequest(fixture, notified, SNAPSHOT_TIMEOUT_MS) && PumpUntil(CountAbove, &snapshot, SNAPSHOT_TIMEOUT_MS));
+        completed = fixture->searchCompletions;
+        ReleaseHeldSearch(fixture);
+        Check(fixture, sessions->tree, "a pending refresh presents every completed pass without waiting for the refill timer",
+              fixture->searchCompletions > completed && FindTitle(sessions->tree, TreeView_GetRoot(sessions->tree), title) != NULL);
+    }
+    fixture->holdSearch = FALSE;
+    ReleaseHeldSearch(fixture);
+    SetDlgItemTextW(sessions->dialog, IDC_S_SEARCH, L"");
+}
+
+/* Only transcript bodies change: entries and the tree's content hash stay
+ * the same. The query must follow notifications even after zero matches. */
+typedef struct CrossSearchCheck { LayoutFixture *fixture; BOOL checked; } CrossSearchCheck;
+
+static LRESULT CALLBACK CheckCrossSearch(HWND owner, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR reference)
+{
+    CrossSearchCheck *check = (CrossSearchCheck *)reference;
+    (void)id;
+    if (message == WM_ENTERIDLE && wp == MSGF_DIALOGBOX && !check->checked) {
+        HWND dialog = (HWND)lp, list = GetWindow(GetDlgItem(dialog, IDC_X_LIST), GW_CHILD), profiles = GetDlgItem(dialog, IDC_X_PROFILE);
+        WCHAR title[256];
+        int i, shared = -1;
+        if (!list) return DefSubclassProc(owner, message, wp, lp);
+        check->checked = TRUE;
+        if (ListView_GetItemCount(list) != 2) {
+            GetDlgItemTextW(dialog, IDC_X_TEXT, title, ARRAYSIZE(title));
+            printf("  cross-search query=%ls count=%d\n", title, ListView_GetItemCount(list));
+        }
+        Check(check->fixture, list, "cross-profile search deduplicates shared sessions and finds another profile's unique session", ListView_GetItemCount(list) == 2);
+        for (i = 0; i < ListView_GetItemCount(list); i++) {
+            ListView_GetItemText(list, i, 0, title, ARRAYSIZE(title));
+            if (wcscmp(title, L"cross-needle shared") == 0) shared = i;
+        }
+        Check(check->fixture, list, "cross-profile results show the matching profile's title", shared >= 0);
+        if (shared >= 0) {
+            NMLISTVIEW notification;
+            ListView_SetItemState(list, shared, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            Check(check->fixture, profiles, "a shared result offers both opening profiles", SendMessageW(profiles, CB_GETCOUNT, 0, 0) == 2);
+            SendMessageW(profiles, CB_SETCURSEL, 1, 0);
+            ZeroMemory(&notification, sizeof notification);
+            notification.hdr.hwndFrom = list;
+            notification.hdr.idFrom = IDC_X_LIST;
+            notification.hdr.code = LVN_ITEMCHANGED;
+            notification.iItem = shared;
+            notification.uChanged = LVIF_TEXT;
+            SendMessageW(dialog, WM_NOTIFY, IDC_X_LIST, (LPARAM)&notification);
+            Check(check->fixture, profiles, "result text changes preserve the chosen opening profile", SendMessageW(profiles, CB_GETCURSEL, 0, 0) == 1);
+        }
+        PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
+    }
+    return DefSubclassProc(owner, message, wp, lp);
+}
+
+static void CheckCrossProfileSearch(void)
+{
+    SessionsFixture sessions;
+    DWORD previous = Util_GetSetting(L"SessionsSearch", 1), resultFilter = Util_GetSetting(L"SessionsResult", 0);
+    if (!NativeScaleFits("the cross-profile search")) return;
+    Util_SetSetting(L"SessionsSearch", 1);
+    Util_SetSetting(L"SessionsResult", 0);
+    if (OpenSessionsFixture(&sessions, Language(L"en"))) {
+        WCHAR entries[MAX_PATH], path[MAX_PATH], shared[SESSION_ID_CCH], unique[SESSION_ID_CCH];
+        char json[1024];
+        CrossSearchCheck check = { &sessions.layout, FALSE };
+        BOOL ready;
+        SessionId(0, shared, ARRAYSIZE(shared));
+        SessionId(UNKNOWN_ROW + 30, unique, ARRAYSIZE(unique));
+        StringCchPrintfW(entries, ARRAYSIZE(entries), L"%s\\claude-code-sessions\\account-ui\\organization-ui", sessions.profiles.items[1].storageDir);
+        ready = Util_EnsureDir(entries);
+        StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\local_%s.json", entries, shared);
+        StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"title\":\"cross-needle shared\"}", shared, shared);
+        ready = ready && SaveFixtureFile(sessions.root.path, path, json, FALSE);
+        StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\local_%s.json", entries, unique);
+        StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"title\":\"cross-needle unique\"}", unique, unique);
+        ready = ready && SaveFixtureFile(sessions.root.path, path, json, FALSE) && AwaitWritesRead(&sessions, 45, L"Cross search refresh marker");
+        Check(&sessions.layout, NULL, "cross-profile fixtures are ready", ready);
+        if (ready) {
+            SessionSet set;
+            int row, listed = 0;
+            BOOL loaded = SessionStore_LoadProfiles(&set, &sessions.profiles);
+            for (row = 0; loaded && row < set.rowCount; row++) if (set.rows[row].entry[1] >= 0) listed++;
+            Check(&sessions.layout, NULL, "the second profile has both cross-profile test entries", loaded && listed == 2);
+            SessionStore_Free(&set);
+        }
+        if (ready) {
+            SetDlgItemTextW(sessions.dialog, IDC_S_SEARCH, L"cross-needle");
+            SetWindowSubclass(sessions.dialog, CheckCrossSearch, 0x7123, (DWORD_PTR)&check);
+            SessionsView_SearchAll();
+            RemoveWindowSubclass(sessions.dialog, CheckCrossSearch, 0x7123);
+            Check(&sessions.layout, NULL, "cross-profile result dialog was reviewed", check.checked);
+        }
+    }
+    CloseSessionsFixture(&sessions);
+    Util_SetSetting(L"SessionsSearch", previous);
+    Util_SetSetting(L"SessionsResult", resultFilter);
+}
+
+static void CheckLiveConversationSearch(void)
+{
+    SessionsFixture sessions;
+    DWORD previous = Util_GetSetting(L"SessionsSearch", 1);
+    if (!NativeScaleFits("the live conversation search")) return;
+    Util_SetSetting(L"SessionsSearch", 2);   /* SEARCH_TEXT only, in the private state folder */
+    if (OpenSessionsFixture(&sessions, Language(L"en"))) {
+        LayoutFixture *fixture = &sessions.layout;
+        WCHAR first[64], second[64];
+        SearchTreeWait wait = { &sessions, first, second, 0 };
+        WPARAM oldGeneration;
+        int notifications;
+        RowTitle(0, first, ARRAYSIZE(first));
+        RowTitle(1, second, ARRAYSIZE(second));
+        Check(fixture, NULL, "search transcripts prepared", WriteSearchTranscript(&sessions, 0, "watcher-needle") &&
+              WriteSearchTranscript(&sessions, 1, "other-message"));
+        wait.after = fixture->searchCompletions;
+        SetDlgItemTextW(sessions.dialog, IDC_S_SEARCH, L"watcher-needle");
+        Check(fixture, sessions.tree, "a message query finds its first transcript", PumpUntil(SearchTreeShows, &wait, SNAPSHOT_TIMEOUT_MS));
+        oldGeneration = fixture->searchGeneration;
+        notifications = fixture->reloadRequests;
+        wait.after = fixture->searchCompletions;
+        wait.present = second;
+        wait.absent = first;
+        Check(fixture, NULL, "matching text moves between transcripts", WriteSearchTranscript(&sessions, 0, "other-message") &&
+              WriteSearchTranscript(&sessions, 1, "watcher-needle"));
+        Check(fixture, sessions.tree, "unchanged query follows transcript notifications and drops the old match",
+              AwaitReloadRequest(fixture, notifications, SNAPSHOT_TIMEOUT_MS) && PumpUntil(SearchTreeShows, &wait, SNAPSHOT_TIMEOUT_MS));
+        SendMessageW(sessions.dialog, WM_APP_SESSION_SEARCH, oldGeneration, 0);
+        PumpUntil(NULL, NULL, 200);
+        Check(fixture, sessions.tree, "an old search generation cannot restore its stale match", SearchTreeShows(&wait));
+        notifications = fixture->searchCompletions;
+        SendMessageW(sessions.dialog, WM_APP_SESSION_SEARCH, oldGeneration, -1);
+        Check(fixture, sessions.tree, "a stale completion cannot satisfy a current search wait", fixture->searchCompletions == notifications);
+        wait.after = fixture->searchCompletions;
+        wait.present = NULL;
+        wait.absent = second;
+        SetDlgItemTextW(sessions.dialog, IDC_S_SEARCH, L"previously-absent-needle");
+        Check(fixture, sessions.tree, "a message query can finish without a match", PumpUntil(SearchTreeShows, &wait, SNAPSHOT_TIMEOUT_MS));
+        wait.after = fixture->searchCompletions;
+        wait.present = first;
+        Check(fixture, NULL, "a previously absent message arrives", WriteSearchTranscript(&sessions, 0, "previously-absent-needle"));
+        Check(fixture, sessions.tree, "a zero-match query gains a match from a transcript event",
+              PumpUntil(SearchTreeShows, &wait, SNAPSHOT_TIMEOUT_MS));
+        CheckPendingSearchPasses(&sessions);
+    }
+    CloseSessionsFixture(&sessions);
+    Util_SetSetting(L"SessionsSearch", previous);
+}
+
+typedef struct FilterMenuCheck { const LayoutFixture *fixture; BOOL seen; } FilterMenuCheck;
+
+static void CALLBACK CancelFilterMenu(HWND window, UINT message, UINT_PTR id, DWORD time)
+{
+    (void)window; (void)message; (void)id; (void)time;
+    EndMenu();
+}
+
+static LRESULT CALLBACK InspectFilterMenu(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR data)
+{
+    FilterMenuCheck *check = (FilterMenuCheck *)data;
+    (void)id;
+    if (message == WM_INITMENUPOPUP && !check->seen) {
+        HMENU menu = (HMENU)wp, group = GetSubMenu(menu, 4), sort = GetSubMenu(menu, 5), show = GetSubMenu(menu, 6);
+        WCHAR text[160];
+        check->seen = TRUE;
+        Check(check->fixture, NULL, "filter menu has grouping, sorting and Show submenus", group && sort && show && GetMenuItemCount(menu) == 10);
+        GetMenuStringW(group, 2, text, ARRAYSIZE(text), MF_BYPOSITION);
+        Check(check->fixture, NULL, "environment grouping is visible and selected in the real menu",
+              wcscmp(text, TR(L"Environment")) == 0 && (GetMenuState(group, 2, MF_BYPOSITION) & MF_CHECKED));
+        GetMenuStringW(sort, 0, text, ARRAYSIZE(text), MF_BYPOSITION);
+        Check(check->fixture, NULL, "last updated leads the sorting choices", wcscmp(text, TR(L"Last updated")) == 0);
+        Check(check->fixture, NULL, "sorting direction has its own radio choice",
+              (GetMenuState(sort, 5, MF_BYPOSITION) & MF_CHECKED) && !(GetMenuState(sort, 4, MF_BYPOSITION) & MF_CHECKED));
+        GetMenuStringW(show, 0, text, ARRAYSIZE(text), MF_BYPOSITION);
+        Check(check->fixture, NULL, "metadata is explicitly labeled as PR status", wcscmp(text, TR(L"Meta&data (PR status)")) == 0);
+        Check(check->fixture, NULL, "empty environment groups can be requested", !(GetMenuState(show, 2, MF_BYPOSITION) & MF_GRAYED));
+        Check(check->fixture, NULL, "reset display defaults is available independently of clear filters",
+              !(GetMenuState(menu, 9, MF_BYPOSITION) & MF_GRAYED) && (GetMenuState(menu, 8, MF_BYPOSITION) & MF_GRAYED));
+        PostMessageW(window, WM_CANCELMODE, 0, 0);
+    }
+    return DefSubclassProc(window, message, wp, lp);
+}
+
+/* Persisted display choices are exercised through the real reader and tree. */
+static void CheckSessionDisplayChoices(void)
+{
+    static const WCHAR *const kSettings[] = { L"SessionsGroupBy", L"SessionsSortBy", L"SessionsSortDescending", L"SessionsEmptyGroups",
+                                              L"SessionsEnvironments", L"SessionsStatus", L"SessionsResult" };
+    static const struct { DWORD group, sort, descending, empty, environments; int first; } kCases[] = {
+        { 5, 2, 0, 0, 0, UNKNOWN_ROW }, { 5, 2, 1, 0, 0, 0 },
+        { 4, 0, 0, 0, 0, 0 }, { 5, 2, 1, 0, SESSION_ENV_CLOUD, -1 }, { 5, 2, 1, 1, SESSION_ENV_CLOUD, -1 }
+    };
+    DWORD saved[ARRAYSIZE(kSettings)];
+    size_t i, setting;
+    if (!NativeScaleFits("session display choices")) return;
+    for (setting = 0; setting < ARRAYSIZE(kSettings); setting++) saved[setting] = Util_GetSetting(kSettings[setting], setting == 2 ? 1 : 0);
+    for (i = 0; i < ARRAYSIZE(kCases); i++) {
+        SessionsFixture sessions;
+        Util_SetSetting(kSettings[0], kCases[i].group);
+        Util_SetSetting(kSettings[1], kCases[i].sort);
+        Util_SetSetting(kSettings[2], kCases[i].descending);
+        Util_SetSetting(kSettings[3], kCases[i].empty);
+        Util_SetSetting(kSettings[4], kCases[i].environments);
+        Util_SetSetting(kSettings[5], 0);
+        Util_SetSetting(kSettings[6], 0);
+        if (OpenSessionsFixture(&sessions, Language(L"en"))) {
+            LayoutFixture *fixture = &sessions.layout;
+            CountWait wait = { &fixture->snapshots, 0 };
+            HTREEITEM group, first;
+            WCHAR actual[128], expected[128];
+            Check(fixture, sessions.tree, "display-choice snapshot arrives", PumpUntil(CountAbove, &wait, SNAPSHOT_TIMEOUT_MS));
+            if (i == 0) {
+                FilterMenuCheck menu = { fixture, FALSE };
+                UINT_PTR timer = SetTimer(sessions.dialog, 0x7145, 2000, CancelFilterMenu);
+                Check(fixture, NULL, "private filter menu has a bounded close", timer != 0);
+                if (timer) {
+                    SetWindowSubclass(sessions.dialog, InspectFilterMenu, 0x7145, (DWORD_PTR)&menu);
+                    SessionsView_Command(MAKEWPARAM(IDC_S_FILTER, BN_CLICKED));
+                    RemoveWindowSubclass(sessions.dialog, InspectFilterMenu, 0x7145);
+                    KillTimer(sessions.dialog, timer);
+                    Check(fixture, NULL, "real filter menu was inspected", menu.seen);
+                }
+            }
+            group = FindTitle(sessions.tree, TreeView_GetRoot(sessions.tree), TR(L"Local"));
+            if (kCases[i].first >= 0) {
+                first = kCases[i].group == 5 ? TreeView_GetChild(sessions.tree, group) : NthChild(sessions.tree, NULL, 1);
+                RowTitle(kCases[i].first, expected, ARRAYSIZE(expected));
+                Check(fixture, sessions.tree, "saved grouping and sorting direction determine the first session",
+                      (kCases[i].group != 5 || group) && ItemTitle(sessions.tree, first, actual, ARRAYSIZE(actual)) && wcscmp(actual, expected) == 0);
+            } else if (kCases[i].empty) {
+                Check(fixture, sessions.tree, "show empty groups retains a known environment excluded by the filter",
+                      group && TreeView_GetChild(sessions.tree, group) == NULL && TreeView_GetCount(sessions.tree) == 1);
+            } else Check(fixture, sessions.tree, "empty groups stay hidden unless requested", !group && TreeView_GetCount(sessions.tree) == 0);
+        }
+        CloseSessionsFixture(&sessions);
+    }
+    for (setting = 0; setting < ARRAYSIZE(kSettings); setting++) Util_SetSetting(kSettings[setting], saved[setting]);
+}
+
 static void CheckPopulatedSessions(void)
 {
     static const WCHAR *const kLanguages[] = { L"en", L"zh-CN" };
@@ -3409,6 +3876,7 @@ int wmain(void)
     CheckHiddenRows();
     CheckMainStates();
     CheckProfileNotes();
+    CheckProfileSearchLayout();
     CheckLanguageRoundTrips();
     CheckResponsiveMain();
     CheckMainFrameMessages();
@@ -3418,6 +3886,9 @@ int wmain(void)
         CheckRealSessionsTransition(language);
     }
     CheckPopulatedSessions();
+    CheckSessionDisplayChoices();
+    CheckLiveConversationSearch();
+    CheckCrossProfileSearch();
     UnregisterClassW(g_fixtureClass, g_hInst);
     HeapFree(GetProcessHeap(), 0, g_mainTemplate);
     ZeroMemory(&none, sizeof none);

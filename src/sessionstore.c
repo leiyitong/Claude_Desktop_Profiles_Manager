@@ -281,7 +281,7 @@ BOOL SessionStore_WorkingDir(const SessionSet *set, const WCHAR *cwd, WCHAR *out
     int p;
     for (p = 0; p < set->profiles.count; p++) {
         const Profile *profile = &set->profiles.items[p];
-        if (Core_PathUnder(cwd, profile->dataDir)) return Core_ProfileFilePath(profile, cwd, out, cch);
+        if (Core_ProfileHoldsPath(profile, cwd)) return Core_ProfileFilePath(profile, cwd, out, cch);
     }
     return SUCCEEDED(StringCchCopyW(out, cch, cwd));
 }
@@ -289,7 +289,7 @@ BOOL SessionStore_WorkingDir(const SessionSet *set, const WCHAR *cwd, WCHAR *out
 /* The subfolder of `dir` whose local_*.json is the most recent: an
  * organization folder, or with `holdsAccounts` the most recent organization
  * folder of any account folder. */
-static BOOL NewestSubfolder(const WCHAR *dir, WCHAR *out, size_t cch, BOOL holdsAccounts, ULONGLONG *modified, HANDLE cancel)
+static BOOL NewestSubfolder(const WCHAR *dir, WCHAR *out, size_t cch, BOOL holdsAccounts, ULONGLONG *modified, HANDLE cancel, BOOL *complete)
 {
     WCHAR child[LONG_PATH_CCH], organization[LONG_PATH_CCH], newestFolder[LONG_PATH_CCH];
     WIN32_FIND_DATAW sub, entry;
@@ -297,15 +297,22 @@ static BOOL NewestSubfolder(const WCHAR *dir, WCHAR *out, size_t cch, BOOL holds
     HANDLE subfolders, entries;
     BOOL found = FALSE;
     subfolders = Util_FindFiles(dir, L"*", &sub, TRUE);
-    if (subfolders == INVALID_HANDLE_VALUE) return FALSE;
+    if (subfolders == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) *complete = FALSE;
+        return FALSE;
+    }
     do {
         ULONGLONG newest = 1;   /* an empty folder still beats none */
         const WCHAR *candidate = child;
         if (Cancelled(cancel)) break;
         if (!(sub.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || sub.cFileName[0] == L'.') continue;
-        if (FAILED(StringCchPrintfW(child, ARRAYSIZE(child), L"%s\\%s", dir, sub.cFileName))) continue;
+        if (FAILED(StringCchPrintfW(child, ARRAYSIZE(child), L"%s\\%s", dir, sub.cFileName))) {
+            *complete = FALSE;
+            continue;
+        }
         if (holdsAccounts) {
-            if (!NewestSubfolder(child, organization, ARRAYSIZE(organization), FALSE, &newest, cancel)) continue;
+            if (!NewestSubfolder(child, organization, ARRAYSIZE(organization), FALSE, &newest, cancel, complete)) continue;
             candidate = organization;
         } else if ((entries = Util_FindFiles(child, L"local_*.json", &entry, FALSE)) != INVALID_HANDLE_VALUE) {
             do {
@@ -313,13 +320,18 @@ static BOOL NewestSubfolder(const WCHAR *dir, WCHAR *out, size_t cch, BOOL holds
                 if (Cancelled(cancel)) break;
                 if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && written > newest) newest = written;
             } while (FindNextFileW(entries, &entry));
+            if (GetLastError() != ERROR_NO_MORE_FILES) *complete = FALSE;
             FindClose(entries);
+        } else {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) *complete = FALSE;
         }
         if (newest > best && SUCCEEDED(StringCchCopyW(newestFolder, ARRAYSIZE(newestFolder), candidate))) {
             best = newest;
             found = TRUE;
         }
     } while (FindNextFileW(subfolders, &sub));
+    if (GetLastError() != ERROR_NO_MORE_FILES) *complete = FALSE;
     FindClose(subfolders);
     found = found && SUCCEEDED(StringCchCopyW(out, cch, newestFolder));
     if (modified && found) *modified = best;
@@ -340,31 +352,38 @@ static BOOL IsPlainFolderName(const WCHAR *name)
  * account config.json names (none when that account has no entries folder:
  * Claude does not show another account's entries), else, when no account is
  * named, those of the account with the latest entry. */
-static BOOL EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn, HANDLE cancel)
+static BOOL EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn, HANDLE cancel, BOOL *complete)
 {
     WCHAR root[LONG_PATH_CCH], config[LONG_PATH_CCH], account[SESSION_ID_CCH], dir[LONG_PATH_CCH];
     DWORD length = 0;
     char *json;
     account[0] = 0;
     *signedIn = FALSE;
-    if (!p->storageDir[0]) return FALSE;
+    *complete = TRUE;
+    if (!p->storageDir[0]) {
+        *complete = p->dataDir[0] && Util_QueryPath(p->dataDir, NULL) == PATH_MISSING;
+        return FALSE;
+    }
     if (SUCCEEDED(StringCchPrintfW(config, ARRAYSIZE(config), L"%s\\" CLAUDE_APP_SETTINGS, p->storageDir)) &&
         (json = Util_ReadFile(config, SESSION_ENTRY_MAX_BYTES, FALSE, &length)) != NULL) {
         MemberString(json, length, "lastKnownAccountUuid", account, ARRAYSIZE(account));
         HeapFree(GetProcessHeap(), 0, json);
+    } else if (Util_QueryPath(config, NULL) != PATH_MISSING) {
+        *complete = FALSE;
     }
     *signedIn = account[0] != 0;
-    if (!SessionStore_SessionsDir(p, root, ARRAYSIZE(root))) return FALSE;
-    if (account[0])
-        return IsPlainFolderName(account) && SUCCEEDED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s", root, account)) &&
-               NewestSubfolder(dir, out, cch, FALSE, NULL, cancel);
-    return NewestSubfolder(root, out, cch, TRUE, NULL, cancel);
+    if (!SessionStore_SessionsDir(p, root, ARRAYSIZE(root)) ||
+        (account[0] && (!IsPlainFolderName(account) || FAILED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s", root, account))))) {
+        *complete = FALSE;
+        return FALSE;
+    }
+    return NewestSubfolder(account[0] ? dir : root, out, cch, !account[0], NULL, cancel, complete);
 }
 
 BOOL SessionStore_EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn)
 {
-    BOOL ignored;
-    return EntriesDir(p, out, cch, signedIn ? signedIn : &ignored, NULL);
+    BOOL ignored, complete;
+    return EntriesDir(p, out, cch, signedIn ? signedIn : &ignored, NULL, &complete);
 }
 
 int SessionStore_FindRow(const SessionSet *set, const WCHAR *key)
@@ -527,6 +546,10 @@ static EntryOutcome AddEntry(SessionSet *set, int profile, const WCHAR *file, co
     entry.created = MemberNumber(json, length, "createdAt");
     entry.environment = Core_SessionEnvironment(json, length);
     entry.pullRequest = Core_SessionPullRequest(json, length, &entry.pullRequestNumber);
+    entry.result = Core_SessionResult(json, length, entry.resultDetail, ARRAYSIZE(entry.resultDetail));
+    MemberString(json, length, "model", entry.model, ARRAYSIZE(entry.model));
+    MemberString(json, length, "effort", entry.effort, ARRAYSIZE(entry.effort));
+    MemberString(json, length, "permissionMode", entry.permissionMode, ARRAYSIZE(entry.permissionMode));
     entry.pendingStar = -1;
     entry.duplicate = -1;
     MemberString(json, length, "cliSessionId", cliSessionId, ARRAYSIZE(cliSessionId));
@@ -565,6 +588,12 @@ static EntryOutcome AddEntry(SessionSet *set, int profile, const WCHAR *file, co
     } else {
         entry.duplicate = set->entries[listed].duplicate;
         set->entries[listed].duplicate = added;
+    }
+    {
+        const char *titles;
+        size_t titlesLength;
+        if (Core_JsonMember(json, length, "previousTitles", &titles, &titlesLength))
+            entry.previousTitles = Core_JsonStringList(titles, titlesLength);
     }
     set->entries[added] = entry;
     /* The folder of the latest entry: after Claude Code moved a session to
@@ -640,18 +669,22 @@ static EntriesRead LoadProfileEntries(SessionSet *set, int profile, const Transc
     WIN32_FIND_DATAW found;
     HANDLE entries;
     EntriesRead read = ENTRIES_COMPLETE;
-    BOOL located = TRUE;
-    if (!EntriesDir(p, source->entriesDir, ARRAYSIZE(source->entriesDir), &source->signedIn, cancel)) {
+    BOOL located = TRUE, complete;
+    if (!EntriesDir(p, source->entriesDir, ARRAYSIZE(source->entriesDir), &source->signedIn, cancel, &complete)) {
         source->entriesDir[0] = 0;
         located = FALSE;
     }
     /* A read cancelled while looking for the folder found nothing to tell. */
     if (Cancelled(cancel)) return ENTRIES_PARTIAL;
     LogSource(p, source);
-    if (!located) return ENTRIES_PARTIAL;
+    if (!located) return complete ? ENTRIES_COMPLETE : ENTRIES_PARTIAL;
+    if (!complete) read = ENTRIES_PARTIAL;
     if (!Core_ScratchDirFor(p->dataDir, source->entriesDir, source->scratchDir, ARRAYSIZE(source->scratchDir))) source->scratchDir[0] = 0;
+    if (!p->formerDir[0] ||
+        !Core_ScratchDirFor(p->formerDir, source->entriesDir, source->formerScratchDir, ARRAYSIZE(source->formerScratchDir)))
+        source->formerScratchDir[0] = 0;
     entries = Util_FindFiles(source->entriesDir, L"local_*.json", &found, FALSE);
-    if (entries == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND ? ENTRIES_COMPLETE : ENTRIES_PARTIAL;
+    if (entries == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND ? read : ENTRIES_PARTIAL;
     do {
         DWORD length;
         char *json;
@@ -1023,16 +1056,22 @@ static BOOL GroupRows(SessionSet *set, HANDLE cancel)
     BOOL ok = FALSE;
     if (!set->rowCount) return TRUE;
     order = (GroupOrder *)HeapAlloc(GetProcessHeap(), 0, (size_t)set->rowCount * sizeof *order);
-    scratch = (WCHAR (*)[MAX_PATH])HeapAlloc(GetProcessHeap(), 0, (size_t)max(set->profiles.count, 1) * sizeof *scratch);
+    /* Each profile's area, then the one below its former folder. */
+    scratch = (WCHAR (*)[MAX_PATH])HeapAlloc(GetProcessHeap(), 0, (size_t)max(set->profiles.count, 1) * 2 * sizeof *scratch);
     if (!order || !scratch) goto done;
-    for (p = 0; p < set->profiles.count; p++)
-        if (FAILED(StringCchPrintfW(scratch[p], ARRAYSIZE(scratch[p]), L"%s\\" SCRATCH_DIR, set->profiles.items[p].dataDir))) scratch[p][0] = 0;
+    for (p = 0; p < set->profiles.count; p++) {
+        const Profile *profile = &set->profiles.items[p];
+        if (FAILED(StringCchPrintfW(scratch[2 * p], ARRAYSIZE(scratch[0]), L"%s\\" SCRATCH_DIR, profile->dataDir))) scratch[2 * p][0] = 0;
+        if (!profile->formerDir[0] ||
+            FAILED(StringCchPrintfW(scratch[2 * p + 1], ARRAYSIZE(scratch[0]), L"%s\\" SCRATCH_DIR, profile->formerDir)))
+            scratch[2 * p + 1][0] = 0;
+    }
     for (r = 0; r < set->rowCount; r++) {
         if (Cancelled(cancel)) goto done;
         order[r].row = r;
         order[r].owner = -1;
-        for (p = 0; p < set->profiles.count && order[r].owner < 0; p++)
-            if (scratch[p][0] && Core_PathUnder(set->rows[r].cwd, scratch[p])) order[r].owner = p;
+        for (p = 0; p < 2 * set->profiles.count && order[r].owner < 0; p++)
+            if (scratch[p][0] && Core_PathUnder(set->rows[r].cwd, scratch[p])) order[r].owner = p / 2;
     }
     qsort_s(order, (size_t)set->rowCount, sizeof *order, CompareGroupOrder, set);
     for (r = 0; r < set->rowCount; r++) {
@@ -1083,8 +1122,11 @@ BOOL SessionStore_LoadProfilesCancel(SessionSet *set, const ProfileList *profile
     set->noTranscripts = !SessionStore_ProjectsDir(projects, ARRAYSIZE(projects)) ||
                          !Util_ExtendedPath(projects, extended, ARRAYSIZE(extended)) || !Util_DirExists(extended);
     enough = LoadTranscripts(&transcripts, cancel);
-    for (p = 0; enough && p < set->profiles.count && !Cancelled(cancel); p++)
-        enough = LoadProfileEntries(set, p, &transcripts, cancel) != ENTRIES_NO_MEMORY;
+    for (p = 0; enough && p < set->profiles.count && !Cancelled(cancel); p++) {
+        EntriesRead read = LoadProfileEntries(set, p, &transcripts, cancel);
+        set->source[p].complete = read == ENTRIES_COMPLETE;
+        enough = read != ENTRIES_NO_MEMORY;
+    }
     if (enough) AddOtherTranscriptBytes(set, &transcripts, cancel);
     if (transcripts.items) HeapFree(GetProcessHeap(), 0, transcripts.items);
     if (!enough) Util_Log(L"sessions could not be read whole: not enough memory");
@@ -1114,11 +1156,15 @@ BOOL SessionStore_LoadEntries(SessionSet *set, const Profile *profile)
     ZeroMemory(&none, sizeof none);
     set->profiles.count = 1;
     set->profiles.items[0] = *profile;
-    return LoadProfileEntries(set, 0, &none, NULL) == ENTRIES_COMPLETE;
+    set->source[0].complete = LoadProfileEntries(set, 0, &none, NULL) == ENTRIES_COMPLETE;
+    return set->source[0].entriesDir[0] && set->source[0].complete;
 }
 
 void SessionStore_Free(SessionSet *set)
 {
+    int i;
+    for (i = 0; i < set->entryCount; i++)
+        if (set->entries[i].previousTitles) HeapFree(GetProcessHeap(), 0, set->entries[i].previousTitles);
     if (set->entries) HeapFree(GetProcessHeap(), 0, set->entries);
     if (set->rows) HeapFree(GetProcessHeap(), 0, set->rows);
     if (set->groups) HeapFree(GetProcessHeap(), 0, set->groups);

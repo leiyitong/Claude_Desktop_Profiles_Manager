@@ -315,6 +315,11 @@ static HANDLE OpenLog(void)
     return log;
 }
 
+BOOL Util_LogDirectory(WCHAR *out, size_t cch)
+{
+    return Util_StateDir(out, cch);
+}
+
 /* Leaves the caller's last-error value as it was, so a failure can be logged
  * before it is reported. */
 void Util_Log(const WCHAR *fmt, ...)
@@ -431,7 +436,10 @@ BOOL Util_CopyTree(const WCHAR *from, const WCHAR *to, BOOL replace, DWORD *erro
         return FALSE;
     }
     find = Util_FindFiles(from, L"*", &found, FALSE);
-    if (find == INVALID_HANDLE_VALUE) return TRUE;   /* empty */
+    if (find == INVALID_HANDLE_VALUE) {
+        *error = GetLastError();
+        return *error == ERROR_FILE_NOT_FOUND;   /* no matching files, not a failed read */
+    }
     do {
         if (wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0) continue;
         if (FAILED(StringCchPrintfW(source, ARRAYSIZE(source), L"%s\\%s", from, found.cFileName)) ||
@@ -451,6 +459,10 @@ BOOL Util_CopyTree(const WCHAR *from, const WCHAR *to, BOOL replace, DWORD *erro
             ok = FALSE;
         }
     } while (FindNextFileW(find, &found));
+    if (GetLastError() != ERROR_NO_MORE_FILES) {
+        *error = GetLastError();
+        ok = FALSE;
+    }
     FindClose(find);
     return ok;
 }

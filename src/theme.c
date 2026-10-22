@@ -5469,7 +5469,8 @@ static const MainButton kMainSessionIcons[] = {
 static const MainButton kMainColumn[] = {
     { IDC_SYNC, { L"S&ync settings\x2026", NULL }, { 0xE895, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE }, FALSE },
     { IDC_BACKUP, { L"&Backup && Restore\x2026", NULL }, { 0xE74E, 0 }, { THEME_TINT_GREEN, THEME_TINT_NONE }, FALSE },
-    { IDC_REPAIR, { L"Rep&air", NULL }, { 0xE90F, 0 }, { THEME_TINT_AMBER, THEME_TINT_NONE }, FALSE }
+    { IDC_REPAIR, { L"Rep&air", NULL }, { 0xE90F, 0 }, { THEME_TINT_AMBER, THEME_TINT_NONE }, FALSE },
+    { IDC_PROFILE_FIND, { L"Search profiles", NULL }, { 0xE721, 0 }, { THEME_TINT_BLUE, THEME_TINT_NONE }, FALSE }
 };
 /* The shortcuts menu's commands, each in the state its profile is in. */
 static const MainButton kMainShortcuts[] = {
@@ -5572,7 +5573,7 @@ typedef struct MainBudget {
     ULONGLONG fontKey;
     BOOL initialized, measuring;
     SIZE minimum;
-    int margin, gap, sideGap, groupGap, column, buttonHeight, searchRow;
+    int margin, gap, sideGap, groupGap, column, buttonHeight, searchRow, profileSearchLabel;
     int toolbarWidth[ARRAYSIZE(kMainToolbar)], toolbarTotal;   /* with the icons at its end, square */
     int profileWidth, roleWidth, dataMinimum, sessionsMinimum, stateWidth, profilesPane;
     int viewButton;   /* the view's button: atop the column, or at the end of the sessions' search row */
@@ -5663,7 +5664,7 @@ static ULONGLONG MainFontKey(HWND dialog)
 {
     static const int kControls[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_BACKUP,
         IDC_REPAIR, IDC_SHORTCUTS, IDC_SETTINGS, IDC_ABOUT, IDC_SESSIONS, IDC_STATUS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE, IDC_S_SEARCH,
-        IDC_S_FIND, IDC_S_FILTER, IDC_NOTE };
+        IDC_S_FIND, IDC_S_FILTER, IDC_NOTE, IDC_PROFILE_SEARCH_LABEL, IDC_PROFILE_SEARCH, IDC_PROFILE_FIND };
     HWND list = MainViewContent(dialog, IDC_LIST);
     ULONGLONG key = Core_HashBytes(CORE_HASH_START, &g_dark, sizeof g_dark);
     size_t i;
@@ -5755,6 +5756,8 @@ static int MeasureSessionsPanes(HWND dialog, const DialogBase *base, MainBudget 
     searchWidth = source.right - source.left;
     LayoutTextBudget(search, searchWidth, FALSE, &textWidth, &searchHeight, &tallestFont);
     budget->searchRow = max(budget->buttonHeight, searchHeight);
+    LayoutTextBudget(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), 0, FALSE, &budget->profileSearchLabel, &searchHeight, &tallestFont);
+    budget->searchRow = max(budget->searchRow, searchHeight);
     return searchWidth + 2 * (budget->buttonHeight + budget->gap) + budget->gap + budget->viewButton;
 }
 
@@ -5881,7 +5884,8 @@ static int LabelTextHeight(HWND label, int width)
     old = SelectObject(dc, (HFONT)SendMessageW(label, WM_GETFONT, 0, 0));
     GetWindowTextW(label, text, ARRAYSIZE(text));
     if (GetTextMetricsW(dc, &metrics)) line = metrics.tmHeight;
-    if (text[0]) DrawTextW(dc, text, -1, &measured, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | Localize_ReadingFlags());
+    if (text[0]) DrawTextW(dc, text, -1, &measured, DT_CALCRECT | DT_WORDBREAK | Localize_ReadingFlags() |
+                         ((GetWindowLongW(label, GWL_STYLE) & SS_NOPREFIX) ? DT_NOPREFIX : 0));
     SelectObject(dc, old);
     ReleaseDC(label, dc);
     return max(line, (int)measured.bottom) + LABEL_SLACK_PX;
@@ -5941,7 +5945,14 @@ static void PlaceProfilesView(MainMoves *moves, const MainBudget *budget, const 
 {
     HWND dialog = moves->dialog;
     int width = area->right - area->columnLeft, top = area->bodyTop + budget->buttonHeight + budget->groupGap, i;
-    PlaceMainControl(moves, GetDlgItem(dialog, IDC_LIST), area->left, area->bodyTop, area->bodyRight - area->left, area->bodyBottom - area->bodyTop);
+    int listTop = area->bodyTop;
+    int labelHeight = LabelTextHeight(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), budget->profileSearchLabel);
+    if (Shown(dialog, IDC_PROFILE_SEARCH)) listTop += budget->searchRow + budget->gap;
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), area->left, area->bodyTop + (budget->searchRow - labelHeight) / 2,
+                     budget->profileSearchLabel, labelHeight);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_PROFILE_SEARCH), area->left + budget->profileSearchLabel + budget->gap, area->bodyTop,
+                     area->bodyRight - area->left - budget->profileSearchLabel - budget->gap, budget->searchRow);
+    PlaceMainControl(moves, GetDlgItem(dialog, IDC_LIST), area->left, listTop, area->bodyRight - area->left, area->bodyBottom - listTop);
     for (i = 0; i < (int)ARRAYSIZE(kMainColumn); i++) {
         PlaceMainControl(moves, GetDlgItem(dialog, kMainColumn[i].id), area->columnLeft, top, width, budget->buttonHeight);
         top += budget->buttonHeight + budget->gap;
@@ -6297,6 +6308,61 @@ static void PlaceFitControls(HWND dialog, const FitControl *controls, int count)
     }
 }
 
+/* The profile's sync choice and its action share a row. A native combo's
+ * closed height follows CB_SETITEMHEIGHT, not SetWindowPos's height. */
+static void AlignProfileSync(HWND dialog)
+{
+    HWND combo = GetDlgItem(dialog, IDC_P_SYNC), button = GetDlgItem(dialog, IDC_P_SYNC_ITEMS);
+    RECT choice, action;
+    int height, itemHeight;
+    if (!combo || !button || !(GetWindowLongW(combo, GWL_STYLE) & WS_VISIBLE)) return;
+    GetWindowRect(combo, &choice);
+    GetWindowRect(button, &action);
+    height = action.bottom - action.top;
+    itemHeight = (int)SendMessageW(combo, CB_GETITEMHEIGHT, (WPARAM)-1, 0);
+    if (itemHeight >= 0 && height != choice.bottom - choice.top)
+        SendMessageW(combo, CB_SETITEMHEIGHT, (WPARAM)-1, itemHeight + height - (choice.bottom - choice.top));
+    GetWindowRect(combo, &choice);
+    MapWindowPoints(NULL, dialog, (POINT *)&choice, 2);
+    MapWindowPoints(NULL, dialog, (POINT *)&action, 2);
+    SetWindowPos(combo, NULL, choice.left, action.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(button, NULL, action.left, action.top, action.right - action.left, choice.bottom - choice.top, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/* Side-by-side captions follow the field's final native height. A label's
+ * text paints at its top, so extra space from row growth is not centered. */
+static void AlignDialogRows(HWND dialog)
+{
+    static const struct { int caption, field; } kRows[] = {
+        { IDC_P_NAME_LABEL, IDC_P_NAME }, { IDC_P_COLOR_LABEL, IDC_P_COLOR },
+        { IDC_P_BADGE_LABEL, IDC_P_BADGE }, { IDC_P_TITLE_LABEL, IDC_P_TITLE },
+        { IDC_P_NOTE_LABEL, IDC_P_NOTE }, { IDC_P_SYNC_LABEL, IDC_P_SYNC },
+        { IDC_R_PROFILE_LABEL, IDC_R_PROFILE }, { IDC_C_SHOW_LABEL, IDC_C_PROFILE },
+        { IDC_C_ALL, IDC_C_PROFILE }, { IDC_X_LABEL, IDC_X_PROFILE },
+        { IDC_G_DAYS_LABEL, IDC_G_DAYS }, { IDC_G_DAYS_UNIT, IDC_G_DAYS },
+        { IDC_K_LABEL, IDC_K_PASSWORD }, { IDC_K_AGAIN_LABEL, IDC_K_AGAIN },
+        { IDC_SIGNIN_BROWSER_LABEL, IDC_SIGNIN_BROWSER }, { IDC_H_WEEKLY, IDC_H_CODE }
+    };
+    size_t i;
+    AlignProfileSync(dialog);
+    for (i = 0; i < ARRAYSIZE(kRows); i++) {
+        HWND caption = GetDlgItem(dialog, kRows[i].caption), field = GetDlgItem(dialog, kRows[i].field);
+        RECT text, box;
+        int height;
+        /* Some dialogs reuse ids, but not these pairs of control classes. */
+        if (!caption || !field || (!IsClass(caption, WC_STATICW) && !IsCheckBox(caption)) ||
+            (!IsClass(field, WC_EDITW) && !IsDropDownList(field) && !IsPushButton(field)) ||
+            !(GetWindowLongW(caption, GWL_STYLE) & WS_VISIBLE) || !(GetWindowLongW(field, GWL_STYLE) & WS_VISIBLE)) continue;
+        GetWindowRect(caption, &text);
+        GetWindowRect(field, &box);
+        MapWindowPoints(NULL, dialog, (POINT *)&text, 2);
+        MapWindowPoints(NULL, dialog, (POINT *)&box, 2);
+        height = IsCheckBox(caption) ? text.bottom - text.top : LabelTextHeight(caption, text.right - text.left);
+        SetWindowPos(caption, NULL, text.left, box.top + ((box.bottom - box.top) - height) / 2,
+                     text.right - text.left, height, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 /* Localized captions are measured in every language, not clipped to their
  * source language's widths: a dialog widens for the widest and its rows
  * grow for wrapped text; the rows it hides close. Scaling keeps each row's
@@ -6345,6 +6411,7 @@ void Theme_FitDialog(HWND dialog)
     if (width != actualClient.right || height != actualClient.bottom || left != window.left || top != window.top)
         SetWindowPos(dialog, NULL, left, top, width + nonclientWidth, height + nonclientHeight, SWP_NOZORDER | SWP_NOACTIVATE);
     PlaceFitControls(dialog, controls, count);
+    AlignDialogRows(dialog);
 }
 
 /* ------------------------------------------------------------ theming */
@@ -6449,6 +6516,8 @@ void Theme_Apply(HWND dialog)
     if (g_allowDarkModeForWindow) g_allowDarkModeForWindow(dialog, g_dark);
     ApplyTitleBarMode(dialog);
     EnumChildWindows(dialog, ThemeChild, 0);
+    /* Applying fonts and the control theme resets a native combo's height. */
+    AlignDialogRows(dialog);
     RedrawWindow(dialog, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
 }
 

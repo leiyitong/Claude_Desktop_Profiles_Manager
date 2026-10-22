@@ -6,6 +6,66 @@
 
 Every version of Claude Desktop Profiles Manager, newest first. A day's updates make one version, named after that day, which is the version the program shows; **About**, the icon right of Settings, shows this list too: a version chosen on the left, or **Changelog** for all of it. Each build of `main` is also published as an unsigned pre-release (`build-<number>`), which an installed copy does not update to.
 
+## v2026.10.22
+
+Main syncs again after Claude moved its data out of its package, and the manager sees it running again; a sync no longer sends a profile the same unchanged layout every time.
+
+### Bug fixes
+
+1. Main, the regular Claude icon's profile, syncs its sessions, settings and layout again: since Claude moved its data to `%LOCALAPPDATA%\Claude-Data`, the manager found no sessions for it and left it out of its sync group
+2. Main shows as Running again while it runs, so changes for it wait until it closes, and opening it from the manager no longer reports that it did not start
+3. Sessions without a folder that Main made before the move stay its own: a sync neither rewrites them nor sends them as another profile's
+4. A sync no longer sends a profile the same layout every time when its own session presets, or a page zoom it has none of yet, keep what it holds
+
+## v2026.10.20
+
+Profiles gain notes and search, session imports show a preview, and backup history, per-profile results and private browser sign-in make common tasks easier to follow. Session sync, restore and cleanup keep their data safe when a write is interrupted, a file cannot be read or another operation changes the session list. Local-only inspection, migration and reading tools add the next set of capabilities without requesting Claude APIs.
+
+### New features
+
+1. Add a note to a profile and search profiles by name, folder or note
+2. Preview new sessions, duplicates, updates and conflicts for each destination before importing
+3. View the last 64 profile ZIP locations saved by this version, their size and whether the file still exists; open the containing folder or refresh the list
+4. Open the log folder from About, or preview and copy diagnostics containing versions and numeric status without profile names, paths, links or log bodies
+5. Open a separate Edge InPrivate or Chrome Incognito session for manual registration or sign-in, with a new browser directory each time; a complete Desktop authorization link can be pasted, and browser folders can be opened for manual cleanup after closing the browser
+6. Search local sessions across all profiles from Search options, with shared sessions listed once and a choice of profile to open
+7. Filter sessions by their last recorded result and read the associated summary; outdated summaries stay unknown
+8. Review pending session transfers and local edits in their application order without applying them
+9. Preview profile backup restores and vault recoveries, including session changes, deletion handling and sync-group effects
+10. Validate backup and session ZIP files offline, including nested archives, item checksums and declared session counts, with cancellation
+11. Search previous session titles and show the first matching message with nearby context, including matches outside the ordinary preview
+12. Filter saved model and effort values, inspect execution settings and rewind/fork metadata, and review an artifact destination before opening its cloud link
+13. Export reading copies to Markdown or plain text, and browse historical accounts/organizations and remote session metadata without changing account selection
+14. Inspect local usage samples, current session/index health, configuration differences, logical storage sizes and known dated Claude Code copies on demand
+15. Export and import manager names, notes, badges, actual custom images, default selection and sync relationships through an explicit existing-profile mapping with a pre-change backup
+16. Save changed supported window geometry and developer flags on manager events, retain sixteen snapshots per profile, and restore selected supported values into closed profiles while preserving unrelated fields
+17. Keep the latest sixty-four operation results locally, including per-profile counts, waiting status, bounded failure details and backup references
+18. Recover only checked historical vault entries and archived marks, leaving other sidebar settings in place; historical transcript text is not rolled back
+19. Back up and synchronize account-scoped session presets, mapping the selected account and preserving unrelated account data
+20. Validate all archive members before restoring, including extra entries and nested session archives, before target data is replaced
+21. Collect local scheduled-task definitions with coverage reports; tasks restored from definition-aware backups stay disabled and saved grants are not automatically applied, while older backup formats keep their existing restore behavior
+22. Open valid unlisted local conversations through Claude Resume in a chosen initialized profile; Claude creates its own session entry
+
+### Improvements
+
+1. Profile search stays hidden until requested from the right-hand button or Ctrl+F; Esc clears and hides it. Opening, closing and restarting complete quietly, with a compact warning on failure. Session transfers show each profile's results
+2. Conversation search reuses matching results for unchanged files and invalidates them on file notifications and refresh
+3. The profile search label and form captions are centered on their fields; the sync choice and action keep the same height after a dialog opens or its theme changes, in both languages
+4. A profile's badge stays editable while a picture is used; the saved badge appears when the picture is removed
+5. Session display options gain environment grouping, ascending and descending sorting, a Show submenu for PR metadata and empty groups, and Reset to defaults; existing choices are kept
+
+### Bug fixes
+
+1. A session entry still being written is treated as unreadable, so it cannot make another profile lose its session
+2. Replacing queued changes keeps the previous content until the new plan has been saved successfully
+3. Cleaning up conversations checks the profiles and vault again before deleting, keeping sessions restored while the dialog was open
+4. Restoring sign-in establishes the account before restoring sessions and settings; an account without an initialized session folder reports that it needs to be opened once
+5. Settings appended after a damaged LevelDB log block can be read again after reopening the profile
+6. Backups and folder copies report directory read failures instead of treating unreadable folders as empty
+7. Importing stops before writing entries when a conversation cannot be extracted, and backup restore reports failed entry writes
+8. Vault cleanup leaves its objects alone when it cannot collect every version's references
+9. Deletion and restoration of sessions serialize updates to the vault's deleted list, preserving concurrent changes
+
 ## v2026.10.14
 
 Backups choose from the same detailed list as what to sync and restore only what you check, a profile's window shows its own title and icon, and Esc no longer closes the manager window.

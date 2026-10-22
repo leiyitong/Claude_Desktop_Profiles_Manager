@@ -126,6 +126,17 @@ src/settings.c                the Settings dialog: the interface language and th
 src/about.c                   the About dialog: this version, help, and the changelog the program embeds
 src/sessions.c                the sessions view of the manager window: profiles, tree, filter menu and search, menus, several sessions
 src/sessionsearch.c           the sessions view's search in the conversations themselves, on a thread of its own
+src/signin.c                  private Edge/Chrome sessions for manual account registration and Desktop authorization
+src/backuphistory.c           the last 64 successful profile ZIP locations and their current availability
+src/presets.c/.h              account-scoped preset validation and merge while preserving unrelated scopes and extensions
+src/vaulttools.c/.h/.rc       search/check historical entries for selective recovery; official-resume target picker
+src/vaulttools_tasks.c/.h     task definition collection, declared coverage, safe mapping and disabled restoration
+src/profiletools.c/.h/.rc     local usage, cancellable storage and scoped health/configuration-difference tools
+src/profileconfig.c          versioned manager configuration ZIPs, explicit existing-profile mapping and PNG migration
+src/profilesnapshots.c        bounded event-driven typed UI-configuration snapshots and backed-up selective restoration
+src/operationhistory.c/.h     bounded local operation counts, wait status, error summaries and backup references
+src/sessiontools.c/.h/.rc     local hit context, reading-copy export, lineage/artifacts, historical and remote metadata browsers
+src/diagnostics.c             text previews, log-folder entry and a deliberately limited diagnostic summary
 src/sessionundo.c             what the manager did to sessions, undone and done again (Ctrl+Z, Ctrl+Y) while it runs
 src/main.c                    command-line dispatch
 src/app.rc, src/resource.h    dialogs, version info, control ids
@@ -137,6 +148,12 @@ tests/test_localize.c         catalogs, format arguments, language selection, re
 tests/test_pin.c              taskbar-pin.c: entries, records, edits and their retries, on private values and files
 tests/test_sessions.c         sessionstore.c, sessionedit.c, sessionsync.c, sessionundo.c and the sessions view on private profiles,
                               transcripts and state folder
+tests/test_presets.c          account mapping, default/built-in preset handling, unknown-field preservation and malformed data
+tests/test_backupfeatures.inc vault subset recovery, preset backup/sync, task coverage and full-ZIP validation fixtures
+tests/test_profiletools.c     GUID-private files and HKCU override: usage, space, migration, PNGs, safe snapshots and health
+tests/test_operationhistory.c bounded operation results, per-profile counts and corrupt-history preservation
+tests/test_sessiontools.c    metadata privacy, artifact URL policy, hit context and reading-copy export limits
+tests/test_backuphistory.c    backup-history ordering, Unicode, concurrent appends and failed/corrupt reads on private state
 tests/test_platform.c         update, install, watcher, routing and removal failures (sources included with fixtures
                               in place of their system calls; their exported functions renamed Tested<Name>)
 tests/test_shortcuts.c        shortcuts.c on private files and registry records, with COM failure fixtures
@@ -161,3 +178,13 @@ CHANGELOG.md                  every version (a day's commits, named after the da
 - **Shortcut fixtures** - `tests/test_shortcuts.c` checks setup, allocation, reading and property-store failures (every COM interface released on each path), the saved target, arguments and AppUserModelID, updates, renames, the recorded shortcuts and their removal. Its shortcuts stay in a private temporary directory, their records in a private volatile registry key, and their targets are never launched.
 - **Interface fixtures** - `tests/test_layout.c`, linked with the program's manifest, measures native controls and compares rendered sidebar text in both languages and four simulated scales (font and geometry scaled on top of the monitor's DPI; a scale whose window does not fit the work area is skipped and printed), including repeated language changes in the same window. It also drives the sessions view on private profiles: refills that keep the selection, folded folders and the top row, the folder watcher, a steady stream of transcript writes, double clicks. It checks the real message box in both languages, the real Settings dialog: the language box lists the languages with the one in use chosen, and a language applied with **Apply** (enabled by a change only) is followed by the open dialog; the vault's days are left as they are, so nothing is written; and the real About dialog: this version shown and chosen in the changelog, and each help question showing its own answer. Its log and queued session changes stay in a private folder, and its manager window uses a class of its own, so a running manager never finds it. It briefly shows windows; its maximized window, profile dialog and message boxes take the foreground. Physical monitor changes and the perceived menu animation still need manual checks.
 - **Launching and routing** - Read [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) before changing them: it lists the measured behavior they rely on
+
+### Local data feature checks
+
+`build.cmd` compiles the local data modules with the same `/W4 /WX /sdl` flags and runs their isolated tests. Manager migration tests override HKCU with a GUID-private registry root before invoking any profile setter; setting only `Util_SetStateDir` is not sufficient registry isolation. New resource dialogs are included in the existing English/Simplified Chinese layout and language round-trip checks. The localization checker scans every `src/*.rc` fragment as well as the C call sites. `comdlg32.lib` supplies the native ZIP filename picker; it is a Windows system DLL.
+
+Manager configuration packages contain `manager-config-v1.dat` (a versioned Win32 UTF-16 metadata record) and actual `pictures/NN.png` files, not machine-specific registry exports or taskbar pin blobs. Imports validate all selected image data before changing metadata, back up existing configuration, and rebuild synchronization group IDs from mapped members. UI snapshots keep only typed, measured `window-state.json` geometry/display bounds and `developer_settings.json`'s `allowDevTools`; `source-presence.json` distinguishes an absent source file from collected values. Unknown fields and credentials never enter these snapshots. A snapshot does not preserve conversation bodies or promise a complete profile rollback.
+
+Vault subset recovery changes selected entries and their archived marks, preserving the remaining current sidebar and deletion rules; it does not store or rewind historical transcript bodies. Task backups record coverage for local definitions and external/remote omissions. For definition-aware backups, restoration maps collected local definition paths, disables the restored tasks and excludes saved authorization grants so Claude can request fresh permission. Older backup formats keep their existing restore behavior. A valid unlisted local transcript is opened through `SessionEdit_Open` and `claude://resume`, never by a new direct entry writer.
+
+`Zip_ValidateAll` validates names, local headers, sizes and checksums on the already-open `ZipIn` handle, including members a caller does not otherwise use. Manager configuration import and UI snapshot restore invoke it before target changes; the existing typed backup/session validation adds manifest, nested-session and task-coverage checks. Tests construct invalid extra-member CRCs and locked later profile pictures to check preflight and rollback behavior.

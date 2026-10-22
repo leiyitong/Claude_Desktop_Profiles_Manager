@@ -35,6 +35,7 @@
  */
 #include "app.h"
 #include "resource.h"
+#include "sessiontools.h"
 #include <commctrl.h>
 #include <limits.h>
 #include <shellapi.h>
@@ -87,6 +88,8 @@ static const struct { DWORD environment; WCHAR glyph; ThemeTint tint; } kEnviron
 #define SETTING_SESSIONS_EMPTY    L"SessionsEmptyGroups"
 #define SETTING_SESSIONS_PRS      L"SessionsPullRequests"
 #define SETTING_SESSIONS_SEARCH   L"SessionsSearch"   /* SEARCH_* bits */
+#define SETTING_SESSIONS_RESULT   L"SessionsResult"
+#define SETTING_SESSIONS_DESC     L"SessionsSortDescending"
 #define SEARCH_TITLES   0x1u            /* titles and folders */
 #define SEARCH_TEXT     0x2u            /* the conversations' text */
 #define SEARCH_REGEX    0x4u
@@ -105,7 +108,7 @@ static const struct { DWORD environment; WCHAR glyph; ThemeTint tint; } kEnviron
 
 typedef enum Action {
     ACT_OPEN, ACT_RENAME, ACT_STAR, ACT_REMOVE, ACT_KEEP, ACT_SHARE, ACT_COPY, ACT_SHOW_FOLDER, ACT_PREVIEW, ACT_DELETE_ALL,
-    ACT_TO_LOCAL,
+    ACT_TO_LOCAL, ACT_RESULT, ACT_EXECUTION, ACT_BRANCHES, ACT_ARTIFACTS, ACT_READING, ACT_HIT,
     ACTIONS
 } Action;
 
@@ -118,7 +121,8 @@ typedef enum BatchAction {
 
 /* The filter menu's choices, as Claude's sidebar offers them, in its order. */
 typedef enum ViewStatus { STATUS_ACTIVE, STATUS_ARCHIVED, STATUS_ALL, STATUSES } ViewStatus;
-typedef enum Grouping { GROUP_DATE, GROUP_FOLDER, GROUP_STATE, GROUP_CUSTOM, GROUP_NONE, GROUPINGS } Grouping;
+/* Existing persisted values stay in place when a grouping is added. */
+typedef enum Grouping { GROUP_DATE, GROUP_FOLDER, GROUP_STATE, GROUP_CUSTOM, GROUP_NONE, GROUP_ENVIRONMENT, GROUPINGS } Grouping;
 typedef enum Sorting { SORT_NAME, SORT_CREATED, SORT_ACTIVITY, SORTINGS } Sorting;
 typedef enum DateBucket { DATE_TODAY, DATE_YESTERDAY, DATE_WEEK, DATE_MONTH, DATE_OLDER, DATE_BUCKETS } DateBucket;
 typedef enum StateBucket { STATE_OPEN, STATE_WAITING, STATE_IDLE, STATE_BUCKETS } StateBucket;
@@ -198,12 +202,15 @@ typedef struct SessionsView {
     DWORD         environments;         /* SESSION_ENV_* shown; 0: every one */
     Grouping      grouping;
     Sorting       sorting;
+    BOOL          descending;
     BOOL          showEmptyGroups, showPullRequests;
     DWORD         searchIn;             /* SEARCH_* */
+    WCHAR         modelFilter[128], effortFilter[64];
+    int           resultFilter;         /* 0 all; 1..SESSION_RESULTS selects a recorded result, including unknown */
     CoreRegex    *regex;                /* the search as a regular expression, compiled; NULL when not one */
     /* The search in the conversations (sessionsearch.c): what it found, by key. */
     ULONG         textSearch;           /* the search under way's number */
-    BOOL          textSearching, textRefillPending;
+    BOOL          textSearching, textRefillPending, textRefreshPending;
     WCHAR       (*textKeys)[SESSION_ID_CCH];   /* the sessions searched, by the index the search posts */
     int           textKeyCount;
     WCHAR       (*textFound)[SESSION_ID_CCH];
@@ -258,6 +265,7 @@ typedef struct SessionsView {
 } SessionsView;
 
 static SessionsView g_view;
+static const WCHAR *ResultName(SessionResult result);
 static volatile LONG g_reloadMessagePending;   /* a WM_APP_SESSIONS is posted and no snapshot asked for since */
 
 static const int kControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_FIND, IDC_S_FILTER, IDC_S_TREE };
@@ -378,6 +386,12 @@ static BOOL Matches(const SessionRow *row, int profile)
     if ((g_view.searchIn & SEARCH_TEXT) && FoundInText(row->key)) return TRUE;
     if (!(g_view.searchIn & SEARCH_TITLES)) return FALSE;
     SessionStore_GroupName(&g_view.set, row->group, name, ARRAYSIZE(name));
+    {
+        const SessionEntry *entry = EntryOf(row, profile);
+        const WCHAR *title;
+        for (title = entry ? entry->previousTitles : NULL; title && *title; title += wcslen(title) + 1)
+            if (TextHasSearch(title)) return TRUE;
+    }
     return TextHasSearch(ShownTitle(row, profile)) || TextHasSearch(name) || TextHasSearch(row->cwd);
 }
 
@@ -385,6 +399,9 @@ static BOOL Matches(const SessionRow *row, int profile)
 static BOOL EntryChosen(const SessionEntry *entry)
 {
     if (!entry || (g_view.status == STATUS_ACTIVE && entry->archived) || (g_view.status == STATUS_ARCHIVED && !entry->archived)) return FALSE;
+    if (g_view.resultFilter && entry->result != (SessionResult)(g_view.resultFilter - 1)) return FALSE;
+    if (g_view.modelFilter[0] && !Core_EqualsI(entry->model, g_view.modelFilter)) return FALSE;
+    if (g_view.effortFilter[0] && !Core_EqualsI(entry->effort, g_view.effortFilter)) return FALSE;
     return !g_view.environments || (entry->environment & g_view.environments) != 0;
 }
 
@@ -565,7 +582,15 @@ static ULONGLONG TreeContentHash(const SessionSet *set)
             hash = Core_HashBytes(hash, flags, sizeof flags);
             if (entry) {
                 hash = Core_HashText(hash, entry->title);
+                hash = Core_HashText(hash, entry->model);
+                hash = Core_HashText(hash, entry->effort);
+                {
+                    const WCHAR *old;
+                    for (old = entry->previousTitles; old && *old; old += wcslen(old) + 1) hash = Core_HashText(hash, old);
+                }
                 hash = Core_HashText(hash, entry->pendingTitle);
+                hash = Core_HashBytes(hash, &entry->result, sizeof entry->result);
+                hash = Core_HashText(hash, entry->resultDetail);
                 hash = Core_HashBytes(hash, &entry->created, sizeof entry->created);
             }
         }
@@ -1160,6 +1185,9 @@ static int CustomGroupOf(const SessionEntry *entry)
 
 /* The heading session `row` shows under, made when it is new; -1 without
  * headings (grouped by nothing). */
+static const WCHAR *EnvironmentName(int i);
+static const DWORD kEnvironments[] = { SESSION_ENV_LOCAL, SESSION_ENV_CLOUD, SESSION_ENV_REMOTE, SESSION_ENV_SSH, SESSION_ENV_SLACK };
+
 static int BucketOfRow(const SessionRow *row, const SessionEntry *entry, int p, LONGLONG today)
 {
     WCHAR key[MAX_PATH], name[MAX_PATH];
@@ -1179,6 +1207,10 @@ static int BucketOfRow(const SessionRow *row, const SessionEntry *entry, int p, 
         StringCchPrintfW(key, ARRAYSIZE(key), L"*state:%d", (int)state);
         return AddBucket(key, StateName(state), -1, (int)state);
     }
+    case GROUP_ENVIRONMENT:
+        for (g = 0; g + 1 < (int)ARRAYSIZE(kEnvironments) && !(entry->environment & kEnvironments[g]); g++) {}
+        StringCchPrintfW(key, ARRAYSIZE(key), L"*environment:%lu", kEnvironments[g]);
+        return AddBucket(key, EnvironmentName(g), -1, g);
     case GROUP_CUSTOM:
         if ((g = CustomGroupOf(entry)) >= 0) {
             StringCchPrintfW(key, ARRAYSIZE(key), L"*group:%s", g_view.custom.id[g]);
@@ -1190,26 +1222,16 @@ static int BucketOfRow(const SessionRow *row, const SessionEntry *entry, int p, 
     }
 }
 
-/* Two titles as people sort them: case ignored, numbers by their value. */
-static int CompareNames(const WCHAR *one, const WCHAR *other)
-{
-    int order = CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE | SORT_DIGITSASNUMBERS, one, -1, other, -1, NULL, NULL, 0);
-    return order ? order - CSTR_EQUAL : wcscmp(one, other);
-}
-
 static int g_sortProfile;   /* the profile whose sessions are sorted (qsort has no context) */
 
-/* Sessions in the order the filter menu chose: by name, or the latest first. */
+/* Sessions in the order and direction the filter menu chose. */
 static int CompareRows(int one, int other)
 {
     const SessionRow *a = &g_view.set.rows[one], *b = &g_view.set.rows[other];
-    ULONGLONG timeA = RowTime(a, g_sortProfile), timeB = RowTime(b, g_sortProfile);
-    if (g_view.sorting == SORT_NAME) {
-        int order = CompareNames(ShownTitle(a, g_sortProfile), ShownTitle(b, g_sortProfile));
-        if (order) return order;
-    }
-    if (timeA != timeB) return timeA > timeB ? -1 : 1;
-    return one - other;
+    int order = Core_CompareSessionOrder(ShownTitle(a, g_sortProfile), RowTime(a, g_sortProfile),
+                                         ShownTitle(b, g_sortProfile), RowTime(b, g_sortProfile),
+                                         g_view.sorting == SORT_NAME, g_view.descending);
+    return order ? order : one - other;
 }
 
 static int CompareRowIndexes(const void *one, const void *other)
@@ -1224,12 +1246,9 @@ static int CompareBuckets(const void *one, const void *other)
 {
     const Bucket *a = &g_view.buckets[*(const int *)one], *b = &g_view.buckets[*(const int *)other];
     if (g_view.grouping == GROUP_FOLDER) {
-        if (g_view.sorting == SORT_NAME) {
-            int order = CompareNames(a->name, b->name);
-            if (order) return order;
-        } else if (a->newest != b->newest) {
-            return a->newest > b->newest ? -1 : 1;
-        }
+        int order = Core_CompareSessionOrder(a->name, a->newest, b->name, b->newest,
+                                             g_view.sorting == SORT_NAME, g_view.descending);
+        if (order) return order;
     } else if (a->rank != b->rank) {
         return a->rank < b->rank ? -1 : 1;
     }
@@ -1348,7 +1367,7 @@ static HTREEITEM FirstShownSession(void)
 static void AddPart(HTREEITEM parent, const ShownRow *shown, int from, int to, const int *byRank, BOOL underArchived, RefillMatch *match)
 {
     int p = ShownProfileIndex(), i = to - 1, rank;
-    BOOL empties = !underArchived && g_view.grouping == GROUP_CUSTOM && g_view.showEmptyGroups;
+    BOOL empties = !underArchived && g_view.showEmptyGroups;
     HTREEITEM item;
     if (g_view.grouping == GROUP_NONE || !byRank) {
         for (; i >= from; i--) {
@@ -1361,8 +1380,9 @@ static void AddPart(HTREEITEM parent, const ShownRow *shown, int from, int to, c
         int bucket = byRank[rank];
         LPARAM node = underArchived ? NODE_ARCHIVED - 1 - bucket : -2 - bucket;
         HTREEITEM heading;
-        /* An empty one only for one of Claude's groups: "*group:" and its id. */
-        if (!(i >= from && shown[i].bucket == bucket) && !(empties && g_view.buckets[bucket].key[7])) continue;
+        /* Ungrouped is a fallback, not an empty group the user created. */
+        if (!(i >= from && shown[i].bucket == bucket) &&
+            !(empties && (g_view.grouping != GROUP_CUSTOM || g_view.buckets[bucket].key[7]))) continue;
         heading = AddNode(parent, g_view.buckets[bucket].name, node);
         MatchNode(match, heading, node, FALSE);
         for (; i >= from && shown[i].bucket == bucket; i--) {
@@ -1397,7 +1417,7 @@ static void FillTree(void)
     SendMessageW(g_view.tree, WM_SETREDRAW, FALSE, 0);
     TreeView_DeleteAllItems(g_view.tree);
     g_view.bucketCount = g_view.starredCount = g_view.archivedCount = 0;
-    if (p >= 0 && g_view.set.rowCount) {
+    if (p >= 0) {
         if (g_view.grouping == GROUP_CUSTOM) {
             LoadCustomGroups(p, FALSE);
             if (g_view.showEmptyGroups)
@@ -1407,14 +1427,15 @@ static void FillTree(void)
                     AddBucket(groupKey, g_view.custom.name[i], -1, i);
                 }
         }
-        shown = (ShownRow *)HeapAlloc(GetProcessHeap(), 0, (size_t)g_view.set.rowCount * sizeof *shown);
-        starred = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)g_view.set.rowCount * sizeof *starred);
+        shown = (ShownRow *)HeapAlloc(GetProcessHeap(), 0, (size_t)max(1, g_view.set.rowCount) * sizeof *shown);
+        starred = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)max(1, g_view.set.rowCount) * sizeof *starred);
     }
     if (shown && starred) {
         for (r = 0; r < g_view.set.rowCount; r++) {
             const SessionRow *row = &g_view.set.rows[r];
             const SessionEntry *entry = EntryOf(row, p);
             int bucket;
+            if (entry && g_view.showEmptyGroups) BucketOfRow(row, entry, p, today);
             if (!RowVisibleIn(row, p)) continue;
             bucket = BucketOfRow(row, entry, p, today);
             shown[count].row = r;
@@ -1947,6 +1968,8 @@ static void EmptyText(WCHAR *out, size_t cch)
                          name);
     else if (listed && !chosen && g_view.status == STATUS_ARCHIVED && !archived)
         StringCchPrintfW(out, cch, TR(L"\x201C%s\x201D has no archived session."), name);
+    else if (listed && !chosen && g_view.resultFilter)
+        StringCchCopyW(out, cch, TR(L"No session matches the selected result and other filters."));
     else if (listed && !chosen)
         StringCchPrintfW(out, cch, TR(L"No session of \x201C%s\x201D runs in the environments chosen in the filter menu."), name);
     else if (source->elsewhere)
@@ -2405,6 +2428,24 @@ static void PreviewSession(int r)
     HeapFree(GetProcessHeap(), 0, text);
 }
 
+static void ShowMatchingContext(HWND owner, int r)
+{
+    ULONGLONG offset;
+    size_t messageEnd;
+    const SessionRow *row = &g_view.set.rows[r];
+    WCHAR *context = NULL;
+    HCURSOR old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    if (SessionSearch_Locate(row->transcriptPath, g_view.filter, (g_view.searchIn & SEARCH_REGEX) != 0,
+                             (g_view.searchIn & SEARCH_CASE) != 0, &offset, &messageEnd))
+        context = SessionTools_Context(row->transcriptPath, offset, g_view.filter, (g_view.searchIn & SEARCH_REGEX) != 0,
+                                       (g_view.searchIn & SEARCH_CASE) != 0);
+    SetCursor(old);
+    if (context) {
+        Ui_ReviewText(owner, TR(L"First matching message"), TR(L"Local context of the first match. Long messages are excerpted around the match."), context, NULL);
+        HeapFree(GetProcessHeap(), 0, context);
+    } else Ui_Message(owner, MB_ICONINFORMATION, TR(L"No matching message could be read. The conversation may have changed."));
+}
+
 /* `folder` shown in Explorer; the user told when it cannot be. */
 static void ShowFolder(const WCHAR *folder)
 {
@@ -2448,6 +2489,24 @@ static void RunAction(Action action, int p)
         if (SelectedFolder()[0]) ShowFolder(SelectedFolder());
         break;
     case ACT_PREVIEW:     PreviewSession(r); break;
+    case ACT_EXECUTION:
+    case ACT_BRANCHES:
+    case ACT_ARTIFACTS: {
+        const SessionEntry *entry = EntryOf(&g_view.set.rows[r], p);
+        if (entry) SessionTools_Details(g_view.dlg, entry->file, action == ACT_BRANCHES ? 1 : action == ACT_ARTIFACTS ? 2 : 0);
+        break;
+    }
+    case ACT_READING: SessionTools_Export(g_view.dlg, &g_view.set, r); break;
+    case ACT_HIT: ShowMatchingContext(g_view.dlg, r); break;
+    case ACT_RESULT: {
+        const SessionEntry *entry = EntryOf(&g_view.set.rows[r], p);
+        WCHAR resultText[768];
+        if (entry) StringCchPrintfW(resultText, ARRAYSIZE(resultText), L"%s\r\n%s", ResultName(entry->result), entry->resultDetail);
+        if (entry) Ui_ReviewText(g_view.dlg, TR(L"Last recorded result"),
+                                TR(L"This summary belongs to the last recorded assistant message. It is not live task status."),
+                                resultText, NULL);
+        break;
+    }
     case ACT_DELETE_ALL:  changed = DeleteSessionEverywhere(r); break;
     case ACT_TO_LOCAL:    changed = ConvertEntry(r, p); break;
     default: break;
@@ -2539,6 +2598,12 @@ static void ShowMenu(POINT pt)
     EscapeAmpersands(ProfileAt(p)->name, name, ARRAYSIZE(name));
     if (ListedAndKept(entry)) AppendOpenItem(menu, p, name);
     AppendMenuW(menu, MF_STRING | (row->transcript ? 0 : MF_GRAYED), MenuId(ACT_PREVIEW, p), TR(L"Pre&view\tSpace"));
+    AppendMenuW(menu, MF_STRING | (row->transcript && g_view.filter[0] ? 0 : MF_GRAYED), MenuId(ACT_HIT, p), TR(L"First matching message\x2026"));
+    AppendMenuW(menu, MF_STRING | (row->transcript ? 0 : MF_GRAYED), MenuId(ACT_READING, p), TR(L"Export reading copy\x2026"));
+    AppendMenuW(menu, MF_STRING | (entry ? 0 : MF_GRAYED), MenuId(ACT_EXECUTION, p), TR(L"Saved execution settings\x2026"));
+    AppendMenuW(menu, MF_STRING | (entry ? 0 : MF_GRAYED), MenuId(ACT_BRANCHES, p), TR(L"Rewind and fork relationships\x2026"));
+    AppendMenuW(menu, MF_STRING | (entry ? 0 : MF_GRAYED), MenuId(ACT_ARTIFACTS, p), TR(L"Session artifacts\x2026"));
+    AppendMenuW(menu, MF_STRING | (entry && entry->result != RESULT_UNKNOWN ? 0 : MF_GRAYED), MenuId(ACT_RESULT, p), TR(L"Last recorded result"));
     for (otherProfile = 0; otherProfile < g_view.set.profiles.count; otherProfile++) {
         const SessionEntry *otherEntry = EntryOf(row, otherProfile);
         if (otherProfile == p) continue;
@@ -3056,6 +3121,7 @@ static ULONGLONG WatchedState(const WatchedFolder *folder)
 /* One WM_APP_SESSIONS for a burst of notifications: RequestLoad clears the flag. */
 static void PostReload(HWND dlg)
 {
+    SessionSearch_Invalidate();
     if (InterlockedExchange(&g_reloadMessagePending, 1) == 0) PostMessageW(dlg, WM_APP_SESSIONS, 0, 0);
 }
 
@@ -3444,8 +3510,9 @@ void SessionsView_Warm(const ProfileList *profiles)
 /* ------------------------------------------------- filter menu and search */
 
 /* The filter menu's commands: IDM_FILTER + one of these (+ the choice). */
-enum { FILTER_STATUS = 0, FILTER_ENV_ALL = 8, FILTER_ENV = 9, FILTER_GROUP = 16, FILTER_SORT = 24, FILTER_EMPTY = 30, FILTER_PRS, FILTER_CLEAR };
-static const DWORD kEnvironments[] = { SESSION_ENV_LOCAL, SESSION_ENV_CLOUD, SESSION_ENV_REMOTE, SESSION_ENV_SSH, SESSION_ENV_SLACK };
+enum { FILTER_STATUS = 0, FILTER_ENV_ALL = 8, FILTER_ENV = 9, FILTER_GROUP = 16, FILTER_SORT = 24, FILTER_EMPTY = 30, FILTER_PRS,
+       FILTER_RESULT = 32, FILTER_CLEAR = FILTER_RESULT + SESSION_RESULTS + 1, FILTER_RESET,
+       FILTER_DESCENDING = FILTER_SORT + SORTINGS, FILTER_ASCENDING };
 
 static const WCHAR *StatusName(ViewStatus status)
 {
@@ -3474,6 +3541,7 @@ static const WCHAR *GroupingName(Grouping grouping)
     case GROUP_FOLDER: return TR(L"Folder");
     case GROUP_STATE: return TR(L"State");
     case GROUP_CUSTOM: return TR(L"Custom groups");
+    case GROUP_ENVIRONMENT: return TR(L"Environment");
     default: return TR(L"None");
     }
 }
@@ -3483,7 +3551,7 @@ static const WCHAR *SortingName(Sorting sorting)
     switch (sorting) {
     case SORT_NAME: return TR(L"Name");
     case SORT_CREATED: return TR(L"Date created");
-    default: return TR(L"Last activity");
+    default: return TR(L"Last updated");
     }
 }
 
@@ -3495,8 +3563,11 @@ static void LoadChoices(void)
     if (g_view.environments == SESSION_ENV_ALL) g_view.environments = 0;
     g_view.grouping = (Grouping)min(Util_GetSetting(SETTING_SESSIONS_GROUP, GROUP_FOLDER), (DWORD)GROUPINGS - 1);
     g_view.sorting = (Sorting)min(Util_GetSetting(SETTING_SESSIONS_SORT, SORT_ACTIVITY), (DWORD)SORTINGS - 1);
+    /* Old installations sorted names upwards and times downwards. */
+    g_view.descending = Util_GetSetting(SETTING_SESSIONS_DESC, g_view.sorting != SORT_NAME) != 0;
     g_view.showEmptyGroups = Util_GetSetting(SETTING_SESSIONS_EMPTY, 0) != 0;
     g_view.showPullRequests = Util_GetSetting(SETTING_SESSIONS_PRS, 1) != 0;
+    g_view.resultFilter = (int)min(Util_GetSetting(SETTING_SESSIONS_RESULT, 0), (DWORD)SESSION_RESULTS);
     g_view.searchIn = Util_GetSetting(SETTING_SESSIONS_SEARCH, SEARCH_TITLES) & (SEARCH_TITLES | SEARCH_TEXT | SEARCH_REGEX | SEARCH_CASE);
     if (!(g_view.searchIn & (SEARCH_TITLES | SEARCH_TEXT))) g_view.searchIn |= SEARCH_TITLES;
     g_view.openedCount = Util_GetSettingList(OPENED_SECTION, g_view.opened, MAX_OPENED);
@@ -3507,7 +3578,9 @@ static void SaveChoices(void)
     if (!Util_SetSetting(SETTING_SESSIONS_STATUS, (DWORD)g_view.status) || !Util_SetSetting(SETTING_SESSIONS_ENV, g_view.environments) ||
         !Util_SetSetting(SETTING_SESSIONS_GROUP, (DWORD)g_view.grouping) || !Util_SetSetting(SETTING_SESSIONS_SORT, (DWORD)g_view.sorting) ||
         !Util_SetSetting(SETTING_SESSIONS_EMPTY, (DWORD)g_view.showEmptyGroups) ||
-        !Util_SetSetting(SETTING_SESSIONS_PRS, (DWORD)g_view.showPullRequests) || !Util_SetSetting(SETTING_SESSIONS_SEARCH, g_view.searchIn))
+        !Util_SetSetting(SETTING_SESSIONS_PRS, (DWORD)g_view.showPullRequests) || !Util_SetSetting(SETTING_SESSIONS_SEARCH, g_view.searchIn) ||
+        !Util_SetSetting(SETTING_SESSIONS_DESC, (DWORD)g_view.descending) ||
+        !Util_SetSetting(SETTING_SESSIONS_RESULT, (DWORD)g_view.resultFilter))
         Util_Log(L"sessions: the filter menu's choices could not be kept (error %lu)", GetLastError());
 }
 
@@ -3532,7 +3605,7 @@ static void StopTextSearch(void)
     }
     SessionSearch_Stop();
     g_view.textSearch++;   /* what an older search posted is ignored */
-    g_view.textSearching = g_view.textRefillPending = FALSE;
+    g_view.textSearching = g_view.textRefillPending = g_view.textRefreshPending = FALSE;
     g_view.textFoundCount = g_view.textKeyCount = 0;
 }
 
@@ -3566,6 +3639,20 @@ static void StartTextSearch(void)
     InvalidateRect(g_view.tree, NULL, FALSE);   /* the empty tree says it searches */
 }
 
+/* A snapshot can change message text without changing any tree row. Let an
+ * in-flight search finish before refreshing, so a stream cannot starve it. */
+static BOOL RefreshTextSearch(void)
+{
+    if (!g_view.shown || !(g_view.searchIn & SEARCH_TEXT) || !g_view.filter[0]) return FALSE;
+    if (g_view.textSearching) {
+        g_view.textRefreshPending = TRUE;
+        return FALSE;
+    }
+    StopTextSearch();
+    StartTextSearch();
+    return TRUE;
+}
+
 static void CALLBACK SearchTimer(HWND window, UINT message, UINT_PTR id, DWORD time)
 {
     (void)message;
@@ -3592,9 +3679,9 @@ static void ApplySearch(void)
     FillTree();
 }
 
-void SessionsView_SearchFound(WPARAM search, LPARAM index)
+BOOL SessionsView_SearchFound(WPARAM search, LPARAM index)
 {
-    if (!g_view.shown || (ULONG)search != g_view.textSearch) return;   /* an older search's */
+    if (!g_view.shown || (ULONG)search != g_view.textSearch) return FALSE;   /* an older search's */
     if (index >= 0 && index < g_view.textKeyCount && g_view.textFound && g_view.textFoundCount < g_view.textKeyCount) {
         StringCchCopyW(g_view.textFound[g_view.textFoundCount++], SESSION_ID_CCH, g_view.textKeys[index]);
         if (!g_view.textRefillPending) {   /* those found together show together */
@@ -3603,8 +3690,14 @@ void SessionsView_SearchFound(WPARAM search, LPARAM index)
         }
     } else if (index < 0) {
         g_view.textSearching = FALSE;
+        KillTimer(g_view.dlg, TIMER_SEARCH_REFILL);
+        g_view.textRefillPending = FALSE;
+        RememberTopRow();
+        FillTree();   /* publish this complete pass before its pending refresh clears the keys */
+        if (g_view.textRefreshPending) RefreshTextSearch();
         InvalidateRect(g_view.tree, NULL, FALSE);   /* the empty tree no longer says it searches */
-    }
+    } else return FALSE;
+    return TRUE;
 }
 
 /* A menu below `button`, its own window's commands; 0 for none chosen. */
@@ -3622,7 +3715,13 @@ static UINT MenuBelow(HWND button, HMENU menu)
 /* The status and the environments as they were first: everything shown but the archived. */
 static BOOL FiltersCleared(void)
 {
-    return g_view.status == STATUS_ACTIVE && !g_view.environments;
+    return g_view.status == STATUS_ACTIVE && !g_view.environments && !g_view.resultFilter && !g_view.modelFilter[0] && !g_view.effortFilter[0];
+}
+
+static BOOL DisplayDefaults(void)
+{
+    return FiltersCleared() && g_view.grouping == GROUP_FOLDER && g_view.sorting == SORT_ACTIVITY &&
+           g_view.descending && !g_view.showEmptyGroups && g_view.showPullRequests;
 }
 
 /* A choice of the filter menu, kept and shown. */
@@ -3630,33 +3729,45 @@ static void FilterCommand(UINT cmd)
 {
     UINT choice;
     int p = ShownProfileIndex();
-    if (cmd < IDM_FILTER || cmd > IDM_FILTER + FILTER_CLEAR) return;
+    if (cmd < IDM_FILTER || cmd > IDM_FILTER + FILTER_RESET) return;
     choice = cmd - IDM_FILTER;
-    if (choice < FILTER_ENV_ALL) {
+    if (choice < STATUSES) {
         g_view.status = (ViewStatus)choice;
     } else if (choice == FILTER_ENV_ALL) {
         g_view.environments = 0;
-    } else if (choice < FILTER_GROUP) {
+    } else if (choice >= FILTER_ENV && choice < FILTER_ENV + ARRAYSIZE(kEnvironments)) {
         DWORD bit = kEnvironments[choice - FILTER_ENV];
         g_view.environments = g_view.environments ? g_view.environments ^ bit : bit;
         if (g_view.environments == SESSION_ENV_ALL) g_view.environments = 0;
-    } else if (choice < FILTER_SORT) {
+    } else if (choice >= FILTER_GROUP && choice < FILTER_GROUP + GROUPINGS) {
         g_view.grouping = (Grouping)(choice - FILTER_GROUP);
         if (g_view.grouping == GROUP_CUSTOM && p >= 0) LoadCustomGroups(p, TRUE);   /* as Claude has them now */
-    } else if (choice < FILTER_EMPTY) {
+    } else if (choice >= FILTER_SORT && choice < FILTER_SORT + SORTINGS) {
         g_view.sorting = (Sorting)(choice - FILTER_SORT);
+    } else if (choice == FILTER_DESCENDING || choice == FILTER_ASCENDING) {
+        g_view.descending = choice == FILTER_DESCENDING;
     } else if (choice == FILTER_EMPTY) {
         g_view.showEmptyGroups = !g_view.showEmptyGroups;
     } else if (choice == FILTER_PRS) {
         g_view.showPullRequests = !g_view.showPullRequests;
-    } else {
+    } else if (choice >= FILTER_RESULT && choice < FILTER_CLEAR) {
+        g_view.resultFilter = (int)(choice - FILTER_RESULT);
+    } else if (choice == FILTER_CLEAR || choice == FILTER_RESET) {
         g_view.status = STATUS_ACTIVE;
         g_view.environments = 0;
-    }
+        g_view.resultFilter = 0;
+        g_view.modelFilter[0] = g_view.effortFilter[0] = 0;
+        if (choice == FILTER_RESET) {
+            g_view.grouping = GROUP_FOLDER;
+            g_view.sorting = SORT_ACTIVITY;
+            g_view.descending = g_view.showPullRequests = TRUE;
+            g_view.showEmptyGroups = FALSE;
+        }
+    } else return;
     SaveChoices();
     CountSessions();
     InvalidateRect(g_view.profiles, NULL, FALSE);
-    if (g_view.textSearching || g_view.textFoundCount) ApplySearch();   /* the sessions searched follow the filters */
+    if ((g_view.searchIn & SEARCH_TEXT) && g_view.filter[0]) ApplySearch();   /* a previous zero-match search covered the old filters only */
     else {
         ForgetNeighbors();
         FillTree();
@@ -3670,17 +3781,21 @@ static void FilterCommand(UINT cmd)
  * listed. */
 static void FilterMenu(void)
 {
+    static const Grouping kGroupOrder[] = { GROUP_DATE, GROUP_STATE, GROUP_ENVIRONMENT, GROUP_FOLDER, GROUP_CUSTOM, GROUP_NONE };
+    static const Sorting kSortOrder[] = { SORT_ACTIVITY, SORT_CREATED, SORT_NAME };
     WCHAR text[160];
     HMENU menu = CreatePopupMenu(), status = CreatePopupMenu(), environment = CreatePopupMenu(), grouping = CreatePopupMenu(),
-          sorting = CreatePopupMenu();
+          sorting = CreatePopupMenu(), result = CreatePopupMenu(), show = CreatePopupMenu();
     int p = ShownProfileIndex(), i, chosen = 0, last = 0;
     UINT cmd;
-    if (!menu || !status || !environment || !grouping || !sorting) {
+    if (!menu || !status || !environment || !grouping || !sorting || !result || !show) {
         if (menu) DestroyMenu(menu);
         if (status) DestroyMenu(status);
         if (environment) DestroyMenu(environment);
         if (grouping) DestroyMenu(grouping);
         if (sorting) DestroyMenu(sorting);
+        if (result) DestroyMenu(result);
+        if (show) DestroyMenu(show);
         return;
     }
     for (i = 0; i < STATUSES; i++) AppendMenuW(status, MF_STRING, IDM_FILTER + FILTER_STATUS + (UINT)i, StatusName((ViewStatus)i));
@@ -3700,31 +3815,48 @@ static void FilterMenu(void)
         AppendMenuW(environment, MF_SEPARATOR, 0, NULL);
         AppendMenuW(environment, MF_STRING | MF_GRAYED, 0, text);
     }
-    for (i = 0; i < GROUPINGS; i++) {
-        if (i == GROUP_NONE) AppendMenuW(grouping, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(grouping, MF_STRING, IDM_FILTER + FILTER_GROUP + (UINT)i, GroupingName((Grouping)i));
+    for (i = 0; i < (int)ARRAYSIZE(kGroupOrder); i++) {
+        if (kGroupOrder[i] == GROUP_NONE) AppendMenuW(grouping, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(grouping, MF_STRING, IDM_FILTER + FILTER_GROUP + (UINT)kGroupOrder[i], GroupingName(kGroupOrder[i]));
     }
     CheckMenuRadioItem(grouping, IDM_FILTER + FILTER_GROUP, IDM_FILTER + FILTER_GROUP + GROUPINGS - 1, IDM_FILTER + FILTER_GROUP + (UINT)g_view.grouping,
                        MF_BYCOMMAND);
-    for (i = 0; i < SORTINGS; i++) AppendMenuW(sorting, MF_STRING, IDM_FILTER + FILTER_SORT + (UINT)i, SortingName((Sorting)i));
+    for (i = 0; i < (int)ARRAYSIZE(kSortOrder); i++)
+        AppendMenuW(sorting, MF_STRING, IDM_FILTER + FILTER_SORT + (UINT)kSortOrder[i], SortingName(kSortOrder[i]));
     CheckMenuRadioItem(sorting, IDM_FILTER + FILTER_SORT, IDM_FILTER + FILTER_SORT + SORTINGS - 1, IDM_FILTER + FILTER_SORT + (UINT)g_view.sorting,
                        MF_BYCOMMAND);
+    AppendMenuW(sorting, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(sorting, MF_STRING, IDM_FILTER + FILTER_DESCENDING, TR(L"Descending"));
+    AppendMenuW(sorting, MF_STRING, IDM_FILTER + FILTER_ASCENDING, TR(L"Ascending"));
+    CheckMenuRadioItem(sorting, IDM_FILTER + FILTER_DESCENDING, IDM_FILTER + FILTER_ASCENDING,
+                       IDM_FILTER + (g_view.descending ? FILTER_DESCENDING : FILTER_ASCENDING), MF_BYCOMMAND);
     StringCchPrintfW(text, ARRAYSIZE(text), L"%s\t%s", TR(L"&Status"), StatusName(g_view.status));
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)status, text);
+    {
+        for (i = 0; i <= SESSION_RESULTS; i++)
+            AppendMenuW(result, MF_STRING | (g_view.resultFilter == i ? MF_CHECKED : 0), IDM_FILTER + FILTER_RESULT + (UINT)i,
+                        i ? ResultName((SessionResult)(i - 1)) : TR(L"All"));
+        StringCchPrintfW(text, ARRAYSIZE(text), L"%s\t%s", TR(L"Last recorded result"),
+                         g_view.resultFilter ? ResultName((SessionResult)(g_view.resultFilter - 1)) : TR(L"All"));
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)result, text);
+    }
     StringCchPrintfW(text, ARRAYSIZE(text), L"%s\t%s", TR(L"&Environment"),
                      !chosen ? TR(L"All") : chosen == 1 ? EnvironmentName(last) : TR(L"Several"));
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)environment, text);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     StringCchPrintfW(text, ARRAYSIZE(text), L"%s\t%s", TR(L"&Group by"), GroupingName(g_view.grouping));
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)grouping, text);
-    StringCchPrintfW(text, ARRAYSIZE(text), L"%s\t%s", TR(L"S&ort by"), SortingName(g_view.sorting));
+    StringCchPrintfW(text, ARRAYSIZE(text), L"%s\t%s %s", TR(L"S&ort by"), SortingName(g_view.sorting),
+                     g_view.descending ? L"\x2193" : L"\x2191");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)sorting, text);
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (g_view.showEmptyGroups ? MF_CHECKED : 0) | (g_view.grouping == GROUP_CUSTOM ? 0 : MF_GRAYED),
+    AppendMenuW(show, MF_STRING | (g_view.showPullRequests ? MF_CHECKED : 0), IDM_FILTER + FILTER_PRS, TR(L"Meta&data (PR status)"));
+    AppendMenuW(show, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(show, MF_STRING | (g_view.showEmptyGroups ? MF_CHECKED : 0) | (g_view.grouping == GROUP_NONE ? MF_GRAYED : 0),
                 IDM_FILTER + FILTER_EMPTY, TR(L"Show e&mpty groups"));
-    AppendMenuW(menu, MF_STRING | (g_view.showPullRequests ? MF_CHECKED : 0), IDM_FILTER + FILTER_PRS, TR(L"Show &PR status"));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)show, TR(L"Sho&w"));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (FiltersCleared() ? MF_GRAYED : 0), IDM_FILTER + FILTER_CLEAR, TR(L"&Clear filters"));
+    AppendMenuW(menu, MF_STRING | (DisplayDefaults() ? MF_GRAYED : 0), IDM_FILTER + FILTER_RESET, TR(L"&Reset to defaults"));
     cmd = MenuBelow(g_view.filterButton, menu);
     DestroyMenu(menu);   /* its submenus with it */
     FilterCommand(cmd);
@@ -3733,6 +3865,207 @@ static void FilterMenu(void)
 /* The search options, below their button: where the search looks (the
  * titles and folders, the conversations, or both), and how it reads what
  * is typed (a regular expression; the case). */
+typedef struct AllSearch {
+    HWND list, profiles;
+    BOOL *included;
+    int row, profile;
+    ULONG generation;
+} AllSearch;
+
+static const WCHAR *ResultName(SessionResult result)
+{
+    switch (result) {
+    case RESULT_COMPLETED: return TR(L"Completed");
+    case RESULT_BLOCKED: return TR(L"Blocked");
+    case RESULT_REVIEW: return TR(L"Ready for review");
+    case RESULT_ACTION: return TR(L"Needs action");
+    default: return TR(L"Unknown or outdated");
+    }
+}
+
+static void AllSearchAdd(AllSearch *state, int r, int matchedProfile)
+{
+    const SessionRow *row = &g_view.set.rows[r];
+    WCHAR names[NAMES_CCH] = L"";
+    LVITEMW item;
+    int p, first = -1, at;
+    if (state->included[r]) return;
+    for (p = 0; p < g_view.set.profiles.count; p++)
+        if (EntryChosen(EntryOf(row, p))) {
+            if (first < 0) first = p;
+            else StringCchCatW(names, ARRAYSIZE(names), L", ");
+            StringCchCatW(names, ARRAYSIZE(names), ProfileAt(p)->name);
+        }
+    if (first < 0) return;
+    if (matchedProfile >= 0) first = matchedProfile;
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_TEXT | LVIF_PARAM;
+    item.iItem = ListView_GetItemCount(state->list);
+    item.pszText = (LPWSTR)ShownTitle(row, first);
+    item.lParam = r;
+    at = ListView_InsertItem(state->list, &item);
+    if (at < 0) return;
+    ListView_SetItemText(state->list, at, 1, names);
+    ListView_SetItemText(state->list, at, 2, (LPWSTR)row->cwd);
+    ListView_SetItemText(state->list, at, 3, (LPWSTR)ResultName(EntryOf(row, first)->result));
+    state->included[r] = TRUE;
+}
+
+static void AllSearchSelection(HWND dialog, AllSearch *state)
+{
+    LVITEMW item;
+    int selected = ListView_GetNextItem(state->list, -1, LVNI_SELECTED), p;
+    SendMessageW(state->profiles, CB_RESETCONTENT, 0, 0);
+    state->row = -1;
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_PARAM;
+    item.iItem = selected;
+    if (selected >= 0 && ListView_GetItem(state->list, &item)) {
+        state->row = (int)item.lParam;
+        for (p = 0; p < g_view.set.profiles.count; p++) {
+            const SessionEntry *entry = EntryOf(&g_view.set.rows[state->row], p);
+            if (EntryChosen(entry) && ListedAndKept(entry)) {
+                LRESULT at = SendMessageW(state->profiles, CB_ADDSTRING, 0, (LPARAM)ProfileAt(p)->name);
+                if (at >= 0) SendMessageW(state->profiles, CB_SETITEMDATA, (WPARAM)at, p);
+            }
+        }
+    }
+    SendMessageW(state->profiles, CB_SETCURSEL, 0, 0);
+    EnableWindow(GetDlgItem(dialog, IDOK), state->row >= 0 && SendMessageW(state->profiles, CB_GETCOUNT, 0, 0) > 0);
+    EnableWindow(GetDlgItem(dialog, IDC_ST_HIT), state->row >= 0 && g_view.set.rows[state->row].transcript);
+}
+
+static INT_PTR CALLBACK AllSearchProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    AllSearch *state = (AllSearch *)GetWindowLongPtrW(dialog, DWLP_USER);
+    if (message == WM_INITDIALOG) {
+        const WCHAR *titles[] = { TR(L"Session title"), TR(L"Profiles"), TR(L"Folder"), TR(L"Last recorded result") };
+        static const int widths[] = { 240, 170, 240, 150 };
+        WCHAR (*paths)[LONG_PATH_CCH];
+        int r, p;
+        size_t i;
+        state = (AllSearch *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        state->list = GetDlgItem(dialog, IDC_X_LIST);
+        state->profiles = GetDlgItem(dialog, IDC_X_PROFILE);
+        SetWindowTextW(dialog, TR(L"Search all profiles"));
+        SetDlgItemTextW(dialog, IDC_X_TEXT, g_view.filter);
+        SetDlgItemTextW(dialog, IDC_X_LABEL, TR(L"Open in:"));
+        SetDlgItemTextW(dialog, IDC_X_NOTE, TR(L"Current filters apply. Each local session is listed once. Choose a profile to open it."));
+        SetDlgItemTextW(dialog, IDOK, TR(L"Open"));
+        SetDlgItemTextW(dialog, IDC_ST_HIT, TR(L"First matching message\x2026"));
+        SetDlgItemTextW(dialog, IDCANCEL, TR(L"Close"));
+        ListView_SetExtendedListViewStyle(state->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        for (i = 0; i < ARRAYSIZE(titles); i++) {
+            LVCOLUMNW column;
+            ZeroMemory(&column, sizeof column);
+            column.mask = LVCF_TEXT | LVCF_WIDTH;
+            column.pszText = (LPWSTR)titles[i];
+            column.cx = MulDiv(widths[i], (int)GetDpiForWindow(dialog), 96);
+            ListView_InsertColumn(state->list, (int)i, &column);
+        }
+        Theme_SmoothView(state->list);
+        for (r = 0; r < g_view.set.rowCount; r++)
+            for (p = 0; p < g_view.set.profiles.count; p++)
+                if (EntryChosen(EntryOf(&g_view.set.rows[r], p)) && (g_view.searchIn & SEARCH_TITLES) && Matches(&g_view.set.rows[r], p)) {
+                    AllSearchAdd(state, r, p);
+                    break;
+                }
+        AllSearchSelection(dialog, state);
+        if (!(g_view.searchIn & SEARCH_TEXT)) return TRUE;
+        paths = (WCHAR (*)[LONG_PATH_CCH])HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                  (size_t)max(g_view.set.rowCount, 1) * sizeof *paths);
+        if (!paths) return TRUE;
+        for (r = 0; r < g_view.set.rowCount; r++)
+            for (p = 0; p < g_view.set.profiles.count; p++)
+                if (g_view.set.rows[r].transcript && EntryChosen(EntryOf(&g_view.set.rows[r], p))) {
+                    StringCchCopyW(paths[r], LONG_PATH_CCH, g_view.set.rows[r].transcriptPath);
+                    break;
+                }
+        if (!SessionSearch_Start(dialog, state->generation, g_view.filter, (g_view.searchIn & SEARCH_REGEX) != 0,
+                                 (g_view.searchIn & SEARCH_CASE) != 0, paths, g_view.set.rowCount))
+            SetDlgItemTextW(dialog, IDC_X_NOTE, TR(L"The conversations could not be searched. Only title and folder matches are shown."));
+        return TRUE;
+    }
+    if (!state) return FALSE;
+    if (message == WM_APP_SESSION_SEARCH && (ULONG)wp == state->generation) {
+        if (lp >= 0 && lp < g_view.set.rowCount) AllSearchAdd(state, (int)lp, -1);
+        else if (lp == -1) SetDlgItemTextW(dialog, IDC_X_TEXT, TR(L"Search complete"));
+        return TRUE;
+    }
+    if (message == WM_NOTIFY && ((const NMHDR *)lp)->hwndFrom == state->list && ((const NMHDR *)lp)->code == LVN_ITEMCHANGED) {
+        const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
+        if ((change->uChanged & LVIF_STATE) && ((change->uOldState ^ change->uNewState) & LVIS_SELECTED)) AllSearchSelection(dialog, state);
+    }
+    if (message == WM_COMMAND && LOWORD(wp) == IDC_ST_HIT) {
+        if (state->row >= 0) ShowMatchingContext(dialog, state->row);
+        return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wp) == IDOK) {
+        LRESULT at = SendMessageW(state->profiles, CB_GETCURSEL, 0, 0);
+        if (state->row >= 0 && at >= 0) {
+            state->profile = (int)SendMessageW(state->profiles, CB_GETITEMDATA, (WPARAM)at, 0);
+            EndDialog(dialog, IDOK);
+        }
+        return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wp) == IDCANCEL) { EndDialog(dialog, IDCANCEL); return TRUE; }
+    return FALSE;
+}
+
+void SessionsView_SearchAll(void)
+{
+    AllSearch state;
+    INT_PTR result;
+    if (!g_view.shown || !g_view.filter[0] || ((g_view.searchIn & SEARCH_REGEX) && !g_view.regex)) return;
+    ZeroMemory(&state, sizeof state);
+    state.included = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)max(g_view.set.rowCount, 1) * sizeof(BOOL));
+    if (!state.included) return;
+    StopTextSearch();
+    state.generation = ++g_view.textSearch;
+    g_view.actionDepth++;
+    result = Ui_Dialog(g_view.dlg, IDD_SESSIONSEARCH, AllSearchProc, (LPARAM)&state);
+    SessionSearch_Stop();
+    if (result == IDOK && state.profile >= 0 && state.profile < g_view.set.profiles.count) OpenSession(state.row, state.profile);
+    g_view.actionDepth--;
+    TakeHeldSnapshot();
+    HeapFree(GetProcessHeap(), 0, state.included);
+    ApplySearch();
+}
+
+static INT_PTR CALLBACK ExecutionFilterProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    int i;
+    (void)lp;
+    if (message == WM_INITDIALOG) {
+        SetWindowTextW(dialog, TR(L"Execution filters"));
+        SetDlgItemTextW(dialog, IDC_ST_MODEL_LABEL, TR(L"Model:"));
+        SetDlgItemTextW(dialog, IDC_ST_EFFORT_LABEL, TR(L"Effort:"));
+        SetDlgItemTextW(dialog, IDOK, TR(L"Apply"));
+        SetDlgItemTextW(dialog, IDCANCEL, TR(L"Cancel"));
+        for (i = 0; i < g_view.set.entryCount; i++) {
+            const SessionEntry *entry = &g_view.set.entries[i];
+            if (entry->model[0] && SendDlgItemMessageW(dialog, IDC_ST_MODEL, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)entry->model) == CB_ERR)
+                SendDlgItemMessageW(dialog, IDC_ST_MODEL, CB_ADDSTRING, 0, (LPARAM)entry->model);
+            if (entry->effort[0] && SendDlgItemMessageW(dialog, IDC_ST_EFFORT, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)entry->effort) == CB_ERR)
+                SendDlgItemMessageW(dialog, IDC_ST_EFFORT, CB_ADDSTRING, 0, (LPARAM)entry->effort);
+        }
+        SetDlgItemTextW(dialog, IDC_ST_MODEL, g_view.modelFilter);
+        SetDlgItemTextW(dialog, IDC_ST_EFFORT, g_view.effortFilter);
+        SendDlgItemMessageW(dialog, IDC_ST_MODEL, CB_LIMITTEXT, ARRAYSIZE(g_view.modelFilter) - 1, 0);
+        SendDlgItemMessageW(dialog, IDC_ST_EFFORT, CB_LIMITTEXT, ARRAYSIZE(g_view.effortFilter) - 1, 0);
+        return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wp) == IDOK) {
+        GetDlgItemTextW(dialog, IDC_ST_MODEL, g_view.modelFilter, ARRAYSIZE(g_view.modelFilter));
+        GetDlgItemTextW(dialog, IDC_ST_EFFORT, g_view.effortFilter, ARRAYSIZE(g_view.effortFilter));
+        EndDialog(dialog, IDOK);
+        return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wp) == IDCANCEL) { EndDialog(dialog, IDCANCEL); return TRUE; }
+    return FALSE;
+}
+
 static void FindMenu(void)
 {
     HMENU menu = CreatePopupMenu();
@@ -3744,8 +4077,37 @@ static void FindMenu(void)
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | ((g_view.searchIn & SEARCH_REGEX) ? MF_CHECKED : 0), IDM_FIND + 2, TR(L"&Regular expression"));
     AppendMenuW(menu, MF_STRING | ((g_view.searchIn & SEARCH_CASE) ? MF_CHECKED : 0), IDM_FIND + 3, TR(L"Match &case"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (g_view.filter[0] ? 0 : MF_GRAYED), IDM_FIND + 4, TR(L"Search all profiles"));
+    AppendMenuW(menu, MF_STRING, IDM_FIND + 5, TR(L"Pending changes"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, IDM_FIND + 6, TR(L"Execution filters\x2026"));
+    AppendMenuW(menu, MF_STRING, IDM_FIND + 7, TR(L"Historical accounts and organizations\x2026"));
+    AppendMenuW(menu, MF_STRING, IDM_FIND + 8, TR(L"SSH, WSL and cloud metadata\x2026"));
     cmd = MenuBelow(g_view.findButton, menu);
     DestroyMenu(menu);
+    if (cmd == IDM_FIND + 4) { SessionsView_SearchAll(); return; }
+    if (cmd == IDM_FIND + 6) {
+        if (Ui_Dialog(g_view.dlg, IDD_SESSIONFILTER, ExecutionFilterProc, 0) == IDOK) ApplySearch();
+        return;
+    }
+    if (cmd == IDM_FIND + 7 || cmd == IDM_FIND + 8) {
+        int p = ShownProfileIndex();
+        if (p >= 0) {
+            g_view.actionDepth++;
+            SessionTools_Catalog(g_view.dlg, ProfileAt(p), cmd == IDM_FIND + 7);
+            g_view.actionDepth--;
+            TakeHeldSnapshot();
+        }
+        return;
+    }
+    if (cmd == IDM_FIND + 5) {
+        g_view.actionDepth++;
+        SyncUi_Pending(g_view.dlg, &g_view.set.profiles);
+        g_view.actionDepth--;
+        TakeHeldSnapshot();
+        return;
+    }
     if (cmd < IDM_FIND || cmd > IDM_FIND + 3) return;
     bit = 1u << (cmd - IDM_FIND);
     g_view.searchIn ^= bit;
@@ -3878,6 +4240,7 @@ static void AcceptSnapshot(void)
     g_view.treeHash = treeHash;
     CountSessions();
     Watch(&g_view.planned);
+    RefreshTextSearch();   /* the previous pass stays drawn until this one publishes results */
     Render(FALSE);
 }
 
@@ -3902,6 +4265,10 @@ void SessionsView_Enter(const ClaudePackage *pkg, const WCHAR *folder)
     SessionsView_Warm(&g_view.profilesToRead);
     SessionsView_Ready(TRUE);          /* before the view shows: it renders once, below */
     g_view.shown = TRUE;
+    if ((g_view.searchIn & SEARCH_TEXT) && g_view.filter[0]) {
+        StopTextSearch();
+        StartTextSearch();
+    }
     Render(TRUE);
     for (i = 0; i < ARRAYSIZE(kControls); i++) ShowWindow(GetDlgItem(g_view.dlg, kControls[i]), SW_SHOW);
     /* The profile shown, in sight in the side bar (the tree's selection is: FillTree). */
@@ -3917,6 +4284,7 @@ void SessionsView_Leave(void)
 
 void SessionsView_Reload(void)
 {
+    SessionSearch_Invalidate();
     RequestLoad(FALSE);
 }
 
@@ -4132,6 +4500,17 @@ BOOL SessionsView_Notify(const NMHDR *header, LRESULT *result)
             const SessionRow *row = &g_view.set.rows[tip->lParam];
             size_t cch = (size_t)tip->cchTextMax;
             StringCchCopyW(tip->pszText, cch, ShownTitle(row, ShownProfileIndex()));
+            {
+                const SessionEntry *entry = EntryOf(row, ShownProfileIndex());
+                if (entry && entry->result != RESULT_UNKNOWN) {
+                    StringCchCatW(tip->pszText, cch, L"\n");
+                    StringCchCatW(tip->pszText, cch, TR(L"Last recorded result"));
+                    StringCchCatW(tip->pszText, cch, L": ");
+                    StringCchCatW(tip->pszText, cch, ResultName(entry->result));
+                    StringCchCatW(tip->pszText, cch, L"\n");
+                    StringCchCatW(tip->pszText, cch, entry->resultDetail);
+                }
+            }
             if (row->cwd[0]) {
                 StringCchCatW(tip->pszText, cch, L"\n");
                 StringCchCatW(tip->pszText, cch, row->cwd);

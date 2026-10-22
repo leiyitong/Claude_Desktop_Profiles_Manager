@@ -3627,12 +3627,22 @@ static void TestViewPaging(void)
     static const struct { UINT key; int pages; const char *name; } kPresses[] = {
         { VK_NEXT, 1, "Page Down" }, { VK_NEXT, 2, "a second Page Down" }, { VK_PRIOR, 1, "Page Up" }
     };
+    BYTE savedKeyboard[256], plainKeyboard[256];
+    BOOL haveKeyboard = GetKeyboardState(savedKeyboard);
+    Check("view paging keyboard state can be isolated", haveKeyboard);
+    if (!haveKeyboard) return;
+    CopyMemory(plainKeyboard, savedKeyboard, sizeof plainKeyboard);
+    plainKeyboard[VK_CONTROL] = plainKeyboard[VK_LCONTROL] = plainKeyboard[VK_RCONTROL] = 0;
+    plainKeyboard[VK_SHIFT] = plainKeyboard[VK_LSHIFT] = plainKeyboard[VK_RSHIFT] = 0;
+    plainKeyboard[VK_MENU] = plainKeyboard[VK_LMENU] = plainKeyboard[VK_RMENU] = 0;
+    Check("view paging: plain-key modifiers set", SetKeyboardState(plainKeyboard));
     HWND host = ThemedHost();
     ViewedControls viewed;
     int kind;
     size_t press;
     if (!CreateViewedControls(host, 100, &viewed)) {
         Check("view paging: controls created", FALSE);
+        Check("view paging: keyboard state restored", SetKeyboardState(savedKeyboard));
         return;
     }
     for (kind = 0; kind < 3; kind++) {
@@ -3650,6 +3660,8 @@ static void TestViewPaging(void)
             char name[200];
             int index, position;
             count.changes = 0;
+            /* Message pumps can import fresh hardware state after setup. */
+            Check("view paging: plain-key modifiers set", SetKeyboardState(plainKeyboard));
             SendMessageW(viewed.controls[kind], WM_KEYDOWN, kPresses[press].key, 0);
             SendMessageW(viewed.controls[kind], WM_KEYUP, kPresses[press].key, 0);
             PumpMessages();
@@ -3679,6 +3691,7 @@ static void TestViewPaging(void)
     }
     ShowWindow(host, SW_HIDE);
     DestroyViewedControls(&viewed);
+    Check("view paging: keyboard state restored", SetKeyboardState(savedKeyboard));
 }
 
 /* A view keeps its place when its control is refilled, when a tree's folder
@@ -4175,11 +4188,21 @@ static void TestViewKeys(void)
  * into sight in a list box's, a list view's and a tree's views. */
 static void TestViewRevealsKeyboardRow(void)
 {
+    BYTE savedKeyboard[256], plainKeyboard[256];
+    BOOL haveKeyboard = GetKeyboardState(savedKeyboard);
+    Check("view reveal keyboard state can be isolated", haveKeyboard);
+    if (!haveKeyboard) return;
+    CopyMemory(plainKeyboard, savedKeyboard, sizeof plainKeyboard);
+    plainKeyboard[VK_CONTROL] = plainKeyboard[VK_LCONTROL] = plainKeyboard[VK_RCONTROL] = 0;
+    plainKeyboard[VK_SHIFT] = plainKeyboard[VK_LSHIFT] = plainKeyboard[VK_RSHIFT] = 0;
+    plainKeyboard[VK_MENU] = plainKeyboard[VK_LMENU] = plainKeyboard[VK_RMENU] = 0;
+    Check("view reveal: plain-key modifiers set", SetKeyboardState(plainKeyboard));
     HWND host = ThemedHost();
     ViewedControls viewed;
     int kind;
     if (!CreateViewedControls(host, 100, &viewed)) {
         Check("view reveal: controls created", FALSE);
+        Check("view reveal: keyboard state restored", SetKeyboardState(savedKeyboard));
         return;
     }
     for (kind = 0; kind < 3; kind++) {
@@ -4191,12 +4214,14 @@ static void TestViewRevealsKeyboardRow(void)
         SelectRow(control, kind, 10);
         PumpMessages();
         SendMessageW(view, WM_VSCROLL, MAKEWPARAM(SB_THUMBPOSITION, 60 * rowHeight), 0);
+        Check("view reveal: plain-key modifiers set", SetKeyboardState(plainKeyboard));
         SendMessageW(control, WM_KEYDOWN, VK_DOWN, 0);
         SendMessageW(control, WM_KEYUP, VK_DOWN, 0);
         PumpMessages();
         StringCchPrintfA(name, ARRAYSIZE(name), "view reveal: an arrow in %s's view brings the keyboard's row into sight", kViewedNames[kind]);
         Check(name, RowInSight(control, view, kind, 11));
         SendMessageW(view, WM_VSCROLL, MAKEWPARAM(SB_THUMBPOSITION, 60 * rowHeight), 0);
+        Check("view reveal: plain-key modifiers set", SetKeyboardState(plainKeyboard));
         SendMessageW(control, WM_CHAR, L'R', 0);
         PumpMessages();
         index = KeyboardRow(control, kind, &row);
@@ -4208,6 +4233,7 @@ static void TestViewRevealsKeyboardRow(void)
         SelectRow(control, kind, 10);
         PumpMessages();
         SendMessageW(view, WM_VSCROLL, MAKEWPARAM(SB_THUMBPOSITION, 40 * rowHeight + rowHeight / 2 - client.bottom), 0);
+        Check("view reveal: plain-click modifiers set", SetKeyboardState(plainKeyboard));
         if (kind == 0) {
             SendMessageW(control, LB_GETITEMRECT, 40, (LPARAM)&row);
             SendMessageW(control, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(row.left + 5, row.top + 2));
@@ -4226,6 +4252,7 @@ static void TestViewRevealsKeyboardRow(void)
     }
     ShowWindow(host, SW_HIDE);
     DestroyViewedControls(&viewed);
+    Check("view reveal: keyboard state restored", SetKeyboardState(savedKeyboard));
 }
 
 typedef struct PositionWatch { HWND view; int from; } PositionWatch;

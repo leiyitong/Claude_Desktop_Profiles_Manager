@@ -57,12 +57,15 @@ BEGIN
     PUSHBUTTON      "S&hortcuts", IDC_SHORTCUTS, 350, 6, 18, 15
     PUSHBUTTON      "Se&ttings", IDC_SETTINGS, 370, 6, 18, 15
     PUSHBUTTON      "About", IDC_ABOUT, 390, 6, 18, 15
+    LTEXT           "Search profiles:", IDC_PROFILE_SEARCH_LABEL, 10, 30, 64, 10, NOT WS_VISIBLE
+    EDITTEXT        IDC_PROFILE_SEARCH, 78, 28, 212, 14, ES_AUTOHSCROLL | NOT WS_VISIBLE
     CONTROL         "", IDC_LIST, "SysListView32", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 28, 280, 246
     PUSHBUTTON      "Sessions &view", IDC_SESSIONS, 296, 28, 114, 15
     PUSHBUTTON      L"S&ync settings\x2026", IDC_SYNC, 296, 51, 114, 15
     PUSHBUTTON      L"&Backup && Restore\x2026", IDC_BACKUP, 296, 70, 114, 15
     PUSHBUTTON      "Rep&air", IDC_REPAIR, 296, 89, 114, 15
-    LTEXT           "", IDC_NOTE, 296, 111, 114, 42, SS_NOPREFIX
+    PUSHBUTTON      "Search profiles", IDC_PROFILE_FIND, 296, 108, 114, 15
+    LTEXT           "", IDC_NOTE, 296, 130, 114, 42, SS_NOPREFIX
     LTEXT           "", IDC_STATUS, 296, 186, 114, 20, SS_NOPREFIX
     CONTROL         "", IDC_PROGRESS, "Static", SS_OWNERDRAW | SS_NOPREFIX | NOT WS_VISIBLE, 296, 191, 114, 15
     PUSHBUTTON      "", IDC_STATUS_ACTION, 296, 210, 114, 15, NOT WS_VISIBLE
@@ -75,7 +78,7 @@ BEGIN
     CONTROL         "", IDC_S_TREE, "SysTreeView32", TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_FULLROWSELECT | TVS_NOHSCROLL | TVS_INFOTIP | TVS_NONEVENHEIGHT | TVS_TRACKSELECT | WS_BORDER | WS_TABSTOP | NOT WS_VISIBLE, 112, 46, 178, 228
 END
 
-IDD_PROFILE DIALOGEX 0, 0, 268, 201
+IDD_PROFILE DIALOGEX 0, 0, 268, 222
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Profile"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -91,16 +94,36 @@ BEGIN
     PUSHBUTTON      "Re&move picture", IDC_P_NO_PICTURE, 172, 52, 72, 14
     LTEXT           "T&itle:", IDC_P_TITLE_LABEL, 10, 76, 40, 10
     EDITTEXT        IDC_P_TITLE, 52, 73, 206, 14, ES_AUTOHSCROLL
-    LTEXT           "S&ync:", IDC_P_SYNC_LABEL, 10, 97, 40, 10
-    COMBOBOX        IDC_P_SYNC, 52, 94, 132, 200, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      L"Wha&t to sync\x2026", IDC_P_SYNC_ITEMS, 188, 93, 70, 14
-    LTEXT           "", IDC_P_FOLDER, 10, 113, 248, 18, SS_NOPREFIX
-    LTEXT           "", IDC_P_ERROR, 10, 113, 248, 18, SS_NOPREFIX | NOT WS_VISIBLE
-    AUTOCHECKBOX    "Open at &Windows sign-in", IDC_P_STARTUP, 10, 135, 200, 10
-    AUTOCHECKBOX    "", IDC_P_COPY, 10, 148, 248, 10
-    AUTOCHECKBOX    "&Open it now to sign in", IDC_P_OPEN, 10, 161, 140, 10
-    DEFPUSHBUTTON   "OK", IDOK, 154, 179, 50, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 208, 179, 50, 15
+    LTEXT           "Notes:", IDC_P_NOTE_LABEL, 10, 97, 40, 10
+    EDITTEXT        IDC_P_NOTE, 52, 94, 206, 14, ES_AUTOHSCROLL
+    LTEXT           "S&ync:", IDC_P_SYNC_LABEL, 10, 118, 40, 10
+    COMBOBOX        IDC_P_SYNC, 52, 115, 132, 200, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      L"Wha&t to sync\x2026", IDC_P_SYNC_ITEMS, 188, 114, 70, 14
+    LTEXT           "", IDC_P_FOLDER, 10, 134, 248, 18, SS_NOPREFIX
+    LTEXT           "", IDC_P_ERROR, 10, 134, 248, 18, SS_NOPREFIX | NOT WS_VISIBLE
+    AUTOCHECKBOX    "Open at &Windows sign-in", IDC_P_STARTUP, 10, 156, 200, 10
+    AUTOCHECKBOX    "", IDC_P_COPY, 10, 169, 248, 10
+    AUTOCHECKBOX    "&Open it now to sign in", IDC_P_OPEN, 10, 182, 140, 10
+    DEFPUSHBUTTON   "OK", IDOK, 154, 200, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 208, 200, 50, 15
+END
+
+IDD_SIGNIN DIALOGEX 0, 0, 410, 262
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Private sign-in"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_SIGNIN_PROFILE, 10, 10, 390, 12, SS_NOPREFIX
+    LTEXT           "Create an account or sign in on Claude's website. To authorize Claude Desktop, first start sign-in in this profile and paste its complete link here. Opening this page alone does not sign in Claude Desktop.", IDC_SIGNIN_HELP, 10, 28, 390, 46, SS_NOPREFIX
+    LTEXT           "&Sign-in link:", IDC_SIGNIN_URL_LABEL, 10, 80, 390, 10
+    EDITTEXT        IDC_SIGNIN_URL, 10, 94, 390, 14, ES_AUTOHSCROLL
+    LTEXT           "&Browser:", IDC_SIGNIN_BROWSER_LABEL, 10, 116, 60, 10
+    COMBOBOX        IDC_SIGNIN_BROWSER, 74, 113, 200, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Each opening uses a separate browser folder. Close its windows, then use Open browser folders to remove those folders manually. They are kept when this window or the manager closes.", IDC_SIGNIN_CLEANUP, 10, 136, 390, 40, SS_NOPREFIX
+    LTEXT           "", IDC_SIGNIN_STATUS, 10, 182, 390, 40, SS_NOPREFIX
+    PUSHBUTTON      "Open browser &folders", IDC_SIGNIN_FOLDERS, 10, 237, 124, 15
+    DEFPUSHBUTTON   "&Open private browser", IDC_SIGNIN_OPEN, 176, 237, 166, 15
+    PUSHBUTTON      "Close", IDCANCEL, 350, 237, 50, 15
 END
 
 IDD_TITLE DIALOGEX 0, 0, 268, 68
@@ -165,7 +188,21 @@ BEGIN
     LTEXT           "", IDC_W_VERSION, 10, 22, 460, 10, SS_NOPREFIX
     CONTROL         "", IDC_W_TOPICS, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 38, 160, 236
     CONTROL         "", IDC_W_TEXT, "RICHEDIT50W", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 176, 38, 294, 236
+    PUSHBUTTON      "Open &logs", IDC_W_LOGS, 10, 280, 85, 15
+    PUSHBUTTON      L"&Diagnostics\x2026", IDC_W_DIAGNOSTICS, 101, 280, 90, 15
     DEFPUSHBUTTON   "Close", IDCANCEL, 420, 280, 50, 15
+END
+
+IDD_TEXTVIEW DIALOGEX 0, 0, 480, 290
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Details"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_T_NOTE, 10, 10, 460, 28, SS_NOPREFIX
+    EDITTEXT        IDC_T_TEXT, 10, 42, 460, 215, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
+    PUSHBUTTON      "&Copy", IDC_T_COPY, 10, 267, 70, 15
+    DEFPUSHBUTTON   "Continue", IDOK, 314, 267, 90, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 410, 267, 60, 15
 END
 
 IDD_MESSAGE DIALOGEX 0, 0, 282, 70
@@ -246,6 +283,8 @@ BEGIN
     DEFPUSHBUTTON   "&Restore", IDC_C_RESTORE, 152, 228, 50, 15
     PUSHBUTTON      "Delete", IDOK, 206, 228, 50, 15
     PUSHBUTTON      "Close", IDCANCEL, 260, 228, 50, 15
+    PUSHBUTTON L"&Open in profile\x2026", 6505, 10, 228, 120, 15
+
 END
 
 IDD_SYNC_ITEMS DIALOGEX 0, 0, 268, 214
@@ -290,7 +329,20 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 214, 50, 15
 END
 
-IDD_BACKUP_HUB DIALOGEX 0, 0, 268, 196
+IDD_HISTORY DIALOGEX 0, 0, 540, 274
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Backup history"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "The latest 64 profile ZIP locations saved by this version. Available means the file exists; archive contents have not been checked.", IDC_HISTORY_NOTE, 10, 10, 520, 30, SS_NOPREFIX
+    CONTROL         "", IDC_HISTORY_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 46, 520, 196
+    PUSHBUTTON      "&Refresh", IDC_HISTORY_REFRESH, 10, 249, 72, 15
+    PUSHBUTTON      "Open &folder", IDC_HISTORY_OPEN, 88, 249, 98, 15, WS_DISABLED
+    PUSHBUTTON      "&Validate", IDC_HISTORY_VALIDATE, 192, 249, 78, 15, WS_DISABLED
+    PUSHBUTTON      "Close", IDCANCEL, 480, 249, 50, 15
+END
+
+IDD_BACKUP_HUB DIALOGEX 0, 0, 268, 239
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Backup & Restore"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -306,8 +358,11 @@ BEGIN
     LTEXT           "Claude Code", IDC_H_CODE_LABEL, 10, 105, 248, 10
     PUSHBUTTON      L"Back up .&claude\x2026", IDC_H_CODE, 10, 119, 121, 15
     AUTOCHECKBOX    "Back up once a &week", IDC_H_WEEKLY, 137, 122, 121, 10
-    LTEXT           "Each backup asks what it keeps. What a restore or a recovery replaces is kept in a backup first.", IDC_H_NOTE, 10, 143, 248, 20
-    PUSHBUTTON      "Close", IDCANCEL, 208, 174, 50, 15
+    PUSHBUTTON      L"Backup &history\x2026", IDC_H_HISTORY, 10, 142, 121, 15
+    PUSHBUTTON      "Validate &archive", IDC_H_VALIDATE, 137, 142, 121, 15
+    PUSHBUTTON      L"Local profile tools\x2026", 6320, 10, 163, 248, 15
+    LTEXT           "Each backup asks what it keeps. What a restore or a recovery replaces is kept in a backup first.", IDC_H_NOTE, 10, 186, 248, 20
+    PUSHBUTTON      "Close", IDCANCEL, 208, 217, 50, 15
 END
 
 IDD_UNINSTALL DIALOGEX 0, 0, 292, 206
@@ -323,3 +378,9 @@ BEGIN
     DEFPUSHBUTTON   "Uninstall", IDOK, 178, 182, 50, 15
     PUSHBUTTON      "Cancel", IDCANCEL, 232, 182, 50, 15
 END
+
+#include "profiletools.rc"
+
+#include "sessiontools.rc"
+
+#include "vaulttools.rc"

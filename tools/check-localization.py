@@ -67,6 +67,7 @@ NONLITERAL_CALLS = {
               "Theme_MainNote", "Theme_SessionsFolderState"],
     "localize.c": ["key"],
     "profiles.c": ["invalid"],
+    "profiletools.c": ["part.label"],
     "syncui.c": ["kSyncKinds[k].heading"],
     "checklist.c": ["checks->groups[g].heading", "item->label"],
     "sessionvault.c": ["context->part->label"],
@@ -76,7 +77,7 @@ NONLITERAL_CALLS = {
 # titles and roles (theme.c measures them, gui.c shows them) and the name
 # errors of Core_ValidateNewName and Core_ValidateLabel.
 TRANSLATED_THROUGH_VARIABLES = {
-    "sessionsync.c": ["Starred sessions", "Pinned sessions", "Starred groups", "Project order", "Status filter", "Environment filter", "Show empty groups", "Show PR status", "Projects shown", "Links in previews", "Go on after a usage limit", "Folders' permission modes", "Permission warnings confirmed", "Archive when the PR closes", "Cowork web search", "Cowork browser tools", "Cowork's browser", "Cowork scheduled tasks", "Code scheduled tasks", "Remote Control: excluded folders", "Remote Control: pinned folders", "Cowork's trusted folders", "Groups", "Sidebar sections", "Edit sidebar", "Folded groups", "Group by", "Sort by", "Recents: type", "Recents: status", "Routines' place", "Sidebar width", "Interface font", "System font", "Editor", "Zoom", "Language", "Language source", "Default model", "Cowork's recent folders", "Sessions' model and effort", "Unread marks", "Session side bar", "Side pane layout", "Side pane sizes", "Transcript view", "Transcript view by default", "Files tree", "Diff tree", "App language", "Controls' zoom", "Page zoom", "Spelling languages"],
+    "sessionsync.c": ["Starred sessions", "Pinned sessions", "Starred groups", "Project order", "Status filter", "Environment filter", "Show empty groups", "Show PR status", "Projects shown", "Links in previews", "Go on after a usage limit", "Folders' permission modes", "Permission warnings confirmed", "Archive when the PR closes", "Cowork web search", "Cowork browser tools", "Cowork's browser", "Cowork scheduled tasks", "Code scheduled tasks", "Remote Control: excluded folders", "Remote Control: pinned folders", "Cowork's trusted folders", "Groups", "Sidebar sections", "Edit sidebar", "Folded groups", "Group by", "Sort by", "Recents: type", "Recents: status", "Routines' place", "Sidebar width", "Interface font", "System font", "Editor", "Zoom", "Language", "Language source", "Default model", "Cowork's recent folders", "Sessions' model and effort", "Session presets", "Unread marks", "Session side bar", "Side pane layout", "Side pane sizes", "Transcript view", "Transcript view by default", "Files tree", "Diff tree", "App language", "Controls' zoom", "Page zoom", "Spelling languages"],
     "icons.c": ["Blue", "Green", "Orange", "Pink", "Purple", "Red", "Slate", "Teal", "Amber", "Gold", "Lime", "Forest", "Sky",
                 "Indigo", "Fuchsia", "Crimson", "Brown", "Navy", "Plum", "Graphite"],
     "core.c": ["Claude uses this name itself. Pick another one.", "Enter a name.", "Name too long.",
@@ -86,15 +87,15 @@ TRANSLATED_THROUGH_VARIABLES = {
     "gui.c": ["A profile folder with this name already exists."],
     "syncui.c": ["Sessions", "Sidebar", "Session details", "Appearance", "Interface language", "Default model", "Permissions",
                  "New sessions", "Titles", "Archived or not", "Deleted sessions", "Stars and pins", "Groups and sections", "Project order",
-                 "Filters, grouping and sorting", "Width and the place of Routines", "Model and effort", "Side pane", "Unread marks", "Cost",
+                 "Filters, grouping and sorting", "Width and the place of Routines", "Model, effort and session presets", "Side pane", "Unread marks", "Cost",
                  "Fonts", "Editor", "Zoom", "Spelling", "Archive when the PR closes", "Cowork", "Cowork's recent folders",
                  "Code: scheduled tasks, links in previews, going on after a usage limit", "Folders' permission modes",
                  "Cowork's trusted folders"],
     "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "&Delete\u2026", "S&ync settings\u2026", "&Backup && Restore\u2026",
-                "Rep&air", "Set as de&fault", "S&hortcuts", "Se&ttings", "Search o&ptions", "F&ilter", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
+                "Rep&air", "Search profiles", "Set as de&fault", "S&hortcuts", "Se&ttings", "Search o&ptions", "F&ilter", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
                 "Pin to &taskbar", "Pinned", "Add to Start &menu", "Remove from Start &menu", "Sessions &view", "&Back",
                 "&Get Claude", "&Update",
-                "Profile", "Role", "Data folder", "Sessions", "Status", "Running", "Not running", "This profile", "Not signed in", "No sessions yet", "Link broken",
+                "Role", "Data folder", "Sessions", "Running", "Not running", "This profile", "No sessions yet", "Link broken",
                 "Claude icon, default", "Claude icon", "Default",
                 "Version %s is available", "Downloading version %s\u2026", "Installing the new version\u2026",
                 "Claude Desktop %s\nclaude:// links are not set up yet",
@@ -110,7 +111,8 @@ TOOLBAR = ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u
 ACCESS_KEY_GROUPS = {
     "profiles view": TOOLBAR + ["Sessions &view", "S&ync settings\u2026", "&Backup && Restore\u2026", "Rep&air", "&Update"] + STATUS_ACTIONS,
     "sessions view": TOOLBAR + ["&Back", "Search o&ptions", "F&ilter"],
-    "filter menu": ["&Status", "&Environment", "&Group by", "S&ort by", "Show e&mpty groups", "Show &PR status", "&Clear filters"],
+    "filter menu": ["&Status", "&Environment", "&Group by", "S&ort by", "Sho&w", "&Clear filters", "&Reset to defaults"],
+    "filter display": ["Meta&data (PR status)", "Show e&mpty groups"],
     "search options": ["Search &titles and folders", "Search the con&versations", "&Regular expression", "Match &case"],
     "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "S&ync:", "Wha&t to sync\u2026",
                        "Open at &Windows sign-in",
@@ -128,7 +130,8 @@ ACCESS_KEY_GROUPS = {
     "sync settings dialog": ["&What they sync:", "&Sync now"],
     "backup and restore dialog": ["&Back up\u2026", "&Restore from backup\u2026", "E&xport sessions\u2026", "&Import sessions\u2026",
                                   "Reco&ver sessions\u2026", "C&lean up sessions\u2026", "Back up .&claude\u2026",
-                                  "Back up once a &week"],
+                                  "Back up once a &week", "Backup &history\u2026", "Validate &archive"],
+    "backup history dialog": ["&Refresh", "Open &folder", "&Validate"],
     "conflicts dialog": ["&Use for all:"],
     "shortcuts menu of a profile": ["Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar",
                                     "Pinned", "Add to Start &menu", "Remove from Start &menu"],
@@ -409,24 +412,25 @@ def main():
                 line = source.count("\n", 0, call.start()) + 1
                 errors.append(f"tests/{path.name}:{line}: missing key {ascii(key)}")
     resource_labels = 0
-    for line in (ROOT / "src" / "app.rc").read_text(encoding="utf-8-sig").splitlines():
-        statement = RESOURCE_STATEMENT.match(line)
-        if not statement:
-            continue
-        strings = RESOURCE_STRING.findall(line)
-        if not strings or not strings[0]:
-            continue
-        if statement[1] == "CONTROL" and (len(strings) < 2 or strings[1].lower() not in TRANSLATED_CLASSES):
-            continue
-        key = decode(strings[0])
-        if key == APP_NAME:
-            continue
-        resource_labels += 1
-        resource_used.add(key)
-        if "..." in key:
-            errors.append(f"app.rc: three dots in {ascii(key)}: write L\"...\\x2026\"")
-        elif key not in catalog:
-            errors.append(f"app.rc: missing resource label {ascii(key)}")
+    for resource_path in sorted((ROOT / "src").glob("*.rc")):
+        for line in resource_path.read_text(encoding="utf-8-sig").splitlines():
+            statement = RESOURCE_STATEMENT.match(line)
+            if not statement:
+                continue
+            strings = RESOURCE_STRING.findall(line)
+            if not strings or not strings[0]:
+                continue
+            if statement[1] == "CONTROL" and (len(strings) < 2 or strings[1].lower() not in TRANSLATED_CLASSES):
+                continue
+            key = decode(strings[0])
+            if key == APP_NAME:
+                continue
+            resource_labels += 1
+            resource_used.add(key)
+            if "..." in key:
+                errors.append(f"app.rc: three dots in {ascii(key)}: write L\"...\\x2026\"")
+            elif key not in catalog:
+                errors.append(f"app.rc: missing resource label {ascii(key)}")
     for file, keys in TRANSLATED_THROUGH_VARIABLES.items():
         for key in keys:
             if key not in catalog:

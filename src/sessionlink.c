@@ -95,17 +95,24 @@ void SessionLink_Read(const ProfileList *list, int index, LinkState *state)
 }
 
 /* A profile's Claude, from its data folder as a running one titles its
- * Chromium message window: the stock folder through its storage. */
+ * Chromium message window: the stock folder through its storage, also once
+ * Claude moved it out of its package. */
 static void RunningProfile(const WCHAR *dataDir, const ClaudePackage *pkg, Profile *p)
 {
-    WCHAR appData[MAX_PATH], localAppData[MAX_PATH], stock[MAX_PATH];
+    WCHAR appData[MAX_PATH], localAppData[MAX_PATH], stock[MAX_PATH], moved[MAX_PATH];
     const WCHAR *leaf = wcsrchr(dataDir, L'\\');
+    BOOL local = pkg->found && Util_LocalAppData(localAppData, ARRAYSIZE(localAppData));
     ZeroMemory(p, sizeof *p);
     StringCchCopyW(p->dataDir, ARRAYSIZE(p->dataDir), dataDir);
     StringCchCopyW(p->folder, ARRAYSIZE(p->folder), leaf ? leaf + 1 : dataDir);
-    p->isStock = Util_AppData(appData, ARRAYSIZE(appData)) &&
-                 SUCCEEDED(StringCchPrintfW(stock, ARRAYSIZE(stock), L"%s\\" STOCK_FOLDER, appData)) && Core_PathEquals(stock, dataDir);
-    if (p->isStock && pkg->found && Util_LocalAppData(localAppData, ARRAYSIZE(localAppData)))
+    if (Util_AppData(appData, ARRAYSIZE(appData)) && SUCCEEDED(StringCchPrintfW(stock, ARRAYSIZE(stock), L"%s\\" STOCK_FOLDER, appData)) &&
+        (Core_PathEquals(stock, dataDir) ||
+         (local && Core_MovedStockDir(localAppData, pkg->family, moved, ARRAYSIZE(moved)) && Core_PathEquals(moved, dataDir)))) {
+        p->isStock = TRUE;
+        StringCchCopyW(p->dataDir, ARRAYSIZE(p->dataDir), stock);
+        StringCchCopyW(p->folder, ARRAYSIZE(p->folder), STOCK_FOLDER);
+    }
+    if (p->isStock && local)
         Profiles_ResolveStorage(p, localAppData, pkg->family);
     else
         Profiles_ResolveStorage(p, NULL, NULL);

@@ -41,7 +41,7 @@ rem The tests link every object: one left from a renamed or deleted source must 
 del /q "%OUT%\obj\*.obj" "%OUT%\obj\app.res" "%OUT%\obj\%EXE_NAME%" >nul 2>&1
 
 set "CFLAGS=/nologo /W4 /WX /O2 /MT /GS /guard:cf /sdl /utf-8 /DUNICODE /D_UNICODE"
-set "LIBS=user32.lib gdi32.lib shell32.lib ole32.lib comctl32.lib advapi32.lib uuid.lib uxtheme.lib dwmapi.lib winhttp.lib oleaut32.lib wintrust.lib crypt32.lib windowscodecs.lib rstrtmgr.lib bcrypt.lib"
+set "LIBS=user32.lib gdi32.lib shell32.lib ole32.lib comctl32.lib advapi32.lib uuid.lib uxtheme.lib dwmapi.lib winhttp.lib oleaut32.lib wintrust.lib crypt32.lib windowscodecs.lib rstrtmgr.lib bcrypt.lib comdlg32.lib"
 
 pushd "%ROOT%src" || exit /b 1
 rc /nologo /fo "%OUT%\obj\app.res" app.rc
@@ -76,6 +76,13 @@ rem Pin entries, records and their commit, on private values and files.
 call :Test test_pin "" || exit /b 1
 rem Session storage and copies in private temporary fixtures.
 call :Test test_sessions "/MANIFEST:NO" "%OUT%\obj\app.res" || exit /b 1
+rem Backup history uses its own private state, including concurrent and failed writes.
+call :Test test_backuphistory "" || exit /b 1
+rem New local profile tools, private registry migration and snapshot fixtures.
+call :Test test_profiletools "" || exit /b 1
+call :Test test_operationhistory "" || exit /b 1
+call :Test test_sessiontools "" || exit /b 1
+call :Test test_presets "" || exit /b 1
 rem Update, installation, watcher, routing and removal failures, with private files and controlled callbacks.
 call :Test test_platform "" || exit /b 1
 rem Shortcut COM failures use private files without launching their targets.

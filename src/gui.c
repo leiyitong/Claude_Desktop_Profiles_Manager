@@ -12,6 +12,8 @@
  */
 #include "app.h"
 #include "resource.h"
+#include "profiletools.h"
+#include "operationhistory.h"
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shellapi.h>
@@ -51,6 +53,7 @@ typedef enum StatusAction { STATUS_ACTION_NONE, STATUS_ACTION_GET_CLAUDE } Statu
 typedef struct MainState {
     HWND         dlg;
     HWND         list;
+    WCHAR        profileSearch[128];
     ProfileList  profiles;
     ClaudePackage pkg;
     StatusAction statusAction;
@@ -83,6 +86,8 @@ typedef struct MainState {
     BOOL         selectionPending; /* WM_APP_SELECTION posted */
     BOOL         shortcutsCheckPending; /* WM_APP_SHORTCUTS_CHECK posted */
     BOOL         layoutReady, layingOut;
+    BOOL         profileSearchShown;
+    HHOOK        searchHook;
     HANDLE       shellWork;        /* the thread writing shortcuts and pins in a new language */
 } MainState;
 
@@ -96,13 +101,36 @@ static BOOL StateChangesBlocked(void)
     return g_manager.uninstalled || g_manager.uninstallInProgress || g_manager.closing;
 }
 
+/* Filtering changes row numbers; each row keeps the full list's index plus
+ * one, so a missing item's zero cannot stand for the stock profile. */
+static int ProfileIndexAtRow(int row)
+{
+    LPARAM value = row >= 0 ? Theme_RowParam(g_manager.list, row) : 0;
+    return value > 0 && value <= g_manager.profiles.count ? (int)value - 1 : -1;
+}
+
+static int VisibleProfileRow(int profile)
+{
+    int row, count = ListView_GetItemCount(g_manager.list);
+    if (profile < 0 || profile >= g_manager.profiles.count) return -1;
+    for (row = 0; row < count; row++)
+        if (ProfileIndexAtRow(row) == profile) return row;
+    return -1;
+}
+
+static BOOL ProfileMatchesSearch(const Profile *profile)
+{
+    return !g_manager.profileSearch[0] || Core_ContainsI(profile->name, g_manager.profileSearch) ||
+           Core_ContainsI(profile->folder, g_manager.profileSearch) || Core_ContainsI(profile->note, g_manager.profileSearch);
+}
+
 /* The profile selected alone: what Edit, Set as default and the shortcuts
  * act on; NULL when none or several are. */
 static const Profile *SelectedProfile(void)
 {
     int i;
     if (ListView_GetSelectedCount(g_manager.list) != 1) return NULL;
-    i = ListView_GetNextItem(g_manager.list, -1, LVNI_SELECTED);
+    i = ProfileIndexAtRow(ListView_GetNextItem(g_manager.list, -1, LVNI_SELECTED));
     return (i >= 0 && i < g_manager.profiles.count) ? &g_manager.profiles.items[i] : NULL;
 }
 
@@ -111,6 +139,7 @@ static const Profile *FocusedProfile(void)
 {
     int i = ListView_GetNextItem(g_manager.list, -1, LVNI_FOCUSED | LVNI_SELECTED);
     if (i < 0) i = ListView_GetNextItem(g_manager.list, -1, LVNI_SELECTED);
+    i = ProfileIndexAtRow(i);
     return (i >= 0 && i < g_manager.profiles.count) ? &g_manager.profiles.items[i] : NULL;
 }
 
@@ -119,9 +148,10 @@ static const Profile *FocusedProfile(void)
 static DWORD SelectedProfiles(void)
 {
     DWORD bits = 0;
-    int i = -1, next;
-    while ((next = ListView_GetNextItem(g_manager.list, i, LVNI_SELECTED)) > i && next < g_manager.profiles.count) {
-        bits |= 1u << next;
+    int i = -1, next, profile;
+    while ((next = ListView_GetNextItem(g_manager.list, i, LVNI_SELECTED)) > i) {
+        profile = ProfileIndexAtRow(next);
+        if (profile >= 0) bits |= 1u << profile;
         i = next;
     }
     return bits;
@@ -257,14 +287,21 @@ static const WCHAR *SessionsFolderText(int i, WCHAR *text, size_t cch)
 static void UpdateRow(int i)
 {
     const Profile *p = &g_manager.profiles.items[i];
-    WCHAR text[MAX_PATH];
-    ListView_SetItemText(g_manager.list, i, 0, (LPWSTR)p->name);
-    ListView_SetItemText(g_manager.list, i, 1,
+    WCHAR text[MAX_PATH], label[LABEL_CCH + 260];
+    int row = VisibleProfileRow(i);
+    if (row < 0) return;
+    if (p->note[0]) StringCchPrintfW(label, ARRAYSIZE(label), L"%s \x2014 %s", p->name, p->note);
+    else StringCchCopyW(label, ARRAYSIZE(label), p->name);
+    ListView_SetItemText(g_manager.list, row, 0, label);
+    ListView_SetItemText(g_manager.list, row, 1,
                          (LPWSTR)TR(Theme_ProfileRole(p->isStock, Core_EqualsI(p->folder, g_manager.profiles.defaultFolder))));
-    StringCchPrintfW(text, ARRAYSIZE(text), L"%%APPDATA%%\\%s", p->folder);
-    ListView_SetItemText(g_manager.list, i, 2, text);
-    ListView_SetItemText(g_manager.list, i, 3, (LPWSTR)SessionsFolderText(i, text, ARRAYSIZE(text)));
-    ListView_SetItemText(g_manager.list, i, PROFILE_COLUMN_STATE, (LPWSTR)TR(Theme_ProfileState(p->running)));
+    if (p->formerDir[0] && wcsrchr(p->dataDir, L'\\'))   /* moved out of Claude's package by Claude */
+        StringCchPrintfW(text, ARRAYSIZE(text), L"%%LOCALAPPDATA%%\\" CLAUDE_MOVED_DATA L"%s", wcsrchr(p->dataDir, L'\\'));
+    else
+        StringCchPrintfW(text, ARRAYSIZE(text), L"%%APPDATA%%\\%s", p->folder);
+    ListView_SetItemText(g_manager.list, row, 2, text);
+    ListView_SetItemText(g_manager.list, row, 3, (LPWSTR)SessionsFolderText(i, text, ARRAYSIZE(text)));
+    ListView_SetItemText(g_manager.list, row, PROFILE_COLUMN_STATE, (LPWSTR)TR(Theme_ProfileState(p->running)));
 }
 
 static int IconPixels(void)
@@ -371,12 +408,24 @@ static void TakeSelection(ListSelection *selection)
             StringCchCopyW(selection->folders[selection->count++], ARRAYSIZE(selection->folders[0]), g_manager.profiles.items[i].folder);
 }
 
+/* A filtered-out focused row must not add an unrelated first row when
+ * another member of the old selection remains visible. */
+static const WCHAR *VisibleSelectionFolder(const ListSelection *selection)
+{
+    int i;
+    if (!selection) return NULL;
+    if (VisibleProfileRow(Profiles_Find(&g_manager.profiles, selection->focused)) >= 0) return selection->focused;
+    for (i = 0; i < selection->count; i++)
+        if (VisibleProfileRow(Profiles_Find(&g_manager.profiles, selection->folders[i])) >= 0) return selection->folders[i];
+    return selection->focused;
+}
+
 /* Selects the row of `folder` alone, else the first one: its index, -1 in
  * an empty list. */
 static int SetSelectedRow(const WCHAR *folder)
 {
-    int row = Profiles_Find(&g_manager.profiles, folder);
-    if (row < 0 && g_manager.profiles.count > 0) row = 0;
+    int row = VisibleProfileRow(Profiles_Find(&g_manager.profiles, folder));
+    if (row < 0 && ListView_GetItemCount(g_manager.list) > 0) row = 0;
     ListView_SetItemState(g_manager.list, -1, 0, LVIS_SELECTED);
     if (row >= 0) ListView_SetItemState(g_manager.list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     return row;
@@ -385,7 +434,11 @@ static int SetSelectedRow(const WCHAR *folder)
 /* The program moves the selection: the row comes into sight. */
 static void SelectProfileRow(const WCHAR *folder)
 {
-    int row = SetSelectedRow(folder);
+    int row;
+    if (g_manager.profileSearch[0] && Profiles_Find(&g_manager.profiles, folder) >= 0 &&
+        VisibleProfileRow(Profiles_Find(&g_manager.profiles, folder)) < 0)
+        SetDlgItemTextW(g_manager.dlg, IDC_PROFILE_SEARCH, L"");
+    row = SetSelectedRow(folder);
     if (row >= 0) ListView_EnsureVisible(g_manager.list, row, FALSE);
 }
 
@@ -403,17 +456,20 @@ static void FillList(const ListSelection *selection)
     ListView_DeleteAllItems(g_manager.list);
     RebuildImages(rowImages);
     for (i = 0; i < g_manager.profiles.count; i++) {
+        if (!ProfileMatchesSearch(&g_manager.profiles.items[i])) continue;
         ZeroMemory(&item, sizeof item);
-        item.mask = LVIF_TEXT | LVIF_IMAGE;
-        item.iItem = i;
+        item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
+        item.iItem = ListView_GetItemCount(g_manager.list);
+        item.lParam = i + 1;
         item.iImage = rowImages[i];
         item.pszText = g_manager.profiles.items[i].name;
         ListView_InsertItem(g_manager.list, &item);
         UpdateRow(i);
     }
+    select = VisibleSelectionFolder(selection);
     row = SetSelectedRow(select);
     for (i = 0; selection && i < selection->count; i++)
-        if ((other = Profiles_Find(&g_manager.profiles, selection->folders[i])) >= 0 && other != row)
+        if ((other = VisibleProfileRow(Profiles_Find(&g_manager.profiles, selection->folders[i]))) >= 0 && other != row)
             ListView_SetItemState(g_manager.list, other, LVIS_SELECTED, LVIS_SELECTED);
     SendMessageW(g_manager.list, WM_SETREDRAW, TRUE, 0);
     if (selectionMoved && row >= 0) ListView_EnsureVisible(g_manager.list, row, FALSE);
@@ -432,7 +488,7 @@ static BOOL SameProfileRows(const ProfileList *a, const ProfileList *b)
     for (i = 0; i < a->count; i++) {
         if (!Core_EqualsI(a->items[i].folder, b->items[i].folder) || wcscmp(a->items[i].name, b->items[i].name) != 0 ||
             a->items[i].color != b->items[i].color || wcscmp(a->items[i].badge, b->items[i].badge) != 0 ||
-            a->items[i].picture != b->items[i].picture)
+            a->items[i].picture != b->items[i].picture || wcscmp(a->items[i].note, b->items[i].note) != 0)
             return FALSE;
     }
     return TRUE;
@@ -597,6 +653,7 @@ static void Refresh(BOOL rescanPackage)
     if (!StateChangesBlocked()) SessionsView_Ready(TRUE);
     UpdateStatus();
     WatchRunningProfiles();
+    ProfileTools_SnapshotEvent(&g_manager.profiles);
 }
 
 /* What changed shows at once, before work that keeps the window from
@@ -657,6 +714,7 @@ typedef struct ProfileDialog {
     int            color;
     WCHAR          badge[BADGE_CCH];   /* once closed: the badge's own text, empty for the initial */
     WCHAR          windowTitle[WINDOW_TITLE_CCH];   /* once closed: its windows' title, empty for the default */
+    WCHAR          note[256];
     DWORD         *picture;            /* the picture shown, NULL for the Claude icon; the caller frees it */
     BOOL           pictureChanged;     /* chosen or removed in the dialog */
     BOOL           badgeOwn;           /* the badge shows text the user typed, not the initial */
@@ -758,11 +816,11 @@ static void FollowName(HWND dialog, ProfileDialog *state)
     state->filling = FALSE;
 }
 
-/* With a picture, the icon has no badge to write in: the badge box rests,
- * and the picture can be removed. */
+/* A picture takes precedence over the badge. The badge stays editable for
+ * when the user removes the picture. */
 static void ShowPictureState(HWND dialog, const ProfileDialog *state)
 {
-    EnableWindow(GetDlgItem(dialog, IDC_P_BADGE), state->picture == NULL);
+    EnableWindow(GetDlgItem(dialog, IDC_P_BADGE), TRUE);
     EnableWindow(GetDlgItem(dialog, IDC_P_NO_PICTURE), state->picture != NULL);
 }
 
@@ -991,7 +1049,7 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
             /* Several profiles: what they share, their sessions; the rows of the rest close (Theme_FitDialog). */
             static const int kOwn[] = { IDC_P_NAME_LABEL, IDC_P_NAME, IDC_P_COLOR_LABEL, IDC_P_COLOR, IDC_P_PREVIEW, IDC_P_BADGE_LABEL,
                                         IDC_P_BADGE, IDC_P_PICTURE, IDC_P_NO_PICTURE, IDC_P_TITLE_LABEL, IDC_P_TITLE, IDC_P_STARTUP,
-                                        IDC_P_COPY, IDC_P_OPEN, IDC_P_ERROR };
+                                        IDC_P_COPY, IDC_P_OPEN, IDC_P_ERROR, IDC_P_NOTE_LABEL, IDC_P_NOTE };
             size_t own;
             for (own = 0; own < ARRAYSIZE(kOwn); own++) ShowWindow(GetDlgItem(dialog, kOwn[own]), SW_HIDE);
             ValidateProfileDialog(dialog, state, FALSE);
@@ -1001,9 +1059,11 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
         SendDlgItemMessageW(dialog, IDC_P_NAME, EM_LIMITTEXT, state->existing ? MAX_LABEL : MAX_NAME, 0);
         SendDlgItemMessageW(dialog, IDC_P_BADGE, EM_LIMITTEXT, 2 * MAX_BADGE, 0);   /* surrogate pairs too */
         SendDlgItemMessageW(dialog, IDC_P_TITLE, EM_LIMITTEXT, WINDOW_TITLE_CCH - 1, 0);
+        SendDlgItemMessageW(dialog, IDC_P_NOTE, EM_LIMITTEXT, ARRAYSIZE(state->note) - 1, 0);
         FillColors(dialog, state);
         if (state->existing) SetDlgItemTextW(dialog, IDC_P_NAME, state->existing->name);
         if (state->existing) SetDlgItemTextW(dialog, IDC_P_TITLE, state->existing->windowTitle);
+        if (state->existing) SetDlgItemTextW(dialog, IDC_P_NOTE, state->existing->note);
         ShowDefaultTitle(dialog);
         state->badgeOwn = state->existing && state->existing->badge[0];
         if (state->badgeOwn) {
@@ -1086,6 +1146,7 @@ static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM
             state->color = ChosenColor(dialog, state);
             ChosenBadge(dialog, state, state->name, state->badge, ARRAYSIZE(state->badge));
             GetDlgItemTextW(dialog, IDC_P_TITLE, state->windowTitle, ARRAYSIZE(state->windowTitle));
+            GetDlgItemTextW(dialog, IDC_P_NOTE, state->note, ARRAYSIZE(state->note));
             state->openNow = IsDlgButtonChecked(dialog, IDC_P_OPEN) == BST_CHECKED;
             state->startup = IsDlgButtonChecked(dialog, IDC_P_STARTUP) == BST_CHECKED;
             state->copy = !state->existing && state->copyFrom && IsDlgButtonChecked(dialog, IDC_P_COPY) == BST_CHECKED;
@@ -1241,6 +1302,12 @@ typedef enum JobKind {
     JOB_KEEP    /* the manager opened, or was repaired: only what failed is said */
 } JobKind;
 
+typedef struct JobProfileResult {
+    BOOL quitTried, openTried, alreadyClosed, alreadyRunning;
+    DWORD quitError;
+    HRESULT openError;
+} JobProfileResult;
+
 typedef struct Job {
     HWND          dialog;
     JobKind       kind;
@@ -1248,9 +1315,7 @@ typedef struct Job {
     ProfileList   profiles;
     DWORD         chosen;      /* the profiles it is for */
     DWORD         notQuit;     /* ... whose Claude could not be closed */
-    DWORD         quitError;
-    int           notOpened;
-    HRESULT       openError;   /* the first start that failed */
+    JobProfileResult results[MAX_PROFILES];
     SyncReport    report;
 } Job;
 
@@ -1269,12 +1334,19 @@ static DWORD WINAPI JobThread(void *parameter)
     if (job->kind == JOB_QUIT || job->kind == JOB_RESTART)
         for (i = 0; i < job->profiles.count; i++) {
             const Profile *p = &job->profiles.items[i];
+            JobProfileResult *result = &job->results[i];
             DWORD error = ERROR_SUCCESS;
-            if (!(job->chosen & (1u << i)) || !Claude_IsRunning(p)) continue;
+            if (!(job->chosen & (1u << i))) continue;
+            if (!Claude_IsRunning(p)) {
+                result->alreadyClosed = TRUE;
+                if (job->kind == JOB_QUIT) synced &= ~(1u << i);
+                continue;
+            }
+            result->quitTried = TRUE;
             Taskbar_QuitComing(p);
             if (!Claude_Quit(p, &error)) {
                 job->notQuit |= 1u << i;
-                if (!job->quitError) job->quitError = error;
+                result->quitError = error ? error : ERROR_GEN_FAILURE;
             }
         }
     /* Opened: one open already only comes forward, its sessions as they are. */
@@ -1286,15 +1358,18 @@ static DWORD WINAPI JobThread(void *parameter)
     if (job->kind == JOB_OPEN || job->kind == JOB_RESTART)
         for (i = 0; i < job->profiles.count; i++) {
             BOOL identity = FALSE;
+            JobProfileResult *result = &job->results[i];
             HRESULT hr;
             if (!(job->chosen & (1u << i)) || (job->notQuit & (1u << i))) continue;
+            result->alreadyRunning = Claude_IsRunning(&job->profiles.items[i]);
+            result->openTried = TRUE;
             hr = Launcher_OpenSynced(&job->pkg, &job->profiles.items[i], NULL, &identity);
-            if (FAILED(hr)) {
-                if (!job->notOpened++) job->openError = hr;
-            } else {
+            result->openError = hr;
+            if (SUCCEEDED(hr)) {
                 Util_Log(L"opened %s from the manager%s", job->profiles.items[i].folder, identity ? L"" : L" without package identity");
             }
         }
+    ProfileTools_SnapshotEvent(&job->profiles);
     if (SUCCEEDED(com)) CoUninitialize();
     if (!PostMessageW(job->dialog, WM_APP_JOB_DONE, 0, (LPARAM)job)) HeapFree(GetProcessHeap(), 0, job);
     return 0;
@@ -1363,10 +1438,50 @@ static void RunJob(JobKind kind, DWORD chosen)
     UpdateButtons();
 }
 
+static void FormatJobResult(const Job *job, int index, WCHAR *text, size_t cch)
+{
+    const JobProfileResult *result = &job->results[index];
+    WCHAR line[256];
+    text[0] = 0;
+    if (job->kind == JOB_QUIT || job->kind == JOB_RESTART) {
+        if (result->alreadyClosed) StringCchCopyW(line, ARRAYSIZE(line), TR(L"Quit: already closed"));
+        else if (result->quitError == ERROR_CANCELLED) StringCchCopyW(line, ARRAYSIZE(line), TR(L"Quit: cancelled"));
+        else if (result->quitError)
+            StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Quit: failed (error %lu, 0x%08lX)"), result->quitError,
+                             (unsigned long)HRESULT_FROM_WIN32(result->quitError));
+        else if (result->quitTried) StringCchCopyW(line, ARRAYSIZE(line), TR(L"Quit: completed"));
+        else StringCchCopyW(line, ARRAYSIZE(line), TR(L"Quit: not attempted"));
+        StringCchCatW(text, cch, line);
+    }
+    if (job->kind == JOB_OPEN || job->kind == JOB_RESTART) {
+        if (text[0]) StringCchCatW(text, cch, L"\r\n");
+        if (!result->openTried) StringCchCopyW(line, ARRAYSIZE(line), TR(L"Open: skipped because quitting failed"));
+        else if (result->openError == HRESULT_FROM_WIN32(ERROR_CANCELLED)) StringCchCopyW(line, ARRAYSIZE(line), TR(L"Open: cancelled"));
+        else if (FAILED(result->openError))
+            StringCchPrintfW(line, ARRAYSIZE(line), TR(L"Open: failed (error 0x%08lX)"), (unsigned long)result->openError);
+        else StringCchCopyW(line, ARRAYSIZE(line), result->alreadyRunning ? TR(L"Open: already running, brought forward") : TR(L"Open: completed"));
+        StringCchCatW(text, cch, line);
+    }
+}
+
+static void ShowJobFailure(const Job *job)
+{
+    WCHAR outcome[512];
+    int i;
+    for (i = 0; i < job->profiles.count; i++) {
+        const JobProfileResult *result = &job->results[i];
+        if (!(job->chosen & (1u << i))) continue;
+        if ((!result->quitError || result->quitError == ERROR_CANCELLED) &&
+            (!result->openTried || SUCCEEDED(result->openError) || result->openError == HRESULT_FROM_WIN32(ERROR_CANCELLED))) continue;
+        FormatJobResult(job, i, outcome, ARRAYSIZE(outcome));
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s\n%s", job->profiles.items[i].name, outcome);
+        break;
+    }
+}
+
 /* What a job left undone is said; a sync asked for says what it did. */
 static void JobDone(Job *job)
 {
-    WCHAR names[MAX_PROFILES * (LABEL_CCH + 8)];
     if (g_manager.job) {
         WaitForSingleObject(g_manager.job, JOB_END_WAIT_MS);   /* it ends right after posting */
         CloseHandle(g_manager.job);
@@ -1377,12 +1492,7 @@ static void JobDone(Job *job)
         Refresh(FALSE);
         SessionsView_Reload();
         UpdateButtons();
-        if (job->notQuit) {
-            JoinNames(job->notQuit, names, ARRAYSIZE(names));
-            Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"Claude for \x201C%s\x201D could not be closed (error %lu)."), names, job->quitError);
-        }
-        if (job->notOpened)
-            Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"Claude could not be started (error 0x%08lX)."), (unsigned long)job->openError);
+        if (job->kind == JOB_OPEN || job->kind == JOB_QUIT || job->kind == JOB_RESTART) ShowJobFailure(job);
         if (job->kind == JOB_SYNC || job->report.failed || job->report.forked)
             SyncUi_ShowReport(g_manager.dlg, &job->profiles, &job->report, NULL);
     }
@@ -1420,9 +1530,7 @@ static void DoQuit(BOOL restart)
     WCHAR text[512 + MAX_PROFILES * (LABEL_CCH + 8)], names[MAX_PROFILES * (LABEL_CCH + 8)];
     DWORD selected = SelectedProfiles(), running = RunningOf(selected);
     if (!running) {
-        const Profile *p = FocusedProfile();
-        if (restart) RunJob(JOB_RESTART, selected);
-        else if (p) Ui_Message(g_manager.dlg, MB_ICONINFORMATION, TR(L"Claude is not open for \x201C%s\x201D."), p->name);
+        RunJob(restart ? JOB_RESTART : JOB_QUIT, selected);
         return;
     }
     JoinNames(running, names, ARRAYSIZE(names));
@@ -1431,7 +1539,7 @@ static void DoQuit(BOOL restart)
                              : TR(L"Quit Claude for %s?\n\nIts windows and running sessions close."),
                      names);
     if (!Ui_Ask(g_manager.dlg, IDI_QUESTION, text, restart ? TR(L"Restart") : TR(L"Quit"), TR(L"Cancel"), FALSE)) return;
-    RunJob(restart ? JOB_RESTART : JOB_QUIT, restart ? selected : running);
+    RunJob(restart ? JOB_RESTART : JOB_QUIT, selected);
 }
 
 /* ----------------------------------------------------- sessions kept the same */
@@ -1546,6 +1654,8 @@ static void DoNew(void)
     if (dialog.picture) HeapFree(GetProcessHeap(), 0, dialog.picture);
     if (dialog.windowTitle[0] && !Profiles_SetWindowTitle(folder, dialog.windowTitle))
         Util_Log(L"could not save the window title of %s (error %lu)", folder, GetLastError());
+    if (dialog.note[0] && !Profiles_SetNote(folder, dialog.note))
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The profile notes could not be saved."));
     Refresh(FALSE);
     i = Profiles_Find(&g_manager.profiles, folder);
     if (i < 0) {
@@ -1676,6 +1786,8 @@ static void DoEdit(void)
     if (!picture && before.picture) Icons_DeletePicture(before.folder);
     if (wcscmp(before.windowTitle, dialog.windowTitle) != 0 && !Profiles_SetWindowTitle(before.folder, dialog.windowTitle))
         Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The window title could not be saved."));
+    if (wcscmp(before.note, dialog.note) != 0 && !Profiles_SetNote(before.folder, dialog.note))
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The profile notes could not be saved."));
     after = before;
     StringCchCopyW(after.name, ARRAYSIZE(after.name), dialog.name);
     after.color = dialog.color;
@@ -1695,6 +1807,37 @@ static void DoEdit(void)
     UpdateButtons();
     StringCchCopyW(folder[0], FOLDER_CCH, before.folder);
     ApplySessionsChoice(folder, 1, dialog.sync, dialog.syncFolder, dialog.syncItems);
+}
+
+/* Every tools entry point uses the ordinary profile-edit refresh path. Pins
+ * remain owned by ApplyBadge/taskbar-pin.c, including in-place rename notices. */
+void Gui_ProfileTools(HWND owner, const ProfileList *profiles, const WCHAR *selectedFolder)
+{
+    ProfileList *before;
+    int i;
+    if (!profiles || (g_manager.dlg && (StateChangesBlocked() || g_manager.job))) return;
+    before = (ProfileList *)HeapAlloc(GetProcessHeap(), 0, sizeof *before);
+    if (!before) return;
+    *before = *profiles;
+    ProfileTools_Show(owner, before, selectedFolder);
+    if (!g_manager.dlg) { HeapFree(GetProcessHeap(), 0, before); return; }
+    Refresh(FALSE);
+    ShowChanges();
+    for (i = 0; i < before->count; i++) {
+        const Profile *old = &before->items[i];
+        int index = Profiles_Find(&g_manager.profiles, old->folder);
+        if (index >= 0) {
+            const Profile *after = &g_manager.profiles.items[index];
+            WCHAR icon[MAX_PATH];
+            BOOL renamed = wcscmp(old->name, after->name) != 0;
+            BOOL appearance = renamed || old->color != after->color || wcscmp(old->badge, after->badge) != 0 || old->picture != after->picture;
+            if (appearance && Icons_Ensure(&g_manager.pkg, after, icon, ARRAYSIZE(icon))) ApplyBadge(old, after, icon);
+            if (renamed || wcscmp(old->windowTitle, after->windowTitle) != 0) Taskbar_Refresh(after, FALSE);
+        }
+    }
+    g_manager.shortcutStateFolder[0] = 0;
+    UpdateButtons();
+    HeapFree(GetProcessHeap(), 0, before);
 }
 
 static BOOL ConfirmDelete(const Profile *p)
@@ -2190,7 +2333,7 @@ static INT_PTR CALLBACK BackupHubProc(HWND dialog, UINT message, WPARAM wp, LPAR
             Util_SetSetting(SETTING_WEEKLY_BACKUP, IsDlgButtonChecked(dialog, IDC_H_WEEKLY) == BST_CHECKED);
             return TRUE;
         }
-        if (LOWORD(wp) >= IDC_H_BACKUP && LOWORD(wp) <= IDC_H_CODE && HIWORD(wp) == BN_CLICKED) {
+        if (((LOWORD(wp) >= IDC_H_BACKUP && LOWORD(wp) <= IDC_H_CODE) || LOWORD(wp) == IDC_H_HISTORY || LOWORD(wp) == IDM_PROFILE_TOOLS) && HIWORD(wp) == BN_CLICKED) {
             hub->chosen = LOWORD(wp);
             EndDialog(dialog, IDOK);
             return TRUE;
@@ -2220,6 +2363,9 @@ static void DoBackupHub(void)
     case IDC_H_RECOVER: DoSessions(SESSIONS_RESTORE); break;
     case IDC_H_PURGE:   DoSessions(SESSIONS_PURGE); break;
     case IDC_H_CODE:    SyncUi_BackUpCode(g_manager.dlg); break;
+    case IDC_H_HISTORY: BackupHistory_Show(g_manager.dlg); break;
+    case IDC_H_VALIDATE: Backup_ValidateArchive(g_manager.dlg, NULL); break;
+    case IDM_PROFILE_TOOLS: Gui_ProfileTools(g_manager.dlg, &g_manager.profiles, hub.profile ? hub.profile->folder : NULL); break;
     }
 }
 
@@ -2255,6 +2401,7 @@ static void ListMenu(LPARAM pos)
     AppendMenuW(menu, MF_STRING | (selected && g_manager.pkg.found && idle ? 0 : MF_GRAYED), IDC_OPEN, TR(Theme_MainCaption(IDC_OPEN, 0)));
     AppendMenuW(menu, MF_STRING | (RunningOf(selected) && idle ? 0 : MF_GRAYED), IDC_STOP, TR(Theme_MainCaption(IDC_STOP, 0)));
     AppendMenuW(menu, MF_STRING | (selected && g_manager.pkg.found && idle ? 0 : MF_GRAYED), IDC_RESTART, TR(Theme_MainCaption(IDC_RESTART, 0)));
+    AppendMenuW(menu, MF_STRING | (one && idle ? 0 : MF_GRAYED), IDC_PRIVATE_SIGNIN, TR(L"Private sign-in\x2026"));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDC_EDIT, TR(Theme_MainCaption(IDC_EDIT, 0)));
     AppendMenuW(menu, MF_STRING | (Deletable(selected) ? 0 : MF_GRAYED), IDC_DELETE, TR(Theme_MainCaption(IDC_DELETE, 0)));
@@ -2270,6 +2417,7 @@ static void ListMenu(LPARAM pos)
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (selected ? 0 : MF_GRAYED), IDM_LIST_BACKUP, TR(L"&Back up\x2026"));
     AppendMenuW(menu, MF_STRING | (one ? 0 : MF_GRAYED), IDM_LIST_RESTORE, TR(L"Restore from back&up\x2026"));
+    AppendMenuW(menu, MF_STRING | (idle ? 0 : MF_GRAYED), IDM_PROFILE_TOOLS, TR(L"Local profile tools\x2026"));
     cmd = Theme_TrackMenu(g_manager.list, menu, &at);
     DestroyMenu(menu);
     MenuCommand(cmd);
@@ -2278,7 +2426,31 @@ static void ListMenu(LPARAM pos)
 /* The profiles and the sessions share the window: Sessions view swaps them,
  * and becomes "< Back" in the same place. The toolbar stays: in the
  * sessions view it acts on the profile shown. */
-static const int kProfileControls[] = { IDC_LIST, IDC_SYNC, IDC_BACKUP, IDC_REPAIR, IDC_NOTE };
+static const int kProfileControls[] = { IDC_PROFILE_FIND, IDC_LIST, IDC_SYNC, IDC_BACKUP, IDC_REPAIR, IDC_NOTE };
+
+static void ShowProfileSearch(HWND dialog, BOOL show)
+{
+    g_manager.profileSearchShown = show;
+    if (!show) {
+        FocusView(dialog, FALSE);
+        SetDlgItemTextW(dialog, IDC_PROFILE_SEARCH, L"");
+    }
+    ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), show ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH), show ? SW_SHOW : SW_HIDE);
+    Theme_LayoutMain(dialog);
+    if (show) {
+        SetFocus(GetDlgItem(dialog, IDC_PROFILE_SEARCH));
+        SendDlgItemMessageW(dialog, IDC_PROFILE_SEARCH, EM_SETSEL, 0, -1);
+    }
+}
+
+static void FocusSearch(HWND dialog, BOOL reveal)
+{
+    if (SessionsView_Shown()) {
+        SetFocus(GetDlgItem(dialog, IDC_S_SEARCH));
+        SendDlgItemMessageW(dialog, IDC_S_SEARCH, EM_SETSEL, 0, -1);
+    } else ShowProfileSearch(dialog, reveal || !g_manager.profileSearchShown);
+}
 
 static const WCHAR *SessionsButtonCaption(BOOL sessionsShown)
 {
@@ -2293,8 +2465,12 @@ void Gui_ShowSessions(HWND dialog, const ClaudePackage *package, BOOL showSessio
         SessionsView_Enter(package, folder);
         FocusView(dialog, TRUE);
         for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
+        ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), SW_HIDE);
+        ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH), SW_HIDE);
     } else {
         for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_SHOW);
+        ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), g_manager.profileSearchShown ? SW_SHOW : SW_HIDE);
+        ShowWindow(GetDlgItem(dialog, IDC_PROFILE_SEARCH), g_manager.profileSearchShown ? SW_SHOW : SW_HIDE);
         FocusView(dialog, FALSE);
         SessionsView_Leave();
     }
@@ -3020,6 +3196,7 @@ static void DoLanguage(int choice)
     Localize_Window(g_manager.dlg);
     Theme_Apply(g_manager.dlg);
     SetColumnTitles();
+    SendDlgItemMessageW(g_manager.dlg, IDC_PROFILE_SEARCH, EM_SETCUEBANNER, TRUE, (LPARAM)TR(L"Name, folder or notes"));
     SetTextIfChanged(IDC_SESSIONS, SessionsButtonCaption(SessionsView_Shown()));
     /* The registry watch reloads the profiles after the write: only the texts change here. */
     UpdateRowsAndButtons();
@@ -3184,13 +3361,30 @@ BOOL Gui_MainWindowGeometry(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
     return FALSE;
 }
 
+/* DialogBox owns the message loop; its filter sees Ctrl+F from every main-window control. */
+static LRESULT CALLBACK SearchShortcut(int code, WPARAM wp, LPARAM lp)
+{
+    const MSG *message = (const MSG *)lp;
+    if (code == MSGF_DIALOGBOX && message->message == WM_KEYDOWN && message->wParam == 'F' &&
+        GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_MENU) >= 0 && g_manager.dlg &&
+        GetAncestor(message->hwnd, GA_ROOT) == g_manager.dlg && IsWindowEnabled(g_manager.dlg)) {
+        FocusSearch(g_manager.dlg, TRUE);
+        return 1;
+    }
+    return CallNextHookEx(g_manager.searchHook, code, wp, lp);
+}
+
 static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
     switch (message) {
     case WM_INITDIALOG:
         g_manager.dlg = dialog;
+        g_manager.profileSearchShown = FALSE;
+        g_manager.searchHook = SetWindowsHookExW(WH_MSGFILTER, SearchShortcut, NULL, GetCurrentThreadId());
         Localize_Window(dialog);
         g_manager.list = GetDlgItem(dialog, IDC_LIST);
+        SendDlgItemMessageW(dialog, IDC_PROFILE_SEARCH, EM_LIMITTEXT, ARRAYSIZE(g_manager.profileSearch) - 1, 0);
+        SendDlgItemMessageW(dialog, IDC_PROFILE_SEARCH, EM_SETCUEBANNER, TRUE, (LPARAM)TR(L"Name, folder or notes"));
         SetIcons(dialog);
         ListView_SetExtendedListViewStyle(g_manager.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
         AddColumns();
@@ -3342,12 +3536,29 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
             return TRUE;
         }
         switch (LOWORD(wp)) {
+        case IDC_PROFILE_FIND:
+            FocusSearch(dialog, FALSE);
+            return TRUE;
+        case IDC_PROFILE_SEARCH:
+            if (HIWORD(wp) == EN_CHANGE && g_manager.list) {
+                ListSelection selection;
+                TakeSelection(&selection);
+                GetDlgItemTextW(dialog, IDC_PROFILE_SEARCH, g_manager.profileSearch, ARRAYSIZE(g_manager.profileSearch));
+                FillList(&selection);
+            }
+            return TRUE;
         case IDC_OPEN:          DoOpen(); return TRUE;
         case IDC_STOP:          DoQuit(FALSE); return TRUE;
         case IDC_RESTART:       DoQuit(TRUE); return TRUE;
+        case IDC_PRIVATE_SIGNIN:
+            if (!StateChangesBlocked() && !g_manager.job && SelectedProfile()) SignIn_Open(dialog, SelectedProfile());
+            return TRUE;
         case IDC_SYNC_NOW:      if (ConfirmSync(SelectedProfiles())) RunJob(JOB_SYNC, SelectedProfiles()); return TRUE;
         case IDC_SYNC:          DoSyncSetup(); return TRUE;
         case IDC_BACKUP:        DoBackupHub(); return TRUE;
+        case IDM_PROFILE_TOOLS:
+            if (!StateChangesBlocked() && !g_manager.job) { Gui_ProfileTools(dialog, &g_manager.profiles, SelectedProfile() ? SelectedProfile()->folder : NULL); }
+            return TRUE;
         case IDC_REPAIR:        DoRepair(); return TRUE;
         case IDC_SHORTCUTS:     ShortcutsMenu(); return TRUE;
         case IDC_SETTINGS:      Settings_Show(g_manager.dlg, DoLanguage); return TRUE;
@@ -3370,7 +3581,8 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
             /* Esc clears a search box that holds text, and never closes the
              * window: its close box, Alt+F4 and the tray do (WM_CLOSE), so a
              * key pressed by mistake cannot quit the manager. */
-            SessionsView_ClearSearch();
+            if (SessionsView_Shown()) SessionsView_ClearSearch();
+            else if (g_manager.profileSearchShown) ShowProfileSearch(dialog, FALSE);
             return TRUE;
         }
         if (SessionsView_Command(wp)) return TRUE;
@@ -3526,6 +3738,8 @@ static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
 
     case WM_DESTROY:
         g_manager.layoutReady = FALSE;
+        if (g_manager.searchHook) UnhookWindowsHookEx(g_manager.searchHook);
+        g_manager.searchHook = NULL;
         FinishShellWork();
         Localize_ForgetWindow(dialog);
         StopWatchingOutside();

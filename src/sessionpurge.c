@@ -20,6 +20,7 @@
  * itself as <name>_auto_<date>, and only the two latest such copies stay.
  */
 #include "app.h"
+#include "vaulttools.h"
 #include <objbase.h>
 #include <shellapi.h>
 #include <stdlib.h>
@@ -152,13 +153,23 @@ int SessionPurge_List(const ProfileList *profiles, PurgeItem **items, WCHAR *err
     ProfileList now = *profiles;
     ULONGLONG recent = NowMs() - PURGE_RECENT_HOURS * HOUR_MS;
     int count = 0, capacity = 0, i, p;
+    BOOL complete = TRUE;
     *items = NULL;
     error[0] = 0;
     if (!SessionStore_LoadProfiles(&set, profiles)) {
         StringCchCopyW(error, errorCch, TR(L"Sessions could not be loaded."));
         return -1;
     }
-    SessionVault_Ids(&listed, &deleted);
+    for (p = 0; p < set.profiles.count; p++)
+        if (!set.source[p].complete) complete = FALSE;
+    if (!SessionVault_Ids(&listed, &deleted)) complete = FALSE;
+    if (!complete) {
+        SessionVault_FreeIds(&listed);
+        SessionVault_FreeIds(&deleted);
+        SessionStore_Free(&set);
+        StringCchCopyW(error, errorCch, TR(L"Sessions could not be loaded."));
+        return -1;
+    }
     AddMarks(&set, &deleted);
     Claude_UpdateRunning(&now);
     if (SessionStore_ProjectsDir(projects, ARRAYSIZE(projects)) &&
@@ -241,16 +252,56 @@ RemoveResult SessionPurge_Delete(HWND owner, const ProfileList *profiles, const 
     WCHAR (*paths)[LONG_PATH_CCH] = NULL;
     const WCHAR **ids, **list = NULL;
     ProfileList now = *profiles;
+    SessionSet set;
+    VaultIds listed, marks;
+    HANDLE lock;
     RemoveResult result = REMOVE_FAILED;
     int i, idCount = 0, pathCount = 0;
+    BOOL complete = TRUE;
     *deleted = 0;
     error[0] = 0;
     if (count <= 0) return REMOVE_DONE;
     if ((ids = (const WCHAR **)HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof *ids)) == NULL) return REMOVE_FAILED;
+    if ((lock = Util_SyncLock()) == NULL) {
+        Free((void *)ids);
+        return REMOVE_FAILED;
+    }
+    /* The dialog can stay open while a session is restored or synced. Read
+     * its references again under the same lock as those writers. */
+    ZeroMemory(&listed, sizeof listed);
+    ZeroMemory(&marks, sizeof marks);
+    if (!SessionStore_LoadProfiles(&set, profiles)) complete = FALSE;
+    if (complete)
+        for (i = 0; i < set.profiles.count; i++)
+            if (!set.source[i].complete) complete = FALSE;
+    if (!SessionVault_Ids(&listed, &marks)) complete = FALSE;
+    if (!complete) {
+        StringCchCopyW(error, errorCch, TR(L"Sessions could not be loaded."));
+        goto done;
+    }
+    for (i = 0; i < set.profiles.count; i++) {
+        SyncOp *ops = NULL;
+        int k, queued = SessionSync_Queued(&set.profiles.items[i], &ops);
+        BOOL pending = FALSE;
+        for (k = 0; k < queued; k++)
+            if (ops[k].kind == SYNC_PUT) pending = TRUE;
+        Free(ops);
+        /* A queued entry can name earlier transcripts as well as its key.
+         * Wait for it to be applied before authorizing any cleanup. */
+        if (queued < 0 || pending) {
+            StringCchCopyW(error, errorCch, pending ? TR(L"Close the profiles with pending session changes before cleaning up conversations.")
+                                                   : TR(L"Sessions could not be loaded."));
+            goto done;
+        }
+    }
     Claude_UpdateRunning(&now);
     for (i = 0; i < count; i++) {
         BOOL outside = FALSE;
         const PurgeItem *item = &items[chosen[i]];
+        if (SessionStore_ClaimedByOther(&set, -1, -1, item->id) || SessionVault_HasId(&listed, item->id)) {
+            Util_Log(L"conversation %s kept: a list names it now", item->id);
+            continue;
+        }
         /* Read again: one may have started since the list was made. */
         if (SessionStore_RunningNow(&now, item->id, &outside) || outside) {
             Util_Log(L"conversation %s kept: it runs now", item->id);
@@ -285,6 +336,10 @@ RemoveResult SessionPurge_Delete(HWND owner, const ProfileList *profiles, const 
         SessionVault_AddDeleted(ids, idCount);
     }
 done:
+    SessionStore_Free(&set);
+    SessionVault_FreeIds(&listed);
+    SessionVault_FreeIds(&marks);
+    Util_SyncUnlock(lock);
     Free(paths);
     Free((void *)list);
     Free((void *)ids);
@@ -447,4 +502,16 @@ void SessionPurge_WeeklyBackUp(const ProfileList *profiles)
 done:
     ReleaseMutex(mutex);
     CloseHandle(mutex);
+}
+
+/* The discovery list already excludes recent and currently used transcripts.
+ * Recheck path type at click time; this never opens Chromium's lockfile. */
+BOOL SessionPurge_CanOpen(const PurgeItem *item)
+{
+    WCHAR code[LONG_PATH_CCH];
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    return item && item->kind == PURGE_UNKNOWN && !item->restorable && Core_IsUuid(item->id) &&
+           SessionPurge_CodeFolder(code, ARRAYSIZE(code)) && Core_PathUnder(item->path, code) &&
+           GetFileAttributesExW(item->path, GetFileExInfoStandard, &data) &&
+           !(data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
 }
