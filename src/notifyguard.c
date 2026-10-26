@@ -31,14 +31,11 @@ static DWORD g_guardThread;
 /* A process made its Chromium single-instance window: a Claude starting. */
 static void CALLBACK InstanceCreated(HWINEVENTHOOK hook, DWORD event, HWND window, LONG object, LONG child, DWORD thread, DWORD time)
 {
-    WCHAR windowClass[32];
     (void)hook;
     (void)event;
     (void)thread;
     (void)time;
-    if (object != OBJID_WINDOW || child != CHILDID_SELF || !window || !GetClassNameW(window, windowClass, ARRAYSIZE(windowClass)) ||
-        CompareStringOrdinal(windowClass, -1, L"Chrome_MessageWindow", -1, FALSE) != CSTR_EQUAL)
-        return;
+    if (object != OBJID_WINDOW || child != CHILDID_SELF || !Claude_IsInstanceWindow(window)) return;
     PostThreadMessageW(g_guardThread, WM_GUARD_INSTANCE, (WPARAM)window, 0);
 }
 
@@ -106,6 +103,7 @@ static void InstanceStarted(HWND window)
         Util_Log(L"notification: opened %s, the only Claude open", list.items[stock].folder);
         return;
     }
+    Taskbar_QuitComing(&list.items[stock]);   /* its watcher takes the close for a quit, not for an update */
     if (!Claude_Quit(&list.items[stock], &error))
         Util_Log(L"notification: %s, started by it, could not be quit (error %lu)", list.items[stock].folder, error);
     if (ask && (target = Router_ChooseNotification(&pkg, &list, target)) < 0) {

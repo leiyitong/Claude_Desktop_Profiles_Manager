@@ -49,12 +49,12 @@ static const WCHAR *Answer(int topic)
     case 3:
         return TR(L"An open Claude keeps its list in memory and writes it back, so a change to an open profile is made once it closes.");
     case 4:
-        return TR(L"Backup & Restore\x2026, then Clean up sessions\x2026: check it and click Restore.");
+        return TR(L"Settings, then Clean up sessions\x2026: check it and click Restore.");
     case 5:
         return TR(L"A copy of each profile's list of sessions, kept outside Claude for the days set in Settings. Recover sessions\x2026 puts "
                   L"a version back.");
     default:
-        return TR(L"Back up Main first (Backup & Restore\x2026). Once Claude is installed again, open Main here and sign in; "
+        return TR(L"Export Main first (Export\x2026). Once Claude is installed again, open Main here and sign in; "
                   L"Recover sessions\x2026 brings its list back if it is gone.");
     }
 }
@@ -284,23 +284,13 @@ static INT_PTR CALLBACK AboutProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp)
         } else if (header->code == NM_CLICK || header->code == NM_DBLCLK) {
             /* The arrow folds or opens a heading; so does a double-click on it. */
             LVHITTESTINFO hit;
-            ZeroMemory(&hit, sizeof hit);
-            hit.pt = ((const NMITEMACTIVATE *)lp)->ptAction;
-            if (ListView_SubItemHitTest(list, &hit) >= 0 && Theme_RowParam(list, hit.iItem) < 0 &&
-                (Theme_OnFoldArrow(list, hit.iItem, hit.pt) || header->code == NM_DBLCLK))
-                FoldHeading(list, hit.iItem, !HeadingOpen(list, hit.iItem));
+            int row = Theme_FoldClickRow(list, header, &hit);
+            if (row >= 0) FoldHeading(list, row, !HeadingOpen(list, row));
         } else if (header->code == LVN_KEYDOWN) {
             /* Right opens a heading, Left folds it, or goes from a row up to its heading. */
             WORD key = ((const NMLVKEYDOWN *)lp)->wVKey;
-            int row = ListView_GetNextItem(list, -1, LVNI_FOCUSED);
-            if (row >= 0 && (key == VK_LEFT || key == VK_RIGHT)) {
-                if (Theme_RowParam(list, row) < 0) {
-                    FoldHeading(list, row, key == VK_RIGHT);
-                } else if (key == VK_LEFT) {
-                    while (row > 0 && Theme_RowParam(list, row) >= 0) row--;
-                    Theme_FocusRow(list, row);
-                }
-            }
+            int row = Theme_FoldKeyRow(list, key);
+            if (row >= 0) FoldHeading(list, row, key == VK_RIGHT);
         }
         return TRUE;
     }

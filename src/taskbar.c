@@ -3,7 +3,7 @@
  *
  * Every Claude window carries Claude's package identity, so the taskbar puts
  * all profiles under one Claude button. The watcher (--watch <folder>), started
- * when Claude Desktop Profiles Manager opens a profile, gives that profile's
+ * when Claude Delta opens a profile, gives that profile's
  * windows, through their shell property store, the AppUserModelID its
  * shortcuts carry with a relaunch command, name and badged icon: they get their
  * own button, and pinning it pins the profile. It colors the profile's
@@ -48,6 +48,8 @@
 #define UPDATE_WAIT_MS    120000 /* Windows installs the new package after closing Claude */
 #define QUIT_TOLD_MS      60000  /* a quit the manager told of explains a close this long after */
 #define REOPEN_WAIT_MS    60000  /* Windows opens Claude again by itself (measured: 1 to 33 s) */
+#define PACKAGE_RECHECK_MS 2000  /* the new package looked for again this long after a change... */
+#define PACKAGE_RECHECKS   10    /* ...this many times at most */
 #define WATCH_STOP_MS     10000  /* includes a watcher's bounded notification-area calls */
 #define WATCH_REGISTRATION_MUTEX L"Local\\ClaudeDesktopProfilesManager.WatcherRegistration"
 #define MAX_LINKS         64
@@ -457,6 +459,9 @@ static void DressProcessWindows(void)
     context.pid = g_watch.pid;
     context.dress = TRUE;
     if (g_dressedTitle[0]) StringCchCopyW(g_earlierTitle, ARRAYSIZE(g_earlierTitle), g_dressedTitle);
+    /* A rename, a new title or a new Claude: the title is given again, and given up again only if Claude fights it. */
+    g_dressTitlesGivenUp = FALSE;
+    g_dressBurst = 0;
     if (context.pid) EnumWindows(DressProc, (LPARAM)&context);
     for (i = 0; i < 2; i++)
         if (old[i]) DestroyIcon(old[i]);
@@ -972,7 +977,8 @@ static DWORD PumpUntil(const HANDLE *handles, DWORD count, DWORD ms)
             if (now >= deadline) return WAIT_TIMEOUT;
             left = (DWORD)(deadline - now);
         }
-        wait = MsgWaitForMultipleObjects(count, handles, FALSE, left, QS_ALLINPUT);
+        /* Messages already in the queue (a filtered peek left them) wake it too. */
+        wait = MsgWaitForMultipleObjectsEx(count, handles, left, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (wait == WAIT_OBJECT_0 + count) {
             while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
                 TranslateMessage(&msg);
@@ -989,11 +995,9 @@ static DWORD PumpUntil(const HANDLE *handles, DWORD count, DWORD ms)
  * (see Claude_UpdateRunning): the profile's Claude has started. */
 static void CALLBACK MessageWindowCreated(HWINEVENTHOOK hook, DWORD event, HWND window, LONG object, LONG child, DWORD thread, DWORD time)
 {
-    WCHAR windowClass[32], title[MAX_PATH];
+    WCHAR title[MAX_PATH];
     (void)hook; (void)event; (void)thread; (void)time;
-    if (object != OBJID_WINDOW || child != CHILDID_SELF || !window || !GetClassNameW(window, windowClass, ARRAYSIZE(windowClass)) ||
-        CompareStringOrdinal(windowClass, -1, L"Chrome_MessageWindow", -1, FALSE) != CSTR_EQUAL)
-        return;
+    if (object != OBJID_WINDOW || child != CHILDID_SELF || !Claude_IsInstanceWindow(window)) return;
     if (GetWindowTextW(window, title, ARRAYSIZE(title)) > 0 && Core_PathEquals(title, g_startedDir)) SetEvent(g_started);
 }
 
@@ -1215,36 +1219,22 @@ static BOOL ReopenedClaudeLives(const Profile *profile)
 /* Handles of the wait for a new Claude package, by index. */
 enum { PACKAGE_LIST_CHANGED, PACKAGE_APPS_CHANGED, PACKAGE_QUIT, PACKAGE_HANDOVER, PACKAGE_REOPENED, PACKAGE_HANDLE_COUNT };
 
-/* The profile's Claude, which ran package `ran`, has exited. When it closed
- * for an update, the profile opens again once the new package is installed:
- * TRUE, with `pid` the Claude started for it (0 when Windows started it).
- * Windows itself opens the stock profile again: that one is given a moment
- * first. The user opening the profile meanwhile ends the wait. */
-static BOOL ReopenAfterUpdate(const WCHAR *folder, const WCHAR *ran, HANDLE quit, HANDLE handover, DWORD *pid)
+/* Waits, at most UPDATE_WAIT_MS, for a Claude package other than `ran`:
+ * TRUE with it in `pkg`. A change to the user's package list or to the Apps
+ * folder wakes the check; Windows shows the new package a moment after the
+ * changes that tell of it, so after the close, and after each change, it is
+ * looked for again PACKAGE_RECHECKS times, PACKAGE_RECHECK_MS apart (a
+ * bounded retry after an event). FALSE when none comes, the watcher is told
+ * to stop, or `profile` was opened again meanwhile (logged). */
+static BOOL WaitForNewPackage(const WCHAR *folder, const Profile *profile, const WCHAR *ran, HANDLE quit, HANDLE handover,
+                              ClaudePackage *pkg)
 {
-    ProfileList list;
-    ClaudePackage pkg;
     HANDLE handles[PACKAGE_HANDLE_COUNT];
     HKEY packages = NULL;
     ULONGLONG deadline;
-    BOOL updated = FALSE, rearm = TRUE, interrupted = FALSE, identity = FALSE;
+    BOOL updated = FALSE, rearm = TRUE;
     LSTATUS rc;
-    HRESULT hr;
-    int i;
-
-    *pid = 0;
-    Profiles_Load(&list, &g_watchPkg);
-    i = Profiles_Find(&list, folder);
-    if (g_quitTold && GetTickCount64() - g_quitTold < QUIT_TOLD_MS) {
-        g_quitTold = 0;
-        Util_Log(L"%s was quit from the manager", folder);
-        return FALSE;
-    }
-    if (i < 0 || !Claude_ClosedForUpdate(&g_watchPkg, &list.items[i])) return FALSE;
-    Util_Log(L"%s closed for a Claude update", folder);
-
-    /* The new package: a change to the user's package list or to the Apps
-     * folder wakes the check. */
+    int rechecks;
     handles[PACKAGE_LIST_CHANGED] = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!handles[PACKAGE_LIST_CHANGED]) {
         Util_Log(L"taskbar watcher for %s cannot wait for the Claude update (error %lu)", folder, GetLastError());
@@ -1259,8 +1249,8 @@ static BOOL ReopenAfterUpdate(const WCHAR *folder, const WCHAR *ran, HANDLE quit
         packages = NULL;
         Util_Log(L"taskbar watcher for %s: the package list cannot be watched (error %ld), only the Apps folder", folder, rc);
     }
-    ResetEvent(g_appsChanged);
     deadline = GetTickCount64() + UPDATE_WAIT_MS;
+    rechecks = PACKAGE_RECHECKS;
     for (;;) {
         ULONGLONG now;
         DWORD wait;
@@ -1272,7 +1262,7 @@ static BOOL ReopenAfterUpdate(const WCHAR *folder, const WCHAR *ran, HANDLE quit
             packages = NULL;
         }
         rearm = FALSE;
-        if (Claude_FindPackage(&pkg) && !Core_EqualsI(pkg.fullName, ran)) {
+        if (Claude_FindPackage(pkg) && !Core_EqualsI(pkg->fullName, ran)) {
             updated = TRUE;
             break;
         }
@@ -1281,11 +1271,14 @@ static BOOL ReopenAfterUpdate(const WCHAR *folder, const WCHAR *ran, HANDLE quit
             Util_Log(L"no new Claude package after %s closed for an update", folder);
             break;
         }
-        wait = PumpUntil(handles, PACKAGE_HANDLE_COUNT, (DWORD)(deadline - now));
-        if (wait == PACKAGE_LIST_CHANGED) {
-            rearm = TRUE;
+        wait = PumpUntil(handles, PACKAGE_HANDLE_COUNT, rechecks > 0 ? (DWORD)min(deadline - now, PACKAGE_RECHECK_MS) : (DWORD)(deadline - now));
+        if (wait == WAIT_TIMEOUT && rechecks > 0) {
+            rechecks--;
+        } else if (wait == PACKAGE_LIST_CHANGED || wait == PACKAGE_APPS_CHANGED) {
+            rearm = wait == PACKAGE_LIST_CHANGED || rearm;
+            rechecks = PACKAGE_RECHECKS;
         } else if (wait == PACKAGE_REOPENED) {
-            if (ReopenedClaudeLives(&list.items[i])) {
+            if (ReopenedClaudeLives(profile)) {
                 Util_Log(L"%s was opened again during the Claude update", folder);
                 break;
             }
@@ -1300,7 +1293,39 @@ static BOOL ReopenAfterUpdate(const WCHAR *folder, const WCHAR *ran, HANDLE quit
     }
     if (packages) RegCloseKey(packages);
     CloseHandle(handles[PACKAGE_LIST_CHANGED]);
-    if (!updated) return FALSE;
+    return updated;
+}
+
+/* The profile's Claude, which ran package `ran`, has exited. When it closed
+ * for an update, the profile opens again once the new package is installed
+ * (WaitForNewPackage): TRUE, with `pid` the Claude started for it (0 when
+ * Windows started it). Windows itself opens the stock profile again: that
+ * one is given a moment first. The user opening the profile meanwhile ends
+ * the wait. With SETTING_REOPEN_AFTER_UPDATE off, only what Windows opens
+ * itself is watched again: the other profiles stay closed. */
+static BOOL ReopenAfterUpdate(const WCHAR *folder, const WCHAR *ran, HANDLE quit, HANDLE handover, DWORD *pid)
+{
+    ProfileList list;
+    ClaudePackage pkg;
+    BOOL interrupted = FALSE, identity = FALSE;
+    HRESULT hr;
+    int i;
+
+    *pid = 0;
+    Profiles_Load(&list, &g_watchPkg);
+    i = Profiles_Find(&list, folder);
+    if (g_quitTold && GetTickCount64() - g_quitTold < QUIT_TOLD_MS) {
+        g_quitTold = 0;
+        Util_Log(L"%s was quit from the manager", folder);
+        return FALSE;
+    }
+    if (i < 0 || !Claude_ClosedForUpdate(&g_watchPkg, &list.items[i])) return FALSE;
+    Util_Log(L"%s closed for a Claude update", folder);
+    if (!list.items[i].isStock && !Util_GetSetting(SETTING_REOPEN_AFTER_UPDATE, 1)) {
+        Util_Log(L"%s stays closed after the Claude update (Settings)", folder);
+        return FALSE;
+    }
+    if (!WaitForNewPackage(folder, &list.items[i], ran, quit, handover, &pkg)) return FALSE;
     g_watchPkg = pkg;
     Util_Log(L"taskbar watcher for %s: Claude %s is installed", folder, pkg.version);
 
@@ -1309,6 +1334,10 @@ static BOOL ReopenAfterUpdate(const WCHAR *folder, const WCHAR *ran, HANDLE quit
         return TRUE;
     }
     if (interrupted || (i = Profiles_Find(&list, folder)) < 0) return FALSE;
+    if (!Util_GetSetting(SETTING_REOPEN_AFTER_UPDATE, 1)) {
+        Util_Log(L"%s stays closed after the Claude update (Settings)", folder);
+        return FALSE;
+    }
     hr = Claude_Launch(&g_watchPkg, &list.items[i], NULL, pid, &identity);
     if (FAILED(hr)) {
         Util_Log(L"could not open %s again after the Claude update (0x%08lX)", folder, (unsigned long)hr);

@@ -1,10 +1,10 @@
 /*
  * What the manager changed in sessions, undone and redone (Ctrl+Z, Ctrl+Y in
  * the sessions view). An action, one menu choice or one key, is a list of
- * steps, each about one session in one profile: its star, its title, or its
- * entry (listed or not, and as what). A step keeps both sides, so undoing
+ * steps, each about one session in one profile: its star, its title, read or
+ * unread, or its entry (listed or not, and as what). A step keeps both sides, so undoing
  * goes back to the first and redoing to the second whatever came between:
- * stars and titles through sessionedit.c, entries through sessionsync.c,
+ * stars, titles and unread marks through sessionedit.c, entries through sessionsync.c,
  * the only writer of new entries, which also waits for a running profile to
  * close. The lists live as long as the manager.
  */
@@ -12,13 +12,14 @@
 
 #define UNDO_DEPTH 50   /* actions kept each way */
 
-typedef enum UndoKind { UNDO_STAR, UNDO_TITLE, UNDO_ENTRY } UndoKind;
+typedef enum UndoKind { UNDO_STAR, UNDO_TITLE, UNDO_ENTRY, UNDO_READ } UndoKind;
 
 typedef struct UndoStep {
     UndoKind kind;
     WCHAR    folder[FOLDER_CCH];             /* the profile's */
     WCHAR    key[SESSION_ID_CCH];            /* the session's */
     BOOL     starred[2];                     /* star: before, after */
+    BOOL     unread[2];                      /* unread: before, after */
     WCHAR    title[2][SESSION_TITLE_CCH];    /* title: before, after; "" for none */
     BOOL     autoTitle[2];                   /* ... given by Claude itself */
     BOOL     listed[2];                      /* entry: listed before, after */
@@ -72,15 +73,6 @@ static void Push(UndoList *list, UndoAction *action)
     ZeroMemory(action, sizeof *action);
 }
 
-static char *CopyBytes(const char *data, size_t length)
-{
-    char *copy;
-    if (!data || (copy = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1)) == NULL) return NULL;
-    memcpy(copy, data, length);
-    copy[length] = 0;
-    return copy;
-}
-
 static char *ReadEntry(const WCHAR *file, size_t *length)
 {
     DWORD read = 0;
@@ -131,7 +123,7 @@ static void Sent(void *context, const Profile *p, const SyncOp *op, const char *
     step->listed[1] = op->kind == SYNC_PUT;
     if (listed) step->entry[0] = ReadEntry(set->entries[found].file, &step->length[0]);
     if (op->kind == SYNC_PUT) {
-        step->entry[1] = CopyBytes(content, length);
+        step->entry[1] = content ? Util_CopyBytes(content, length) : NULL;
         step->length[1] = step->entry[1] ? length : 0;
     }
 }
@@ -169,6 +161,14 @@ void SessionUndo_Star(const Profile *p, const WCHAR *key, BOOL before, BOOL afte
     if (!before == !after || (step = NewStep(UNDO_STAR, p, key)) == NULL) return;
     step->starred[0] = before;
     step->starred[1] = after;
+}
+
+void SessionUndo_Read(const Profile *p, const WCHAR *key, BOOL unreadBefore, BOOL unreadAfter)
+{
+    UndoStep *step;
+    if (!unreadBefore == !unreadAfter || (step = NewStep(UNDO_READ, p, key)) == NULL) return;
+    step->unread[0] = unreadBefore;
+    step->unread[1] = unreadAfter;
 }
 
 void SessionUndo_Title(const Profile *p, const WCHAR *key, const WCHAR *before, BOOL beforeAuto, const WCHAR *after)
@@ -377,6 +377,9 @@ static void ApplyStep(Applying *a, UndoStep *step, int side)
     switch (step->kind) {
     case UNDO_STAR:
         Change(a, profile, entry, PENDING_STAR, step->key, step->starred[side] ? L"1" : L"0");
+        break;
+    case UNDO_READ:
+        Change(a, profile, entry, PENDING_READ, step->key, step->unread[side] ? L"0" : L"1");
         break;
     case UNDO_TITLE:
         Change(a, profile, entry, step->autoTitle[side] ? PENDING_TITLE_AUTO : PENDING_TITLE, step->key, step->title[side]);

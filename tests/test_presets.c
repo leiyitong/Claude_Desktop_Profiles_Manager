@@ -34,6 +34,14 @@ int main(void)
         size_t ownLength = 0, mergedLength = 0;
         char *own = again ? Presets_Account(again, m, "target", &ownLength) : NULL, *merged;
         zoom.ownOnly = TRUE;
+        presets.mergeOnly = TRUE;
+        {
+            size_t unionLength = 0;
+            char *both = own ? SessionSync_MergePart(&presets, own, ownLength, different, sizeof different - 1, &unionLength) : NULL;
+            Check("presets merge: a part merged keeps what each has", both && unionLength >= ownLength && strstr(both, "\"Different\""));
+            Check("presets merge: no other part merges", !SessionSync_MergePart(&zoom, "{}", 2, "{}", 2, &unionLength) && !unionLength);
+            Free(both);
+        }
         merged = own ? Presets_MergeAccount(own, ownLength, different, sizeof different - 1, &mergedLength) : NULL;
         Check("an account's merge with presets it already took leaves it as it is",
               merged && mergedLength == ownLength && memcmp(merged, own, ownLength) == 0);

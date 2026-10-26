@@ -4,13 +4,6 @@
 #include <string.h>
 #include <wchar.h>
 
-static void Free(void *p) { if (p) HeapFree(GetProcessHeap(), 0, p); }
-static char *Copy(const char *p, size_t n)
-{
-    char *out = (char *)HeapAlloc(GetProcessHeap(), 0, n + 1);
-    if (out) { memcpy(out, p, n); out[n] = 0; }
-    return out;
-}
 static BOOL Object(const char *p, size_t n)
 {
     size_t i = 0;
@@ -20,13 +13,13 @@ static BOOL Object(const char *p, size_t n)
 static BOOL Set(char **json, size_t *length, const char *key, const char *value, size_t n)
 {
     const char *keys[1] = { key };
-    char *raw = Copy(value, n), *next;
+    char *raw = Util_CopyBytes(value, n), *next;
     size_t used = 0;
     if (!raw) return FALSE;
     next = Core_JsonSetNested(*json, *length, keys, 1, raw, &used);
-    Free(raw);
+    Util_Free(raw);
     if (!next) return FALSE;
-    Free(*json); *json = next; *length = used;
+    Util_Free(*json); *json = next; *length = used;
     return TRUE;
 }
 char *Presets_Account(const char *json, size_t length, const char *account, size_t *outLength)
@@ -37,7 +30,7 @@ char *Presets_Account(const char *json, size_t length, const char *account, size
     if (!Object(json, length) || !Core_JsonMember(json, length, "byAccount", &value, &n) ||
         !Core_JsonMember(value, n, account, &value, &n) || !Object(value, n)) return NULL;
     *outLength = n;
-    return Copy(value, n);
+    return Util_CopyBytes(value, n);
 }
 
 typedef struct MergeObject { char **json; size_t *length; BOOL replace, ok; int depth; } MergeObject;
@@ -57,17 +50,17 @@ static BOOL MergeMember(void *context, const char *key, size_t keyLength, const 
         } else if (!m->replace) return TRUE;
     }
     m->ok = Set(m->json, m->length, name, value, valueLength);
-    Free(merged);
+    Util_Free(merged);
     return m->ok;
 }
 static char *Merge(const char *base, size_t baseLength, const char *other, size_t otherLength, BOOL replace, int depth, size_t *length)
 {
     MergeObject m;
     char *out;
-    if (!Object(base, baseLength) || !Object(other, otherLength) || !(out = Copy(base, baseLength))) return NULL;
+    if (!Object(base, baseLength) || !Object(other, otherLength) || !(out = Util_CopyBytes(base, baseLength))) return NULL;
     *length = baseLength;
     m.json = &out; m.length = length; m.replace = replace; m.ok = TRUE; m.depth = depth;
-    if (!Core_JsonEachMember(other, otherLength, MergeMember, &m) || !m.ok) { Free(out); return NULL; }
+    if (!Core_JsonEachMember(other, otherLength, MergeMember, &m) || !m.ok) { Util_Free(out); return NULL; }
     return out;
 }
 
@@ -111,7 +104,7 @@ static ULONGLONG SemanticHash(const char *json, size_t n, int depth)
         WCHAR *text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (n + 1) * sizeof(WCHAR));
         if (text && Core_JsonString(json, n, text, n + 1)) h.hash = Core_HashBytes(CORE_HASH_START, text, wcslen(text) * sizeof(WCHAR));
         else h.hash = Core_HashBytes(CORE_HASH_START, json, n);
-        Free(text); return h.hash;
+        Util_Free(text); return h.hash;
     }
     return Core_HashBytes(CORE_HASH_START, json, n);
 }
@@ -159,7 +152,7 @@ static BOOL SemanticEqual(const char *a, size_t an, const char *b, size_t bn, in
         WCHAR *aw = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (an + 1) * sizeof(WCHAR));
         WCHAR *bw = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (bn + 1) * sizeof(WCHAR));
         BOOL equal = aw && bw && Core_JsonString(a, an, aw, an + 1) && Core_JsonString(b, bn, bw, bn + 1) && wcscmp(aw, bw) == 0;
-        Free(aw); Free(bw); return equal;
+        Util_Free(aw); Util_Free(bw); return equal;
     }
     return an == bn && memcmp(a, b, an) == 0;
 }
@@ -182,7 +175,7 @@ static BOOL RefreshMetadata(MergePresets *m, const FindPreset *find, const char 
 {
     static const char *const times[] = { "createdAt", "lastUsedAt" };
     size_t n = find->length, i, rawLength;
-    char *changed = Copy(find->value, find->length), *next;
+    char *changed = Util_CopyBytes(find->value, find->length), *next;
     const char *raw;
     if (!changed) return FALSE;
     for (i = 0; i < ARRAYSIZE(times); i++) {
@@ -191,16 +184,16 @@ static BOOL RefreshMetadata(MergePresets *m, const FindPreset *find, const char 
         if (Core_JsonMember(find->value, find->length, times[i], &raw, &rawLength)) Core_JsonNumber(raw, rawLength, &old);
         if (!old || (i == 0 ? fresh < old : fresh > old)) {
             char number[32]; StringCchPrintfA(number, sizeof number, "%I64u", fresh);
-            if (!Set(&changed, &n, times[i], number, strlen(number))) { Free(changed); return FALSE; }
+            if (!Set(&changed, &n, times[i], number, strlen(number))) { Util_Free(changed); return FALSE; }
         }
     }
     next = (char *)HeapAlloc(GetProcessHeap(), 0, m->length - find->length + n + 1);
-    if (!next) { Free(changed); return FALSE; }
+    if (!next) { Util_Free(changed); return FALSE; }
     i = (size_t)(find->value - m->array);
     memcpy(next, m->array, i); memcpy(next + i, changed, n);
     memcpy(next + i + n, find->value + find->length, m->length - i - find->length);
     m->length = m->length - find->length + n; next[m->length] = 0;
-    Free(m->array); m->array = next; Free(changed); return TRUE;
+    Util_Free(m->array); m->array = next; Util_Free(changed); return TRUE;
 }
 static BOOL AddPreset(void *context, const char *value, size_t length)
 {
@@ -229,20 +222,20 @@ static BOOL AddPreset(void *context, const char *value, size_t length)
             if (SemanticEqual(find.value, find.length, value, length, 0)) return m->ok = RefreshMetadata(m, &find, value, length);
         }
         if (collision == 1024 || !Core_JsonQuote(find.id, quoted, sizeof quoted)) return m->ok = FALSE;
-        changed = Copy(value, length); changedLength = length;
-        if (!changed || !Set(&changed, &changedLength, "id", quoted, strlen(quoted))) { Free(changed); return m->ok = FALSE; }
+        changed = Util_CopyBytes(value, length); changedLength = length;
+        if (!changed || !Set(&changed, &changedLength, "id", quoted, strlen(quoted))) { Util_Free(changed); return m->ok = FALSE; }
         value = changed; length = changedLength;
     }
     next = (char *)HeapAlloc(GetProcessHeap(), 0, m->length + length + 2);
-    if (!next) { Free(changed); return m->ok = FALSE; }
+    if (!next) { Util_Free(changed); return m->ok = FALSE; }
     n = m->length;
-    if (!n || m->array[n - 1] != ']') { Free(next); Free(changed); return m->ok = FALSE; }
+    if (!n || m->array[n - 1] != ']') { Util_Free(next); Util_Free(changed); return m->ok = FALSE; }
     memcpy(next, m->array, n - 1); n--;
     if (n > 1) next[n++] = ',';
     memcpy(next + n, value, length); n += length;
     next[n++] = ']'; next[n] = 0;
-    Free(m->array); m->array = next; m->length = n;
-    Free(changed);
+    Util_Free(m->array); m->array = next; m->length = n;
+    Util_Free(changed);
     return TRUE;
 }
 char *Presets_MergeAccount(const char *old, size_t oldLength, const char *incoming, size_t incomingLength, size_t *outLength)
@@ -265,16 +258,16 @@ char *Presets_MergeAccount(const char *old, size_t oldLength, const char *incomi
     a = "[]"; aLength = 2; b = "[]"; bLength = 2;
     Core_JsonMember(old, oldLength, "presets", &a, &aLength);
     Core_JsonMember(incoming, incomingLength, "presets", &b, &bLength);
-    m.array = Copy("[]", 2); m.length = 2; m.ok = m.array != NULL;
+    m.array = Util_CopyBytes("[]", 2); m.length = 2; m.ok = m.array != NULL;
     if (!m.ok || !Core_JsonEachElement(a, aLength, AddPreset, &m) || !m.ok ||
         !Core_JsonEachElement(b, bLength, AddPreset, &m) || !m.ok || !Set(&merged, outLength, "presets", m.array, m.length)) {
-        Free(m.array); goto failed;
+        Util_Free(m.array); goto failed;
     }
-    Free(m.array);
-    Free(builtMerge);
+    Util_Free(m.array);
+    Util_Free(builtMerge);
     return merged;
 failed:
-    Free(builtMerge); Free(merged);
+    Util_Free(builtMerge); Util_Free(merged);
     *outLength = 0;
     return NULL;
 }
@@ -293,6 +286,6 @@ char *Presets_Merge(const char *json, size_t length, const char *account, const 
     }
     if ((merged = Presets_MergeAccount(old, oldLength, incoming, incomingLength, &mergedLength)) == NULL) return NULL;
     root = Core_JsonSetNested(json, length, keys, 2, merged, outLength);
-    Free(merged);
+    Util_Free(merged);
     return root;
 }

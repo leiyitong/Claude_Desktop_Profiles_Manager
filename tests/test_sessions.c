@@ -12,13 +12,17 @@
  */
 #include "../src/app.h"
 #include <wincrypt.h>
+#include <bcrypt.h>
 #include "../src/resource.h"
 #include <commctrl.h>
 #include <objbase.h>
+#include <ole2.h>
+#include <shlobj.h>
 #include <shellapi.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include <winioctl.h>
 
 #define TRANSCRIPT_READ_MAX (1024u * 1024u)
 
@@ -372,21 +376,23 @@ static int FixtureFileOperation(LPSHFILEOPSTRUCTW operation)
 #define Backup_ReadAppKey    TestedBackup_ReadAppKey
 #define Backup_WriteAppKey   TestedBackup_WriteAppKey
 #define Backup_FillPartsList TestedBackup_FillPartsList
-#define Backup_ValidateArchive TestedBackup_ValidateArchive
+#define Backup_FillImportList TestedBackup_FillImportList
+#define Backup_FillLayoutList TestedBackup_FillLayoutList
+#define Backup_RestoreFiles  TestedBackup_RestoreFiles
+#define Backup_ChooseItems   TestedBackup_ChooseItems
+#define Backup_Write         TestedBackup_Write
+#define Backup_FreeChoice    TestedBackup_FreeChoice
+#define Backup_ArchiveName   TestedBackup_ArchiveName
 #define Backup_CheckArchive TestedBackup_CheckArchive
+#define Backup_Reopen        TestedBackup_Reopen
+#define Backup_ReadOwn       TestedBackup_ReadOwn
+#define Backup_RestoreNew    TestedBackup_RestoreNew
 #include "../src/backup.c"
 
-static DWORD g_searchReads;
-static char *ReadSearchFixture(const WCHAR *path, DWORD maximum, BOOL tail, DWORD *length)
-{
-    g_searchReads++;
-    return Util_ReadFile(path, maximum, tail, length);
-}
 #define SessionSearch_Locate     TestedSessionSearch_Locate
 #define SessionSearch_Start      TestedSessionSearch_Start
 #define SessionSearch_Stop       TestedSessionSearch_Stop
 #define SessionSearch_Invalidate TestedSessionSearch_Invalidate
-#define Util_ReadFile            ReadSearchFixture
 #include "../src/sessionsearch.c"
 #undef Util_ReadFile
 
@@ -1258,6 +1264,61 @@ static void TestEntryDetails(void)
     if (row >= 0) SessionStore_GroupName(&set, set.rows[row].group, name, ARRAYSIZE(name));
     Check("a session without a working folder is shown in the unknown folder", row >= 0 && wcscmp(name, L"Unknown folder") == 0);
     SessionStore_Free(&set);
+}
+
+/* A load of `profiles` shows `title` for the session of g_projectId; NULL: lists no such session. */
+static BOOL LoadsTitle(const ProfileList *profiles, const WCHAR *title)
+{
+    SessionSet set;
+    int row, entry;
+    BOOL shown;
+    if (!SessionStore_LoadProfiles(&set, profiles)) return FALSE;
+    row = SessionStore_FindRow(&set, g_projectId);
+    entry = row >= 0 ? set.rows[row].entry[0] : -1;
+    shown = title ? entry >= 0 && wcscmp(set.entries[entry].title, title) == 0 : row < 0;
+    SessionStore_Free(&set);
+    return shown;
+}
+
+/* The entry of g_projectId titled `title` (each is as long), written `written` (FILETIME ticks). */
+static BOOL SaveTitledEntry(const WCHAR *path, const char *title, ULONGLONG written)
+{
+    char json[512];
+    return SUCCEEDED(StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_cache\",\"cliSessionId\":\"%ls\",\"title\":\"%s\","
+                                                         "\"lastActivityAt\":30}", g_projectId, title)) &&
+           Save(path, json) && SetModified(path, written);
+}
+
+/* A load reads again only the entries whose size or last write changed,
+ * and those written in the last seconds every time: two writes in one tick
+ * of the clock keep both. */
+static void TestEntryCache(void)
+{
+    ProfileList profiles;
+    WCHAR entries[MAX_PATH], path[LONG_PATH_CCH];
+    FILETIME now;
+    ULONGLONG old, recent;
+    BOOL ready;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 1;
+    GetSystemTimeAsFileTime(&now);
+    old = (((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - 3600ULL * 10000000ULL;
+    ready = PrepareProfile(&profiles.items[0], L"Cache", L"cache\\profile", L"cache", L"organization", entries, ARRAYSIZE(entries)) &&
+            Join(entries, L"local_cache.json", path, ARRAYSIZE(path)) && SaveTitledEntry(path, "Title one", old);
+    Check("entry cache fixture created", ready);
+    if (!ready) return;
+    Check("an entry is read", LoadsTitle(&profiles, L"Title one"));
+    Check("an entry that keeps its size and last write is not read again",
+          SaveTitledEntry(path, "Title two", old) && LoadsTitle(&profiles, L"Title one"));
+    Check("an entry whose last write changed is read again", SetModified(path, old + 10000000ULL) && LoadsTitle(&profiles, L"Title two"));
+    Check("a removed entry is no longer listed", DeleteFileW(path) && LoadsTitle(&profiles, NULL));
+    Check("what a removed entry said is forgotten",
+          SaveTitledEntry(path, "Title zed", old + 10000000ULL) && LoadsTitle(&profiles, L"Title zed"));
+    GetSystemTimeAsFileTime(&now);
+    recent = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    Check("an entry written in the last seconds is read", SaveTitledEntry(path, "Title six", recent) && LoadsTitle(&profiles, L"Title six"));
+    Check("an entry written in the last seconds is read again after a write that keeps its size and time",
+          SaveTitledEntry(path, "Title ten", recent) && LoadsTitle(&profiles, L"Title ten"));
 }
 
 /* Stars made at once and later, what a snapshot shows of waiting
@@ -2266,6 +2327,98 @@ static BOOL WaitForViewChange(HWND window, HWND tree, int expected, BOOL notific
     }
 }
 
+typedef struct HeldLock { HANDLE held, release; BOOL ok; } HeldLock;
+
+/* The sync lock held by a thread of its own, as a sync under way holds it, until `release`. */
+static DWORD WINAPI HoldSyncLock(void *param)
+{
+    HeldLock *hold = (HeldLock *)param;
+    HANDLE lock = Util_SyncLock();
+    hold->ok = lock != NULL;
+    SetEvent(hold->held);
+    WaitForSingleObject(hold->release, 30000);
+    Util_SyncUnlock(lock);
+    return 0;
+}
+
+/* The window's queue handled as the manager does for `ms`. */
+static void PumpView(HWND window, DWORD ms)
+{
+    ULONGLONG deadline = GetTickCount64() + ms, now;
+    MSG message;
+    while ((now = GetTickCount64()) < deadline) {
+        MsgWaitForMultipleObjectsEx(0, NULL, (DWORD)(deadline - now), QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+            if (message.hwnd == window && message.message == WM_APP_SESSIONS) SessionsView_Reload();
+            else if (message.hwnd == window && message.message == WM_APP_SESSIONS_READY) SessionsView_Ready(TRUE);
+            else {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+}
+
+/* A sync under way holds the lock the changes waiting for a closed profile
+ * need (a watcher's session vault once its Claude closed): the snapshots
+ * still show at once, and the change is made once the lock is free. */
+static void CheckWaitingChangesUnderSync(HWND window, const ProfileList *profiles)
+{
+    const Profile *profile = &profiles->items[0];
+    SessionSet set;
+    PendingEdit edit;
+    HeldLock hold;
+    HANDLE thread = NULL;
+    HWND fake = NULL;
+    WCHAR pending[MAX_PATH], file[LONG_PATH_CCH], title[SESSION_TITLE_CCH];
+    ULONGLONG started, deadline;
+    BOOL waiting = FALSE, loaded, ready = FALSE;
+    int row = -1;
+    ZeroMemory(&hold, sizeof hold);
+    ZeroMemory(&edit, sizeof edit);
+    edit.op = PENDING_TITLE;
+    StringCchCopyW(edit.key, ARRAYSIZE(edit.key), g_projectId);
+    StringCchCopyW(edit.value, ARRAYSIZE(edit.value), L"Made after the sync");
+    loaded = SessionStore_LoadProfiles(&set, profiles);
+    if (loaded && (row = FindRow(&set, g_projectId)) >= 0 && set.rows[row].entry[0] >= 0 && SessionStore_PendingPath(profile, pending, ARRAYSIZE(pending))) {
+        StringCchCopyW(file, ARRAYSIZE(file), set.entries[set.rows[row].entry[0]].file);
+        fake = StartFakeClaude(profile);
+        ready = fake && SessionEdit_Change(NULL, profile, &set.entries[set.rows[row].entry[0]], &edit, &waiting, NULL, 0) && waiting;
+        if (fake) StopFakeClaude(fake);
+    }
+    if (loaded) SessionStore_Free(&set);
+    Check("a change waits for a profile that has closed", ready);
+    if (!ready) return;
+    hold.held = CreateEventW(NULL, TRUE, FALSE, NULL);
+    hold.release = CreateEventW(NULL, TRUE, FALSE, NULL);
+    thread = hold.held && hold.release ? CreateThread(NULL, 0, HoldSyncLock, &hold, 0, NULL) : NULL;
+    ready = thread && WaitForSingleObject(hold.held, 5000) == WAIT_OBJECT_0 && hold.ok;
+    Check("a sync under way holds the sync lock", ready);
+    if (ready) {
+        /* Snapshots read after the profile closed, each accepted with its change waiting. */
+        started = GetTickCount64();
+        SessionsView_Reload();
+        PumpView(window, 2000);
+        Check("snapshots show while a sync under way holds the lock their waiting changes need", GetTickCount64() - started < 5000);
+        Check("the waiting change waits for the sync", ReadString(file, "title", title, ARRAYSIZE(title)) &&
+              wcscmp(title, L"Made after the sync") != 0 && Util_FileExists(pending));
+    }
+    if (hold.release) SetEvent(hold.release);
+    if (thread) {
+        WaitForSingleObject(thread, 30000);
+        CloseHandle(thread);
+    }
+    if (hold.held) CloseHandle(hold.held);
+    if (hold.release) CloseHandle(hold.release);
+    /* Until the view shows both conversations again, too: a snapshot read while the change replaced its entry
+     * (ReplaceFileW leaves the name free for a moment) lacks that conversation until the next one. */
+    for (deadline = GetTickCount64() + 10000;
+         (Util_FileExists(pending) || TreeView_GetCount(GetDlgItem(window, IDC_S_TREE)) != 4) && GetTickCount64() < deadline;)
+        WaitForSnapshot(window, TRUE);
+    Check("the waiting change is made once the sync is done", !Util_FileExists(pending) && ReadString(file, "title", title, ARRAYSIZE(title)) &&
+          wcscmp(title, L"Made after the sync") == 0);
+}
+
 static void TestBackgroundView(const ProfileList *profiles)
 {
     static const int ids[] = { IDC_S_PROFILES, IDC_S_TREE, IDC_S_SEARCH, IDC_S_FIND, IDC_S_FILTER };
@@ -2294,6 +2447,7 @@ static void TestBackgroundView(const ProfileList *profiles)
         CreateWindowExW(0, classes[i], L"", style, i * 100, 0, 100, 300, window, (HMENU)(INT_PTR)ids[i], g_hInst, NULL);
     }
     tree = GetDlgItem(window, IDC_S_TREE);
+    Util_SetSetting(L"SessionsGrouping", 1);   /* by folder: a heading for each of the two conversations' folders */
     SessionsView_Init(window);
     SessionsView_SetProfiles(profiles);
     SessionsView_Warm(profiles);
@@ -2319,6 +2473,7 @@ static void TestBackgroundView(const ProfileList *profiles)
         Check("transcript append produces a sessions window event", ready && WaitForViewChange(window, tree, 0, TRUE));
         Check("transcript write snapshot completes", WaitForSnapshot(window, TRUE));
     }
+    CheckWaitingChangesUnderSync(window, profiles);
     SessionsView_Leave();
     newer = *profiles;
     newer.count = 0;
@@ -2621,33 +2776,20 @@ static void TestSessionSync(const WCHAR *projects)
         Check("exporting two sessions succeeds",
               SessionSync_Export(&set, 0, rows, 2, archive, &exported, error, ARRAYSIZE(error)) && exported == 2 && !error[0]);
         Check("the export is a session archive", SessionSync_IsArchive(archive));
+        {
+            ZipIn *exportedZip = Zip_Open(archive);
+            ArchivedSession *listed = NULL;
+            int count = exportedZip ? SessionSync_ArchiveSessions(exportedZip, &listed) : -1, i, found = 0;
+            for (i = 0; i < count; i++) found += _wcsicmp(listed[i].key, g_syncIds[0]) == 0 || _wcsicmp(listed[i].key, g_syncIds[2]) == 0;
+            Check("an archive lists its sessions, each by its key, with its title", count == 2 && found == 2 && listed[0].title[0] && listed[1].title[0]);
+            Check("an export says which conversation files are each session's",
+                  exportedZip && Zip_Find(exportedZip, "conversations/1.json") >= 0 && Zip_Find(exportedZip, "conversations/2.json") >= 0);
+            Util_Free(listed);
+            Zip_Free(exportedZip);
+        }
         Check("another file is not a session archive", !SessionSync_IsArchive(transcript));
         Check("a conversation of the fixture is taken away", DeleteFileW(transcript));
         {
-            WCHAR *preview = SessionSync_ImportPreview(&set, archive, 0x9, error, ARRAYSIZE(error));
-            Check("import preview distinguishes duplicate and new entries",
-                  preview && wcsstr(preview, TR(L"Duplicate; keep existing")) && wcsstr(preview, TR(L"New session")));
-            Check("preview does not extract transcripts or create target entries", preview && !FileThere(transcript) &&
-                  !EntryThere(entries[3], g_syncIds[0]) && !EntryThere(entries[3], g_syncIds[2]));
-            if (preview) HeapFree(GetProcessHeap(), 0, preview);
-            set.source[3].complete = FALSE;
-            preview = SessionSync_ImportPreview(&set, archive, 0x8, error, ARRAYSIZE(error));
-            Check("preview rejects an incomplete target snapshot", !preview && error[0]);
-            if (preview) HeapFree(GetProcessHeap(), 0, preview);
-            set.source[3].complete = TRUE;
-            {
-                WCHAR collision[MAX_PATH];
-                char json[512];
-                BOOL made = EntryPath(entries[3], g_syncIds[0], collision, ARRAYSIZE(collision)) &&
-                            SUCCEEDED(StringCchPrintfA(json, sizeof json,
-                                "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"lastActivityAt\":1}", g_syncIds[0], g_syncIds[4])) &&
-                            Save(collision, json);
-                preview = made ? SessionSync_ImportPreview(&set, archive, 0x8, error, ARRAYSIZE(error)) : NULL;
-                Check("preview reports an existing destination file as a conflict",
-                      preview && wcsstr(preview, TR(L"Conflict; keep existing entry with the same file name")));
-                if (preview) HeapFree(GetProcessHeap(), 0, preview);
-                if (made) DeleteFileW(collision);
-            }
             {
                 int at = SessionStore_FindEntry(&set, 0, g_syncIds[2], NULL);
                 if (at >= 0) {
@@ -2701,9 +2843,16 @@ static void TestSessionSync(const WCHAR *projects)
             ready = Zip_Close(out, added) && added && ready;
         }
         if (ready) zip = Zip_Open(wrapped);
+        {
+            ZipIn *inner = zip ? Zip_OpenItem(zip, Zip_Find(zip, SESSIONS_ARCHIVE)) : NULL;
+            ArchivedSession *listed = NULL;
+            Check("an archive inside a backup opens, its sessions listed", inner && SessionSync_ArchiveSessions(inner, &listed) == 2);
+            Util_Free(listed);
+            Zip_Free(inner);
+        }
         error[0] = 0;
         Check("backup restore rejects an import report with failed entry writes",
-              zip && !RestoreSessions(zip, &profiles, 3, g_root, &sessions, &signedOut, error, ARRAYSIZE(error)) && error[0]);
+              zip && !RestoreSessions(zip, &profiles, 3, NULL, g_root, &sessions, &signedOut, error, ARRAYSIZE(error)) && error[0]);
         Zip_Free(zip);
         for (i = 0; i < 2; i++)
             if (held[i] != INVALID_HANDLE_VALUE) {
@@ -2719,6 +2868,25 @@ static void TestSessionSync(const WCHAR *projects)
         Check("the imported entries are the exported ones",
               EntryTitled(entries[3], g_syncIds[2], L"A three") && EntryTitled(entries[3], g_syncIds[0], L"Fixture session"));
         SessionStore_Free(&set);
+        /* Some of them: their entries, and only their conversations' files. */
+        {
+            WCHAR picked[1][SESSION_ID_CCH];
+            SessionPick pick;
+            BOOL cleared = TRUE;
+            for (i = 0; i < 2; i++)
+                cleared = EntryPath(entries[3], g_syncIds[i == 0 ? 0 : 2], path, ARRAYSIZE(path)) && DeleteFileW(path) && cleared;
+            cleared = DeleteFileW(transcript) && cleared;
+            StringCchCopyW(picked[0], ARRAYSIZE(picked[0]), g_syncIds[2]);
+            pick.keys = (const WCHAR (*)[SESSION_ID_CCH])picked;
+            pick.count = 1;
+            loaded = cleared && SessionStore_LoadProfiles(&set, &profiles);
+            ZeroMemory(&report, sizeof report);
+            Check("importing some of an archive's sessions takes those alone",
+                  loaded && SessionSync_ImportPicked(&set, archive, 0x8, &pick, &sessions, &report) && sessions == 1 && report.added == 1 &&
+                  EntryThere(entries[3], g_syncIds[2]) && !EntryThere(entries[3], g_syncIds[0]));
+            Check("and only their conversations' files", loaded && !FileThere(transcript));
+            if (loaded) SessionStore_Free(&set);
+        }
     }
     if (before) HeapFree(GetProcessHeap(), 0, before);
     if (after) HeapFree(GetProcessHeap(), 0, after);
@@ -3059,6 +3227,14 @@ static const PurgeItem *FindPurged(const PurgeItem *items, int count, const WCHA
  * made in either, a deletion with Claude's mark or without, a list lost and
  * given back, a profile running meanwhile; a version restored; the
  * conversations no list names; Claude Code's folder copied. */
+/* The vault's last look for entries no version names, a day ago: the next keep looks again. */
+static BOOL AgeSweep(const WCHAR *state)
+{
+    WCHAR marker[MAX_PATH];
+    return SUCCEEDED(StringCchPrintfW(marker, ARRAYSIZE(marker), L"%s\\vault\\objects-swept", state)) &&
+           (!FileThere(marker) || SetModified(marker, 132000000000000000ULL));
+}
+
 static void TestVault(const WCHAR *projects)
 {
     static const WCHAR *const labels[3] = { L"Vault-A", L"Vault-B", L"Vault-C" };
@@ -3095,12 +3271,6 @@ static void TestVault(const WCHAR *projects)
     Check("a profile outside the group is left alone", !EntryThere(entries[2], g_vaultIds[0]) && !EntryThere(entries[2], g_vaultIds[1]));
     Check("a version of the group's list is kept",
           SessionVault_Versions(VAULT_GROUP_LIST, versions, ARRAYSIZE(versions)) == 1 && versions[0].sessions == 2 && versions[0].time > 0);
-    {
-        WCHAR *preview = SessionVault_RestorePreview(&profiles, 2, VAULT_GROUP_LIST, versions[0].name);
-        Check("recovery preview lists new sessions without writing entries", preview && wcsstr(preview, L"A one") &&
-              !EntryThere(entries[2], g_vaultIds[0]) && !EntryThere(entries[2], g_vaultIds[1]));
-        if (preview) HeapFree(GetProcessHeap(), 0, preview);
-    }
     Check("syncing again changes nothing and keeps no other version",
           KeepGroup(&profiles, 0x3, &report) && report.added + report.updated + report.removed == 0 &&
           SessionVault_Versions(VAULT_GROUP_LIST, versions, ARRAYSIZE(versions)) == 1);
@@ -3296,7 +3466,8 @@ static void TestVault(const WCHAR *projects)
         if (text) HeapFree(GetProcessHeap(), 0, text);
         Check("old versions and a stray entry in the vault", ready && made == 25);
         Sleep(20);
-        ready = ready && WriteVaultEntry(entries[0], g_vaultIds[0], "A one pruned", 600, FALSE) && KeepGroup(&profiles, 0x3, &report);
+        ready = ready && AgeSweep(state) && WriteVaultEntry(entries[0], g_vaultIds[0], "A one pruned", 600, FALSE) &&
+                KeepGroup(&profiles, 0x3, &report);
         after = SessionVault_Versions(VAULT_GROUP_LIST, many, ARRAYSIZE(many));
         for (p = 0; p < after; p++)
             if (wcsncmp(many[p].name, L"2020", 4) == 0) oldLeft++;
@@ -3305,6 +3476,10 @@ static void TestVault(const WCHAR *projects)
         Check("an entry no version names, written long ago, goes", ready && !FileThere(stray));
         Check("the entries the versions name stay", ready && EntryTitled(entries[1], g_vaultIds[0], L"A one pruned") &&
               SessionVault_Restore(&profiles, 2, VAULT_GROUP_LIST, many[0].name, &report) && report.failed == 0);
+        Check("the entries no version names are looked for once a day: one more stays until then",
+              Save(stray, "{}") && SetModified(stray, 132000000000000000ULL) &&
+              WriteVaultEntry(entries[0], g_vaultIds[0], "A one pruned again", 650, FALSE) && KeepGroup(&profiles, 0x3, &report) &&
+              FileThere(stray));
         {
             WCHAR blocked[MAX_PATH], version[MAX_PATH];
             BOOL denied;
@@ -3312,7 +3487,7 @@ static void TestVault(const WCHAR *projects)
                     Join(blocked, L"20200101-000000-000.txt", version, ARRAYSIZE(version)) &&
                     Save(version, "claude-desktop-profiles-manager-vault 1\nlisted\tabababab-0000-4000-8000-000000000001\t00000000000abcde\t1\n") &&
                     Save(stray, "{}") && SetModified(stray, 132000000000000000ULL);
-            denied = ready && DenyDirectory(blocked, TRUE);
+            denied = ready && DenyDirectory(blocked, TRUE) && AgeSweep(state);
             Sleep(20);
             Check("vault collection stops when another list cannot be enumerated",
                   denied && WriteVaultEntry(entries[0], g_vaultIds[0], "A one guarded", 700, FALSE) &&
@@ -3324,7 +3499,7 @@ static void TestVault(const WCHAR *projects)
             }
             Sleep(20);
             Check("vault collection resumes once every list can be read",
-                  ready && WriteVaultEntry(entries[0], g_vaultIds[0], "A one recovered", 800, FALSE) &&
+                  ready && AgeSweep(state) && WriteVaultEntry(entries[0], g_vaultIds[0], "A one recovered", 800, FALSE) &&
                   KeepGroup(&profiles, 0x3, &report) && !FileThere(stray));
         }
     }
@@ -3888,6 +4063,57 @@ static BOOL SetWebMember(const Profile *p, const WCHAR *name, const char *const 
     return ok;
 }
 
+/* Read and unread, as Claude's sidebar shows them (its web storage's
+ * epitaxy-unread-v1): a session Claude marked shows unread; Mark as read in
+ * a closed profile takes it out of Claude's lists at once, the others kept;
+ * Mark as unread puts it in the list of those marked by hand. */
+static void TestUnreadMarks(void)
+{
+    static const WCHAR *const names[1] = { L"epitaxy-unread-v1" };
+    ProfileList profiles;
+    SessionSet set;
+    PendingEdit edit;
+    WCHAR entries[MAX_PATH];
+    char value[256], id[64], marked[96];
+    const char *values[1];
+    BOOL ready, waiting = TRUE, unread = FALSE;
+    int found = -1;
+    ZeroMemory(&profiles, sizeof profiles);
+    ZeroMemory(&set, sizeof set);
+    profiles.count = 1;
+    StringCchPrintfA(id, sizeof id, "\"local_%ls\"", g_keptIds[2]);
+    StringCchPrintfA(marked, sizeof marked, "\"explicitUnreadIds\":[%s]", id);
+    StringCchPrintfA(value, sizeof value, "{\"state\":{\"unreadIds\":[%s,\"local_other\"],\"explicitUnreadIds\":[]},\"version\":0}", id);
+    values[0] = value;
+    ready = PrepareProfile(&profiles.items[0], L"Unread-A", L"unread\\A", L"unread-a", L"unread-organization", entries, ARRAYSIZE(entries)) &&
+            WriteKeptEntry(entries, g_keptIds[2], "Unread one", L"C:\\Fixture", AtSecond(2)) &&
+            MakeWebStorage(profiles.items[0].storageDir, names, values, 1);
+    Check("unread: fixtures created", ready);
+    if (!ready) return;
+    if (SessionStore_LoadProfiles(&set, &profiles) && (found = SessionStore_FindEntry(&set, 0, g_keptIds[2], NULL)) >= 0)
+        unread = set.entries[found].unread;
+    Check("unread: a session Claude marked shows unread", unread);
+    ZeroMemory(&edit, sizeof edit);
+    edit.op = PENDING_READ;
+    StringCchCopyW(edit.key, ARRAYSIZE(edit.key), g_keptIds[2]);
+    StringCchCopyW(edit.value, ARRAYSIZE(edit.value), L"1");
+    Check("unread: read in a closed profile at once",
+          found >= 0 && SessionEdit_Change(NULL, &profiles.items[0], &set.entries[found], &edit, &waiting, NULL, 0) && !waiting);
+    Check("unread: out of Claude's list, the other session kept", !WebHas(&profiles.items[0], names[0], id) &&
+                                                                  WebHas(&profiles.items[0], names[0], "[\"local_other\"]"));
+    SessionStore_Free(&set);
+    unread = TRUE;
+    if (SessionStore_LoadProfiles(&set, &profiles) && (found = SessionStore_FindEntry(&set, 0, g_keptIds[2], NULL)) >= 0)
+        unread = set.entries[found].unread;
+    Check("unread: shown read once read", !unread);
+    StringCchCopyW(edit.value, ARRAYSIZE(edit.value), L"0");
+    waiting = TRUE;
+    Check("unread: marked unread in a closed profile at once",
+          found >= 0 && SessionEdit_Change(NULL, &profiles.items[0], &set.entries[found], &edit, &waiting, NULL, 0) && !waiting &&
+          WebHas(&profiles.items[0], names[0], marked));
+    SessionStore_Free(&set);
+}
+
 /* What profiles sync, chosen item by item: Claude's settings and its window's
  * copies of them, plain text values, its own files (Chromium's zoom under
  * each profile's own key), each session's own values made the same session
@@ -4423,6 +4649,66 @@ static void TestCleanupReferences(const WCHAR *projects)
     HeapFree(GetProcessHeap(), 0, items);
 }
 
+/* `text` added to the end of `path`. */
+static BOOL AppendText(const WCHAR *path, const char *text)
+{
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD written = 0;
+    BOOL ok = file != INVALID_HANDLE_VALUE && WriteFile(file, text, (DWORD)strlen(text), &written, NULL) && written == strlen(text);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    return ok;
+}
+
+/* A transcript written well before keeps its result through file
+ * notifications; one Claude Code adds lines to is searched in those lines
+ * only, and keeps a line found; more transcripts than the cache once held
+ * (256) are each read once. */
+static void TestGrowingSearch(SessionSearch *search, const WCHAR *path, WCHAR *message)
+{
+    static const char kLine[] = "{\"type\":\"user\",\"message\":{\"content\":\"Older words\"}}\n";
+    WCHAR name[64], many[MAX_PATH];
+    FILETIME now;
+    ULONGLONG old, hitOffset = 0;
+    size_t hitEnd = 0;
+    LONG reads;
+    BOOL ready;
+    int i, pass;
+    GetSystemTimeAsFileTime(&now);
+    old = (((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - 3600ULL * 10000000ULL;
+    search->regex = FALSE;
+    search->matchCase = TRUE;
+    StringCchCopyW(search->text, ARRAYSIZE(search->text), L"Gamma");
+    ready = Save(path, kLine) && SetModified(path, old);
+    reads = g_transcriptReads;
+    Check("a transcript without the text is read", ready && !TranscriptMatches(search, path, message, &hitOffset, &hitEnd) &&
+          g_transcriptReads == reads + 1);
+    SessionSearch_Invalidate();
+    Check("a transcript written well before keeps its result through a file notification",
+          !TranscriptMatches(search, path, message, &hitOffset, &hitEnd) && g_transcriptReads == reads + 1);
+    ready = AppendText(path, "{\"type\":\"assistant\",\"message\":{\"content\":\"Gamma rays\"}}\n");
+    Check("the lines added to a transcript are searched", ready && TranscriptMatches(search, path, message, &hitOffset, &hitEnd) &&
+          hitOffset == sizeof kLine - 1 && g_transcriptReads == reads + 2);
+    ready = AppendText(path, kLine);
+    Check("a transcript that only grew keeps the line found", ready && TranscriptMatches(search, path, message, &hitOffset, &hitEnd) &&
+          hitOffset == sizeof kLine - 1 && g_transcriptReads == reads + 3);
+    ready = Save(path, "{\"type\":\"user\",\"message\":{\"content\":\"Other words\"}}\n"
+                       "{\"type\":\"user\",\"message\":{\"content\":\"more bytes than before, so that the file looks as if it only grew, "
+                       "though its start is not what was read; nothing here holds the text searched for\"}}\n");
+    Check("a transcript written again from its start, longer, is read whole",
+          ready && !TranscriptMatches(search, path, message, &hitOffset, &hitEnd) && g_transcriptReads == reads + 4);
+    for (i = 0, ready = TRUE; ready && i < 300; i++)
+        ready = SUCCEEDED(StringCchPrintfW(name, ARRAYSIZE(name), L"search-many\\%03d.jsonl", i)) && FixturePath(name, many, ARRAYSIZE(many)) &&
+                Save(many, kLine) && SetModified(many, old);
+    Check("300 search transcripts prepared", ready);
+    reads = g_transcriptReads;
+    for (pass = 0; ready && pass < 2; pass++)
+        for (i = 0; ready && i < 300; i++)
+            ready = SUCCEEDED(StringCchPrintfW(name, ARRAYSIZE(name), L"search-many\\%03d.jsonl", i)) && FixturePath(name, many, ARRAYSIZE(many)) &&
+                    !TranscriptMatches(search, many, message, &hitOffset, &hitEnd);
+    Check("each of 300 transcripts is read once for two searches", ready && g_transcriptReads == reads + 300);
+}
+
 static void TestSearchCache(void)
 {
     SessionSearch search;
@@ -4443,13 +4729,13 @@ static void TestSearchCache(void)
     Check("search cache fixture created", ready);
     if (!ready) { if (message) HeapFree(GetProcessHeap(), 0, message); return; }
     SessionSearch_Invalidate();
-    g_searchReads = 0;
-    Check("the initial search reads decoded conversation text", TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 1);
-    Check("an unchanged file reuses its search result", TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 1);
+    g_transcriptReads = 0;
+    Check("the initial search reads decoded conversation text", TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_transcriptReads == 1);
+    Check("an unchanged file reuses its search result", TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_transcriptReads == 1);
     Check("a different query has its own cache entry", StringCchCopyW(search.text, ARRAYSIZE(search.text), L"Beta") == S_OK &&
-          !TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 2);
+          !TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_transcriptReads == 2);
     ready = Save(path, "{\"type\":\"user\",\"message\":{\"content\":\"Beta Beta\"}}\n");
-    Check("changing file size invalidates cached results", ready && TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 3);
+    Check("changing file size invalidates cached results", ready && TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_transcriptReads == 3);
     ready = FileStamp(path, &stamp) && Save(path, "{\"type\":\"user\",\"message\":{\"content\":\"Zeta Zeta\"}}\n");
     file = ready ? CreateFileW(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
@@ -4459,7 +4745,7 @@ static void TestSearchCache(void)
     } else ready = FALSE;
     SessionSearch_Invalidate();
     Check("a file notification invalidates even equal-size equal-time replacements",
-          ready && !TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_searchReads == 4);
+          ready && !TranscriptMatches(&search, path, message, &hitOffset, &hitEnd) && g_transcriptReads == 4);
     StringCchCopyW(search.text, ARRAYSIZE(search.text), L"zeta");
     search.matchCase = TRUE;
     Check("case-sensitive searches remain separate", !TranscriptMatches(&search, path, message, &hitOffset, &hitEnd));
@@ -4469,6 +4755,7 @@ static void TestSearchCache(void)
     StringCchCopyW(search.text, ARRAYSIZE(search.text), L"Zeta.*Zeta");
     Check("regular-expression searches retain message semantics", Core_RegexCompile(&search.compiled, search.text, FALSE) &&
           TranscriptMatches(&search, path, message, &hitOffset, &hitEnd));
+    TestGrowingSearch(&search, path, message);
     HeapFree(GetProcessHeap(), 0, message);
 }
 
@@ -4494,9 +4781,94 @@ static void TestPrivateDiagnostics(void)
     Check("diagnostics reject an undersized output buffer", !Diagnostics_Text(&pkg, &profiles, text, 4));
 }
 
+/* The sign-in's key goes in a backup with the sign-in, in the clear, and
+ * opens in a profile where the key it had does not: no password asked. */
+/* A backup of `items` (WriteBackup), the profile's own as `own` says (NULL: as it is). */
+static BOOL WriteItems(const ProfileList *profiles, int index, DWORD items, const ProfileOwn *own, const WCHAR *path, WCHAR *error, size_t cch)
+{
+    BackupChoice choice;
+    ZeroMemory(&choice, sizeof choice);
+    choice.items = items;
+    if (own) choice.own = *own;
+    return WriteBackup(profiles, index, &choice, path, error, cch);
+}
+
+static void TestSignInKey(void)
+{
+    static const BYTE kKey[32] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32 };
+    ProfileList profiles;
+    WCHAR entries[2][MAX_PATH], archive[MAX_PATH], error[512];
+    BYTE opened[64];
+    size_t length = 0;
+    DWORD manifestLength = 0;
+    ULONGLONG items = 0;
+    const char *value;
+    size_t valueLength;
+    char *manifest = NULL;
+    ZipIn *zip = NULL;
+    BOOL ready;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    ready = PrepareProfile(&profiles.items[0], L"Key-A", L"key\\A", L"key-a", L"organization", entries[0], ARRAYSIZE(entries[0])) &&
+            PrepareProfile(&profiles.items[1], L"Key-B", L"key\\B", L"key-b", L"organization", entries[1], ARRAYSIZE(entries[1])) &&
+            SaveIn(profiles.items[0].storageDir, L"Local State", "{\"os_crypt\":{}}") &&
+            Backup_WriteAppKey(profiles.items[0].storageDir, kKey, sizeof kKey) && FixturePath(L"key-backup.zip", archive, ARRAYSIZE(archive)) &&
+            WriteItems(&profiles, 0, BK_SIGNIN | BK_PROFILE, NULL, archive, error, ARRAYSIZE(error));
+    Check("sign-in key fixtures created", ready);
+    if (ready) zip = Zip_Open(archive);
+    if (zip) manifest = (char *)Zip_Read(zip, Zip_Find(zip, MANIFEST_NAME), MANIFEST_MAX, &manifestLength);
+    Check("a backup's sign-in carries its key, named in its items",
+          zip && Zip_Find(zip, KEY_NAME) >= 0 && manifest && Core_JsonMember(manifest, manifestLength, "items", &value, &valueLength) &&
+          Core_JsonNumber(value, valueLength, &items) && (items & BK_KEY) && (items & BK_SIGNIN));
+    {
+        DWORD ownLength = 0;
+        char *own = zip ? (char *)Zip_Read(zip, Zip_Find(zip, PROFILE_NAME), MANIFEST_MAX, &ownLength) : NULL;
+        WCHAR name[LABEL_CCH];
+        Check("a backup carries the profile's own name, note, icon and title",
+              own && Core_JsonMemberString(own, ownLength, "name", name, ARRAYSIZE(name)) && wcscmp(name, L"Key-A") == 0 &&
+              Core_JsonMember(own, ownLength, "color", &value, &valueLength) && Core_JsonMember(own, ownLength, "windowTitle", &value, &valueLength) &&
+              (items & BK_PROFILE));
+        Util_Free(own);
+    }
+    {
+        ProfileOwn edited, read;
+        WCHAR second[MAX_PATH];
+        ZipIn *again = NULL;
+        ZeroMemory(&edited, sizeof edited);
+        ZeroMemory(&read, sizeof read);
+        edited.held = PROFILE_OWN_NAME | PROFILE_OWN_NOTE | PROFILE_OWN_COLOR;
+        edited.parts = PROFILE_OWN_NAME | PROFILE_OWN_COLOR;   /* the note left out */
+        StringCchCopyW(edited.name, ARRAYSIZE(edited.name), L"Edited \x201Cname\x201D");
+        StringCchCopyW(edited.note, ARRAYSIZE(edited.note), L"not taken");
+        edited.color = 3;
+        Check("an export writes the profile's own as the person left it, the parts taken only",
+              FixturePath(L"own-backup.zip", second, ARRAYSIZE(second)) &&
+              WriteItems(&profiles, 0, BK_PROFILE, &edited, second, error, ARRAYSIZE(error)) && (again = Zip_Open(second)) != NULL &&
+              ReadProfileOwn(again, &read) && read.held == (PROFILE_OWN_NAME | PROFILE_OWN_COLOR) && read.parts == read.held &&
+              wcscmp(read.name, edited.name) == 0 && read.color == 3);
+        Zip_Free(again);
+        /* What a backup dropped where no profile is starts the new profile's form with. */
+        ZeroMemory(&read, sizeof read);
+        Check("a backup's own is read for a new profile", Backup_ReadOwn(second, &read) && read.held == (PROFILE_OWN_NAME | PROFILE_OWN_COLOR) &&
+              wcscmp(read.name, edited.name) == 0 && read.color == 3);
+        Check("a file that is no backup has none", FixturePath(L"not-a-backup.zip", second, ARRAYSIZE(second)) && Save(second, "not a zip") &&
+              !Backup_ReadOwn(second, &read) && !read.held && read.color == -1);
+    }
+    Check("the key opens in a profile whose own key it is not, without a password",
+          zip && SaveIn(profiles.items[1].storageDir, L"Local State", "{}") &&
+          OpenSignInKey(NULL, zip, &profiles.items[1], L"Fixture", TRUE) == NULL &&
+          Backup_ReadAppKey(profiles.items[1].storageDir, opened, sizeof opened, &length) && length == sizeof kKey &&
+          memcmp(opened, kKey, sizeof kKey) == 0);
+    Util_Free(manifest);
+    Zip_Free(zip);
+}
+
 static void TestBackupFailures(void)
 {
-    static const WCHAR *const id = L"abababab-0000-4000-8000-00000000b001";
+    static const WCHAR *const id = L"abababab-0000-4000-8000-00000000b001", *const second = L"abababab-0000-4000-8000-00000000b002";
+    WCHAR picked[1][SESSION_ID_CCH];
+    SessionPick pick;
+    RestoreChoice choice;
     ProfileList profiles;
     WCHAR entries[2][MAX_PATH], targetEntries[MAX_PATH], archive[MAX_PATH], settings[MAX_PATH], path[MAX_PATH], to[MAX_PATH];
     WCHAR error[LONG_PATH_CCH];
@@ -4512,12 +4884,34 @@ static void TestBackupFailures(void)
     profiles.count = 2;
     ready = PrepareProfile(&profiles.items[0], L"Backup-A", L"backup\\A", L"backup-a", L"organization", entries[0], ARRAYSIZE(entries[0])) &&
             PrepareProfile(&profiles.items[1], L"Backup-B", L"backup\\B", L"backup-b", L"organization", entries[1], ARRAYSIZE(entries[1])) &&
-            WriteSyncEntry(entries[0], id, "Backed up", 123) &&
+            WriteSyncEntry(entries[0], id, "Backed up", 123) && WriteSyncEntry(entries[0], second, "Left out", 124) &&
             SaveIn(profiles.items[0].storageDir, L"config.json", "{\"lastKnownAccountUuid\":\"backup-a\",\"userThemeMode\":\"dark\"}") &&
             Join(profiles.items[1].storageDir, L"claude-code-sessions\\backup-a\\organization", targetEntries, ARRAYSIZE(targetEntries)) &&
             MakeDir(targetEntries) && FixturePath(L"account-backup.zip", archive, ARRAYSIZE(archive)) &&
-            WriteBackup(&profiles, 0, BK_SIGNIN | BK_CONVERSATIONS, NULL, archive, error, ARRAYSIZE(error));
+            WriteItems(&profiles, 0, BK_SIGNIN | BK_CONVERSATIONS, NULL, archive, error, ARRAYSIZE(error));
     Check("cross-account backup fixtures created", ready);
+    StringCchCopyW(picked[0], ARRAYSIZE(picked[0]), id);
+    pick.keys = (const WCHAR (*)[SESSION_ID_CCH])picked;
+    pick.count = 1;
+    {
+        WCHAR kept[1][SESSION_ID_CCH], some[MAX_PATH];
+        BackupChoice exported;
+        ZipIn *backup = NULL, *inner = NULL;
+        ArchivedSession *listed = NULL;
+        int listedCount = -1;
+        ZeroMemory(&exported, sizeof exported);
+        exported.items = BK_CONVERSATIONS;
+        StringCchCopyW(kept[0], ARRAYSIZE(kept[0]), id);
+        exported.sessions = kept;
+        exported.sessionCount = 1;
+        if (ready && FixturePath(L"some-sessions.zip", some, ARRAYSIZE(some)) && WriteBackup(&profiles, 0, &exported, some, error, ARRAYSIZE(error)) &&
+            (backup = Zip_Open(some)) != NULL && (inner = Zip_OpenItem(backup, Zip_Find(backup, SESSIONS_ARCHIVE))) != NULL)
+            listedCount = SessionSync_ArchiveSessions(inner, &listed);
+        Check("an export of some sessions holds those alone", listedCount == 1 && _wcsicmp(listed[0].key, id) == 0);
+        Util_Free(listed);
+        Zip_Free(inner);
+        Zip_Free(backup);
+    }
     if (ready) zip = Zip_Open(archive);
     ready = ready && FixturePath(L"appearance-backup.zip", settings, ARRAYSIZE(settings)) && (out = Zip_Create(settings, &code)) != NULL;
     if (ready) {
@@ -4535,17 +4929,20 @@ static void TestBackupFailures(void)
     sources[1].version = 2;
     from[PICK_UNIT_ACCOUNT] = 0;
     from[PICK_UNIT_SETTINGS] = 1;
+    ZeroMemory(&choice, sizeof choice);
+    choice.items = BK_SIGNIN | BK_CONVERSATIONS | SYNC_ITEM_APPEARANCE;
+    choice.sessions = &pick;
     Check("account restore selects that account before importing its sessions",
-          zip && appearance && RestoreChosen(NULL, &profiles, 1, sources, 2, BK_SIGNIN | BK_CONVERSATIONS | SYNC_ITEM_APPEARANCE,
-                                             from, g_root, L"Fixture restore", &result) && result.sessions == 1 &&
+          zip && appearance && RestoreChosen(NULL, &profiles, 1, sources, 2, &choice, from, g_root, L"Fixture restore", &result) && result.sessions == 1 &&
           EntryThere(targetEntries, id) && !EntryThere(entries[1], id));
+    Check("a restore of some sessions leaves the others out", zip && !EntryThere(targetEntries, second));
     Check("settings from the separately chosen backup survive the sign-in restore",
           appearance &&
           Join(profiles.items[1].storageDir, L"config.json", path, ARRAYSIZE(path)) && FileHas(path, "\"backup-a\"") &&
           FileHas(path, "\"light\""));
     Check("an account without an initialized folder cannot restore into the old account",
           zip && SaveIn(profiles.items[1].storageDir, L"config.json", "{\"lastKnownAccountUuid\":\"not-initialized\"}") &&
-          !RestoreSessions(zip, &profiles, 1, g_root, &sessions, &signedOut, error, ARRAYSIZE(error)) && error[0] &&
+          !RestoreSessions(zip, &profiles, 1, NULL, g_root, &sessions, &signedOut, error, ARRAYSIZE(error)) && error[0] &&
           !EntryThere(entries[1], id));
     Zip_Free(appearance);
     Zip_Free(zip);
@@ -4559,6 +4956,407 @@ static void TestBackupFailures(void)
     Check("archiving an unreadable tree fails", denied && out && !AddTree(out, path, L"data"));
     if (out) Zip_Close(out, FALSE);
     if (denied) Check("the private backup folder's access is restored", DenyDirectory(path, FALSE));
+}
+
+/* A setting as a list shows it, and back: a switch, a text, a number that
+ * stays one, what a list holds only shown. An export and an import carry the
+ * settings the person changed, theirs, the others as they are. */
+static void TestSettingValues(void)
+{
+    ProfileList profiles;
+    WCHAR entries[2][MAX_PATH], archive[MAX_PATH], path[MAX_PATH], error[LONG_PATH_CCH];
+    CheckValue value;
+    char out[256];
+    BackupChoice exported;
+    RestoreSource source;
+    RestoreChoice imported;
+    RestoreResult result;
+    ZipIn *zip = NULL;
+    DWORD length = 0;
+    char *layout = NULL;
+    int from[PICK_UNITS];
+    BOOL ready;
+    ZeroMemory(&value, sizeof value);
+    Check("a setting on or off is a switch, and comes back as the other when turned over",
+          CheckList_FromJson(&value, "true", 4) && value.kind == CHECK_VALUE_SWITCH && value.on && !CheckList_ToJson(&value, "true", 4, out, sizeof out) &&
+          (value.on = FALSE, CheckList_ToJson(&value, "true", 4, out, sizeof out)) && strcmp(out, "false") == 0);
+    ZeroMemory(&value, sizeof value);
+    Check("a text setting is a text, and comes back quoted",
+          CheckList_FromJson(&value, "\"chrome\"", 8) && value.kind == CHECK_VALUE_TEXT && wcscmp(value.text, L"chrome") == 0 &&
+          (StringCchCopyW(value.text, ARRAYSIZE(value.text), L"ed\"ge"), CheckList_ToJson(&value, "\"chrome\"", 8, out, sizeof out)) &&
+          strcmp(out, "\"ed\\\"ge\"") == 0);
+    ZeroMemory(&value, sizeof value);
+    Check("a number stays one: a text that is none does not change it",
+          CheckList_FromJson(&value, "1.25", 4) && wcscmp(value.text, L"1.25") == 0 &&
+          (StringCchCopyW(value.text, ARRAYSIZE(value.text), L"big"), !CheckList_ToJson(&value, "1.25", 4, out, sizeof out)) &&
+          (StringCchCopyW(value.text, ARRAYSIZE(value.text), L"1.5"), CheckList_ToJson(&value, "1.25", 4, out, sizeof out)) && strcmp(out, "1.5") == 0);
+    ZeroMemory(&value, sizeof value);
+    Check("a list setting only shows how many it holds",
+          CheckList_FromJson(&value, "[1,2,3]", 7) && value.readOnly && wcsstr(value.text, L"3") && !CheckList_ToJson(&value, "[1,2,3]", 7, out, sizeof out));
+
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 2;
+    ready = PrepareProfile(&profiles.items[0], L"Setting-A", L"setting\\A", L"setting-a", L"organization", entries[0], ARRAYSIZE(entries[0])) &&
+            PrepareProfile(&profiles.items[1], L"Setting-B", L"setting\\B", L"setting-a", L"organization", entries[1], ARRAYSIZE(entries[1])) &&
+            SaveIn(profiles.items[0].storageDir, CLAUDE_DESKTOP_SETTINGS, "{\"preferences\":{\"ccAutoArchiveOnPrClose\":true,\"coworkWebSearchEnabled\":true}}") &&
+            SaveIn(profiles.items[1].storageDir, CLAUDE_DESKTOP_SETTINGS, "{\"preferences\":{\"ccAutoArchiveOnPrClose\":true,\"coworkWebSearchEnabled\":true}}") &&
+            FixturePath(L"settings-backup.zip", archive, ARRAYSIZE(archive));
+    Check("setting fixtures created", ready);
+    ZeroMemory(&exported, sizeof exported);
+    exported.items = SYNC_ITEM_SETTINGS_ARCHIVE | SYNC_ITEM_SETTINGS_COWORK;
+    exported.settings = Util_CopyBytes("{\"autoArchive\":false}", 21);
+    exported.settingsLength = 21;
+    if (ready && exported.settings && WriteBackup(&profiles, 0, &exported, archive, error, ARRAYSIZE(error)) && (zip = Zip_Open(archive)) != NULL)
+        layout = (char *)Zip_Read(zip, Zip_Find(zip, LAYOUT_NAME), JSON_MAX, &length);
+    Check("an export carries a setting changed, the others as they are",
+          layout && strstr(layout, "\"autoArchive\":false") && strstr(layout, "\"coworkWebSearch\":true"));
+    Util_Free(layout);
+    Util_Free(exported.settings);
+    ZeroMemory(&source, sizeof source);
+    source.zip = zip;
+    source.offered = SYNC_ITEM_SETTINGS_ARCHIVE | SYNC_ITEM_SETTINGS_COWORK;
+    source.version = 2;
+    from[PICK_UNIT_SETTINGS] = 0;
+    from[PICK_UNIT_ACCOUNT] = -1;
+    ZeroMemory(&imported, sizeof imported);
+    imported.items = SYNC_ITEM_SETTINGS_ARCHIVE | SYNC_ITEM_SETTINGS_COWORK;
+    imported.settings = "{\"coworkWebSearch\":false}";
+    imported.settingsLength = 25;
+    Check("an import gives the profile a setting changed, the others as the backup has them",
+          zip && RestoreChosen(NULL, &profiles, 1, &source, 1, &imported, from, g_root, L"Fixture restore", &result) &&
+          Join(profiles.items[1].storageDir, CLAUDE_DESKTOP_SETTINGS, path, ARRAYSIZE(path)) && FileHas(path, "\"ccAutoArchiveOnPrClose\":false") &&
+          FileHas(path, "\"coworkWebSearchEnabled\":false"));
+    Zip_Free(zip);
+    /* The edit dialog's: the settings changed sent as a sync sends a layout. */
+    {
+        SessionSet set;
+        SyncSend send;
+        SyncReport report;
+        ZeroMemory(&set, sizeof set);
+        ZeroMemory(&send, sizeof send);
+        ZeroMemory(&report, sizeof report);
+        send.op.kind = SYNC_LAYOUT;
+        StringCchCopyW(send.op.key, ARRAYSIZE(send.op.key), L"layout");
+        send.content = "{\"coworkWebSearch\":false}";
+        send.length = 25;
+        Check("a setting changed in the edit dialog is made in a closed profile, the others left as they are",
+              ready && SessionStore_LoadProfiles(&set, &profiles) && SessionSync_Send(&set, &send, 1, &report) && !report.failed && !report.unavailable &&
+              Join(profiles.items[0].storageDir, CLAUDE_DESKTOP_SETTINGS, path, ARRAYSIZE(path)) && FileHas(path, "\"coworkWebSearchEnabled\":false") &&
+              FileHas(path, "\"ccAutoArchiveOnPrClose\":true"));
+        SessionStore_Free(&set);
+    }
+}
+
+/* A setting that holds a list or an object shows its parts one by one, a
+ * session by its title: one left out is not in what is written, one changed
+ * is, the others as they were; a setting all left out is null, which an
+ * export takes out. */
+static void TestSettingParts(void)
+{
+    static const char layout[] = "{\"starred\":[\"local_a\",\"local_b\",\"local_c\"],\"editor\":{\"state\":{\"chatTextSize\":\"m\",\"editorFont\":\"\"},"
+                                 "\"version\":0},\"autoArchive\":true}";
+    ProfileList profiles;
+    CheckList checks;
+    CheckValue *values = (CheckValue *)Util_Alloc(64 * sizeof *values);
+    ArchivedSession session;
+    SessionNames names;
+    BackupChoice exported;
+    WCHAR entries[MAX_PATH], archive[MAX_PATH], error[LONG_PATH_CCH];
+    ZipIn *zip = NULL;
+    DWORD length = 0;
+    char *changes = NULL, *written = NULL;
+    size_t changesLength = 0;
+    int i, starred = -1, named = -1, size = -1;
+    ZeroMemory(&checks, sizeof checks);
+    ZeroMemory(&session, sizeof session);
+    StringCchCopyW(session.own, ARRAYSIZE(session.own), L"local_b");
+    StringCchCopyW(session.title, ARRAYSIZE(session.title), L"Fix the parser");
+    names.sessions = &session;
+    names.count = 1;
+    checks.groups = SyncUi_Groups(&checks.groupCount);
+    checks.items = SyncUi_Items(&checks.itemCount);
+    checks.values = values;
+    checks.offered = checks.checked = SYNC_ITEMS_ALL;
+    if (values) SyncUi_AddLayoutValues(&checks, 64, layout, sizeof layout - 1, SYNC_ITEMS_ALL, TRUE, &names);
+    for (i = 0; values && i < checks.valueCount; i++) {
+        if (!values[i].parent && values[i].label && wcscmp(values[i].label, L"Starred sessions") == 0) starred = i;
+        if (values[i].parent && wcscmp(values[i].name, L"Fix the parser") == 0) named = i;
+        if (values[i].parent && wcscmp(values[i].name, L"chatTextSize") == 0) size = i;
+    }
+    Check("a list setting shows its elements one by one, a session by its title, each with a box",
+          starred >= 0 && named == starred + 2 && values[named].parent == starred + 1 && values[named].boxed && values[named].taken);
+    Check("an object's members show by their keys, a text one changed in place", size > 0 && values[size].kind == CHECK_VALUE_TEXT &&
+          wcscmp(values[size].text, L"m") == 0);
+    if (named > 0 && size > 0) {
+        values[named].taken = FALSE;
+        StringCchCopyW(values[size].text, ARRAYSIZE(values[size].text), L"l");
+        changes = SyncUi_LayoutChanges(&checks, 0, layout, sizeof layout - 1, &changesLength);
+    }
+    Check("an element left out is not written, a member changed is, the rest as they were, an unchanged setting not at all",
+          changes && strstr(changes, "\"starred\":[\"local_a\",\"local_c\"]") && strstr(changes, "\"chatTextSize\":\"l\"") &&
+          strstr(changes, "\"editorFont\":\"\"") && strstr(changes, "\"version\":0") && !strstr(changes, "autoArchive"));
+    Util_Free(changes);
+    changes = NULL;
+    for (i = starred + 1; starred >= 0 && i < checks.valueCount && values[i].parent == starred + 1; i++) values[i].taken = FALSE;
+    if (starred >= 0) changes = SyncUi_LayoutChanges(&checks, 0, layout, sizeof layout - 1, &changesLength);
+    Check("a setting all left out is null", changes && strstr(changes, "\"starred\":null"));
+    Util_Free(changes);
+    Util_Free(values);
+
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 1;
+    ZeroMemory(&exported, sizeof exported);
+    exported.items = SYNC_ITEM_SETTINGS_ARCHIVE | SYNC_ITEM_SETTINGS_COWORK;
+    exported.settings = Util_CopyBytes("{\"coworkWebSearch\":null}", 24);
+    exported.settingsLength = 24;
+    if (PrepareProfile(&profiles.items[0], L"Parts-A", L"parts\\A", L"parts-a", L"organization", entries, ARRAYSIZE(entries)) &&
+        SaveIn(profiles.items[0].storageDir, CLAUDE_DESKTOP_SETTINGS, "{\"preferences\":{\"ccAutoArchiveOnPrClose\":true,\"coworkWebSearchEnabled\":true}}") &&
+        FixturePath(L"parts-backup.zip", archive, ARRAYSIZE(archive)) && exported.settings &&
+        WriteBackup(&profiles, 0, &exported, archive, error, ARRAYSIZE(error)) && (zip = Zip_Open(archive)) != NULL)
+        written = (char *)Zip_Read(zip, Zip_Find(zip, LAYOUT_NAME), JSON_MAX, &length);
+    Check("an export leaves out a setting left out, the others as they are",
+          written && strstr(written, "\"autoArchive\":true") && !strstr(written, "coworkWebSearch"));
+    Util_Free(written);
+    Util_Free(exported.settings);
+    Zip_Free(zip);
+}
+
+/* Profiles dragged out of the list: the drag carries a marker of ours; the
+ * folder it is dropped on (its drop target, as Explorer's) copies it, and
+ * the shell's notice of that copy names the folder, the copy taken away.
+ * The notice comes through this thread's messages; OLE's drag and drop
+ * needs OLE here. */
+static void TestDragOut(void)
+{
+    WCHAR marker[MAX_PATH], folder[MAX_PATH], seen[LONG_PATH_CCH] = L"", copied[MAX_PATH];
+    IShellItem *item = NULL, *place = NULL;
+    IDataObject *data = NULL;
+    IDropTarget *target = NULL;
+    POINTL at = { 0, 0 };
+    DWORD effect = DROPEFFECT_COPY;
+    HRESULT ole = OleInitialize(NULL), hr = E_FAIL;
+    DragDrop *drop = NULL;
+    BOOL ready, found = FALSE;
+    ready = SUCCEEDED(ole) && FixturePath(L"dropped", folder, ARRAYSIZE(folder)) && MakeDir(folder) &&
+            (drop = DragOut_Begin(marker, ARRAYSIZE(marker))) != NULL;
+    Check("a drag's marker made, hidden and empty, and watched for",
+          ready && DragOut_IsMarker(marker) && (GetFileAttributesW(marker) & FILE_ATTRIBUTE_HIDDEN) && !DragOut_IsMarker(folder));
+    if (ready && SUCCEEDED(SHCreateItemFromParsingName(marker, NULL, &IID_IShellItem, (void **)&item)) &&
+        SUCCEEDED(item->lpVtbl->BindToHandler(item, NULL, &BHID_DataObject, &IID_IDataObject, (void **)&data)) &&
+        SUCCEEDED(SHCreateItemFromParsingName(folder, NULL, &IID_IShellItem, (void **)&place)) &&
+        SUCCEEDED(place->lpVtbl->BindToHandler(place, NULL, &BHID_SFUIObject, &IID_IDropTarget, (void **)&target)) &&
+        SUCCEEDED(target->lpVtbl->DragEnter(target, data, MK_LBUTTON, at, &effect)) && (effect & DROPEFFECT_COPY)) {
+        effect = DROPEFFECT_COPY;
+        hr = target->lpVtbl->Drop(target, data, MK_LBUTTON, at, &effect);
+    }
+    Check("a folder takes the marker dropped on it", SUCCEEDED(hr));
+    found = drop && SUCCEEDED(hr) && DragOut_Wait(drop, 15000, seen, ARRAYSIZE(seen));
+    Check("the folder a drag is dropped on is found by the copy of its marker, which is taken away there",
+          found && Core_PathEquals(seen, folder) && Join(folder, wcsrchr(marker, L'\\') + 1, copied, ARRAYSIZE(copied)) && !FileThere(copied));
+    if (target) target->lpVtbl->Release(target);
+    if (place) place->lpVtbl->Release(place);
+    if (data) data->lpVtbl->Release(data);
+    if (item) item->lpVtbl->Release(item);
+    DragOut_End(drop);
+    Check("a drag's marker is gone once it ended", !FileThere(marker));
+    if (SUCCEEDED(ole)) OleUninitialize();
+}
+
+/* `path` as the shell gives it to a drag (BHID_DataObject): NULL when it cannot. */
+static IDataObject *DataObjectOf(const WCHAR *path)
+{
+    IShellItem *item = NULL;
+    IDataObject *data = NULL;
+    if (SUCCEEDED(SHCreateItemFromParsingName(path, NULL, &IID_IShellItem, (void **)&item)) &&
+        FAILED(item->lpVtbl->BindToHandler(item, NULL, &BHID_DataObject, &IID_IDataObject, (void **)&data)))
+        data = NULL;
+    if (item) item->lpVtbl->Release(item);
+    return data;
+}
+
+/* What Claude's safeStorage seals with `key`: "v10", a nonce, `plain` in AES-256-GCM, its tag. Its length, 0: none. */
+static size_t SealSafeStorage(const BYTE *key, const char *plain, BYTE *out, size_t cap)
+{
+    static const BYTE kNonce[12] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    BCRYPT_ALG_HANDLE aes = NULL;
+    BCRYPT_KEY_HANDLE handle = NULL;
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO mode;
+    ULONG length = (ULONG)strlen(plain), done = 0;
+    BOOL ok;
+    if (cap < (size_t)length + 31) return 0;
+    memcpy(out, "v10", 3);
+    memcpy(out + 3, kNonce, sizeof kNonce);
+    BCRYPT_INIT_AUTH_MODE_INFO(mode);
+    mode.pbNonce = (PUCHAR)kNonce;
+    mode.cbNonce = sizeof kNonce;
+    mode.pbTag = out + 15 + length;
+    mode.cbTag = 16;
+    ok = BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&aes, BCRYPT_AES_ALGORITHM, NULL, 0)) &&
+         BCRYPT_SUCCESS(BCryptSetProperty(aes, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof BCRYPT_CHAIN_MODE_GCM, 0)) &&
+         BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(aes, &handle, NULL, 0, (PUCHAR)key, 32, 0)) &&
+         BCRYPT_SUCCESS(BCryptEncrypt(handle, (PUCHAR)plain, length, &mode, NULL, 0, out + 15, length, &done, 0));
+    if (handle) BCryptDestroyKey(handle);
+    if (aes) BCryptCloseAlgorithmProvider(aes, 0);
+    return ok && done == length ? (size_t)length + 31 : 0;
+}
+
+/* An export's sign-in item shows what the sign-in holds, read from its
+ * profile: whose it is, the plan, each token's scopes, until when and
+ * whether it renews itself, where it opens, how much it is; never a token. */
+static void TestSignInShown(void)
+{
+    static const BYTE kKey[32] = { 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8 };
+    const char *cache = "{\"acct:a-1|c-1:o-1:https://api.anthropic.com:user:inference user:profile\":"
+                        "{\"token\":\"sk-secret\",\"refreshToken\":\"rt-secret\",\"expiresAt\":1794041189656,\"subscriptionType\":\"max\",\"rateLimitTier\":\"tier\"}}";
+    BackupDialog state;
+    WCHAR storage[MAX_PATH];
+    char config[2048], base64[1024];
+    BYTE sealed[1024];
+    size_t sealedLength;
+    int v, account = -1, organization = -1, plan = -1, tokens = -1, opens = -1, size = -1;
+    BOOL ready, secret = FALSE;
+    ZeroMemory(&state, sizeof state);
+    ready = FixturePath(L"signin-shown", storage, ARRAYSIZE(storage)) && MakeDir(storage) && SaveIn(storage, L"Local State", "{}") &&
+            Backup_WriteAppKey(storage, kKey, sizeof kKey) && (sealedLength = SealSafeStorage(kKey, cache, sealed, sizeof sealed)) > 0 &&
+            Core_Base64Encode(sealed, sealedLength, base64, sizeof base64) &&
+            SUCCEEDED(StringCchPrintfA(config, ARRAYSIZE(config), "{\"lastKnownAccountUuid\":\"a-1\",\"oauth:tokenCacheV2\":\"%s\"}", base64)) &&
+            SaveIn(storage, L"config.json", config);
+    Check("sign-in fixture ready", ready);
+    state.offered = BK_SIGNIN;
+    state.signinStorage = storage;
+    BuildTables(&state);
+    state.values = (CheckValue *)Util_Alloc(SIGNIN_VALUES * sizeof *state.values);
+    state.parts.values = state.values;
+    if (ready && state.values) SetupSignInValues(&state);
+    for (v = 0; v < state.parts.valueCount; v++) {
+        const CheckValue *value = &state.values[v];
+        const WCHAR *label = value->label ? value->label : L"";
+        if (wcscmp(label, L"Account") == 0) account = v;
+        else if (wcscmp(label, L"Organization") == 0) organization = v;
+        else if (wcscmp(label, L"Plan") == 0) plan = v;
+        else if (wcscmp(label, L"Access tokens") == 0) tokens = v;
+        else if (wcscmp(label, L"Opens on") == 0) opens = v;
+        else if (wcscmp(label, L"Size") == 0) size = v;
+        if (wcsstr(value->text, L"secret") || wcsstr(value->name, L"secret")) secret = TRUE;
+    }
+    Check("the sign-in's item: the account, its organization, its plan and tier, read-only under it",
+          account >= 0 && wcscmp(state.values[account].text, L"a-1") == 0 && state.values[account].item == BK_SIGNIN && state.values[account].readOnly &&
+          organization >= 0 && wcscmp(state.values[organization].text, L"o-1") == 0 && plan >= 0 && wcscmp(state.values[plan].text, L"max \x00B7 tier") == 0);
+    Check("the sign-in's item: each token a part of Access tokens, its scopes, until when, renewing itself",
+          tokens >= 0 && tokens + 1 < state.parts.valueCount && state.values[tokens + 1].parent == tokens + 1 &&
+          wcscmp(state.values[tokens + 1].label, L"user:inference user:profile") == 0 && wcsstr(state.values[tokens + 1].text, TR(L"renews itself")) != NULL);
+    Check("the sign-in's item: it opens anywhere, its key going with it; its size; no token shown",
+          opens >= 0 && wcscmp(state.values[opens].text, TR(L"This PC and any other: its key goes with it")) == 0 && size >= 0 &&
+          wcsstr(state.values[size].text, L"KB") != NULL && !secret);
+    Util_Free(state.values);
+}
+
+/* Files dragged onto the manager's window: its drop target takes them and
+ * gives them to the window once let go, a message posted, the program they
+ * came from no longer waiting; a drag of ours (its marker) is refused there,
+ * so that one brought back and let go on the window is cancelled. */
+static void TestFilesDraggedIn(void)
+{
+    const UINT dropped = WM_APP + 77;
+    WCHAR file[MAX_PATH], marker[MAX_PATH];
+    HRESULT ole = OleInitialize(NULL);
+    HWND window = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 10, 10, NULL, NULL, NULL, NULL);
+    IDropTarget *target = window ? DragOut_FileTarget(window, dropped) : NULL;
+    IDataObject *files = NULL, *ours = NULL;
+    DroppedFiles *got = NULL;
+    DragDrop *drop = NULL;
+    POINTL at = { 5, 6 };
+    DWORD entered = 0, effect = 0;
+    MSG message;
+    BOOL posted;
+    if (target && FixturePath(L"dropped-in", file, ARRAYSIZE(file)) && MakeDir(file) && SaveIn(file, L"Work.zip", "PK") &&
+        StringCchCatW(file, ARRAYSIZE(file), L"\\Work.zip") == S_OK && (files = DataObjectOf(file)) != NULL) {
+        entered = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+        target->lpVtbl->DragEnter(target, files, MK_LBUTTON, at, &entered);
+        effect = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+        target->lpVtbl->Drop(target, files, MK_LBUTTON, at, &effect);
+    }
+    posted = PeekMessageW(&message, window, dropped, dropped, PM_REMOVE);
+    got = posted ? (DroppedFiles *)message.lParam : NULL;
+    Check("files dragged onto the window are taken, a copy, and given to it once let go, where",
+          entered == DROPEFFECT_COPY && effect == DROPEFFECT_COPY && got && got->count == 1 && Core_PathEquals(got->paths[0], file) &&
+          got->at.x == 5 && got->at.y == 6);
+    Util_Free(got);
+    entered = effect = DROPEFFECT_COPY;
+    if (target && (drop = DragOut_Begin(marker, ARRAYSIZE(marker))) != NULL && (ours = DataObjectOf(marker)) != NULL) {
+        target->lpVtbl->DragEnter(target, ours, MK_LBUTTON, at, &entered);
+        target->lpVtbl->Drop(target, ours, MK_LBUTTON, at, &effect);
+    } else {
+        entered = effect = DROPEFFECT_COPY | DROPEFFECT_LINK;   /* not made: the check fails */
+    }
+    posted = PeekMessageW(&message, window, dropped, dropped, PM_REMOVE);
+    if (posted) Util_Free((void *)message.lParam);
+    Check("a drag of ours brought back over the window is refused there, and nothing is given to it",
+          entered == DROPEFFECT_NONE && effect == DROPEFFECT_NONE && !posted);
+    if (ours) ours->lpVtbl->Release(ours);
+    if (files) files->lpVtbl->Release(files);
+    DragOut_End(drop);
+    if (target) target->lpVtbl->Release(target);
+    if (window) DestroyWindow(window);
+    if (SUCCEEDED(ole)) OleUninitialize();
+}
+
+/* The step of a copy that stops once it holds `bytes`, and keeps where each step was. */
+typedef struct CopySteps {
+    ULONGLONG stopAt, first;
+    int       calls;
+} CopySteps;
+
+static BOOL CountStep(void *context, ULONGLONG done, ULONGLONG total)
+{
+    CopySteps *steps = (CopySteps *)context;
+    (void)total;
+    if (!steps->calls++) steps->first = done;
+    return !steps->stopAt || done < steps->stopAt;
+}
+
+/* A file the program copies itself: through its hidden part, named once
+ * whole; stopped, it goes on from the part's bytes the next time; a part
+ * that is not the file's beginning starts again. */
+static void TestTransferCopy(void)
+{
+    const DWORD size = 3u << 20;
+    WCHAR source[MAX_PATH], target[MAX_PATH], part[MAX_PATH], other[MAX_PATH], otherPart[MAX_PATH];
+    char *bytes = (char *)Util_Alloc(size), *read = NULL, *zeros = (char *)Util_Alloc(1u << 20);
+    CopySteps steps;
+    DWORD code = 0, length = 0, i;
+    TransferResult result;
+    BOOL ready;
+    for (i = 0; bytes && i < size; i++) bytes[i] = (char)(i * 7 + i / 4096);
+    ready = bytes && zeros && FixturePath(L"transfer-source.bin", source, ARRAYSIZE(source)) && FixturePath(L"transfer-target.bin", target, ARRAYSIZE(target)) &&
+            FixturePath(L"transfer-other.bin", other, ARRAYSIZE(other)) &&
+            SUCCEEDED(StringCchPrintfW(part, ARRAYSIZE(part), L"%s.part", target)) && SUCCEEDED(StringCchPrintfW(otherPart, ARRAYSIZE(otherPart), L"%s.part", other)) &&
+            Util_WriteFileAtomic(source, bytes, size, UTIL_PUT_REPLACE);
+    Check("transfer fixtures created", ready);
+    ZeroMemory(&steps, sizeof steps);
+    steps.stopAt = 1u << 20;
+    result = ready ? Transfer_Copy(source, target, CountStep, &steps, &code) : TRANSFER_FAILED;
+    Check("a copy stopped keeps its hidden part, the file not there yet",
+          result == TRANSFER_STOPPED && FileThere(part) && (GetFileAttributesW(part) & FILE_ATTRIBUTE_HIDDEN) && !FileThere(target));
+    ZeroMemory(&steps, sizeof steps);
+    result = ready ? Transfer_Copy(source, target, CountStep, &steps, &code) : TRANSFER_FAILED;
+    read = result == TRANSFER_DONE ? Util_ReadFile(target, size + 1, FALSE, &length) : NULL;
+    Check("a copy goes on from its part's bytes, whole once done, its part gone and the file not hidden",
+          result == TRANSFER_DONE && steps.first == (1u << 20) && read && length == size && memcmp(read, bytes, size) == 0 && !FileThere(part) &&
+          !(GetFileAttributesW(target) & FILE_ATTRIBUTE_HIDDEN));
+    Util_Free(read);
+    read = NULL;
+    ZeroMemory(&steps, sizeof steps);
+    if (ready && zeros && Util_WriteFileAtomic(otherPart, zeros, 1u << 20, UTIL_PUT_REPLACE))
+        result = Transfer_Copy(source, other, CountStep, &steps, &code);
+    else
+        result = TRANSFER_FAILED;
+    read = result == TRANSFER_DONE ? Util_ReadFile(other, size + 1, FALSE, &length) : NULL;
+    Check("a part that is not the file's beginning is started again", result == TRANSFER_DONE && steps.first == 0 && read && length == size &&
+          memcmp(read, bytes, size) == 0);
+    Util_Free(read);
+    Util_Free(bytes);
+    Util_Free(zeros);
 }
 
 static void TestArchiveValidation(void)
@@ -4614,6 +5412,204 @@ static void TestArchiveValidation(void)
 
 #include "test_backupfeatures.inc"
 
+/* A change sent to a profile that fails stays for another try, at most
+ * SYNC_TRIES_MAX times; a session deleted everywhere takes what waits for it
+ * away (SessionSync_Forget). */
+static void TestFailedChangesWait(void)
+{
+    static const char kNotEntry[] = "{\"title\":\"not an entry\"}";
+    ProfileList profiles;
+    SessionSet set;
+    SyncReport report;
+    SyncSend send;
+    SyncOp *ops = NULL;
+    WCHAR entries[MAX_PATH];
+    int i, queued;
+    BOOL ready;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 1;
+    ready = PrepareProfile(&profiles.items[0], L"Retry", L"retry\\A", L"retry-a", L"retry-organization", entries, ARRAYSIZE(entries)) &&
+            SessionStore_LoadProfiles(&set, &profiles);
+    Check("retry fixture", ready);
+    if (!ready) return;
+    ZeroMemory(&send, sizeof send);
+    send.profile = 0;
+    send.op.kind = SYNC_PUT;
+    send.op.flags = SYNC_UNDELETE;
+    StringCchCopyW(send.op.key, ARRAYSIZE(send.op.key), L"0b6a3a3e-1111-4222-8333-944445555777");
+    send.content = kNotEntry;
+    send.length = sizeof kNotEntry - 1;
+    ZeroMemory(&report, sizeof report);
+    Check("a change that fails is reported", SessionSync_Send(&set, &send, 1, &report) && report.failed == 1);
+    queued = SessionSync_Queued(&profiles.items[0], &ops);
+    Check("... and waits for another try", queued == 1 && ops && ops[0].tries == 1);
+    Util_Free(ops);
+    for (i = 2; i < SYNC_TRIES_MAX; i++) SessionSync_ApplyPending(&profiles.items[0], NULL);
+    ops = NULL;
+    queued = SessionSync_Queued(&profiles.items[0], &ops);
+    Check("each try counts", queued == 1 && ops && ops[0].tries == SYNC_TRIES_MAX - 1);
+    Util_Free(ops);
+    SessionSync_ApplyPending(&profiles.items[0], NULL);
+    Check("... until it is given up", SessionSync_PendingCount(&profiles.items[0]) == 0);
+    ZeroMemory(&report, sizeof report);
+    Check("forgetting a session drops what waits for it", SessionSync_Send(&set, &send, 1, &report) &&
+          SessionSync_PendingCount(&profiles.items[0]) == 1 && SessionSync_Forget(&profiles.items[0], send.op.key) &&
+          SessionSync_PendingCount(&profiles.items[0]) == 0);
+    {
+        /* A content file no change names (its line could not be read) goes when the plan is written again. */
+        WCHAR plan[MAX_PATH], orphan[MAX_PATH];
+        size_t length;
+        SyncSend other = send;
+        StringCchCopyW(other.op.key, ARRAYSIZE(other.op.key), L"0b6a3a3e-2222-4222-8333-944445555777");
+        ZeroMemory(&report, sizeof report);
+        ready = SessionSync_Send(&set, &send, 1, &report) && SessionSync_PlanPath(&profiles.items[0], plan, ARRAYSIZE(plan)) &&
+                (length = wcslen(plan)) > 4 && (plan[length - 4] = 0) == 0 &&
+                SUCCEEDED(StringCchPrintfW(orphan, ARRAYSIZE(orphan), L"%s\\999.json", plan)) && WriteWholeFile(orphan, "{}");
+        ZeroMemory(&report, sizeof report);
+        Check("a content file no change names goes as the plan is written",
+              ready && SessionSync_Send(&set, &other, 1, &report) && SessionSync_PendingCount(&profiles.items[0]) == 2 && !FileThere(orphan));
+        ready = WriteWholeFile(orphan, "{}") && SessionSync_Forget(&profiles.items[0], send.op.key) && SessionSync_Forget(&profiles.items[0], other.op.key);
+        Check("... and with the last change, the plan's folder", ready && SessionSync_PendingCount(&profiles.items[0]) == 0 && !FileThere(orphan) &&
+              GetFileAttributesW(plan) == INVALID_FILE_ATTRIBUTES);
+    }
+    SessionStore_Free(&set);
+}
+
+/* A junction at `link`, a new folder, to the folder `target`. */
+static BOOL MakeJunction(const WCHAR *link, const WCHAR *target)
+{
+    typedef struct MountPoint {
+        DWORD tag;
+        WORD  dataLength, reserved, substituteOffset, substituteLength, printOffset, printLength;
+        WCHAR paths[1];
+    } MountPoint;
+    static BYTE buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    MountPoint *data = (MountPoint *)buffer;
+    WCHAR substitute[MAX_PATH + 8];
+    size_t substituteBytes, printBytes;
+    HANDLE dir;
+    DWORD returned;
+    BOOL ok;
+    if (FAILED(StringCchPrintfW(substitute, ARRAYSIZE(substitute), L"\\??\\%s", target)) || !CreateDirectoryW(link, NULL)) return FALSE;
+    substituteBytes = wcslen(substitute) * sizeof(WCHAR);
+    printBytes = wcslen(target) * sizeof(WCHAR);
+    ZeroMemory(buffer, sizeof buffer);
+    data->tag = IO_REPARSE_TAG_MOUNT_POINT;
+    data->substituteLength = (WORD)substituteBytes;
+    data->printOffset = (WORD)(substituteBytes + sizeof(WCHAR));
+    data->printLength = (WORD)printBytes;
+    memcpy(data->paths, substitute, substituteBytes);
+    memcpy((BYTE *)data->paths + substituteBytes + sizeof(WCHAR), target, printBytes);
+    data->dataLength = (WORD)(4 * sizeof(WORD) + substituteBytes + printBytes + 2 * sizeof(WCHAR));
+    dir = CreateFileW(link, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    ok = dir != INVALID_HANDLE_VALUE &&
+         DeviceIoControl(dir, FSCTL_SET_REPARSE_POINT, data, data->dataLength + 8, NULL, 0, &returned, NULL);
+    if (dir != INVALID_HANDLE_VALUE) CloseHandle(dir);
+    if (!ok) RemoveDirectoryW(link);
+    return ok;
+}
+
+/* A profile whose entries folder links to another's gets a folder of its
+ * own with those sessions; the link goes only once they are copied. */
+static void TestUnlink(void)
+{
+    ProfileList profiles;
+    WCHAR entries[MAX_PATH], shared[MAX_PATH], copied[MAX_PATH], kept[MAX_PATH], temporary[MAX_PATH], error[512];
+    BOOL ready;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 1;
+    ready = PrepareProfile(&profiles.items[0], L"Linked", L"unlink\\A", L"unlink-a", L"unlink-organization", entries, ARRAYSIZE(entries)) &&
+            Join(g_root, L"unlink\\shared", shared, ARRAYSIZE(shared)) && MakeDir(shared) &&
+            WriteEntry(shared, L"0b6a3a3e-3333-4222-8333-944445555777", "") && RemoveDirectoryW(entries) && MakeJunction(entries, shared);
+    Check("unlink fixture (a junction)", ready);
+    if (!ready) return;
+    ready = SessionLink_Remove(&profiles, 0, error, ARRAYSIZE(error));
+    Check("a linked session folder becomes the profile's own", ready && !Util_IsDirectoryLink(entries) &&
+          EntryPath(entries, L"0b6a3a3e-3333-4222-8333-944445555777", copied, ARRAYSIZE(copied)) && FileThere(copied));
+    Check("... the folder it linked to kept as it was", EntryPath(shared, L"0b6a3a3e-3333-4222-8333-944445555777", kept, ARRAYSIZE(kept)) &&
+          FileThere(kept));
+    Check("... and no copy left beside it", SUCCEEDED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" UTIL_TEMPORARY_SUFFIX, entries)) &&
+          GetFileAttributesW(temporary) == INVALID_FILE_ATTRIBUTES);
+}
+
+/* `bytes` of varied content in `path`. */
+static BOOL WriteFilled(const WCHAR *path, DWORD bytes)
+{
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 1u << 20);
+    DWORD seed = 12345, written, i;
+    BOOL ok = file != INVALID_HANDLE_VALUE && chunk != NULL;
+    while (ok && bytes) {
+        DWORD n = min(bytes, 1u << 20);
+        for (i = 0; i < n; i++) chunk[i] = (BYTE)((seed = seed * 1103515245u + 12345u) >> 16);
+        ok = WriteFile(file, chunk, n, &written, NULL) && written == n;
+        bytes -= n;
+    }
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (chunk) HeapFree(GetProcessHeap(), 0, chunk);
+    return ok;
+}
+
+static BOOL SameFiles(const WCHAR *one, const WCHAR *other)
+{
+    HANDLE a = CreateFileW(one, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE b = CreateFileW(other, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    BYTE *x = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 1u << 16), *y = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 1u << 16);
+    DWORD gotA = 0, gotB = 0;
+    BOOL same = a != INVALID_HANDLE_VALUE && b != INVALID_HANDLE_VALUE && x && y;
+    while (same && ReadFile(a, x, 1u << 16, &gotA, NULL) && ReadFile(b, y, 1u << 16, &gotB, NULL)) {
+        same = gotA == gotB && memcmp(x, y, gotA) == 0;
+        if (!gotA) break;
+    }
+    if (a != INVALID_HANDLE_VALUE) CloseHandle(a);
+    if (b != INVALID_HANDLE_VALUE) CloseHandle(b);
+    if (x) HeapFree(GetProcessHeap(), 0, x);
+    if (y) HeapFree(GetProcessHeap(), 0, y);
+    return same;
+}
+
+/* A file past what is read whole goes in stored, a chunk at a time, comes
+ * out the same, and is taken out only whole: a damaged one leaves the file
+ * there as it was. */
+static void TestLargeArchive(void)
+{
+    WCHAR dir[MAX_PATH], big[MAX_PATH], archive[MAX_PATH], out[MAX_PATH], leftover[MAX_PATH], error[256];
+    ZipOut *zip;
+    ZipIn *in = NULL;
+    DWORD code = 0, written = 0;
+    HANDLE file;
+    BYTE flipped = 0;
+    LARGE_INTEGER at;
+    int item = -1;
+    BOOL ready = FixturePath(L"large-archive", dir, ARRAYSIZE(dir)) && MakeDir(dir) && Join(dir, L"big.bin", big, ARRAYSIZE(big)) &&
+                 Join(dir, L"big.zip", archive, ARRAYSIZE(archive)) && Join(dir, L"out.bin", out, ARRAYSIZE(out)) &&
+                 SUCCEEDED(StringCchPrintfW(leftover, ARRAYSIZE(leftover), L"%s" UTIL_TEMPORARY_SUFFIX, out)) && WriteFilled(big, 20u << 20);
+    Check("large archive fixture", ready);
+    if (!ready) return;
+    zip = Zip_Create(archive, &code);
+    Check("a file larger than read whole goes in", zip && Zip_AddFile(zip, "big.bin", big) && Zip_AddData(zip, "small.txt", "x", 1) &&
+          !Zip_Has(zip, "other") && Zip_Has(zip, "BIG.BIN") && Zip_Close(zip, TRUE));
+    in = Zip_Open(archive);
+    item = in ? Zip_Find(in, "big.bin") : -1;
+    Check("... whole, and the archive reads back intact", item >= 0 && Zip_Size(in, item) == (20u << 20) && Zip_ValidateAll(in, NULL, error, ARRAYSIZE(error)));
+    Check("... and comes out the same", item >= 0 && Zip_ExtractTo(in, item, out, UTIL_PUT_NEW) && SameFiles(big, out));
+    Check("taken out where none is, never over one", item >= 0 && !Zip_ExtractTo(in, item, out, UTIL_PUT_NEW) &&
+          (GetLastError() == ERROR_ALREADY_EXISTS || GetLastError() == ERROR_FILE_EXISTS) && !Util_FileExists(leftover));
+    Zip_Free(in);
+    /* A byte of its data changed: the CRC tells. */
+    file = CreateFileW(archive, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    at.QuadPart = 5u << 20;
+    ready = file != INVALID_HANDLE_VALUE && SetFilePointerEx(file, at, NULL, FILE_BEGIN) && ReadFile(file, &flipped, 1, &written, NULL) &&
+            SetFilePointerEx(file, at, NULL, FILE_BEGIN) && (flipped ^= 0xFF, WriteFile(file, &flipped, 1, &written, NULL));
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    in = ready ? Zip_Open(archive) : NULL;
+    item = in ? Zip_Find(in, "big.bin") : -1;
+    Check("a damaged file is found out", item >= 0 && !Zip_ValidateAll(in, NULL, error, ARRAYSIZE(error)));
+    Check("... and leaves the file there as it was", item >= 0 && !Zip_ExtractTo(in, item, out, UTIL_PUT_REPLACE) && SameFiles(big, out) &&
+          !Util_FileExists(leftover));
+    Zip_Free(in);
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     ProfileList profiles;
@@ -4655,6 +5651,7 @@ int wmain(int argc, WCHAR **argv)
             TestPendingApplication(&profiles);
             TestPendingQueueFile();
             TestEntryDetails();
+            TestEntryCache();
             TestPendingChanges();
             TestTurnLocal();
             TestReadonlyPending(&profiles);
@@ -4677,12 +5674,23 @@ int wmain(int argc, WCHAR **argv)
             TestKeptGroups(projects);
             TestWebLayout();
             TestSyncItems();
+            TestUnreadMarks();
             TestReliableSync();
             TestAccountKey();
             TestSearchCache();
             TestPrivateDiagnostics();
             TestBackupFailures();
+            TestSettingValues();
+            TestDragOut();
+            TestFilesDraggedIn();
+            TestSignInShown();
+            TestTransferCopy();
+            TestSettingParts();
+            TestSignInKey();
             TestArchiveValidation();
+            TestLargeArchive();
+            TestFailedChangesWait();
+            TestUnlink();
             TestBackupFeatures(projects);
             TestCleanupReferences(projects);
             TestLedgerTransactions();

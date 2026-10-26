@@ -196,7 +196,7 @@ static void PruneMissing(const WCHAR *appData)
 }
 
 /* Profiles without a color get the first free one; it is saved so it stays
- * put, but only while Claude Desktop Profiles Manager is installed (loading
+ * put, but only while Claude Delta is installed (loading
  * never recreates its registry key after an uninstall). */
 static void AssignColors(ProfileList *list)
 {
@@ -296,6 +296,20 @@ int Profiles_Find(const ProfileList *list, const WCHAR *folder)
     for (i = 0; i < list->count; i++)
         if (Core_EqualsI(list->items[i].folder, folder)) return i;
     return -1;
+}
+
+void Profiles_JoinNames(const ProfileList *list, DWORD bits, WCHAR *out, size_t cch)
+{
+    int p, total, seen = 0;
+    bits &= list->count >= 32 ? ~0u : (1u << list->count) - 1;
+    total = Core_BitCount(bits);
+    out[0] = 0;
+    for (p = 0; p < list->count; p++) {
+        if (!(bits & (1u << p))) continue;
+        if (seen) StringCchCatW(out, cch, seen == total - 1 ? TR(L" and ") : TR(L", "));
+        StringCchCatW(out, cch, list->items[p].name);
+        seen++;
+    }
 }
 
 /* The profile claude:// links open when no Claude runs; -1 for an empty list. */

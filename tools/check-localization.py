@@ -22,12 +22,13 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 LITERAL = re.compile(r'L"((?:\\.|[^"\\])*)"')
-PART = r'(?:L"(?:\\.|[^"\\])*"|APP_NAME)'
+PART = r'(?:L"(?:\\.|[^"\\])*"|APP_NAME|APP_FOLDER)'
 STRING = re.compile(PART + r'(?:\s+' + PART + r')*')
 CALL = re.compile(r'TR\(\s*(' + PART + r'(?:\s+' + PART + r')*)\s*\)')
-TOKEN = re.compile(r'L"((?:\\.|[^"\\])*)"|\b(APP_NAME)\b')
+TOKEN = re.compile(r'L"((?:\\.|[^"\\])*)"|\b(APP_NAME|APP_FOLDER)\b')
 CODE_NOISE = re.compile(r'L?"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
-APP_NAME = "Claude Desktop Profiles Manager"
+APP_NAME = "Claude Delta"
+APP_FOLDER = "Claude Desktop Profiles Manager"   # its earlier name, in its paths
 FORMAT = re.compile(r'%%|%(?:[-+ #0]*)(?:\*|\d+)?(?:\.(?:\*|\d+))?(?:I64|ll|l|h|z|w)?[diuoxXfFeEgGaAcCsSpn]')
 FORBIDDEN_CONVERSIONS = ("a", "A", "n")
 # Names that are no format: their single percent signs are literal.
@@ -45,19 +46,15 @@ OWN_PUNCTUATION = {"zh-CN": "?;,!:"}
 
 # Commands that show in several places, in the same words.
 COMMAND_FAMILIES = [
-    ["&Rename\u2026", "&Rename\u2026\tF2"],
-    ["&Delete sessions everywhere\u2026", "&Delete sessions everywhere\u2026\tShift+Del"],
-    ["&Copy to", "&Copy to\u2026"],
     ["S&hare with", "&Share with\u2026"],
-    ["Remove", "Re&move\u2026%s"],
-    ["Delete", "&Delete\u2026"],
+    ["Delete", "&Delete\u2026", "&Delete\u2026\tDel"],
     ["Restart", "&Restart"],
     ["Repair", "Rep&air"],
     ["Merge all sessions", "Merge &all sessions\u2026"],
     ["Export sessions", "E&xport sessions\u2026"],
+    ["Export", "E&xport\u2026"],
     ["Import sessions", "&Import sessions\u2026"],
-    ["Recover sessions", "Reco&ver sessions\u2026"],
-    ["Clean up sessions", "C&lean up sessions\u2026"],
+    ["Recover sessions", "Recover sessio&ns\u2026"],
 ]
 
 # TR() calls whose argument is no literal, by file: the variable or the
@@ -67,10 +64,14 @@ NONLITERAL_CALLS = {
               "Theme_MainNote", "Theme_SessionsFolderState"],
     "localize.c": ["key"],
     "profiles.c": ["invalid"],
-    "profiletools.c": ["part.label"],
-    "syncui.c": ["kSyncKinds[k].heading"],
-    "checklist.c": ["checks->groups[g].heading", "item->label"],
+    "checklist.c": ["checks->groups[g].heading", "item->label", "value->label"],
+    "backup.c": ["g_ColorNames[i]"],
     "sessionvault.c": ["context->part->label"],
+    "sessions.c": ["Theme_MainCaption"],
+    "dragout.c": ["kZones[i].text"],
+    "signin.c": ["name"],
+    "settings.c": ["kScopeNames[def->scope]", "kImpactNames[def->impact]", "kModeNames[i]", "def->effect", "def->label",
+                   "kKinds[state->kind].name", "kKinds[g].name", "kSections[s].name", "kSettings[state->rows[i].v].label"],
 }
 # Keys the code translates through a variable, by the source file that spells
 # them: the color names (g_ColorNames), the main window's captions, column
@@ -84,20 +85,75 @@ TRANSLATED_THROUGH_VARIABLES = {
                "The name cannot start or end with a dot.", "The name contains an invalid character.",
                "Use 32 characters or fewer.", "Use 48 characters or fewer.",
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
-    "gui.c": ["A profile folder with this name already exists."],
-    "syncui.c": ["Sessions", "Sidebar", "Session details", "Appearance", "Interface language", "Default model", "Permissions",
+    "gui.c": ["A profile folder with this name already exists.", "Open at Windows sign-in"],
+    "dragout.c": ["Copy profile", "Private sign-in"],
+    "settings.c": ["This program", "Sign-in window", "New profiles", "Windows MCP", "Claude Code", "Interface", "Language", "Zoom",
+                   "The language of this program's windows.",
+                   "How large this program's windows are; the main window takes it once Settings closes.", "minimal", "small", "medium", "large", "General", "Claude Desktop", "Claude updates",
+                   "Private sign-in", "Session vault", "SearXNG search", "Cowork", "Conversations", "Privacy and network", "Features",
+                   "Git and pull requests", "Permissions", "Cowork and the browser", "Code tab", "Power and notifications",
+                   "Open profiles again after a Claude update", "A profile that a Claude update closed opens again once the update is in.",
+                   "Browser", "Where private sign-in opens claude.ai: the program's own window, or a browser in private mode.",
+                   "DevTools port (CDP)", "The sign-in window serves DevTools on port 9222 of this PC only, so that tools can drive it.",
+                   "Days to keep versions", "How long the vault keeps the earlier versions of each list of sessions. 0 keeps them all.",
+                   "Set up in new profiles", "New profiles get Windows MCP, which lets Claude see and use this PC's desktop. It needs uv.",
+                   "Read and search claude.ai chats", "Windows MCP may read and search this account's chats on claude.ai.",
+                   "New profiles search the web through SearXNG. It needs Node.js.", "Address",
+                   "The SearXNG instance new profiles search with. Empty: searxng.cheese.ink.", "Turn off in new profiles",
+                   "New profiles start without Cowork, and its virtual machine (several GB) is never downloaded.",
+                   "Days to keep conversations",
+                   "Claude Code deletes conversations older than this when it starts, without asking. Empty: its default, 30.",
+                   "Clean up sessions", "Pick sessions of Claude Code to delete, or bring back those deleted.", "Back up .claude",
+                   "Copies Claude Code's .claude folder beside it now.", "Back up once a week",
+                   "Once a week, the program copies the .claude folder beside it.", "Turn off telemetry",
+                   "Claude Code stops sending usage data. Features it turns on step by step may stay off.", "Turn off error reporting",
+                   "Claude Code stops sending crash and error reports.", "Turn off nonessential traffic",
+                   "Telemetry, error reporting, automatic updates and feedback surveys off together; what needs them stops working.",
+                   "Turn off feedback surveys", "Claude Code stops asking how a session went.", "Turn off automatic updates",
+                   "Claude Code in the terminal stops updating itself: update it by hand.", "Turn off auto memory",
+                   "Claude Code stops keeping notes of its own on your projects between sessions.", "Turn off the 1M-token context",
+                   "Models keep their standard context: long sessions are compacted sooner, and cost less.",
+                   "Turn off claude.ai connectors",
+                   "Connectors added on claude.ai (Gmail, Google Drive and others) are not offered to Claude Code.",
+                   "Agent teams (experimental)", "A session can start a team of agents that work together. It uses more of your usage.",
+                   "Stay in the project folder", "Each shell command starts in the project's folder again, wherever the last one went.",
+                   "Hide cost warnings", "Claude Code no longer warns about what a session costs.", "Hide tips while Claude works",
+                   "No tips beside the spinner while Claude works.", "Leave Claude out of commits and pull requests",
+                   "Commits and pull requests no longer say they were made with Claude Code: no Co-Authored-By line, no link.",
+                   "Turn off built-in git instructions",
+                   "Claude Code's own instructions for commits and pull requests are left out: it follows yours alone.",
+                   "Permission mode at start",
+                   "The mode new sessions start in. Auto and Bypass permissions let Claude act without asking.",
+                   "Approve every project MCP server",
+                   "Servers that a project's .mcp.json lists start without asking. Only for projects you trust.", "Cowork web search",
+                   "Cowork can search the web.", "Cowork browser tools", "Cowork can open and use a browser.", "Claude in Chrome",
+                   "Claude can work in Chrome through its extension.", "Allow all browser actions",
+                   "Claude acts in the browser on every site without asking first.", "Cowork scheduled tasks",
+                   "Cowork can run tasks on a schedule while Claude is open.", "Code scheduled tasks",
+                   "Code sessions can run on a schedule while Claude is open.", "Allow bypass permissions mode",
+                   "Bypass permissions can be picked in Code: Claude then runs every tool without asking.", "Prompt suggestions",
+                   "Code suggests what to type next.", "Archive when the PR closes",
+                   "A Code session is archived once its pull request is merged or closed.", "Keep the computer awake while Claude works",
+                   "Windows does not sleep while a Code session works.", "Keep it awake on battery too",
+                   "The same on battery power, which runs it down sooner.", "Notification sound", "Claude's notifications play a sound.",
+                   "Not set", "Ask permissions", "Accept edits", "Plan mode", "Auto", "Don't ask", "Bypass permissions"],
+    "signin.c": ["A window of its own (WebView2)"],
+    "backup.c": ["Notes", "Color", "Badge", "Picture", "Account", "Organization", "Plan", "Access tokens", "Opens on", "Size"],
+    "syncui.c": ["To these profiles", "Sessions", "Sidebar", "Session details", "Appearance", "Interface language", "Default model", "Permissions",
                  "New sessions", "Titles", "Archived or not", "Deleted sessions", "Stars and pins", "Groups and sections", "Project order",
                  "Filters, grouping and sorting", "Width and the place of Routines", "Model, effort and session presets", "Side pane", "Unread marks", "Cost",
                  "Fonts", "Editor", "Zoom", "Spelling", "Archive when the PR closes", "Cowork", "Cowork's recent folders",
                  "Code: scheduled tasks, links in previews, going on after a usage limit", "Folders' permission modes",
                  "Cowork's trusted folders"],
-    "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "&Delete\u2026", "S&ync settings\u2026", "&Backup && Restore\u2026",
+    "theme.c": ["&Open", "&Quit", "&Restart", "&New\u2026", "S&ync settings\u2026",
                 "Rep&air", "Search profiles", "Set as de&fault", "S&hortcuts", "Se&ttings", "Search o&ptions", "F&ilter", "Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026",
-                "Pin to &taskbar", "Pinned", "Add to Start &menu", "Remove from Start &menu", "Sessions &view", "&Back",
-                "&Get Claude", "&Update",
+                "Pin to &taskbar", "Pinned to taskbar", "Add to Start &menu", "Remove from Start &menu", "Sessions &view", "&Back",
+                "&Get Claude", "&Update", "Windows &MCP", "Remove Windows &MCP", "&SearXNG search", "Remove &SearXNG search",
+                "Remove &Cowork", "Restore &Cowork",
                 "Role", "Data folder", "Sessions", "Running", "Not running", "This profile", "No sessions yet", "Link broken",
                 "Claude icon, default", "Claude icon", "Default",
                 "Version %s is available", "Downloading version %s\u2026", "Installing the new version\u2026",
+                "Checking for updates\u2026",
                 "Claude Desktop %s\nclaude:// links are not set up yet",
                 "Claude Desktop %s\nclaude:// links are routed correctly",
                 "The default profile is selected for claude:// links while Claude is closed.\n\nThe regular Claude icon opens \u201c%s\u201d."],
@@ -109,52 +165,50 @@ STATUS_ACTIONS = ["&Get Claude"]
 # The main window's toolbar, its icons alone included, shown in both views.
 TOOLBAR = ["&Open", "&Quit", "&Restart", "&New\u2026", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "S&hortcuts", "Se&ttings"]
 ACCESS_KEY_GROUPS = {
-    "profiles view": TOOLBAR + ["Sessions &view", "S&ync settings\u2026", "&Backup && Restore\u2026", "Rep&air", "&Update"] + STATUS_ACTIONS,
+    "profiles view": TOOLBAR + ["Sessions &view", "S&ync settings\u2026", "E&xport\u2026", "&Import\u2026", "Rep&air", "Windows &MCP", "Remove Windows &MCP", "Repair Windows &MCP", "&SearXNG search", "Remove &SearXNG search",
+                                "Remove &Cowork", "Restore &Cowork", "&Update"] + STATUS_ACTIONS,
     "sessions view": TOOLBAR + ["&Back", "Search o&ptions", "F&ilter"],
     "filter menu": ["&Status", "&Environment", "&Group by", "S&ort by", "Sho&w", "&Clear filters", "&Reset to defaults"],
     "filter display": ["Meta&data (PR status)", "Show e&mpty groups"],
     "search options": ["Search &titles and folders", "Search the con&versations", "&Regular expression", "Match &case"],
-    "profile dialog": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "S&ync:", "Wha&t to sync\u2026",
-                       "Open at &Windows sign-in",
-                       "Copy &settings from \u201c%s\u201d", "&Open it now to sign in"],
-    "menu of a profile without the session": ["&Share with\u2026", "&Copy to\u2026"],
-    "menu of a profile with the session": ["&Open in %s", "&Rename\u2026", "S&tar", "Uns&tar",
-                                                   "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s"],
-    "session menu": ["&Open in %s", "Pre&view\tSpace", "Open i&n", "S&hare with", "&Copy to", "&Rename\u2026\tF2", "S&tar",
-                     "Uns&tar", "Re&move from %s\u2026%s", "Re&move\u2026%s", "&Keep in %s", "&Show folder",
-                     "&Delete session everywhere\u2026\tShift+Del", "Cop&y\tCtrl+C", "C&ut\tCtrl+X", "&Paste\tCtrl+V",
-                     "&Expand all", "Co&llapse all"],
-    "profile list menu": ["&Open", "&Quit", "&Restart", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "&Sync now",
+    "picture menu": ["Choose &picture\u2026", "Re&move picture"],
+    "new profile form": ["&Name:", "&Color:", "&Badge:", "Choose &picture\u2026", "Re&move picture", "T&itle:", "S&ync:",
+                         "Wha&t to sync\u2026", "Open at &Windows sign-in", "Copy &settings from \u201c%s\u201d", "&Open it now to sign in",
+                         "Save and si&gn in now"],
+    "transfer window": ["&Pause", "&Continue", "&Retry", "&Later"],
+    "menu of a profile without the session": ["&Share with\u2026"],
+    "session menu": ["Open i&n", "&Pin", "Un&pin", "&Mark as read", "&Mark as unread", "&Rename\u2026\tF2", "&Delete from %s\u2026\tDel", "&Delete\u2026\tDel", "&Keep in %s", "Turn into a l&ocal session", "Pre&view\tSpace", "S&hare with", "E&xport", "&Show folder"],
+    "profile list menu": ["&Open", "Sessions &view", "&Quit", "&Restart", "&Edit\u2026", "&Delete\u2026", "Set as de&fault", "&Sync now",
                           "S&ync settings\u2026", "Merge &all sessions\u2026", "&Copy all sessions to\u2026", "&Move all sessions to\u2026",
-                          "U&nlink sessions folder\u2026", "&Back up\u2026", "Restore from back&up\u2026"],
+                          "Un&link sessions folder\u2026", "SearXN&G search\u2026", "E&xport\u2026", "&Import\u2026", "Recover sessio&ns\u2026"],
     "sync settings dialog": ["&What they sync:", "&Sync now"],
-    "backup and restore dialog": ["&Back up\u2026", "&Restore from backup\u2026", "E&xport sessions\u2026", "&Import sessions\u2026",
-                                  "Reco&ver sessions\u2026", "C&lean up sessions\u2026", "Back up .&claude\u2026",
-                                  "Back up once a &week", "Backup &history\u2026", "Validate &archive"],
-    "backup history dialog": ["&Refresh", "Open &folder", "&Validate"],
     "conflicts dialog": ["&Use for all:"],
     "shortcuts menu of a profile": ["Create shortcut on des&ktop", "Shortcut on desktop", "Create s&hortcut\u2026", "Pin to &taskbar",
-                                    "Pinned", "Add to Start &menu", "Remove from Start &menu"],
-    "menu of several sessions": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "Cop&y\tCtrl+C", "C&ut\tCtrl+X",
-                                 "&Paste\tCtrl+V", "S&tar", "Uns&tar", "Re&move\u2026%s", "&Delete sessions everywhere\u2026\tShift+Del"],
-    "menu of a heading": ["&Share with\u2026", "&Copy to\u2026", "E&xport sessions\u2026", "Cop&y\tCtrl+C", "C&ut\tCtrl+X",
-                          "&Paste\tCtrl+V", "S&tar", "Uns&tar", "Re&move\u2026%s", "&Delete sessions everywhere\u2026",
-                          "&Expand all", "Co&llapse all"],
-    "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026", "&Paste\tCtrl+V", "&Undo\tCtrl+Z", "&Redo\tCtrl+Y",
+                                    "Pinned to taskbar", "Add to Start &menu", "Remove from Start &menu"],
+    "menu of several sessions": ["&Pin", "Un&pin", "&Mark as read", "&Mark as unread", "&Delete\u2026\tDel", "&Share with\u2026", "E&xport sessions\u2026"],
+    "export submenu": ["&Original files\u2026", "&Markdown\u2026", "&Web page (HTML)\u2026", "&JSON\u2026", "Plain &text\u2026"],
+    "menu of a heading": ["&Pin", "Un&pin", "&Mark as read", "&Mark as unread", "&Delete\u2026", "&Share with\u2026", "E&xport sessions\u2026"],
+    "menu below the sessions": ["E&xport sessions\u2026", "&Import sessions\u2026", "&Undo\tCtrl+Z", "&Redo\tCtrl+Y",
                                 "&Expand all", "Co&llapse all"],
     "menu of a list whose groups fold": ["&Expand all", "Co&llapse all"],
     "sessions dialog": ["&To these profiles:"],
     "recover dialog": ["&Profile:", "&Version:"],
+    "export dialog": ["Search o&ptions", "Select &all", "Select &none", "&Invert"],
+    "new build dialog": ["&Update now", "&Later"],
     "clean-up dialog": ["&Show:", "Select &all", "&Back up .claude first", "&Restore"],
-    "settings dialog": ["&Language", "&Keep versions for:", "&Apply"],
+    "settings dialog": ["&Apply"],
 }
 # Choices made in the same place: a key of one choice never shows with a key of another.
 ALTERNATIVES = [
-    [{"S&tar"}, {"Uns&tar"}],
-    [{"Re&move from %s\u2026%s"}, {"Re&move\u2026%s"}],
-    [{"&Keep in %s"}, {"&Edit\u2026", "&Edit\u2026\tF2", "S&tar", "Uns&tar",
-                       "Re&move from %s\u2026%s", "Re&move\u2026%s"}],
+    [{"&Pin"}, {"Un&pin"}],
+    [{"&Mark as read"}, {"&Mark as unread"}],
+    [{"&Delete from %s\u2026\tDel"}, {"&Delete\u2026\tDel"}],
+    [{"&Keep in %s"}, {"&Edit\u2026", "&Edit\u2026\tF2", "&Pin", "Un&pin", "&Rename\u2026\tF2",
+                       "&Delete from %s\u2026\tDel", "&Delete\u2026\tDel", "Turn into a l&ocal session", "&Mark as read", "&Mark as unread"}],
     [{"Add to Start &menu"}, {"Remove from Start &menu"}],
+    [{"Windows &MCP"}, {"Remove Windows &MCP"}, {"Repair Windows &MCP"}],
+    [{"&SearXNG search"}, {"Remove &SearXNG search"}],
+    [{"Remove &Cowork"}, {"Restore &Cowork"}],
 ]
 RESOURCE_STATEMENT = re.compile(r'\s*(PUSHBUTTON|DEFPUSHBUTTON|PUSHBOX|LTEXT|RTEXT|CTEXT|GROUPBOX|CHECKBOX|AUTOCHECKBOX|'
                                 r'RADIOBUTTON|AUTORADIOBUTTON|STATE3|AUTO3STATE|CONTROL|CAPTION)\s+')
@@ -166,7 +220,7 @@ def decode(value):
     return re.sub(r'\\(x[0-9a-fA-F]+|[nrt\\"\'])', lambda m: chr(int(m[1][1:], 16)) if m[1].startswith("x") else {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'"}[m[1]], value)
 
 def expression(value):
-    return "".join(decode(m[1]) if m[1] is not None else APP_NAME for m in TOKEN.finditer(value))
+    return "".join(decode(m[1]) if m[1] is not None else APP_NAME if m[2] == "APP_NAME" else APP_FOLDER for m in TOKEN.finditer(value))
 
 def access_key(text):
     """The letter after an ampersand; "&&" is an ampersand shown, and one

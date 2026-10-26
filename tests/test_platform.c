@@ -3410,7 +3410,8 @@ static BOOL FixtureOpenPage(const WCHAR *url)
 
 static UINT WINAPI FixtureCaption(HWND window, int id, LPWSTR text, int cch)
 {
-    if (id == IDC_P_BADGE) return GetDlgItemTextW(window, id, text, cch);
+    (void)window;
+    (void)id;
     if (cch > 0) text[0] = 0;
     return 0;
 }
@@ -3501,12 +3502,14 @@ static INT_PTR FixtureUninstallDialog(HWND owner, int id, DLGPROC procedure, LPA
 #define SessionVault_KeepAll FixtureGuiKeepSessions
 #define Handler_UserChoice FixtureGuiChoice
 #define Install_Uninstall FixtureGuiUninstall
-#define Gui_ProfileTools Fixture_Gui_ProfileTools
 #define Gui_Run TestedGui_Run
 #define Gui_ShowSessions TestedGui_ShowSessions
 #define Gui_LayoutProfileColumns TestedGui_LayoutProfileColumns
 #define Gui_OrderProfileColumns TestedGui_OrderProfileColumns
 #define Gui_MainWindowGeometry TestedGui_MainWindowGeometry
+#define Gui_FillProfileList TestedGui_FillProfileList
+#define Gui_Profiles TestedGui_Profiles
+#define Gui_SetPreferences TestedGui_SetPreferences
 #define GetKeyState FixtureGuiKeyState
 #include "../src/gui.c"
 #undef GetKeyState
@@ -3630,31 +3633,36 @@ static void CheckProfileSearchMapping(void)
     ResetManagerRecords();
 }
 
+/* The badge the person typed is kept while a picture shows, and once it is
+ * removed; the name's initial is no badge of its own. */
 static void CheckBadgeWithPicture(void)
 {
-    HWND window = CreateWindowExW(0, L"STATIC", L"Private badge fixture", WS_POPUP, 0, 0, 300, 100, NULL, NULL, g_hInst, NULL);
-    HWND edit = window ? CreateWindowExW(0, L"EDIT", L"X2", WS_CHILD | WS_DISABLED, 0, 0, 100, 24, window,
-                                        (HMENU)(INT_PTR)IDC_P_BADGE, g_hInst, NULL) : NULL;
-    HWND remove = window ? CreateWindowExW(0, L"BUTTON", L"Remove", WS_CHILD | WS_DISABLED, 110, 0, 100, 24, window,
-                                          (HMENU)(INT_PTR)IDC_P_NO_PICTURE, g_hInst, NULL) : NULL;
-    ProfileDialog state = { 0 };
+    static ProfileDialog state;
+    CheckValue values[1];
     DWORD picture = 0;
     WCHAR badge[BADGE_CCH];
-    Check("private picture and badge fixture created", window && edit && remove);
-    if (window && edit && remove) {
-        state.picture = &picture;
-        state.badgeOwn = TRUE;
-        ShowPictureState(window, &state);
-        Check("a profile with a picture can edit its badge and remove its picture", IsWindowEnabled(edit) && IsWindowEnabled(remove));
-        SetWindowTextW(edit, L"Q7");
-        ChosenBadge(window, &state, L"Work", badge, ARRAYSIZE(badge));
-        Check("a badge edited while the picture shows is kept for saving", wcscmp(badge, L"Q7") == 0 && state.picture == &picture);
-        state.picture = NULL;
-        ShowPictureState(window, &state);
-        ChosenBadge(window, &state, L"Work", badge, ARRAYSIZE(badge));
-        Check("removing a picture retains the edited badge", IsWindowEnabled(edit) && !IsWindowEnabled(remove) && wcscmp(badge, L"Q7") == 0);
-    }
-    if (window) DestroyWindow(window);
+    int i;
+    ZeroMemory(&state, sizeof state);
+    ZeroMemory(values, sizeof values);
+    for (i = 0; i < PV_COUNT; i++) state.at[i] = -1;
+    state.values = values;
+    state.at[PV_BADGE] = 0;
+    state.picture = &picture;
+    state.badgeOwn = TRUE;
+    StringCchCopyW(values[0].text, ARRAYSIZE(values[0].text), L"Q7");
+    ChosenBadge(&state, L"Work", badge, ARRAYSIZE(badge));
+    Check("a badge edited while the picture shows is kept for saving", wcscmp(badge, L"Q7") == 0 && state.picture == &picture);
+    state.picture = NULL;
+    ChosenBadge(&state, L"Work", badge, ARRAYSIZE(badge));
+    Check("removing a picture retains the edited badge", wcscmp(badge, L"Q7") == 0);
+    StringCchCopyW(values[0].text, ARRAYSIZE(values[0].text), L"W");
+    ChosenBadge(&state, L"Work", badge, ARRAYSIZE(badge));
+    Check("a badge that is the name's initial follows the name", badge[0] == 0);
+    state.badgeOwn = FALSE;
+    StringCchCopyW(values[0].text, ARRAYSIZE(values[0].text), L"Q7");
+    ChosenBadge(&state, L"Work", badge, ARRAYSIZE(badge));
+    Check("a badge the person did not type is none of its own", badge[0] == 0);
+    state.values = NULL;
 }
 
 static void CheckProfileSearchShortcut(void)
@@ -3673,7 +3681,12 @@ static void CheckProfileSearchShortcut(void)
         message.wParam = 'F';
         Check("Ctrl+F from a child reveals profile search", SearchShortcut(MSGF_DIALOGBOX, 0, (LPARAM)&message) == 1 &&
               g_manager.profileSearchShown && (GetWindowLongW(edit, GWL_STYLE) & WS_VISIBLE));
-        Check("a repeated Ctrl+F keeps search open", SearchShortcut(MSGF_DIALOGBOX, 0, (LPARAM)&message) == 1 && g_manager.profileSearchShown);
+        if (GetFocus() == edit)
+            Check("a repeated Ctrl+F, in the search, hides it", SearchShortcut(MSGF_DIALOGBOX, 0, (LPARAM)&message) == 1 && !g_manager.profileSearchShown &&
+                  !(GetWindowLongW(edit, GWL_STYLE) & WS_VISIBLE));
+        else
+            Check("a repeated Ctrl+F, the focus elsewhere, keeps the search open", SearchShortcut(MSGF_DIALOGBOX, 0, (LPARAM)&message) == 1 &&
+                  g_manager.profileSearchShown);
         g_guiControlDown = FALSE;
         ShowProfileSearch(window, FALSE);
         Check("closing search hides its edit", !g_manager.profileSearchShown && !(GetWindowLongW(edit, GWL_STYLE) & WS_VISIBLE));
@@ -4255,26 +4268,39 @@ static void CheckLauncherRun(void)
 {
     ResetRoute(1);
     Check("a shortcut to a profile that no longer exists says so, by the name it had, and launches nothing",
-          TestedLauncher_Run(L"Claude-Gone") == 1 && g_routeMessages == 1 && g_routeLaunches == 0 &&
+          TestedLauncher_Run(L"Claude-Gone", NULL) == 1 && g_routeMessages == 1 && g_routeLaunches == 0 &&
           wcsstr(g_routeMessageText, L"Gone") != NULL && wcsstr(g_routeMessageText, L"Claude-Gone") == NULL);
     Check("declining to open the manager starts nothing", g_routeManagerStarts == 0);
     g_routeAnswer = IDYES;
     ResetRouteRecords();
-    TestedLauncher_Run(L"Claude-Gone");
+    TestedLauncher_Run(L"Claude-Gone", NULL);
     Check("accepting starts the manager, this same program, with no argument",
           g_routeManagerStarts == 1 && wcscmp(g_routeManagerExe, ROUTE_SELF_EXE) == 0 && g_routeManagerArguments[0] == 0);
     ResetRoute(1);
     g_routeClaudeMissing = TRUE;
     Check("a shortcut opened without Claude Desktop asks about its download page and launches nothing",
-          TestedLauncher_Run(kRouteFolders[0]) == 1 && g_routeLaunches == 0 && g_routeMessages == 1 &&
+          TestedLauncher_Run(kRouteFolders[0], NULL) == 1 && g_routeLaunches == 0 && g_routeMessages == 1 &&
           (g_routeMessageFlags & MB_TYPEMASK) == MB_YESNO);
     ResetRoute(1);
     Check("a shortcut whose Claude does not start says so",
-          TestedLauncher_Run(kRouteFolders[0]) == 1 && g_routeLaunches == 1 && g_routeMessages == 1 &&
+          TestedLauncher_Run(kRouteFolders[0], NULL) == 1 && g_routeLaunches == 1 && g_routeMessages == 1 &&
           (g_routeMessageFlags & MB_ICONMASK) == MB_ICONERROR);
     g_routeLaunchSucceeds[0] = TRUE;
     ResetRouteRecords();
-    Check("a shortcut opens its profile", TestedLauncher_Run(kRouteFolders[0]) == 0 && g_routeLaunchesOf[0] == 1 && g_routeMessages == 0);
+    Check("a shortcut opens its profile", TestedLauncher_Run(kRouteFolders[0], NULL) == 0 && g_routeLaunchesOf[0] == 1 && g_routeMessages == 0);
+    Check("...with no link", g_routeLaunchedUrl[0] == 0);
+    ResetRoute(2);
+    Check("a link named with its profile opens there, nothing asked",
+          TestedLauncher_Run(kRouteFolders[1], L"claude://resume?session=fixture") == 1 && g_routeLaunchesOf[1] == 1 &&
+          g_routeDialogs == 0);
+    g_routeLaunchSucceeds[1] = TRUE;
+    ResetRouteRecords();
+    Check("...and says it opened",
+          TestedLauncher_Run(kRouteFolders[1], L"claude://claude.ai/chat/fixture") == 0 && g_routeLaunchesOf[1] == 1 &&
+          wcscmp(g_routeLaunchedUrl, L"claude://claude.ai/chat/fixture") == 0 && g_routeMessages == 0 && g_routeDialogs == 0);
+    ResetRouteRecords();
+    Check("a link that is not a claude:// link opens nothing",
+          TestedLauncher_Run(kRouteFolders[1], L"https://example.com/") == 1 && g_routeLaunches == 0);
 }
 
 /* ----------------------------------------------------------------- util.c */
@@ -4410,6 +4436,19 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #define Util_FindFiles TestedUtil_FindFiles
 #define Util_CopyTree TestedUtil_CopyTree
 #define Util_DeleteTree TestedUtil_DeleteTree
+#define Util_NowMs TestedUtil_NowMs
+#define Util_FormatWhen TestedUtil_FormatWhen
+#define Util_Grow TestedUtil_Grow
+#define Util_NewId TestedUtil_NewId
+#define Util_Alloc TestedUtil_Alloc
+#define Util_Free TestedUtil_Free
+#define Util_CopyBytes TestedUtil_CopyBytes
+#define Util_JoinPath TestedUtil_JoinPath
+#define Util_WriteAll TestedUtil_WriteAll
+#define Util_WriteTemporary TestedUtil_WriteTemporary
+#define Util_PutInPlace TestedUtil_PutInPlace
+#define Util_WriteFileAtomic TestedUtil_WriteFileAtomic
+#define Util_ClipboardText TestedUtil_ClipboardText
 #include "../src/util.c"
 #undef CreateMutexW
 #undef RegCreateKeyExW
@@ -4468,6 +4507,15 @@ static HANDLE WINAPI FixtureUnnamedLogMutex(LPSECURITY_ATTRIBUTES security, BOOL
 #undef Util_FindFiles
 #undef Util_CopyTree
 #undef Util_DeleteTree
+#undef Util_Alloc
+#undef Util_Free
+#undef Util_CopyBytes
+#undef Util_JoinPath
+#undef Util_WriteAll
+#undef Util_WriteTemporary
+#undef Util_PutInPlace
+#undef Util_WriteFileAtomic
+#undef Util_ClipboardText
 
 /* The program's own Util_EnsureDir, linked from util.c. */
 static void CheckEnsureDir(void)
@@ -4739,6 +4787,7 @@ static RemoveResult FixtureRecycleLocation(HWND owner, const WCHAR *const *paths
 #define Profiles_ResolveStorage TestedProfiles_ResolveStorage
 #define Profiles_Load TestedProfiles_Load
 #define Profiles_Find TestedProfiles_Find
+#define Profiles_JoinNames TestedProfiles_JoinNames
 #define Profiles_DefaultIndex TestedProfiles_DefaultIndex
 #define Profiles_Create TestedProfiles_Create
 #define Profiles_Update TestedProfiles_Update
@@ -4808,6 +4857,25 @@ static void CheckProfileNotes(void)
     longNote[ARRAYSIZE(longNote) - 1] = 0;
     Check("oversized notes fail without replacing saved notes", !TestedProfiles_SetNote(L"Claude-Work", longNote) && g_noteWrites == 1);
     Check("clearing profile notes removes their value", TestedProfiles_SetNote(L"Claude-Work", L" \t ") && g_noteDeletes == 1 && !g_noteRegistryValue[0]);
+}
+
+static void CheckProfileNames(void)
+{
+    static ProfileList three;
+    WCHAR names[64], expected[64];
+    ZeroMemory(&three, sizeof three);
+    three.count = 3;
+    StringCchCopyW(three.items[0].name, ARRAYSIZE(three.items[0].name), L"Main");
+    StringCchCopyW(three.items[1].name, ARRAYSIZE(three.items[1].name), L"Work");
+    StringCchCopyW(three.items[2].name, ARRAYSIZE(three.items[2].name), L"Test");
+    TestedProfiles_JoinNames(&three, 7, names, ARRAYSIZE(names));
+    StringCchPrintfW(expected, ARRAYSIZE(expected), L"Main%sWork%sTest", TR(L", "), TR(L" and "));
+    Check("three profiles by name: \"Main, Work and Test\"", wcscmp(names, expected) == 0);
+    TestedProfiles_JoinNames(&three, 5 | 8, names, ARRAYSIZE(names));
+    StringCchPrintfW(expected, ARRAYSIZE(expected), L"Main%sTest", TR(L" and "));
+    Check("two profiles by name, a bit past the list left out", wcscmp(names, expected) == 0);
+    TestedProfiles_JoinNames(&three, 0, names, ARRAYSIZE(names));
+    Check("no profile: no names", names[0] == 0);
 }
 
 /* The locations of a profile's data, removed in turn: its folder and "<folder>-Data" in
@@ -4942,6 +5010,7 @@ int wmain(int argc, WCHAR **argv)
     CheckProfileSearchShortcut();
     CheckBadgeWithPicture();
     CheckProfileNotes();
+    CheckProfileNames();
     CheckLauncherWatchers();
     CheckRouteTargets();
     CheckRouteFailures();

@@ -32,6 +32,7 @@ static HINSTANCE WINAPI FixtureOpen(HWND owner, LPCWSTR operation, LPCWSTR file,
 #define SessionTools_Export TestedSessionTools_Export
 #define SessionTools_Context TestedSessionTools_Context
 #define SessionTools_ExportFile TestedSessionTools_ExportFile
+#define SessionTools_PreviewPage TestedSessionTools_PreviewPage
 #define Ui_Ask FixtureAsk
 #define ShellExecuteW FixtureOpen
 #include "../src/sessiontools.c"
@@ -192,6 +193,21 @@ int wmain(void)
     text = Util_ReadFile(output, 1024 * 1024, FALSE, &length);
     Check("reading export names scope and contains role headings", text && strstr(text, "current transcript only") && strstr(text, "## You") && strstr(text, "World"));
     if (text) HeapFree(GetProcessHeap(), 0, text);
+    DeleteFileW(output);
+    Check("an HTML reading copy is a page, the message's markup escaped",
+          Save(source, "{\"type\":\"user\",\"message\":{\"content\":\"Hi <b>there</b> & bye\"}}\n") &&
+          SessionTools_ExportFile(source, output, READING_HTML, &messages, &omitted) && messages == 1 &&
+          (text = Util_ReadFile(output, 1024 * 1024, FALSE, &length)) != NULL && strstr(text, "<!doctype html>") &&
+          strstr(text, "Hi &lt;b&gt;there&lt;/b&gt; &amp; bye") && !strstr(text, "<b>there"));
+    if (text) HeapFree(GetProcessHeap(), 0, text);
+    text = NULL;
+    DeleteFileW(output);
+    Check("a JSON reading copy holds the messages with their roles, and its counts",
+          SessionTools_ExportFile(source, output, READING_JSON, &messages, &omitted) && messages == 1 &&
+          (text = Util_ReadFile(output, 1024 * 1024, FALSE, &length)) != NULL && Core_JsonIsValue(text, length) &&
+          strstr(text, "{\"role\":\"user\",\"text\":\"Hi <b>there</b> & bye\"}") && strstr(text, "\"exported\":1"));
+    if (text) HeapFree(GetProcessHeap(), 0, text);
+    text = NULL;
     Check("export refuses source overwrite", !SessionTools_ExportFile(source, source, FALSE, &messages, &omitted));
     DeleteFileW(output);
     Check("private hard-link fixture created", CreateHardLinkW(output, source, NULL));

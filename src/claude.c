@@ -206,13 +206,21 @@ HRESULT Claude_Launch(const ClaudePackage *pkg, const Profile *profile, const WC
 
 /* Chromium's single-instance lock: the running browser process of a profile
  * owns a message-only window of class Chrome_MessageWindow whose title is the
- * user data directory. A second launch finds it the same way. The next such
- * window after `after` (NULL: the first), with its title. */
-static HWND NextInstanceWindow(HWND after, WCHAR *title, int cch)
+ * user data directory. A second launch finds it the same way. */
+#define INSTANCE_WINDOW_CLASS L"Chrome_MessageWindow"
+
+HWND Claude_NextInstanceWindow(HWND after, WCHAR *title, int cch)
 {
-    while ((after = FindWindowExW(HWND_MESSAGE, after, L"Chrome_MessageWindow", NULL)) != NULL)
+    while ((after = FindWindowExW(HWND_MESSAGE, after, INSTANCE_WINDOW_CLASS, NULL)) != NULL)
         if (GetWindowTextW(after, title, cch) > 0) return after;
     return NULL;
+}
+
+BOOL Claude_IsInstanceWindow(HWND window)
+{
+    WCHAR windowClass[32];
+    return window && GetClassNameW(window, windowClass, ARRAYSIZE(windowClass)) &&
+           CompareStringOrdinal(windowClass, -1, INSTANCE_WINDOW_CLASS, -1, FALSE) == CSTR_EQUAL;
 }
 
 void Claude_UpdateRunning(ProfileList *list)
@@ -225,7 +233,7 @@ void Claude_UpdateRunning(ProfileList *list)
         list->items[i].running = FALSE;
         list->items[i].pid = 0;
     }
-    while ((window = NextInstanceWindow(window, title, ARRAYSIZE(title))) != NULL) {
+    while ((window = Claude_NextInstanceWindow(window, title, ARRAYSIZE(title))) != NULL) {
         for (i = 0; i < list->count; i++) {
             if (!list->items[i].running && Core_PathEquals(title, list->items[i].dataDir)) {
                 list->items[i].running = TRUE;
@@ -241,7 +249,7 @@ static HWND InstanceWindowOf(const Profile *profile)
 {
     HWND window = NULL;
     WCHAR title[MAX_PATH];
-    while ((window = NextInstanceWindow(window, title, ARRAYSIZE(title))) != NULL)
+    while ((window = Claude_NextInstanceWindow(window, title, ARRAYSIZE(title))) != NULL)
         if (Core_PathEquals(title, profile->dataDir)) return window;
     return NULL;
 }
@@ -429,13 +437,19 @@ static BOOL AskToQuit(DWORD pid, ULONGLONG started)
     return ok;
 }
 
-/* The process `pid` ended, if it is still the one that started at `started`. */
+#define END_WAIT_MS 2000   /* a process already on its way out (it refuses TerminateProcess) is given this long */
+
+/* The process `pid` ended, if it is still the one that started at `started`:
+ * looked at first (a process of another that took the id over is left
+ * alone), then ended. One that refuses because it is ending already is
+ * given a moment; `*error` only when it still runs after it. */
 static BOOL EndProcess(DWORD pid, ULONGLONG started, DWORD *error)
 {
-    HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid), terminate;
+    DWORD code = ERROR_SUCCESS;
     BOOL ended;
     if (!process) {
-        DWORD code = GetLastError();
+        code = GetLastError();
         if (code == ERROR_INVALID_PARAMETER) return TRUE;   /* gone already */
         *error = code;
         return FALSE;
@@ -444,9 +458,16 @@ static BOOL EndProcess(DWORD pid, ULONGLONG started, DWORD *error)
         CloseHandle(process);
         return TRUE;
     }
-    ended = TerminateProcess(process, 1) || WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
-    if (!ended) *error = GetLastError();
-    else WaitForSingleObject(process, QUIT_WAIT_MS);
+    terminate = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    ended = terminate && TerminateProcess(terminate, 1);
+    if (!ended) {
+        code = GetLastError();
+        ended = WaitForSingleObject(process, END_WAIT_MS) == WAIT_OBJECT_0;
+    } else {
+        WaitForSingleObject(process, QUIT_WAIT_MS);
+    }
+    if (!ended) *error = code ? code : ERROR_ACCESS_DENIED;
+    if (terminate) CloseHandle(terminate);
     CloseHandle(process);
     return ended;
 }
@@ -477,11 +498,82 @@ BOOL Claude_Quit(const Profile *profile, DWORD *error)
         ok = FALSE;
     }
     /* Claude ends the programs it started as it quits; the ones still there now
-     * (a Claude Code session, a tool) are ended too. */
-    for (i = 0; ok && chosen && i < count; i++)
-        if (chosen[i]) EndProcess(processes[i].pid, processes[i].started, error);
+     * (a Claude Code session, a tool) are ended too. One that cannot be is
+     * told of on its own: Claude itself did quit. */
+    for (i = 0; ok && chosen && i < count; i++) {
+        DWORD left = ERROR_SUCCESS;
+        if (chosen[i] && !EndProcess(processes[i].pid, processes[i].started, &left))
+            Util_Log(L"quit %s: program %lu it started still runs (error %lu)", profile->folder, processes[i].pid, left);
+    }
     if (chosen) HeapFree(GetProcessHeap(), 0, chosen);
     if (processes) HeapFree(GetProcessHeap(), 0, processes);
-    Util_Log(L"quit %s: %s (error %lu)", profile->folder, ok ? L"done" : L"failed", *error);
+    if (ok) Util_Log(L"quit %s: done", profile->folder);
+    else Util_Log(L"quit %s: failed (error %lu)", profile->folder, *error);
     return ok && !Claude_IsRunning(profile);
+}
+
+/* -------------------------------------------------------- Claude ended at once */
+
+/* `path` is in folder `dir`, at any depth. */
+static BOOL PathUnder(const WCHAR *path, const WCHAR *dir)
+{
+    size_t length = wcslen(dir);
+    if (length && dir[length - 1] == L'\\') length--;
+    return length && CompareStringOrdinal(path, (int)min(wcslen(path), length), dir, (int)length, TRUE) == CSTR_EQUAL &&
+           path[length] == L'\\';
+}
+
+int Claude_EndAll(const ClaudePackage *pkg, DWORD what, const WCHAR *within, int *failed)
+{
+    CoreProcess *processes;
+    BOOL *chosen;
+    WCHAR path[MAX_PATH];
+    int count = 0, ended = 0, i;
+    DWORD self = GetCurrentProcessId();
+    *failed = 0;
+    if ((processes = ProcessSnapshot(&count)) == NULL) return 0;
+    if ((chosen = (BOOL *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)count * sizeof *chosen)) == NULL) {
+        HeapFree(GetProcessHeap(), 0, processes);
+        return 0;
+    }
+    for (i = 0; i < count; i++) {
+        HANDLE process;
+        DWORD size = ARRAYSIZE(path);
+        const WCHAR *name;
+        BOOL desktop;
+        if (processes[i].pid == self || processes[i].pid == 0 ||
+            (process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processes[i].pid)) == NULL)
+            continue;
+        if (QueryFullProcessImageNameW(process, 0, path, &size) && (!within || PathUnder(path, within))) {
+            name = wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path;
+            desktop = pkg && pkg->found && PathUnder(path, pkg->installDir);
+            if ((what & CLAUDE_END_DESKTOP) && desktop) {
+                chosen[i] = TRUE;
+                Core_ProcessDescendants(processes, count, i, chosen);   /* what it started: the Code tab's sessions, its tools */
+            } else if ((what & CLAUDE_END_CODE) && !desktop &&
+                       Core_EqualsI(name, L"claude.exe")) {
+                chosen[i] = TRUE;
+            }
+        }
+        CloseHandle(process);
+    }
+    for (i = 0; i < count; i++) {
+        DWORD error = ERROR_SUCCESS;
+        if (!chosen[i] || processes[i].pid == self) continue;
+        if (within) {   /* a descendant outside the folder is not ended there */
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processes[i].pid);
+            DWORD size = ARRAYSIZE(path);
+            BOOL inside = process && QueryFullProcessImageNameW(process, 0, path, &size) && PathUnder(path, within);
+            if (process) CloseHandle(process);
+            if (!inside) continue;
+        }
+        if (EndProcess(processes[i].pid, processes[i].started, &error)) ended++;
+        else {
+            (*failed)++;
+            Util_Log(L"shield: process %lu could not be ended (error %lu)", processes[i].pid, error);
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, chosen);
+    HeapFree(GetProcessHeap(), 0, processes);
+    return ended;
 }

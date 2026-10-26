@@ -5,6 +5,7 @@
 #include <math.h>
 #include <string.h>
 #include <wchar.h>
+#include <ctype.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -363,6 +364,51 @@ BOOL Core_BuildLaunchArgs(const WCHAR *dataDir, const WCHAR *url, WCHAR *out, si
     return TRUE;
 }
 
+/* A sign-in link Claude mails ("https://claude.ai/magic-link#<32 hex>:<the
+ * address in base64>"), whole and nothing else: the link into `url` and the
+ * address it is for into `email` (either may be NULL). */
+BOOL Core_MagicLink(const WCHAR *raw, WCHAR *url, size_t urlCch, WCHAR *email, size_t emailCch)
+{
+    static const WCHAR prefix[] = L"https://claude.ai/magic-link#";
+    static const char digits[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const WCHAR *start, *code;
+    char decoded[256];
+    size_t n, i, prefixLength = ARRAYSIZE(prefix) - 1, length = 0;
+    DWORD bits = 0;
+    int pending = 0, at = 0;
+    if (!raw) return FALSE;
+    n = TrimmedSpan(raw, &start);
+    if (n <= prefixLength + 34 || n >= URL_CCH || !EqualsI(start, (int)prefixLength, prefix, (int)prefixLength)) return FALSE;
+    code = start + prefixLength;
+    for (i = 0; i < 32; i++)
+        if (!((code[i] >= L'0' && code[i] <= L'9') || (code[i] >= L'a' && code[i] <= L'f') || (code[i] >= L'A' && code[i] <= L'F'))) return FALSE;
+    if (code[32] != L':') return FALSE;
+    /* The address: base64, padded or not, nothing after it. */
+    for (i = prefixLength + 33; i < n; i++) {
+        const char *digit;
+        WCHAR c = start[i];
+        if (c == L'=') {
+            if (n - i > 2) return FALSE;
+            continue;
+        }
+        if (c > 0x7F || (digit = strchr(digits, (char)c)) == NULL || c == 0) return FALSE;
+        bits = (bits << 6) | (DWORD)(digit - digits);
+        if ((pending += 6) >= 8) {
+            pending -= 8;
+            if (length + 1 >= sizeof decoded) return FALSE;
+            decoded[length++] = (char)((bits >> pending) & 0xFF);
+        }
+    }
+    decoded[length] = 0;
+    for (i = 0; i < length; i++) {
+        if ((unsigned char)decoded[i] <= ' ' || decoded[i] == '"' || decoded[i] == '\\') return FALSE;
+        if (decoded[i] == '@') at++;
+    }
+    if (at != 1 || decoded[0] == '@' || decoded[length - 1] == '@') return FALSE;
+    if (email && (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, decoded, -1, email, (int)emailCch) <= 0)) return FALSE;
+    return !url || SUCCEEDED(StringCchCopyNW(url, urlCch, start, n));
+}
+
 /* Only Claude's observed web entry points; this is not the claude:// callback.
  * Preserve the query in memory, but never repair an untrusted host or argument. */
 BOOL Core_PrivateSignInUrl(const WCHAR *raw, WCHAR *out, size_t cch)
@@ -381,6 +427,7 @@ BOOL Core_PrivateSignInUrl(const WCHAR *raw, WCHAR *out, size_t cch)
     if (n > originLength && *path != L'/' && *path != L'?' && *path != L'#') return FALSE;
     pathLength = 0;
     while (originLength + pathLength < n && path[pathLength] != L'?' && path[pathLength] != L'#') pathLength++;
+    if (pathLength == 11 && wcsncmp(path, L"/magic-link", 11) == 0) return Core_MagicLink(start, out, cch, NULL, 0);
     if (pathLength > 1 && !(pathLength >= 6 && wcsncmp(path, L"/login", 6) == 0 &&
                            (pathLength == 6 || path[6] == L'/'))) return FALSE;
     return SUCCEEDED(StringCchCopyNW(out, cch, start, n));
@@ -388,7 +435,7 @@ BOOL Core_PrivateSignInUrl(const WCHAR *raw, WCHAR *out, size_t cch)
 
 /* A fresh directory makes each browser process independent even when another
  * private window exists. No shell interprets this command line. */
-BOOL Core_PrivateBrowserArgs(BOOL edge, const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch)
+BOOL Core_PrivateBrowserArgs(int family, const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch)
 {
     WCHAR checked[URL_CCH];
     size_t i, n;
@@ -402,9 +449,11 @@ BOOL Core_PrivateBrowserArgs(BOOL edge, const WCHAR *dataDir, const WCHAR *url, 
         dataDir[1] != L':' || dataDir[2] != L'\\') return FALSE;
     for (i = 0; dataDir[i]; i++)
         if (IsControl(dataDir[i]) || dataDir[i] == L'"') return FALSE;
+    if (family == CORE_BROWSER_FIREFOX)   /* a profile of its own, apart from a Firefox already open */
+        return SUCCEEDED(StringCchPrintfW(out, cch, L"-no-remote -profile \"%.*s\" -private-window \"%s\"", (int)n, dataDir, checked));
     return SUCCEEDED(StringCchPrintfW(out, cch,
         L"--user-data-dir=\"%.*s\" %s --new-window --no-first-run --no-default-browser-check \"%s\"",
-        (int)n, dataDir, edge ? L"--inprivate" : L"--incognito", checked));
+        (int)n, dataDir, family == CORE_BROWSER_EDGE ? L"--inprivate" : L"--incognito", checked));
 }
 
 /* ------------------------------------------------------------ log parsing */
@@ -715,6 +764,21 @@ BOOL Core_ProfileHoldsPath(const Profile *p, const WCHAR *path)
     return p && path && (Core_PathUnder(path, p->dataDir) || (p->formerDir[0] && Core_PathUnder(path, p->formerDir)));
 }
 
+int Core_BitCount(DWORD bits)
+{
+    int n = 0;
+    for (; bits; bits &= bits - 1) n++;
+    return n;
+}
+
+ULONGLONG Core_ProfileLookHash(ULONGLONG hash, const Profile *p)
+{
+    hash = Core_HashText(hash, p->name);
+    hash = Core_HashBytes(hash, &p->color, sizeof p->color);
+    hash = Core_HashText(hash, p->badge);
+    return Core_HashBytes(hash, &p->picture, sizeof p->picture);
+}
+
 /* Stored working directories use the profile's logical path, or the one it
  * had before Claude moved it. File access outside its package uses the same
  * suffix below the resolved storage. */
@@ -772,6 +836,39 @@ void Core_ShortcutFileName(const WCHAR *label, int copyNumber, WCHAR *out, size_
         StringCchPrintfW(out, cch, L"Claude (%s) (%d).lnk", clean, copyNumber);
     else
         StringCchPrintfW(out, cch, L"Claude (%s).lnk", clean);
+}
+
+#define SESSIONS_ARCHIVE_TITLE_MAX 80   /* a title longer than this is cut: the name stays a name */
+
+/* A device name Windows keeps for itself whatever the extension (CON.zip opens the console). */
+static BOOL ReservedFileStem(const WCHAR *stem)
+{
+    static const WCHAR *const kReserved[] = { L"CON", L"PRN", L"AUX", L"NUL" };
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(kReserved); i++)
+        if (Core_EqualsI(stem, kReserved[i])) return TRUE;
+    return wcslen(stem) == 4 && (_wcsnicmp(stem, L"COM", 3) == 0 || _wcsnicmp(stem, L"LPT", 3) == 0) && stem[3] >= L'1' && stem[3] <= L'9';
+}
+
+void Core_SessionsArchiveName(const WCHAR *title, const WCHAR *several, const SYSTEMTIME *day, int copyNumber, WCHAR *out, size_t cch)
+{
+    WCHAR stem[SESSIONS_ARCHIVE_TITLE_MAX + 2];
+    size_t i, start = 0, length = 0;
+    if (!out || !cch) return;
+    out[0] = 0;
+    /* The title, its characters a file name cannot hold made "_", without the
+     * spaces around it or the dots after it (Windows drops those). */
+    for (i = 0; title && title[i] && length < SESSIONS_ARCHIVE_TITLE_MAX; i++)
+        stem[length++] = IsControl(title[i]) || wcschr(L"\\/:*?\"<>|", title[i]) ? L'_' : title[i];
+    stem[length] = 0;
+    while (stem[start] == L' ') start++;
+    while (length > start && (stem[length - 1] == L' ' || stem[length - 1] == L'.')) stem[--length] = 0;
+    if (length > start && ReservedFileStem(stem + start)) StringCchCatW(stem, ARRAYSIZE(stem), L"_");
+    if (length <= start)
+        StringCchPrintfW(stem, ARRAYSIZE(stem), L"%s %04u-%02u-%02u", several && several[0] ? several : L"Claude sessions",
+                         day ? day->wYear : 0, day ? day->wMonth : 0, day ? day->wDay : 0), start = 0;
+    if (copyNumber > 1) StringCchPrintfW(out, cch, L"%s (%d).zip", stem + start, copyNumber);
+    else StringCchPrintfW(out, cch, L"%s.zip", stem + start);
 }
 
 /* ------------------------------------------------------------------- JSON */
@@ -879,10 +976,96 @@ BOOL Core_JsonEachMember(const char *json, size_t len, CoreJsonMember each, void
     return FALSE;
 }
 
+#define JSON_DEPTH_MAX 256   /* the nesting Core_JsonIsValue follows; Claude's files nest a few levels */
+
+static BOOL IsHexDigit(char c)
+{
+    return IsDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+/* Where the JSON string at `i` ends (after its closing quote), its escapes
+ * checked and no control character in it; 0 when it is none. */
+static size_t StrictStringEnd(const char *s, size_t len, size_t i)
+{
+    int k;
+    if (i >= len || s[i] != '"') return 0;
+    for (i++; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"') return i + 1;
+        if (c < 0x20) return 0;
+        if (c != '\\') continue;
+        if (++i >= len) return 0;
+        if (s[i] == 'u') {
+            for (k = 0; k < 4; k++)
+                if (++i >= len || !IsHexDigit(s[i])) return 0;
+        } else if (!s[i] || !strchr("\"\\/bfnrt", s[i])) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static size_t StrictNumberEnd(const char *s, size_t len, size_t i)
+{
+    size_t start;
+    if (i < len && s[i] == '-') i++;
+    if (i >= len || !IsDigit(s[i])) return 0;
+    if (s[i] == '0') i++;
+    else
+        while (i < len && IsDigit(s[i])) i++;
+    if (i < len && s[i] == '.') {
+        for (start = ++i; i < len && IsDigit(s[i]); i++) {}
+        if (i == start) return 0;
+    }
+    if (i < len && (s[i] == 'e' || s[i] == 'E')) {
+        if (++i < len && (s[i] == '+' || s[i] == '-')) i++;
+        for (start = i; i < len && IsDigit(s[i]); i++) {}
+        if (i == start) return 0;
+    }
+    return i;
+}
+
+/* Where the JSON value at `i` ends, checked through and through, `depth`
+ * levels down; 0 when it is none. */
+static size_t StrictValueEnd(const char *s, size_t len, size_t i, int depth)
+{
+    static const char *const kWords[] = { "true", "false", "null" };
+    size_t w;
+    if (i >= len) return 0;
+    if (s[i] == '"') return StrictStringEnd(s, len, i);
+    if (s[i] == '{' || s[i] == '[') {
+        BOOL object = s[i] == '{';
+        char close = object ? '}' : ']';
+        if (depth >= JSON_DEPTH_MAX) return 0;
+        i = SkipSpace(s, len, i + 1);
+        if (i < len && s[i] == close) return i + 1;
+        for (;;) {
+            if (object) {
+                if ((i = StrictStringEnd(s, len, i)) == 0) return 0;
+                i = SkipSpace(s, len, i);
+                if (i >= len || s[i] != ':') return 0;
+                i = SkipSpace(s, len, i + 1);
+            }
+            if ((i = StrictValueEnd(s, len, i, depth + 1)) == 0) return 0;
+            i = SkipSpace(s, len, i);
+            if (i < len && s[i] == close) return i + 1;
+            if (i >= len || s[i] != ',') return 0;
+            i = SkipSpace(s, len, i + 1);
+        }
+    }
+    for (w = 0; w < ARRAYSIZE(kWords); w++) {
+        size_t n = strlen(kWords[w]);
+        if (len - i >= n && memcmp(s + i, kWords[w], n) == 0) return i + n;
+    }
+    return StrictNumberEnd(s, len, i);
+}
+
 BOOL Core_JsonIsValue(const char *text, size_t len)
 {
-    size_t start = SkipSpace(text, len, SkipByteOrderMark(text, len)), end;
-    if (start >= len || (end = ValueEnd(text, len, start)) == 0 || end == start) return FALSE;
+    size_t start, end;
+    if (!text) return FALSE;
+    start = SkipSpace(text, len, SkipByteOrderMark(text, len));
+    if (start >= len || (end = StrictValueEnd(text, len, start, 0)) == 0) return FALSE;
     return SkipSpace(text, len, end) == len;
 }
 
@@ -1020,6 +1203,30 @@ BOOL Core_JsonNumber(const char *raw, size_t len, ULONGLONG *value)
 BOOL Core_JsonTrue(const char *raw, size_t len)
 {
     return raw && len == 4 && memcmp(raw, "true", 4) == 0;
+}
+
+BOOL Core_JsonMemberString(const char *json, size_t len, const char *key, WCHAR *out, size_t cch)
+{
+    const char *value;
+    size_t valueLen;
+    if (cch) out[0] = 0;
+    return Core_JsonMember(json, len, key, &value, &valueLen) && Core_JsonString(value, valueLen, out, cch);
+}
+
+ULONGLONG Core_JsonMemberNumber(const char *json, size_t len, const char *key)
+{
+    const char *value;
+    size_t valueLen;
+    ULONGLONG number = 0;
+    if (Core_JsonMember(json, len, key, &value, &valueLen)) Core_JsonNumber(value, valueLen, &number);
+    return number;
+}
+
+BOOL Core_JsonMemberTrue(const char *json, size_t len, const char *key)
+{
+    const char *value;
+    size_t valueLen;
+    return Core_JsonMember(json, len, key, &value, &valueLen) && Core_JsonTrue(value, valueLen);
 }
 
 /* The member is there, and neither null nor false. */
@@ -1757,6 +1964,17 @@ BOOL Core_JsonRemoveMember(const char *json, size_t len, const char *key, char *
     return TRUE;
 }
 
+BOOL Core_EntryDropHistory(char *entry, size_t *length)
+{
+    static const char *const kOthers[] = { "priorCliSessionIds", "preClearCliSessionId", "unarchivedCliSessionId", "stagedTranscriptPath" };
+    size_t i, shorter;
+    for (i = 0; i < ARRAYSIZE(kOthers); i++) {
+        if (!Core_JsonRemoveMember(entry, *length, kOthers[i], entry, *length, &shorter)) return FALSE;
+        *length = shorter;
+    }
+    return TRUE;
+}
+
 /* `text` as a JSON string, quotes included, in UTF-8. */
 BOOL Core_JsonQuote(const WCHAR *text, char *out, size_t cap)
 {
@@ -1883,8 +2101,8 @@ size_t Core_ReplaceChunk(const char *in, size_t len, const CoreSwap *swaps, int 
 
 /* A change to a session entry waiting for its profile to close, one per
  * line: "<op>\t<session id>\t<value>". */
-static const WCHAR *const kPendingOps[] = { L"title", L"star", L"remove", L"auto-title", L"unremote" };
-C_ASSERT(ARRAYSIZE(kPendingOps) == PENDING_UNREMOTE + 1);
+static const WCHAR *const kPendingOps[] = { L"title", L"star", L"remove", L"auto-title", L"unremote", L"read" };
+C_ASSERT(ARRAYSIZE(kPendingOps) == PENDING_READ + 1);
 
 BOOL Core_PendingFormat(const PendingEdit *edit, WCHAR *out, size_t cch)
 {
@@ -1928,6 +2146,123 @@ BOOL Core_PendingReplaces(const PendingEdit *queued, const PendingEdit *added)
             added->op == PENDING_REMOVE);
 }
 
+/* ---------------------------------------------------------- unread marks */
+
+/* The sessions Claude's sidebar shows unread: its web storage's value
+ * epitaxy-unread-v1, one of its stores ({"state":{"unreadIds":[...],
+ * "explicitUnreadIds":[...]},"version":0}), each session by its entry's own
+ * id (local_<id>). unreadIds are those Claude marked (a session that went on
+ * while it was not shown), explicitUnreadIds those marked with its Mark as
+ * unread. */
+static const char *const kUnreadLists[] = { "unreadIds", "explicitUnreadIds" };
+
+typedef struct UnreadWalk {
+    const WCHAR *id;
+    BOOL         found;
+    char        *out;   /* the array written again without `id`; NULL: only looked for */
+    size_t       used, cap;
+} UnreadWalk;
+
+static BOOL UnreadElement(void *context, const char *value, size_t length)
+{
+    UnreadWalk *walk = (UnreadWalk *)context;
+    WCHAR id[SESSION_ID_CCH];
+    if (Core_JsonString(value, length, id, ARRAYSIZE(id)) && Core_EqualsI(id, walk->id)) {
+        walk->found = TRUE;
+        return walk->out != NULL;   /* only looking: found, the walk stops */
+    }
+    if (!walk->out) return TRUE;
+    if (walk->used + length + 2 > walk->cap) return FALSE;
+    if (walk->used > 1) walk->out[walk->used++] = ',';
+    memcpy(walk->out + walk->used, value, length);
+    walk->used += length;
+    return TRUE;
+}
+
+/* List `list` of the value: its raw array, "[]" when it has none. */
+static void UnreadList(const char *json, size_t len, int list, const char **raw, size_t *rawLength)
+{
+    const char *state;
+    size_t stateLength;
+    if (!json || !Core_JsonMember(json, len, "state", &state, &stateLength) ||
+        !Core_JsonMember(state, stateLength, kUnreadLists[list], raw, rawLength)) {
+        *raw = "[]";
+        *rawLength = 2;
+    }
+}
+
+BOOL Core_UnreadHas(const char *json, size_t len, const WCHAR *id)
+{
+    UnreadWalk walk;
+    const char *raw;
+    size_t rawLength;
+    int list;
+    if (!id[0]) return FALSE;
+    for (list = 0; list < (int)ARRAYSIZE(kUnreadLists); list++) {
+        ZeroMemory(&walk, sizeof walk);
+        walk.id = id;
+        UnreadList(json, len, list, &raw, &rawLength);
+        Core_JsonEachElement(raw, rawLength, UnreadElement, &walk);
+        if (walk.found) return TRUE;
+    }
+    return FALSE;
+}
+
+/* The value with session `id` read (out of both lists) or, `unread`, marked
+ * unread as Mark as unread does (in explicitUnreadIds); the rest as it was.
+ * A value missing or not one of Claude's stores is made anew. A heap block
+ * with a NUL after it (HeapFree it); NULL without memory. */
+char *Core_UnreadSet(const char *json, size_t len, const WCHAR *id, BOOL unread, size_t *outLen)
+{
+    static const char kEmpty[] = "{\"state\":{\"unreadIds\":[],\"explicitUnreadIds\":[]},\"version\":0}";
+    char quoted[SESSION_ID_CCH * 6 + 3], *current, *next;
+    const char *state;
+    size_t currentLength, stateLength;
+    int list;
+    *outLen = 0;
+    if (!id[0] || !Core_JsonQuote(id, quoted, sizeof quoted)) return NULL;
+    if (!json || !Core_JsonIsValue(json, len) || !Core_JsonMember(json, len, "state", &state, &stateLength)) {
+        json = kEmpty;
+        len = sizeof kEmpty - 1;
+    }
+    if ((current = (char *)HeapAlloc(GetProcessHeap(), 0, len + 1)) == NULL) return NULL;
+    memcpy(current, json, len);
+    current[len] = 0;
+    currentLength = len;
+    for (list = 0; list < (int)ARRAYSIZE(kUnreadLists); list++) {
+        const char *keys[2], *raw;
+        size_t rawLength;
+        UnreadWalk walk;
+        ZeroMemory(&walk, sizeof walk);
+        walk.id = id;
+        UnreadList(current, currentLength, list, &raw, &rawLength);
+        walk.cap = rawLength + strlen(quoted) + 4;
+        if ((walk.out = (char *)HeapAlloc(GetProcessHeap(), 0, walk.cap)) == NULL) break;
+        walk.out[walk.used++] = '[';
+        if (!Core_JsonEachElement(raw, rawLength, UnreadElement, &walk)) walk.used = 1;   /* no array: an empty one */
+        if (unread && list == 1) {
+            size_t q = strlen(quoted);
+            if (walk.used > 1) walk.out[walk.used++] = ',';
+            memcpy(walk.out + walk.used, quoted, q);
+            walk.used += q;
+        }
+        walk.out[walk.used++] = ']';
+        walk.out[walk.used] = 0;
+        keys[0] = "state";
+        keys[1] = kUnreadLists[list];
+        next = Core_JsonSetNested(current, currentLength, keys, 2, walk.out, &currentLength);
+        HeapFree(GetProcessHeap(), 0, walk.out);
+        HeapFree(GetProcessHeap(), 0, current);
+        if ((current = next) == NULL) return NULL;
+    }
+    if (list < (int)ARRAYSIZE(kUnreadLists)) {
+        HeapFree(GetProcessHeap(), 0, current);
+        return NULL;
+    }
+    *outLen = currentLength;
+    return current;
+}
+
 /* ------------------------------------------------------------- sync plans */
 
 /* A profile's plan of changes sent to it (sessionsync.c): UTF-8, one change
@@ -1950,8 +2285,11 @@ BOOL Core_SyncOpFormat(const SyncOp *op, WCHAR *out, size_t cch)
     if ((int)op->kind < 0 || (int)op->kind >= (int)ARRAYSIZE(kSyncOps) || !op->key[0] || wcspbrk(op->key, L"\t\r\n") ||
         (op->content[0] && !IsPlainContentName(op->content)))
         return FALSE;
-    return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\t%lu\t%I64u\t%I64u\t%s\t%s", kSyncOps[op->kind], op->flags, op->time, op->seen,
-                                      op->key, op->content));
+    if (FAILED(StringCchPrintfW(out, cch, L"%s\t%lu\t%I64u\t%I64u\t%s\t%s", kSyncOps[op->kind], op->flags, op->time, op->seen,
+                                op->key, op->content)))
+        return FALSE;
+    /* The tries only once there were: a line without them is one an earlier version reads too. */
+    return !op->tries || SUCCEEDED(StringCchPrintfW(out + wcslen(out), cch - wcslen(out), L"\t%lu", op->tries));
 }
 
 /* A decimal number of a plan line up to `end`. */
@@ -1970,17 +2308,21 @@ static BOOL ParsePlanNumber(const WCHAR *start, const WCHAR *end, ULONGLONG limi
 
 BOOL Core_SyncOpParse(const WCHAR *line, SyncOp *op)
 {
-    const WCHAR *field[6], *end[6], *at = line;
-    ULONGLONG flags;
+    const WCHAR *field[7], *end[7], *at = line;
+    ULONGLONG flags, tries = 0;
     size_t kind;
-    int i;
+    int i, count = 6;
     ZeroMemory(op, sizeof *op);
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < count; i++) {
         field[i] = at;
-        end[i] = i < 5 ? wcschr(at, L'\t') : at + wcslen(at);
-        if (!end[i]) return FALSE;
+        end[i] = wcschr(at, L'\t');
+        if (!end[i] && i < 5) return FALSE;
+        if (!end[i]) end[i] = at + wcslen(at);
+        else if (i == 5) count = 7;   /* the tries, written once a try failed */
+        else if (i == 6) return FALSE;
         at = end[i] + 1;
     }
+    if (count == 7 && (!ParsePlanNumber(field[6], end[6], MAXDWORD, &tries) || !tries)) return FALSE;
     for (kind = 0; kind < ARRAYSIZE(kSyncOps); kind++)
         if ((size_t)(end[0] - field[0]) == wcslen(kSyncOps[kind]) && wcsncmp(field[0], kSyncOps[kind], (size_t)(end[0] - field[0])) == 0) break;
     if (kind == ARRAYSIZE(kSyncOps) || !ParsePlanNumber(field[1], end[1], MAXDWORD, &flags) ||
@@ -1991,6 +2333,7 @@ BOOL Core_SyncOpParse(const WCHAR *line, SyncOp *op)
         return FALSE;
     op->kind = (SyncOpKind)kind;
     op->flags = (DWORD)flags;
+    op->tries = (DWORD)tries;
     return TRUE;
 }
 
@@ -2195,6 +2538,59 @@ char *Core_JsonSetNested(const char *json, size_t len, const char *const *keys, 
     return out;
 }
 
+char *Core_JsonSetPath(const char *json, size_t len, const char *const *keys, int depth, const char *raw, size_t *outLen)
+{
+    const char *inner;
+    size_t innerLength, setLength = 0;
+    char *set, *out;
+    if (raw) return Core_JsonSetNested(json, len, keys, depth, raw, outLen);
+    *outLen = 0;
+    if (depth < 1) return NULL;
+    if (depth == 1) {
+        out = (char *)HeapAlloc(GetProcessHeap(), 0, len + 1);
+        if (!out || !Core_JsonRemoveMember(json, len, keys[0], out, len, outLen)) {
+            if (out) HeapFree(GetProcessHeap(), 0, out);
+            *outLen = 0;
+            return NULL;
+        }
+        out[*outLen] = 0;
+        return out;
+    }
+    /* Nothing there to remove: `json` as it is (checked to be an object). */
+    if (!Core_JsonMember(json, len, keys[0], &inner, &innerLength)) return Core_JsonSetPath(json, len, keys, 1, NULL, outLen);
+    if ((set = Core_JsonSetPath(inner, innerLength, keys + 1, depth - 1, NULL, &setLength)) == NULL) return NULL;
+    out = Core_JsonSetNested(json, len, keys, 1, set, outLen);
+    HeapFree(GetProcessHeap(), 0, set);
+    return out;
+}
+
+int Core_EnvSwitch(const char *raw, size_t len)
+{
+    static const char *const kOn[] = { "1", "true", "yes", "on" }, *const kOff[] = { "0", "false", "no", "off" };
+    WCHAR text[16];
+    char value[16];
+    size_t i, n;
+    if (!raw || !len) return -1;
+    if (raw[0] == '"') {
+        if (!Core_JsonString(raw, len, text, ARRAYSIZE(text))) return -1;
+        for (n = 0; text[n] && n < sizeof value - 1; n++) {
+            if (text[n] > 0x7F) return -1;
+            value[n] = (char)text[n];
+        }
+        if (text[n]) return -1;
+    } else {
+        if (len >= sizeof value) return -1;
+        memcpy(value, raw, len);
+        n = len;
+    }
+    value[n] = 0;
+    for (i = 0; i < ARRAYSIZE(kOn); i++) {
+        if (_stricmp(value, kOn[i]) == 0) return 1;
+        if (_stricmp(value, kOff[i]) == 0) return 0;
+    }
+    return -1;
+}
+
 /* Core_JsonArrayUnion's walk: the element sought, and the array it writes. */
 typedef struct ArrayUnion {
     const char *idKey;
@@ -2332,15 +2728,30 @@ grow:
     return out;
 }
 
+#define UNIX_EPOCH_TICKS      116444736000000000ULL   /* 1970-01-01 as a FILETIME */
+#define TICKS_PER_MILLISECOND (TICKS_PER_SECOND / 1000)
+
+ULONGLONG Core_FileTimeMs(const FILETIME *time)
+{
+    ULONGLONG ticks = ((ULONGLONG)time->dwHighDateTime << 32) | time->dwLowDateTime;
+    return ticks > UNIX_EPOCH_TICKS ? (ticks - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND : 0;
+}
+
+FILETIME Core_MsFileTime(ULONGLONG ms)
+{
+    ULONGLONG ticks = ms * TICKS_PER_MILLISECOND + UNIX_EPOCH_TICKS;
+    FILETIME time;
+    time.dwLowDateTime = (DWORD)ticks;
+    time.dwHighDateTime = (DWORD)(ticks >> 32);
+    return time;
+}
+
 /* A time in ms since 1970 as transcripts write theirs: ISO 8601 in UTC with
  * milliseconds, "2026-10-08T08:55:12.345Z", which sorts as the time does. */
 BOOL Core_IsoTime(ULONGLONG ms, char *out, size_t cap)
 {
-    ULONGLONG ticks = ms * 10000ULL + 116444736000000000ULL;
-    FILETIME time;
+    FILETIME time = Core_MsFileTime(ms);
     SYSTEMTIME utc;
-    time.dwLowDateTime = (DWORD)ticks;
-    time.dwHighDateTime = (DWORD)(ticks >> 32);
     return FileTimeToSystemTime(&time, &utc) &&
            SUCCEEDED(StringCchPrintfA(out, cap, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ", utc.wYear, utc.wMonth, utc.wDay, utc.wHour,
                                       utc.wMinute, utc.wSecond, utc.wMilliseconds));
@@ -2489,10 +2900,27 @@ DWORD Core_Crc32(DWORD crc, const void *data, size_t size)
     return ~crc;
 }
 
+/* A part of a path Windows takes for a device whatever follows its first
+ * dot: CON, PRN, AUX, NUL, COM1 to COM9 and LPT1 to LPT9 (also with a
+ * superscript 1, 2 or 3), spaces before the dot ignored. */
+static BOOL DevicePart(const char *part, size_t length)
+{
+    size_t stem = 0;
+    while (stem < length && part[stem] != '.') stem++;
+    while (stem && part[stem - 1] == ' ') stem--;
+    if (stem == 3)
+        return _strnicmp(part, "CON", 3) == 0 || _strnicmp(part, "PRN", 3) == 0 || _strnicmp(part, "AUX", 3) == 0 ||
+               _strnicmp(part, "NUL", 3) == 0;
+    if ((stem != 4 && stem != 5) || (_strnicmp(part, "COM", 3) != 0 && _strnicmp(part, "LPT", 3) != 0)) return FALSE;
+    if (stem == 4) return part[3] >= '1' && part[3] <= '9';
+    return (unsigned char)part[3] == 0xC2 && ((unsigned char)part[4] == 0xB9 || (unsigned char)part[4] == 0xB2 || (unsigned char)part[4] == 0xB3);
+}
+
 /* An archive's file name (UTF-8, '/' between folders) that stays inside the
  * folder it is extracted to and names one file there: relative, no empty,
- * "." or ".." part, no backslash, drive, stream or character Windows
- * refuses, no part ending in a dot or a space (Windows would drop it). */
+ * "." or ".." part, no backslash, drive, stream, device or character
+ * Windows refuses, no part ending in a dot or a space (Windows would drop
+ * it). A dot inside a part ("draft..v2.md") is a name like any other. */
 BOOL Core_ArchiveNameSafe(const char *name, size_t length)
 {
     size_t i, partStart = 0;
@@ -2502,7 +2930,7 @@ BOOL Core_ArchiveNameSafe(const char *name, size_t length)
         if (c == '/') {
             size_t part = i - partStart;
             if (part == 0 || (part == 1 && name[partStart] == '.') || (part == 2 && name[partStart] == '.' && name[partStart + 1] == '.') ||
-                name[i - 1] == '.' || name[i - 1] == ' ')
+                name[i - 1] == '.' || name[i - 1] == ' ' || DevicePart(name + partStart, part))
                 return FALSE;
             partStart = i + 1;
         } else if (c < 0x20 || c == 0x7F || strchr("\\:*?\"<>|", c)) {
@@ -2837,6 +3265,7 @@ size_t Core_Base64Decode(const char *text, size_t length, BYTE *out, size_t cap)
     return used;
 }
 
+#define SEAL_ITERATIONS_MAX 10000000   /* a sealed key that asks for more is refused: it would hang the restore */
 #define SEAL_SALT  16
 #define SEAL_NONCE 12
 #define SEAL_TAG   16
@@ -2925,7 +3354,7 @@ BOOL Core_OpenSecret(const char *json, size_t length, const WCHAR *password, BYT
     BOOL ok;
     if (secretLength) *secretLength = 0;
     if (!json || !password || !secret) return FALSE;
-    if (!Core_JsonMember(json, length, "iterations", &value, &valueLength) || (iterations = strtoul(value, NULL, 10)) == 0 || iterations > 100000000) return FALSE;
+    if (!Core_JsonMember(json, length, "iterations", &value, &valueLength) || (iterations = strtoul(value, NULL, 10)) == 0 || iterations > SEAL_ITERATIONS_MAX) return FALSE;
     sealedLength = SealMember(json, length, "sealed", sealed, sizeof sealed, 0);
     ok = sealedLength && sealedLength <= cap && SealMember(json, length, "salt", salt, sizeof salt, SEAL_SALT) &&
          SealMember(json, length, "nonce", nonce, sizeof nonce, SEAL_NONCE) && SealMember(json, length, "tag", tag, sizeof tag, SEAL_TAG) &&
@@ -2950,6 +3379,115 @@ BOOL Core_OpenSafeStorage(const BYTE *sealed, size_t length, const BYTE *key, si
         return FALSE;
     }
     *outLength = textLength;
+    return TRUE;
+}
+
+BOOL Core_SealSafeStorage(const BYTE *text, size_t length, const BYTE *key, size_t keyLength, BYTE *out, size_t cap, size_t *outLength)
+{
+    BYTE nonce[SEAL_NONCE], tag[SEAL_TAG];
+    if (outLength) *outLength = 0;
+    if (!text || !out || !key || keyLength != SEAL_KEY || length > 0x7FFFFFFF || 3 + SEAL_NONCE + length + SEAL_TAG > cap) return FALSE;
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, nonce, SEAL_NONCE, BCRYPT_USE_SYSTEM_PREFERRED_RNG))) return FALSE;
+    memcpy(out, "v10", 3);
+    memcpy(out + 3, nonce, SEAL_NONCE);
+    if (!SealCipher(TRUE, key, nonce, tag, text, (ULONG)length, out + 3 + SEAL_NONCE)) {
+        SecureZeroMemory(out, 3 + SEAL_NONCE + length);
+        return FALSE;
+    }
+    memcpy(out + 3 + SEAL_NONCE + length, tag, SEAL_TAG);
+    if (outLength) *outLength = 3 + SEAL_NONCE + length + SEAL_TAG;
+    return TRUE;
+}
+
+/* `length` bytes of UTF-8 at `text` into `out`. */
+static void WideOfUtf8(const char *text, size_t length, WCHAR *out, size_t cch)
+{
+    int n = length && cch > 1 ? MultiByteToWideChar(CP_UTF8, 0, text, (int)min(length, cch - 1), out, (int)cch - 1) : 0;
+    out[max(n, 0)] = 0;
+}
+
+/* A token of the cache: its key, and what it says of itself. */
+static BOOL TokenCacheMember(void *context, const char *key, size_t keyLength, const char *value, size_t valueLength)
+{
+    CoreSignIn *signIn = (CoreSignIn *)context;
+    CoreToken *token;
+    const char *end = key + keyLength, *bar, *client, *organization, *api, *scopes, *member;
+    size_t memberLength;
+    ULONGLONG expires = 0;
+    if (signIn->tokenCount >= CORE_TOKENS || keyLength < 5 || memcmp(key, "acct:", 5) != 0 || !valueLength || value[0] != '{') return TRUE;
+    if ((bar = (const char *)memchr(key, '|', keyLength)) == NULL || (client = (const char *)memchr(bar, ':', (size_t)(end - bar))) == NULL ||
+        (organization = (const char *)memchr(client + 1, ':', (size_t)(end - client - 1))) == NULL)
+        return TRUE;
+    /* The API's address holds a colon of its own ("https://"): the scopes start at the one past its host. */
+    for (api = organization + 1; api + 3 <= end && memcmp(api, "://", 3) != 0; api++)
+        ;
+    scopes = api + 3 <= end ? (const char *)memchr(api + 3, ':', (size_t)(end - api - 3)) : NULL;
+    if (!scopes) return TRUE;
+    token = &signIn->tokens[signIn->tokenCount++];
+    ZeroMemory(token, sizeof *token);
+    if (!signIn->account[0]) WideOfUtf8(key + 5, (size_t)(bar - key - 5), signIn->account, ARRAYSIZE(signIn->account));
+    if (!signIn->organization[0]) WideOfUtf8(client + 1, (size_t)(organization - client - 1), signIn->organization, ARRAYSIZE(signIn->organization));
+    WideOfUtf8(scopes + 1, (size_t)(end - scopes - 1), token->scopes, ARRAYSIZE(token->scopes));
+    if (Core_JsonMember(value, valueLength, "expiresAt", &member, &memberLength) && Core_JsonNumber(member, memberLength, &expires)) token->expires = expires;
+    token->renews = Core_JsonMember(value, valueLength, "refreshToken", &member, &memberLength) && memberLength > 2 && member[0] == '"';
+    if (!signIn->plan[0]) Core_JsonMemberString(value, valueLength, "subscriptionType", signIn->plan, ARRAYSIZE(signIn->plan));
+    if (!signIn->tier[0]) Core_JsonMemberString(value, valueLength, "rateLimitTier", signIn->tier, ARRAYSIZE(signIn->tier));
+    return TRUE;
+}
+
+void Core_ReadTokenCache(const char *json, size_t length, CoreSignIn *signIn)
+{
+    if (json && length && json[0] == '{') Core_JsonEachMember(json, length, TokenCacheMember, signIn);
+}
+
+void Core_FormatSize(ULONGLONG bytes, WCHAR *out, size_t cch)
+{
+    const ULONGLONG megabyte = 1024ULL * 1024ULL, gigabyte = 1024ULL * megabyte;
+    if (bytes >= gigabyte)
+        StringCchPrintfW(out, cch, L"%llu.%llu GB", bytes / gigabyte, (bytes % gigabyte) * 10 / gigabyte);
+    else if (bytes >= megabyte)
+        StringCchPrintfW(out, cch, L"%lu.%lu MB", (unsigned long)(bytes / megabyte), (unsigned long)((bytes % megabyte) * 10 / megabyte));
+    else
+        StringCchPrintfW(out, cch, L"%lu KB", (unsigned long)((bytes + 1023) / 1024));
+}
+
+/* The line starting at `at`: its end, past its \r; `*next` where the next one starts. */
+static size_t LineEnd(const WCHAR *text, size_t at, size_t *next)
+{
+    size_t end = at;
+    while (text[end] && text[end] != L'\n') end++;
+    *next = text[end] ? end + 1 : end;
+    return end > at && text[end - 1] == L'\r' ? end - 1 : end;
+}
+
+BOOL Core_ReleaseNotesIn(const WCHAR *notes, BOOL chinese, size_t *start, size_t *length)
+{
+    size_t at = 0, next, end, rules[2], ruleEnds[2], from, to;
+    int found = 0;
+    *start = *length = 0;
+    if (!notes) return FALSE;
+    /* A release's notes: the English, a rule, the Chinese, a rule, how to install it (tools/changelog.py). */
+    while (notes[at] && found < 2) {
+        end = LineEnd(notes, at, &next);
+        if (end - at == 3 && wcsncmp(notes + at, L"---", 3) == 0) {
+            rules[found] = at;
+            ruleEnds[found++] = next;
+        }
+        at = next;
+    }
+    if (found < 2) return FALSE;
+    from = chinese ? ruleEnds[0] : 0;
+    to = chinese ? rules[1] : rules[0];
+    /* Past the quotes before it (the build's note, the program's line) and the blank lines. */
+    while (from < to) {
+        end = LineEnd(notes, from, &next);
+        if (end > from && notes[from] != L'>') break;
+        from = next;
+    }
+    while (to > from && (notes[to - 1] == L'\n' || notes[to - 1] == L'\r' || notes[to - 1] == L' ')) to--;
+    if (to <= from) return FALSE;
+    *start = from;
+    *length = to - from;
     return TRUE;
 }
 
@@ -4419,4 +4957,598 @@ BOOL Core_SafeHttpsUrl(const WCHAR *url)
         if (!(iswalnum(*p) || wcschr(L".-:[]", *p))) return FALSE;
     }
     return TRUE;
+}
+
+/* ----------------------------------------------------------- the shield's facts */
+
+/* Where Claude may be used, by ISO 3166-1 code, sorted: the countries of
+ * Anthropic's Supported Regions Policy (effective Nov 12, 2026), and the
+ * territories of a listed country, which the policy counts with it. */
+static const char kClaudeRegions[] =
+    "AD AE AG AI AL AM AO AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BZ CA CC CD CF CG CH "
+    "CI CK CL CM CO CR CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN "
+    "GP GQ GR GS GT GU GW GY HM HN HR HT HU ID IE IL IM IN IO IQ IS IT JE JM JO JP KE KG KH KI KM KN KR KW KY KZ LA LB LC LI "
+    "LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MN MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ "
+    "OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SZ "
+    "TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VG VI VN VU WF WS YT ZA ZM ZW";
+
+/* Cloudflare's trace (/cdn-cgi/trace): a line "key=value" each; the
+ * client's IP, as the site behind it sees it, and its country code. */
+BOOL Core_ParseTrace(const char *text, size_t len, WCHAR *ip, size_t ipCch, WCHAR *loc, size_t locCch)
+{
+    size_t start = 0, i, n, k;
+    if (ipCch) ip[0] = 0;
+    if (locCch) loc[0] = 0;
+    for (i = 0; text && i <= len; i++) {
+        const char *line = text + start;
+        if (i < len && text[i] != '\n') continue;
+        n = i - start;
+        if (n && line[n - 1] == '\r') n--;
+        start = i + 1;
+        if (n > 3 && memcmp(line, "ip=", 3) == 0 && n - 3 < ipCch && n - 3 <= 45) {
+            for (k = 3; k < n && (isxdigit((unsigned char)line[k]) || line[k] == '.' || line[k] == ':'); k++) ip[k - 3] = (WCHAR)line[k];
+            ip[k < n ? 0 : n - 3] = 0;
+        } else if (n == 6 && memcmp(line, "loc=", 4) == 0 && locCch > 2 && isalnum((unsigned char)line[4]) && isalnum((unsigned char)line[5])) {
+            loc[0] = (WCHAR)toupper((unsigned char)line[4]);
+            loc[1] = (WCHAR)toupper((unsigned char)line[5]);
+            loc[2] = 0;
+        }
+    }
+    return ipCch && ip[0];
+}
+
+/* Claude works in region `countryCode` (any case); in Ukraine, but for the
+ * regions Russia occupies, when `region` names one. Cloudflare's own codes
+ * (XX, T1 for Tor) are none of the regions. */
+BOOL Core_ClaudeRegionSupported(const WCHAR *countryCode, const WCHAR *region)
+{
+    static const WCHAR *const kUkraineOut[] = { L"crimea", L"krym", L"sevastopol", L"donetsk", L"luhansk", L"lugansk", L"kherson",
+                                                L"zaporiz", L"zaporoz" };
+    char code[3];
+    const char *at;
+    size_t i;
+    if (!countryCode || wcslen(countryCode) != 2) return FALSE;
+    for (i = 0; i < 2; i++) {
+        WCHAR c = countryCode[i];
+        if (c >= L'a' && c <= L'z') c = (WCHAR)(c - L'a' + L'A');
+        if (c < L'A' || c > L'Z') return FALSE;
+        code[i] = (char)c;
+    }
+    code[2] = 0;
+    for (at = kClaudeRegions; (at = strstr(at, code)) != NULL; at++)
+        if ((at == kClaudeRegions || at[-1] == ' ') && (at[2] == ' ' || at[2] == 0)) break;
+    if (!at) return FALSE;
+    if (strcmp(code, "UA") == 0 && region)
+        for (i = 0; i < ARRAYSIZE(kUkraineOut); i++)
+            if (Core_ContainsI(region, kUkraineOut[i])) return FALSE;
+    return TRUE;
+}
+
+/* A member as a three-way fact: false 0, absent or null -1, anything else 1
+ * (ipapi.is marks some flags with a value of their own rather than true). */
+static int JsonFact(const char *json, size_t len, const char *key)
+{
+    const char *value;
+    size_t length;
+    if (!json || !Core_JsonMember(json, len, key, &value, &length)) return -1;
+    if (length == 5 && memcmp(value, "false", 5) == 0) return 0;
+    if (length == 4 && memcmp(value, "null", 4) == 0) return -1;
+    return 1;
+}
+
+/* An object member, NULL when it is none. */
+static const char *JsonObject(const char *json, size_t len, const char *key, size_t *length)
+{
+    const char *value;
+    if (!json || !Core_JsonMember(json, len, key, &value, length) || !*length || value[0] != '{') return NULL;
+    return value;
+}
+
+/* The number in "AS15169" or "AS15169 Google LLC", or a JSON number. */
+static ULONGLONG AsNumber(const WCHAR *text)
+{
+    ULONGLONG number = 0;
+    if ((text[0] == L'A' || text[0] == L'a') && (text[1] == L'S' || text[1] == L's')) text += 2;
+    for (; *text >= L'0' && *text <= L'9'; text++) number = number * 10 + (ULONGLONG)(*text - L'0');
+    return number;
+}
+
+static void UpperCode(WCHAR *code)
+{
+    for (; *code; code++)
+        if (*code >= L'a' && *code <= L'z') *code = (WCHAR)(*code - L'a' + L'A');
+}
+
+BOOL Core_ParseIpRisk(int source, const char *json, size_t len, const WCHAR *ip, CoreIpRisk *out)
+{
+    const char *object, *value;
+    size_t objectLength, valueLength;
+    ULONGLONG number;
+    WCHAR text[128];
+    ZeroMemory(out, sizeof *out);
+    out->source = source;
+    out->trustScore = -1;
+    out->datacenter = out->residential = out->mobile = out->vpn = out->proxy = out->tor = out->abuser = -1;
+    if (!json || !len || json[0] != '{') return FALSE;
+    switch (source) {
+    case SHIELD_SOURCE_NETCOFFEE:
+        if (!Core_JsonMemberString(json, len, "countryCode", out->countryCode, ARRAYSIZE(out->countryCode))) return FALSE;
+        Core_JsonMemberString(json, len, "country", out->country, ARRAYSIZE(out->country));
+        Core_JsonMemberString(json, len, "region", out->region, ARRAYSIZE(out->region));
+        Core_JsonMemberString(json, len, "city", out->city, ARRAYSIZE(out->city));
+        Core_JsonMemberString(json, len, "timezone", out->timezone, ARRAYSIZE(out->timezone));
+        if (!Core_JsonMemberString(json, len, "asOrganization", out->isp, ARRAYSIZE(out->isp)) || !out->isp[0])
+            Core_JsonMemberString(json, len, "company_name", out->isp, ARRAYSIZE(out->isp));
+        out->asn = Core_JsonMemberNumber(json, len, "asn");
+        if (Core_JsonMember(json, len, "trust_score", &value, &valueLength) && Core_JsonNumber(value, valueLength, &number) && number <= 100)
+            out->trustScore = (int)number;
+        out->datacenter = JsonFact(json, len, "is_datacenter");
+        out->residential = JsonFact(json, len, "isResidential");
+        out->mobile = JsonFact(json, len, "is_mobile");
+        out->vpn = JsonFact(json, len, "is_vpn");
+        out->proxy = JsonFact(json, len, "is_proxy");
+        out->tor = JsonFact(json, len, "is_tor");
+        out->abuser = JsonFact(json, len, "is_abuser");
+        break;
+    case SHIELD_SOURCE_IPAPIIS:
+        if ((object = JsonObject(json, len, "location", &objectLength)) == NULL ||
+            !Core_JsonMemberString(object, objectLength, "country_code", out->countryCode, ARRAYSIZE(out->countryCode)))
+            return FALSE;
+        Core_JsonMemberString(object, objectLength, "country", out->country, ARRAYSIZE(out->country));
+        Core_JsonMemberString(object, objectLength, "state", out->region, ARRAYSIZE(out->region));
+        Core_JsonMemberString(object, objectLength, "city", out->city, ARRAYSIZE(out->city));
+        Core_JsonMemberString(object, objectLength, "timezone", out->timezone, ARRAYSIZE(out->timezone));
+        if ((object = JsonObject(json, len, "company", &objectLength)) != NULL) {
+            Core_JsonMemberString(object, objectLength, "name", out->isp, ARRAYSIZE(out->isp));
+            if (Core_JsonMemberString(object, objectLength, "type", text, ARRAYSIZE(text)))
+                out->residential = Core_EqualsI(text, L"isp") ? 1 : Core_EqualsI(text, L"hosting") ? 0 : -1;
+        }
+        if ((object = JsonObject(json, len, "asn", &objectLength)) != NULL) {
+            out->asn = Core_JsonMemberNumber(object, objectLength, "asn");
+            if (!out->isp[0]) Core_JsonMemberString(object, objectLength, "org", out->isp, ARRAYSIZE(out->isp));
+        }
+        out->datacenter = JsonFact(json, len, "is_datacenter");
+        out->mobile = JsonFact(json, len, "is_mobile");
+        out->vpn = JsonFact(json, len, "is_vpn");
+        out->proxy = JsonFact(json, len, "is_proxy");
+        out->tor = JsonFact(json, len, "is_tor");
+        out->abuser = JsonFact(json, len, "is_abuser");
+        if (out->datacenter == 1) out->residential = 0;
+        break;
+    case SHIELD_SOURCE_IPAPICOM:
+        if (!Core_JsonMemberString(json, len, "status", text, ARRAYSIZE(text)) || wcscmp(text, L"success") != 0 ||
+            !Core_JsonMemberString(json, len, "countryCode", out->countryCode, ARRAYSIZE(out->countryCode)))
+            return FALSE;
+        Core_JsonMemberString(json, len, "country", out->country, ARRAYSIZE(out->country));
+        Core_JsonMemberString(json, len, "regionName", out->region, ARRAYSIZE(out->region));
+        Core_JsonMemberString(json, len, "city", out->city, ARRAYSIZE(out->city));
+        Core_JsonMemberString(json, len, "timezone", out->timezone, ARRAYSIZE(out->timezone));
+        Core_JsonMemberString(json, len, "isp", out->isp, ARRAYSIZE(out->isp));
+        if (Core_JsonMemberString(json, len, "as", text, ARRAYSIZE(text))) out->asn = AsNumber(text);
+        out->datacenter = JsonFact(json, len, "hosting");
+        out->mobile = JsonFact(json, len, "mobile");
+        out->proxy = JsonFact(json, len, "proxy");
+        if (out->datacenter == 1) out->residential = 0;
+        break;
+    case SHIELD_SOURCE_PROXYCHECK: {
+        char key[64];
+        size_t i;
+        if (!Core_JsonMemberString(json, len, "status", text, ARRAYSIZE(text)) || (wcscmp(text, L"ok") != 0 && wcscmp(text, L"warning") != 0) ||
+            !ip || wcslen(ip) >= sizeof key)
+            return FALSE;
+        for (i = 0; ip[i]; i++) key[i] = (char)ip[i];
+        key[i] = 0;
+        if ((object = JsonObject(json, len, key, &objectLength)) == NULL ||
+            !Core_JsonMemberString(object, objectLength, "isocode", out->countryCode, ARRAYSIZE(out->countryCode)))
+            return FALSE;
+        Core_JsonMemberString(object, objectLength, "country", out->country, ARRAYSIZE(out->country));
+        Core_JsonMemberString(object, objectLength, "region", out->region, ARRAYSIZE(out->region));
+        Core_JsonMemberString(object, objectLength, "city", out->city, ARRAYSIZE(out->city));
+        Core_JsonMemberString(object, objectLength, "timezone", out->timezone, ARRAYSIZE(out->timezone));
+        Core_JsonMemberString(object, objectLength, "provider", out->isp, ARRAYSIZE(out->isp));
+        if (Core_JsonMemberString(object, objectLength, "asn", text, ARRAYSIZE(text))) out->asn = AsNumber(text);
+        if (Core_JsonMemberString(object, objectLength, "proxy", text, ARRAYSIZE(text))) out->proxy = Core_EqualsI(text, L"yes") ? 1 : 0;
+        if (Core_JsonMemberString(object, objectLength, "type", text, ARRAYSIZE(text))) {
+            if (Core_EqualsI(text, L"VPN")) out->vpn = 1;
+            else if (Core_EqualsI(text, L"TOR")) out->tor = 1;
+            else if (Core_EqualsI(text, L"Hosting")) out->datacenter = 1, out->residential = 0;
+            else if (Core_EqualsI(text, L"Residential")) out->residential = 1, out->datacenter = 0;
+            else if (Core_EqualsI(text, L"Wireless")) out->mobile = 1, out->datacenter = 0;
+        }
+        break;
+    }
+    default:
+        return FALSE;
+    }
+    UpperCode(out->countryCode);
+    return wcslen(out->countryCode) == 2;
+}
+
+#define STUN_BINDING_REQUEST  0x0001
+#define STUN_BINDING_SUCCESS  0x0101
+#define STUN_MAPPED_ADDRESS   0x0001
+#define STUN_XOR_MAPPED       0x0020
+static const BYTE kStunCookie[4] = { 0x21, 0x12, 0xA4, 0x42 };   /* RFC 5389's magic cookie */
+
+size_t Core_StunRequest(BYTE *out, size_t cap, const BYTE *transaction)
+{
+    if (cap < 20 || !transaction) return 0;
+    out[0] = 0;
+    out[1] = STUN_BINDING_REQUEST;
+    out[2] = out[3] = 0;   /* no attributes */
+    memcpy(out + 4, kStunCookie, 4);
+    memcpy(out + 8, transaction, 12);
+    return 20;
+}
+
+/* The address a Binding success response gives (XOR-MAPPED-ADDRESS, else the
+ * old MAPPED-ADDRESS), IPv4 or IPv6, as text; FALSE for any other message. */
+BOOL Core_StunMappedAddress(const BYTE *m, size_t len, const BYTE *transaction, WCHAR *ip, size_t cch)
+{
+    size_t at, end;
+    BOOL found = FALSE;
+    if (cch) ip[0] = 0;
+    if (!m || len < 20 || ((unsigned)m[0] << 8 | m[1]) != STUN_BINDING_SUCCESS || memcmp(m + 4, kStunCookie, 4) != 0 ||
+        !transaction || memcmp(m + 8, transaction, 12) != 0)
+        return FALSE;
+    end = 20 + ((size_t)m[2] << 8 | m[3]);
+    if (end > len) return FALSE;
+    for (at = 20; at + 4 <= end; at += 4 + (((size_t)m[at + 2] << 8 | m[at + 3]) + 3) / 4 * 4) {
+        unsigned type = (unsigned)m[at] << 8 | m[at + 1];
+        size_t length = (size_t)m[at + 2] << 8 | m[at + 3], k;
+        const BYTE *v = m + at + 4;
+        BOOL xored = type == STUN_XOR_MAPPED;
+        BYTE a[16];
+        if (at + 4 + length > end) return FALSE;
+        if (!xored && (type != STUN_MAPPED_ADDRESS || found)) continue;
+        if (length >= 8 && v[1] == 0x01) {
+            for (k = 0; k < 4; k++) a[k] = (BYTE)(xored ? v[4 + k] ^ m[4 + k] : v[4 + k]);
+            StringCchPrintfW(ip, cch, L"%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
+        } else if (length >= 20 && v[1] == 0x02) {
+            for (k = 0; k < 16; k++) a[k] = (BYTE)(xored ? v[4 + k] ^ m[4 + k] : v[4 + k]);
+            StringCchPrintfW(ip, cch, L"%x:%x:%x:%x:%x:%x:%x:%x", a[0] << 8 | a[1], a[2] << 8 | a[3], a[4] << 8 | a[5], a[6] << 8 | a[7],
+                             a[8] << 8 | a[9], a[10] << 8 | a[11], a[12] << 8 | a[13], a[14] << 8 | a[15]);
+        } else continue;
+        found = TRUE;
+        if (xored) return TRUE;
+    }
+    return found;
+}
+
+/* The rules on what was found. Claude's exit unread, only the rules about
+ * this PC's own network apply, and the unknown one; a rule that needs what
+ * no IP service could tell stops Claude only with the unknown one. Warn-only:
+ * the same reasons are found, so the badge turns red, but none ends Claude. */
+DWORD Core_ShieldVerdict(const CoreShieldFacts *f, const CoreShieldRules *r)
+{
+    DWORD stop = 0;
+    if (r->stopWhenTunDown && f->tunUp == 0) stop |= SHIELD_STOP_TUN;
+    if (r->stopWhenProxyAppStops && f->proxyApp == 0) stop |= SHIELD_STOP_PROXY_APP;
+    if (f->exitKnown) {
+        if (!f->supported) stop |= SHIELD_STOP_REGION;
+        if (!f->profileAllowed) stop |= SHIELD_STOP_PROFILE;
+        if (!r->allowDatacenter && f->datacenter == 1) stop |= SHIELD_STOP_DATACENTER;
+        if (r->minScore > 0 && f->trustScore >= 0 && f->trustScore < r->minScore) stop |= SHIELD_STOP_SCORE;
+        if (!r->allowDnsLeak && f->dnsLeak == 1) stop |= SHIELD_STOP_DNS;
+        if (!r->allowUdpLeak && f->udpLeak == 1) stop |= SHIELD_STOP_UDP;
+        if (!r->allowIpv6Leak && f->ipv6Leak == 1) stop |= SHIELD_STOP_IPV6;
+        if (r->stopWhenUnknown && ((!r->allowDatacenter && f->datacenter < 0) || (r->minScore > 0 && f->trustScore < 0))) stop |= SHIELD_STOP_UNKNOWN;
+    } else if (r->stopWhenUnknown) {
+        stop |= SHIELD_STOP_UNKNOWN;
+    }
+    return r->warnOnly ? 0 : stop;
+}
+
+DWORD Core_ShieldConcerns(const CoreShieldFacts *f)
+{
+    DWORD concerns = 0;
+    if (!f->exitKnown) return SHIELD_STOP_UNKNOWN;
+    if (!f->supported) concerns |= SHIELD_STOP_REGION;
+    if (!f->profileAllowed) concerns |= SHIELD_STOP_PROFILE;
+    if (f->datacenter == 1) concerns |= SHIELD_STOP_DATACENTER;
+    if (f->trustScore >= 0 && f->trustScore < SHIELD_LOW_SCORE) concerns |= SHIELD_STOP_SCORE;
+    if (f->dnsLeak == 1) concerns |= SHIELD_STOP_DNS;
+    if (f->udpLeak == 1) concerns |= SHIELD_STOP_UDP;
+    if (f->ipv6Leak == 1) concerns |= SHIELD_STOP_IPV6;
+    if (f->tzMismatch == 1) concerns |= SHIELD_CONCERN_TZ;
+    if (f->langMismatch == 1) concerns |= SHIELD_CONCERN_LANG;
+    if (f->cfSplit == 1) concerns |= SHIELD_CONCERN_SPLIT;
+    if (!f->riskKnown) concerns |= SHIELD_STOP_UNKNOWN;
+    return concerns;
+}
+
+/* The exit region's time zone offset from UTC, in minutes (DST aside): an
+ * IANA name, then a 2-letter country code; most-populous zone where a
+ * country spans several. INT_MIN when neither is known. */
+int Core_TimezoneOffsetMinutes(const WCHAR *name)
+{
+    static const struct { const WCHAR *zone; int minutes; } kZones[] = {
+        { L"Asia/Shanghai", 480 }, { L"Asia/Urumqi", 360 }, { L"Asia/Taipei", 480 }, { L"Asia/Hong_Kong", 480 }, { L"Asia/Macau", 480 },
+        { L"Asia/Tokyo", 540 }, { L"Asia/Seoul", 540 }, { L"Asia/Singapore", 480 }, { L"Asia/Kuala_Lumpur", 480 }, { L"Asia/Bangkok", 420 },
+        { L"Asia/Ho_Chi_Minh", 420 }, { L"Asia/Jakarta", 420 }, { L"Asia/Manila", 480 }, { L"Asia/Kolkata", 330 }, { L"Asia/Karachi", 300 },
+        { L"Asia/Dhaka", 360 }, { L"Asia/Tehran", 210 }, { L"Asia/Jerusalem", 120 }, { L"Asia/Dubai", 240 }, { L"Asia/Riyadh", 180 },
+        { L"Europe/Istanbul", 180 }, { L"Europe/Moscow", 180 }, { L"Europe/Kyiv", 120 }, { L"Europe/London", 0 }, { L"Europe/Dublin", 0 },
+        { L"Europe/Paris", 60 }, { L"Europe/Berlin", 60 }, { L"Europe/Rome", 60 }, { L"Europe/Madrid", 60 }, { L"Europe/Lisbon", 0 },
+        { L"Europe/Amsterdam", 60 }, { L"Europe/Brussels", 60 }, { L"Europe/Zurich", 60 }, { L"Europe/Vienna", 60 }, { L"Europe/Stockholm", 60 },
+        { L"Europe/Oslo", 60 }, { L"Europe/Copenhagen", 60 }, { L"Europe/Helsinki", 120 }, { L"Europe/Warsaw", 60 }, { L"Europe/Prague", 60 },
+        { L"Europe/Athens", 120 }, { L"Europe/Bucharest", 120 }, { L"America/Los_Angeles", -480 }, { L"America/Denver", -420 },
+        { L"America/Chicago", -360 }, { L"America/New_York", -300 }, { L"America/Toronto", -300 }, { L"America/Mexico_City", -360 },
+        { L"America/Sao_Paulo", -180 }, { L"America/Argentina/Buenos_Aires", -180 }, { L"America/Santiago", -240 }, { L"Australia/Sydney", 600 },
+        { L"Pacific/Auckland", 720 }, { L"Africa/Johannesburg", 120 }, { L"Africa/Cairo", 120 }, { L"Africa/Lagos", 60 }, { L"Africa/Nairobi", 180 },
+    };
+    static const struct { const WCHAR *cc; const WCHAR *zone; } kCountries[] = {
+        { L"CN", L"Asia/Shanghai" }, { L"TW", L"Asia/Taipei" }, { L"HK", L"Asia/Hong_Kong" }, { L"MO", L"Asia/Macau" }, { L"JP", L"Asia/Tokyo" },
+        { L"KR", L"Asia/Seoul" }, { L"SG", L"Asia/Singapore" }, { L"MY", L"Asia/Kuala_Lumpur" }, { L"TH", L"Asia/Bangkok" }, { L"VN", L"Asia/Ho_Chi_Minh" },
+        { L"ID", L"Asia/Jakarta" }, { L"PH", L"Asia/Manila" }, { L"IN", L"Asia/Kolkata" }, { L"PK", L"Asia/Karachi" }, { L"BD", L"Asia/Dhaka" },
+        { L"IR", L"Asia/Tehran" }, { L"IL", L"Asia/Jerusalem" }, { L"AE", L"Asia/Dubai" }, { L"SA", L"Asia/Riyadh" }, { L"TR", L"Europe/Istanbul" },
+        { L"RU", L"Europe/Moscow" }, { L"UA", L"Europe/Kyiv" }, { L"GB", L"Europe/London" }, { L"IE", L"Europe/Dublin" }, { L"FR", L"Europe/Paris" },
+        { L"DE", L"Europe/Berlin" }, { L"IT", L"Europe/Rome" }, { L"ES", L"Europe/Madrid" }, { L"PT", L"Europe/Lisbon" }, { L"NL", L"Europe/Amsterdam" },
+        { L"BE", L"Europe/Brussels" }, { L"CH", L"Europe/Zurich" }, { L"AT", L"Europe/Vienna" }, { L"SE", L"Europe/Stockholm" }, { L"NO", L"Europe/Oslo" },
+        { L"DK", L"Europe/Copenhagen" }, { L"FI", L"Europe/Helsinki" }, { L"PL", L"Europe/Warsaw" }, { L"CZ", L"Europe/Prague" }, { L"GR", L"Europe/Athens" },
+        { L"RO", L"Europe/Bucharest" }, { L"US", L"America/New_York" }, { L"CA", L"America/Toronto" }, { L"MX", L"America/Mexico_City" },
+        { L"BR", L"America/Sao_Paulo" }, { L"AR", L"America/Argentina/Buenos_Aires" }, { L"CL", L"America/Santiago" }, { L"AU", L"Australia/Sydney" },
+        { L"NZ", L"Pacific/Auckland" }, { L"ZA", L"Africa/Johannesburg" }, { L"EG", L"Africa/Cairo" }, { L"NG", L"Africa/Lagos" }, { L"KE", L"Africa/Nairobi" },
+    };
+    size_t i;
+    if (!name || !name[0]) return INT_MIN;
+    for (i = 0; i < ARRAYSIZE(kZones); i++)
+        if (Core_EqualsI(name, kZones[i].zone)) return kZones[i].minutes;
+    if (wcslen(name) == 2)
+        for (i = 0; i < ARRAYSIZE(kCountries); i++)
+            if (Core_EqualsI(name, kCountries[i].cc)) return Core_TimezoneOffsetMinutes(kCountries[i].zone);
+    return INT_MIN;
+}
+
+BOOL Core_RegionLanguageMatches(const WCHAR *countryCode, const WCHAR *primary)
+{
+    static const struct { const WCHAR *cc; const WCHAR *langs; } kRegion[] = {
+        { L"CN", L"zh" }, { L"TW", L"zh" }, { L"HK", L"zh en" }, { L"MO", L"zh en" }, { L"JP", L"ja" }, { L"KR", L"ko" }, { L"TH", L"th" },
+        { L"VN", L"vi" }, { L"SG", L"en zh ms ta" }, { L"MY", L"ms en zh ta" }, { L"ID", L"id en" }, { L"PH", L"en tl fil" }, { L"IN", L"en hi" },
+        { L"PK", L"ur en" }, { L"BD", L"bn en" }, { L"US", L"en" }, { L"GB", L"en" }, { L"IE", L"en ga" }, { L"AU", L"en" }, { L"NZ", L"en mi" },
+        { L"CA", L"en fr" }, { L"DE", L"de" }, { L"AT", L"de" }, { L"CH", L"de fr it rm" }, { L"BE", L"nl fr de" }, { L"FR", L"fr" }, { L"IT", L"it" },
+        { L"ES", L"es ca gl eu" }, { L"PT", L"pt" }, { L"NL", L"nl fy" }, { L"SE", L"sv" }, { L"NO", L"no nb nn" }, { L"DK", L"da" }, { L"FI", L"fi sv" },
+        { L"PL", L"pl" }, { L"CZ", L"cs" }, { L"SK", L"sk" }, { L"HU", L"hu" }, { L"RO", L"ro" }, { L"GR", L"el" }, { L"RU", L"ru" }, { L"UA", L"uk ru" },
+        { L"TR", L"tr" }, { L"IL", L"he ar en" }, { L"SA", L"ar" }, { L"AE", L"ar en" }, { L"EG", L"ar" }, { L"IR", L"fa" }, { L"ZA", L"en af zu xh" },
+        { L"KE", L"en sw" }, { L"NG", L"en" }, { L"BR", L"pt" }, { L"AR", L"es" }, { L"MX", L"es" }, { L"CL", L"es" },
+    };
+    WCHAR lower[8];
+    size_t i, n;
+    if (!countryCode || !primary || !primary[0]) return TRUE;
+    for (n = 0; n < ARRAYSIZE(lower) - 1 && primary[n] && primary[n] != L'-' && primary[n] != L'_'; n++)
+        lower[n] = (primary[n] >= L'A' && primary[n] <= L'Z') ? (WCHAR)(primary[n] - L'A' + L'a') : primary[n];
+    lower[n] = 0;
+    for (i = 0; i < ARRAYSIZE(kRegion); i++)
+        if (Core_EqualsI(countryCode, kRegion[i].cc)) {
+            const WCHAR *at = kRegion[i].langs;
+            while (*at) {
+                const WCHAR *end = at;
+                while (*end && *end != L' ') end++;
+                if ((size_t)(end - at) == n && _wcsnicmp(at, lower, n) == 0) return TRUE;
+                at = *end ? end + 1 : end;
+            }
+            return FALSE;
+        }
+    return TRUE;   /* the region is not in the table: nothing to claim */
+}
+
+/* What parts a list of regions: a space, a comma or a semicolon, Chinese ones (，、；) too. */
+static BOOL RegionSeparator(WCHAR c)
+{
+    return c == L' ' || c == L',' || c == L';' || c == 0xFF0C || c == 0x3001 || c == 0xFF1B;
+}
+
+/* Only whole 2-letter codes count: a list being typed ("U" on the way to
+ * "US") or holding anything else allows any region rather than none. */
+
+BOOL Core_RegionAllowed(const WCHAR *countryCode, const WCHAR *allowed)
+{
+    const WCHAR *at = allowed;
+    BOOL any = FALSE;
+    if (!allowed) return TRUE;
+    while (*at) {
+        const WCHAR *end;
+        while (RegionSeparator(*at)) at++;
+        end = at;
+        while (*end && !RegionSeparator(*end)) end++;
+        if (end - at == 2 && iswalpha(at[0]) && iswalpha(at[1]) && at[0] < 0x80 && at[1] < 0x80) {
+            any = TRUE;
+            if (countryCode && wcslen(countryCode) == 2 && _wcsnicmp(at, countryCode, 2) == 0) return TRUE;
+        }
+        at = end;
+    }
+    return !any;   /* no whole code: the profile allows any region */
+}
+
+BOOL Core_RegionCodes(const WCHAR *text)
+{
+    const WCHAR *at = text, *end;
+    if (!text) return TRUE;
+    while (*at) {
+        while (RegionSeparator(*at)) at++;
+        if (!*at) break;
+        end = at;
+        while (*end && !RegionSeparator(*end)) end++;
+        if (end - at != 2 || at[0] >= 0x80 || at[1] >= 0x80 || !iswalpha(at[0]) || !iswalpha(at[1])) return FALSE;
+        at = end;
+    }
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------- SearXNG */
+
+BOOL Core_SearXngUrl(const WCHAR *typed, WCHAR *out, size_t cch)
+{
+    WCHAR full[URL_CCH];
+    const WCHAR *host, *text;
+    size_t length, i, scheme;
+    if (!out || !cch) return FALSE;
+    out[0] = 0;
+    if (!typed) return FALSE;
+    while (*typed == L' ' || *typed == L'\t') typed++;
+    /* A bare host is https's. */
+    if (FAILED(StringCchPrintfW(full, ARRAYSIZE(full), wcsstr(typed, L"://") ? L"%s" : L"https://%s", typed))) return FALSE;
+    text = full;
+    length = wcslen(text);
+    while (length && (text[length - 1] == L' ' || text[length - 1] == L'\t' || text[length - 1] == L'/')) length--;
+    /* The server adds /search itself: an address copied from a search page loses it. */
+    if (length > 7 && _wcsnicmp(text + length - 7, L"/search", 7) == 0) {
+        length -= 7;
+        while (length && text[length - 1] == L'/') length--;
+    }
+    if (length >= 8 && _wcsnicmp(text, L"https://", 8) == 0) scheme = 8;
+    else if (length >= 7 && _wcsnicmp(text, L"http://", 7) == 0) scheme = 7;
+    else return FALSE;
+    host = text + scheme;
+    if (length == scheme || *host == L'/' || *host == L':' || *host == L'@') return FALSE;
+    for (i = 0; i < length; i++)
+        if (text[i] <= L' ' || text[i] == L'"' || text[i] == L'\\' || text[i] == L'?' || text[i] == L'#' || text[i] == 0x7F) return FALSE;
+    if (length >= cch) return FALSE;
+    memcpy(out, text, length * sizeof(WCHAR));
+    out[length] = 0;
+    return TRUE;
+}
+
+BOOL Core_SearXngEntry(const WCHAR *npx, const WCHAR *url, BOOL allowPrivate, char *out, size_t cap)
+{
+    char qNpx[MAX_PATH * 3 + 2], qUrl[URL_CCH * 3 + 2];
+    if (!out || !cap) return FALSE;
+    out[0] = 0;
+    if (!npx || !npx[0] || !url || !url[0] || !Core_JsonQuote(npx, qNpx, sizeof qNpx) || !Core_JsonQuote(url, qUrl, sizeof qUrl))
+        return FALSE;
+    if (FAILED(StringCchPrintfA(out, cap, "{\"command\":%s,\"args\":[\"-y\",\"" SEARXNG_PACKAGE "\"],\"env\":{\"SEARXNG_URL\":%s%s}}",
+                                qNpx, qUrl, allowPrivate ? ",\"MCP_HTTP_ALLOW_PRIVATE_URLS\":\"true\"" : ""))) {
+        out[0] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* An element of an entry's args that names the package, at any version ("mcp-searxng", "mcp-searxng@1.2.0"). */
+static BOOL NamesSearXng(void *context, const char *value, size_t valueLen)
+{
+    WCHAR arg[128];
+    size_t n = ARRAYSIZE(SEARXNG_PACKAGE) - 1;
+    if (Core_JsonString(value, valueLen, arg, ARRAYSIZE(arg)) && _wcsnicmp(arg, L"" SEARXNG_PACKAGE, n) == 0 &&
+        (arg[n] == 0 || arg[n] == L'@')) {
+        *(BOOL *)context = TRUE;
+        return FALSE;   /* found: no need to go on */
+    }
+    return TRUE;
+}
+
+BOOL Core_SearXngServer(const char *server, size_t length, WCHAR *url, size_t cch, BOOL *allowPrivate)
+{
+    const char *args, *env, *value;
+    size_t argsLength, envLength, valueLength;
+    BOOL runs = FALSE;
+    if (url && cch) url[0] = 0;
+    if (allowPrivate) *allowPrivate = FALSE;
+    if (!server || !Core_JsonMember(server, length, "args", &args, &argsLength)) return FALSE;
+    Core_JsonEachElement(args, argsLength, NamesSearXng, &runs);
+    if (!runs) return FALSE;
+    if (Core_JsonMember(server, length, "env", &env, &envLength)) {
+        if (url && cch) Core_JsonMemberString(env, envLength, "SEARXNG_URL", url, cch);
+        if (allowPrivate && Core_JsonMember(env, envLength, "MCP_HTTP_ALLOW_PRIVATE_URLS", &value, &valueLength)) {
+            WCHAR flag[8];
+            *allowPrivate = Core_JsonTrue(value, valueLength) ||
+                            (Core_JsonString(value, valueLength, flag, ARRAYSIZE(flag)) && (Core_EqualsI(flag, L"true") || wcscmp(flag, L"1") == 0));
+        }
+    }
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------- Cowork */
+
+BOOL Core_CoworkOff(const char *json, size_t len)
+{
+    const char *preferences, *value;
+    size_t preferencesLength, valueLength;
+    return Core_JsonMember(json, len, "preferences", &preferences, &preferencesLength) &&
+           Core_JsonMember(preferences, preferencesLength, COWORK_PREFERENCE, &value, &valueLength) &&
+           valueLength == 5 && memcmp(value, "false", 5) == 0;
+}
+
+/* ---------------------------------------------------------------- releases of main */
+
+BOOL Core_ReleaseVersion(const WCHAR *tag, WCHAR *version, size_t cch)
+{
+    static const WCHAR kForm[] = L"v0000.00.00";   /* 0: a digit */
+    size_t i;
+    if (version && cch) version[0] = 0;
+    if (!tag || wcslen(tag) != ARRAYSIZE(kForm) - 1) return FALSE;
+    for (i = 0; kForm[i]; i++)
+        if (kForm[i] == L'0' ? (tag[i] < L'0' || tag[i] > L'9') : tag[i] != kForm[i]) return FALSE;
+    return !version || SUCCEEDED(StringCchCopyW(version, cch, tag + 1));
+}
+
+typedef struct NewestRelease { WCHAR *tag; size_t cch; WCHAR newest[16]; BOOL latest; } NewestRelease;
+
+static BOOL TakeNewestRelease(void *context, const char *value, size_t valueLen)
+{
+    NewestRelease *found = (NewestRelease *)context;
+    WCHAR tag[64], version[16];
+    BOOL latest;
+    if (Core_JsonMemberTrue(value, valueLen, "isDraft") || !Core_JsonMemberString(value, valueLen, "tagName", tag, ARRAYSIZE(tag)) ||
+        !Core_ReleaseVersion(tag, version, ARRAYSIZE(version)))
+        return TRUE;
+    /* The one GitHub marks latest, else the newest day's. */
+    latest = Core_JsonMemberTrue(value, valueLen, "isLatest");
+    if ((latest && !found->latest) || (latest == found->latest && wcscmp(version, found->newest) > 0)) {
+        if (FAILED(StringCchCopyW(found->tag, found->cch, tag))) return TRUE;
+        StringCchCopyW(found->newest, ARRAYSIZE(found->newest), version);
+        found->latest = latest;
+    }
+    return TRUE;
+}
+
+BOOL Core_NewestRelease(const char *json, size_t length, WCHAR *tag, size_t cch)
+{
+    NewestRelease found;
+    if (!tag || !cch) return FALSE;
+    tag[0] = 0;
+    ZeroMemory(&found, sizeof found);
+    found.tag = tag;
+    found.cch = cch;
+    if (json) Core_JsonEachElement(json, length, TakeNewestRelease, &found);
+    if (!found.newest[0]) tag[0] = 0;
+    return found.newest[0] != 0;
+}
+
+BOOL Core_NewestReleaseRef(const char *text, size_t length, WCHAR *tag, size_t tagCch, WCHAR *commit, size_t commitCch)
+{
+    static const char prefix[] = "refs/tags/";
+    const char *line = text, *end = text + length, *next, *ref;
+    WCHAR candidate[64], version[16], newest[16] = L"", sha[48];
+    int n;
+    BOOL peeled;
+    if (!tag || !tagCch || !commit || !commitCch) return FALSE;
+    tag[0] = commit[0] = 0;
+    for (; text && line < end; line = next + 1) {
+        if ((next = (const char *)memchr(line, '\n', (size_t)(end - line))) == NULL) next = end;
+        ref = (const char *)memchr(line, '\t', (size_t)(next - line));
+        if (!ref || ref - line < 7 || ref - line >= (ptrdiff_t)ARRAYSIZE(sha) || (size_t)(next - ++ref) <= sizeof prefix - 1 ||
+            memcmp(ref, prefix, sizeof prefix - 1) != 0)
+            continue;
+        n = MultiByteToWideChar(CP_UTF8, 0, ref + sizeof prefix - 1, (int)(next - ref - (int)(sizeof prefix - 1)), candidate, ARRAYSIZE(candidate) - 1);
+        if (n <= 0) continue;
+        candidate[n] = 0;
+        if (candidate[n - 1] == L'\r') candidate[--n] = 0;
+        /* An annotated tag's own line, then its "^{}" line naming the commit: the commit is what counts. */
+        if ((peeled = n > 3 && wcscmp(candidate + n - 3, L"^{}") == 0) != FALSE) candidate[n - 3] = 0;
+        if (!Core_ReleaseVersion(candidate, version, ARRAYSIZE(version)) || wcscmp(version, newest) < 0 ||
+            (wcscmp(version, newest) == 0 && !peeled))
+            continue;
+        n = MultiByteToWideChar(CP_UTF8, 0, line, (int)(ref - 1 - line), sha, ARRAYSIZE(sha) - 1);
+        sha[n > 0 ? n : 0] = 0;
+        StringCchCopyW(newest, ARRAYSIZE(newest), version);
+        StringCchCopyW(tag, tagCch, candidate);
+        StringCchCopyW(commit, commitCch, sha);
+    }
+    return newest[0] != 0;
+}
+
+BOOL Core_SameCommit(const WCHAR *a, const WCHAR *b)
+{
+    size_t la = a ? wcslen(a) : 0, lb = b ? wcslen(b) : 0, n = min(la, lb);
+    return n >= 7 && _wcsnicmp(a, b, n) == 0;
 }

@@ -38,18 +38,12 @@
 #define PLAN_MAX_BYTES        (16u * 1024u * 1024u)
 #define PLAN_LINE_CCH         (SESSION_ID_CCH + SYNC_CONTENT_CCH + 96)   /* the kind, three numbers and the tabs */
 #define CONTENT_MAX_BYTES     (16u * 1024u * 1024u)   /* an entry, or a list of archived sessions */
-#define TEMPORARY_SUFFIX      L".cdm-new"
 #define TOMBSTONE_PREFIX      L"deleted_"
 #define LOCAL_PREFIX          L"local_"
 #define ARCHIVED_INDEX        L"archived-sessions.idx"   /* beside the entries: Claude's list of the archived ones */
 #define BACKUPS_DIR           L"backups"
 #define BACKUPS_KEPT          20
 #define BACKUP_COPIES_MAX     100     /* name~2 ... name~100 when a name is taken in a backup */
-#define WRITE_CHUNK_MAX       0x40000000u
-#define COPY_CHUNK            (1024u * 1024u)
-#define UNIX_EPOCH_TICKS      116444736000000000ULL
-#define TICKS_PER_MILLISECOND (TICKS_PER_SECOND / 1000)
-#define GUID_TEXT_CCH         39
 #define TIME_TEXT_BYTES       sizeof "18446744073709551615"
 #define ID_JSON_BYTES         (SESSION_ID_CCH * 6 + 3)   /* an id as a JSON string, every character escaped at worst */
 #define PATH_JSON_BYTES       (MAX_PATH * 6 + 3)
@@ -59,21 +53,8 @@
 #define ARCHIVE_MANIFEST      "manifest.json"
 #define ARCHIVE_ENTRIES       "entries/"
 #define ARCHIVE_FILES         "claude/"
-#define ZIP_LOCAL_SIGNATURE   0x04034B50u
-#define ZIP_CENTRAL_SIGNATURE 0x02014B50u
-#define ZIP_END_SIGNATURE     0x06054B50u
-#define ZIP_LOCAL_BYTES       30
-#define ZIP_CENTRAL_BYTES     46
-#define ZIP_END_BYTES         22
-#define ZIP_COMMENT_MAX       0xFFFFu
-#define ZIP_VERSION           20      /* 2.0: stored files in folders */
-#define ZIP_UTF8_NAMES        0x0800u
-#define ZIP_ENCRYPTED         0x0001u
-#define ZIP_STORED            0
-#define ZIP_MAX_ITEMS         0xFFFEu
-#define ZIP_MAX_OFFSET        0xFFFFFFFEull
-#define ZIP_DIRECTORY_MAX     (64u * 1024u * 1024u)
-#define ZIP_NAME_MAX          (LONG_PATH_CCH * 3)
+#define ARCHIVE_PARTS         "conversations/"   /* conversations/<n>.json: the files of entries/<n>.json's conversation */
+#define ARCHIVE_NAME_MAX      (LONG_PATH_CCH * 3)   /* claude/<a path under Claude Code's folder>, in UTF-8 */
 
 /* What happened to one change. */
 typedef enum OpResult {
@@ -105,31 +86,13 @@ typedef struct Plan {
 
 /* --------------------------------------------------------------- memory */
 
-static void *Grow(void *items, int *capacity, int need, size_t size)
-{
-    void *bigger;
-    int n;
-    if (need <= *capacity) return items;
-    if (*capacity > INT_MAX / 2) return NULL;
-    n = *capacity ? *capacity * 2 : 16;
-    while (n < need) n *= 2;
-    bigger = items ? HeapReAlloc(GetProcessHeap(), 0, items, (size_t)n * size) : HeapAlloc(GetProcessHeap(), 0, (size_t)n * size);
-    if (bigger) *capacity = n;
-    return bigger;
-}
-
-static void Free(void *block)
-{
-    if (block) HeapFree(GetProcessHeap(), 0, block);
-}
-
 /* `data` (a heap block) owned by the outbox from now on; NULL, freed, when it cannot be. */
 static char *Keep(Outbox *box, char *data)
 {
     char **grown;
     if (!data) return NULL;
-    if ((grown = (char **)Grow(box->owned, &box->ownedCapacity, box->ownedCount + 1, sizeof *box->owned)) == NULL) {
-        Free(data);
+    if ((grown = (char **)Util_Grow(box->owned, &box->ownedCapacity, box->ownedCount + 1, sizeof *box->owned)) == NULL) {
+        Util_Free(data);
         return NULL;
     }
     box->owned = grown;
@@ -140,16 +103,16 @@ static char *Keep(Outbox *box, char *data)
 static BOOL AddSent(Sent *sent, const SyncOp *op, const char *content, size_t length)
 {
     int capacity = sent->capacity;
-    SyncOp *ops = (SyncOp *)Grow(sent->ops, &capacity, sent->count + 1, sizeof *ops);
+    SyncOp *ops = (SyncOp *)Util_Grow(sent->ops, &capacity, sent->count + 1, sizeof *ops);
     const char **contents;
     size_t *lengths;
     if (!ops) return FALSE;
     sent->ops = ops;
     capacity = sent->capacity;
-    if ((contents = (const char **)Grow((void *)sent->contents, &capacity, sent->count + 1, sizeof *contents)) == NULL) return FALSE;
+    if ((contents = (const char **)Util_Grow((void *)sent->contents, &capacity, sent->count + 1, sizeof *contents)) == NULL) return FALSE;
     sent->contents = contents;
     capacity = sent->capacity;
-    if ((lengths = (size_t *)Grow(sent->lengths, &capacity, sent->count + 1, sizeof *lengths)) == NULL) return FALSE;
+    if ((lengths = (size_t *)Util_Grow(sent->lengths, &capacity, sent->count + 1, sizeof *lengths)) == NULL) return FALSE;
     sent->lengths = lengths;
     sent->capacity = capacity;
     sent->ops[sent->count] = *op;
@@ -161,9 +124,9 @@ static BOOL AddSent(Sent *sent, const SyncOp *op, const char *content, size_t le
 
 static void FreeSent(Sent *sent)
 {
-    Free(sent->ops);
-    Free((void *)sent->contents);
-    Free(sent->lengths);
+    Util_Free(sent->ops);
+    Util_Free((void *)sent->contents);
+    Util_Free(sent->lengths);
     ZeroMemory(sent, sizeof *sent);
 }
 
@@ -171,8 +134,8 @@ static void FreeOutbox(Outbox *box)
 {
     int i;
     for (i = 0; i < MAX_PROFILES; i++) FreeSent(&box->sent[i]);
-    for (i = 0; i < box->ownedCount; i++) Free(box->owned[i]);
-    Free(box->owned);
+    for (i = 0; i < box->ownedCount; i++) Util_Free(box->owned[i]);
+    Util_Free(box->owned);
     ZeroMemory(box, sizeof *box);
 }
 
@@ -210,17 +173,6 @@ static BOOL Present(const WCHAR *path)
     return Extended(path, extended) && Util_QueryPath(extended, NULL) == PATH_PRESENT;
 }
 
-static BOOL WriteWhole(HANDLE file, const char *data, size_t length)
-{
-    while (length > 0) {
-        DWORD written = 0, chunk = length > WRITE_CHUNK_MAX ? WRITE_CHUNK_MAX : (DWORD)length;
-        if (!WriteFile(file, data, chunk, &written, NULL) || written == 0) return FALSE;
-        data += written;
-        length -= written;
-    }
-    return TRUE;
-}
-
 /* `path` holds `data`, written beside it and then put in its place: a file
  * of ours (`profile` NULL) replaces the one there; an entry of `profile`'s
  * (or Claude's mark beside them) is written only while that profile is
@@ -228,43 +180,18 @@ static BOOL WriteWhole(HANDLE file, const char *data, size_t length)
  * is none. GetLastError tells why it failed; ERROR_BUSY: its Claude runs. */
 static BOOL WriteFileAt(const WCHAR *path, const char *data, size_t length, const Profile *profile, BOOL replace)
 {
-    WCHAR target[LONG_PATH_CCH], temporary[LONG_PATH_CCH];
-    HANDLE file;
-    DWORD error = ERROR_SUCCESS;
-    BOOL ok;
-    if (!Extended(path, target) || FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" TEMPORARY_SUFFIX, target))) {
-        SetLastError(ERROR_FILENAME_EXCED_RANGE);
-        return FALSE;
-    }
+    WCHAR temporary[LONG_PATH_CCH];
     if (profile && SessionLink_Busy(profile)) {
         SetLastError(ERROR_BUSY);
         return FALSE;
     }
-    file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) return FALSE;
-    ok = WriteWhole(file, data, length) && FlushFileBuffers(file);
-    if (!ok) error = GetLastError();
-    CloseHandle(file);
-    if (ok && profile && SessionLink_Busy(profile)) {
-        ok = FALSE;
-        error = ERROR_BUSY;
-    }
-    if (ok) {
-        if (profile && replace) {
-            ok = ReplaceFileW(target, temporary, NULL, REPLACEFILE_IGNORE_MERGE_ERRORS, NULL, NULL);
-            if (!ok) error = GetLastError();
-            /* ReplaceFileW took the old one away but could not put the new one in its place. */
-            if (!ok && error == ERROR_UNABLE_TO_MOVE_REPLACEMENT && MoveFileExW(temporary, target, MOVEFILE_WRITE_THROUGH)) ok = TRUE;
-        } else {
-            ok = MoveFileExW(temporary, target, MOVEFILE_WRITE_THROUGH | (profile ? 0 : MOVEFILE_REPLACE_EXISTING));
-            if (!ok) error = GetLastError();
-        }
-    }
-    if (!ok) {
+    if (!Util_WriteTemporary(path, data, length, temporary, ARRAYSIZE(temporary))) return FALSE;
+    if (profile && SessionLink_Busy(profile)) {
         DeleteFileW(temporary);
-        SetLastError(error);
+        SetLastError(ERROR_BUSY);
+        return FALSE;
     }
-    return ok;
+    return Util_PutInPlace(temporary, path, !profile ? UTIL_PUT_REPLACE : replace ? UTIL_PUT_OVER : UTIL_PUT_NEW);
 }
 
 /* Each missing folder of `path`'s parent made, at any length: the first
@@ -315,12 +242,12 @@ static int LoadPlan(const Profile *p, Plan *plan)
     wide = MultiByteToWideChar(CP_UTF8, 0, raw, (int)length, NULL, 0);
     text = wide > 0 ? (WCHAR *)HeapAlloc(GetProcessHeap(), 0, ((size_t)wide + 1) * sizeof(WCHAR)) : NULL;
     if (!text) {
-        Free(raw);
+        Util_Free(raw);
         return -1;
     }
     MultiByteToWideChar(CP_UTF8, 0, raw, (int)length, text, wide);
     text[wide] = 0;
-    Free(raw);
+    Util_Free(raw);
     for (line = text; line; line = next) {
         SyncOp op, *grown;
         size_t lineLength;
@@ -329,20 +256,43 @@ static int LoadPlan(const Profile *p, Plan *plan)
         lineLength = wcslen(line);
         if (lineLength && line[lineLength - 1] == L'\r') line[--lineLength] = 0;
         if (!lineLength || !Core_SyncOpParse(line, &op)) continue;
-        if ((grown = (SyncOp *)Grow(plan->ops, &plan->capacity, plan->count + 1, sizeof *plan->ops)) == NULL) {
-            Free(text);
-            Free(plan->ops);
+        if ((grown = (SyncOp *)Util_Grow(plan->ops, &plan->capacity, plan->count + 1, sizeof *plan->ops)) == NULL) {
+            Util_Free(text);
+            Util_Free(plan->ops);
             ZeroMemory(plan, sizeof *plan);
             return -1;
         }
         plan->ops = grown;
         plan->ops[plan->count++] = op;
     }
-    Free(text);
+    Util_Free(text);
     return plan->count;
 }
 
-/* The plan written again as `ops` holds it; none left: its file and folder go. */
+/* The content files of the plan's folder `dir` that no change of `ops`
+ * names go, `ops` being the plan just written: a line LoadPlan could not
+ * read is dropped with its file. */
+static void SweepContents(const WCHAR *dir, const SyncOp *ops, int count)
+{
+    WCHAR pattern[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    int i;
+    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\*.json", dir)) ||
+        (find = FindFirstFileW(pattern, &found)) == INVALID_HANDLE_VALUE)
+        return;
+    do {
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        for (i = 0; i < count && !Core_EqualsI(ops[i].content, found.cFileName); i++) {}
+        if (i == count && SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", dir, found.cFileName))) {
+            if (DeleteFileW(path)) Util_Log(L"sessions sent: %s went, no change named it", path);
+        }
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+}
+
+/* The plan written again as `ops` holds it, under the profile's edit lock;
+ * none left: its file and folder go. */
 static BOOL SavePlan(const Profile *p, const SyncOp *ops, int count)
 {
     WCHAR path[MAX_PATH], dir[MAX_PATH], line[PLAN_LINE_CCH];
@@ -353,6 +303,7 @@ static BOOL SavePlan(const Profile *p, const SyncOp *ops, int count)
     if (!SessionSync_PlanPath(p, path, ARRAYSIZE(path)) || !PlanDir(p, dir, ARRAYSIZE(dir))) return FALSE;
     if (count == 0) {
         ok = DeleteFileW(path) || GetLastError() == ERROR_FILE_NOT_FOUND;
+        if (ok) SweepContents(dir, ops, 0);
         RemoveDirectoryW(dir);   /* when it is empty */
         return ok;
     }
@@ -362,14 +313,15 @@ static BOOL SavePlan(const Profile *p, const SyncOp *ops, int count)
         int bytes;
         if (!Core_SyncOpFormat(&ops[i], line, ARRAYSIZE(line)) || FAILED(StringCchCatW(line, ARRAYSIZE(line), L"\n")) ||
             (bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, out + used, (int)min(capacity - used, INT_MAX), NULL, NULL)) <= 0) {
-            Free(out);
+            Util_Free(out);
             return FALSE;
         }
         used += (size_t)bytes - 1;
     }
     ok = WriteFileAt(path, out, used, NULL, TRUE);
     if (!ok) Util_Log(L"could not write %s (error %lu)", path, GetLastError());
-    Free(out);
+    else SweepContents(dir, ops, count);   /* once the plan names none of them: a failed write keeps the old plan whole */
+    Util_Free(out);
     return ok;
 }
 
@@ -377,8 +329,44 @@ int SessionSync_PendingCount(const Profile *p)
 {
     Plan plan;
     int count = LoadPlan(p, &plan);
-    Free(plan.ops);
+    Util_Free(plan.ops);
     return max(count, 0);
+}
+
+static void DeleteContent(const WCHAR *dir, const SyncOp *op);
+
+/* The changes waiting for `p` that would write or remove the session `key`
+ * taken out of its plan: a session deleted everywhere must not come back
+ * when `p` closes. FALSE when the plan cannot be read or written. */
+BOOL SessionSync_Forget(const Profile *p, const WCHAR *key)
+{
+    WCHAR staging[MAX_PATH];
+    HANDLE lock = NULL, syncLock = NULL;
+    Plan plan;
+    int n, i, kept = 0;
+    BOOL ok = TRUE;
+    if (!PlanDir(p, staging, ARRAYSIZE(staging)) || (syncLock = Util_SyncLock()) == NULL) return FALSE;
+    if ((lock = SessionEdit_Lock(p)) == NULL) {
+        Util_SyncUnlock(syncLock);
+        return FALSE;
+    }
+    if ((n = LoadPlan(p, &plan)) > 0) {
+        for (i = 0; i < plan.count; i++) {
+            if ((plan.ops[i].kind == SYNC_PUT || plan.ops[i].kind == SYNC_REMOVE) && Core_EqualsI(plan.ops[i].key, key)) {
+                DeleteContent(staging, &plan.ops[i]);
+                continue;
+            }
+            plan.ops[kept++] = plan.ops[i];
+        }
+        if (kept < plan.count) {
+            ok = SavePlan(p, plan.ops, kept);
+            Util_Log(L"session %s: %d change(s) waiting for %s dropped", key, plan.count - kept, p->folder);
+        }
+    }
+    SessionEdit_Unlock(lock);
+    Util_SyncUnlock(syncLock);
+    Util_Free(plan.ops);
+    return ok && n >= 0;
 }
 
 int SessionSync_Queued(const Profile *p, SyncOp **ops)
@@ -386,11 +374,10 @@ int SessionSync_Queued(const Profile *p, SyncOp **ops)
     Plan plan;
     int count = LoadPlan(p, &plan);
     *ops = count > 0 ? plan.ops : NULL;
-    if (count <= 0) Free(plan.ops);
+    if (count <= 0) Util_Free(plan.ops);
     return count;
 }
 
-static BOOL MemberText(const char *json, size_t length, const char *key, WCHAR *out, size_t cch);
 
 WCHAR *SessionSync_PendingText(const ProfileList *profiles)
 {
@@ -400,7 +387,7 @@ WCHAR *SessionSync_PendingText(const ProfileList *profiles)
     WCHAR line[SESSION_TITLE_CCH + LABEL_CCH + 512], dir[MAX_PATH], path[LONG_PATH_CCH];
     int p, i, j;
     BOOL full = FALSE;
-    if (!text || !edits) { Free(text); Free(edits); return NULL; }
+    if (!text || !edits) { Util_Free(text); Util_Free(edits); return NULL; }
     for (p = 0; p < profiles->count && !full; p++) {
         const Profile *profile = &profiles->items[p];
         SyncOp *ops = NULL;
@@ -434,13 +421,13 @@ WCHAR *SessionSync_PendingText(const ProfileList *profiles)
                     WCHAR title[SESSION_TITLE_CCH];
                     const char *star, *archived;
                     size_t starLength = 0, archivedLength = 0;
-                    MemberText(content, length, "title", title, ARRAYSIZE(title));
+                    Core_JsonMemberString(content, length, "title", title, ARRAYSIZE(title));
                     Core_JsonMember(content, length, "isStarred", &star, &starLength);
                     Core_JsonMember(content, length, "isArchived", &archived, &archivedLength);
                     StringCchPrintfW(value, ARRAYSIZE(value), TR(L"Title: %s; starred=%d; archived=%d"), title,
                                      starLength == 4 && memcmp(star, "true", 4) == 0, archivedLength == 4 && memcmp(archived, "true", 4) == 0);
                 }
-                Free(content);
+                Util_Free(content);
             }
             StringCchPrintfW(line, ARRAYSIZE(line), L"1. %s | %s | %s\r\n", ops[i].key, action, value);
             if (wcslen(text) + wcslen(line) + 256 >= TEXT_CCH) full = TRUE;
@@ -460,10 +447,10 @@ WCHAR *SessionSync_PendingText(const ProfileList *profiles)
             if (wcslen(text) + wcslen(line) + 256 >= TEXT_CCH) full = TRUE;
             else StringCchCatW(text, TEXT_CCH, line);
         }
-        Free(ops);
+        Util_Free(ops);
     }
     if (full) StringCchCatW(text, TEXT_CCH, TR(L"\r\nThe display limit was reached; more changes may be queued."));
-    Free(edits);
+    Util_Free(edits);
     return text;
 }
 
@@ -548,7 +535,7 @@ static BOOL StageSent(const Profile *p, Sent *sent)
             }
         }
         made = i + 1;
-        if ((grown = (SyncOp *)Grow(plan.ops, &plan.capacity, plan.count + 1, sizeof *plan.ops)) == NULL) goto done;
+        if ((grown = (SyncOp *)Util_Grow(plan.ops, &plan.capacity, plan.count + 1, sizeof *plan.ops)) == NULL) goto done;
         plan.ops = grown;
         plan.ops[plan.count++] = *op;
     }
@@ -562,8 +549,8 @@ done:
     for (i = 0; i < made; i++)
         if (!ok || !PlanKeepsContent(&plan, &sent->ops[i])) DeleteContent(dir, &sent->ops[i]);
     SessionEdit_Unlock(lock);
-    Free(before);
-    Free(plan.ops);
+    Util_Free(before);
+    Util_Free(plan.ops);
     for (i = 0; ok && g_onSent.sent && i < sent->count; i++)
         if (sent->ops[i].kind == SYNC_PUT || sent->ops[i].kind == SYNC_REMOVE)
             g_onSent.sent(g_onSent.context, p, &sent->ops[i], sent->contents[i], sent->lengths[i]);
@@ -613,7 +600,7 @@ static void PruneBackups(const WCHAR *backups)
     do {
         WCHAR (*grown)[MAX_PATH];
         if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == L'.') continue;
-        if ((grown = (WCHAR (*)[MAX_PATH])Grow(names, &capacity, count + 1, sizeof *names)) == NULL) break;
+        if ((grown = (WCHAR (*)[MAX_PATH])Util_Grow(names, &capacity, count + 1, sizeof *names)) == NULL) break;
         names = grown;
         StringCchCopyW(names[count++], MAX_PATH, found.cFileName);
     } while (FindNextFileW(find, &found));
@@ -623,7 +610,7 @@ static void PruneBackups(const WCHAR *backups)
         for (i = 0; i < count - BACKUPS_KEPT; i++)
             if (SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", backups, names[i]))) DeleteTree(path);
     }
-    Free(names);
+    Util_Free(names);
 }
 
 /* The folder `p`'s backups go to in this report's backup, made at its first use. */
@@ -670,23 +657,6 @@ static BOOL BackUp(const Profile *p, const WCHAR *file, BOOL move, SyncReport *r
 
 /* ---------------------------------------------------------- applying */
 
-static BOOL MemberText(const char *json, size_t length, const char *key, WCHAR *out, size_t cch)
-{
-    const char *value;
-    size_t valueLength;
-    out[0] = 0;
-    return Core_JsonMember(json, length, key, &value, &valueLength) && Core_JsonString(value, valueLength, out, cch);
-}
-
-static ULONGLONG MemberNumber(const char *json, size_t length, const char *key)
-{
-    const char *value;
-    size_t valueLength;
-    ULONGLONG number = 0;
-    if (Core_JsonMember(json, length, key, &value, &valueLength)) Core_JsonNumber(value, valueLength, &number);
-    return number;
-}
-
 /* `json` with member `key` set to the JSON string of `text`: a heap block
  * (NULL without memory, or when it is no object). */
 static char *WithString(const char *json, size_t length, const char *key, const WCHAR *text, size_t *outLength)
@@ -697,7 +667,7 @@ static char *WithString(const char *json, size_t length, const char *key, const 
     capacity = length + strlen(key) + strlen(quoted) + 8;
     if ((out = (char *)HeapAlloc(GetProcessHeap(), 0, capacity)) == NULL) return NULL;
     if (Core_JsonSetMember(json, length, key, quoted, out, capacity, outLength)) return out;
-    Free(out);
+    Util_Free(out);
     return NULL;
 }
 
@@ -739,7 +709,6 @@ static OpResult ApplyPut(const Profile *p, const SessionSet *entries, const WCHA
         CannotWrite(report, op->key, ERROR_INVALID_DATA);
         return OP_FAILED;
     }
-
     if (found >= 0) {
         const SessionEntry *entry = &entries->entries[found];
         if ((op->flags & SYNC_REPLACE) ? entry->lastActivity > max(op->time, op->seen) : entry->lastActivity >= op->time) {
@@ -753,7 +722,7 @@ static OpResult ApplyPut(const Profile *p, const SessionSet *entries, const WCHA
         StringCchCopyW(path, ARRAYSIZE(path), entry->file);
         replacing = TRUE;
     } else {
-        if (!MemberText(content, contentLength, "sessionId", ownId, ARRAYSIZE(ownId)) || !IsEntryId(ownId) ||
+        if (!Core_JsonMemberString(content, contentLength, "sessionId", ownId, ARRAYSIZE(ownId)) || !IsEntryId(ownId) ||
             FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s.json", dir, ownId))) {
             CannotWrite(report, op->key, ERROR_INVALID_DATA);
             return OP_FAILED;
@@ -806,12 +775,11 @@ static OpResult ApplyPut(const Profile *p, const SessionSet *entries, const WCHA
         CannotWrite(report, path, GetLastError());
     }
 done:
-    Free(data);
-    Free(current);
+    Util_Free(data);
+    Util_Free(current);
     return result;
 }
 
-static ULONGLONG NowMs(void);
 
 /* Claude's mark that session `id` (an id, or an entry's own) was deleted
  * from the entries folder `dir`, holding the time in ms. */
@@ -835,7 +803,7 @@ static BOOL HoldsAnother(const SessionEntry *entry, const WCHAR *key)
     char *json = Util_ReadFile(entry->file, CONTENT_MAX_BYTES, FALSE, &size);
     BOOL another = json && Core_JsonMember(json, size, "cliSessionId", &value, &valueLength) &&
                    Core_JsonString(value, valueLength, cli, ARRAYSIZE(cli)) && Core_IsUuid(cli) && !Core_EqualsI(cli, key);
-    Free(json);
+    Util_Free(json);
     return another;
 }
 
@@ -847,7 +815,16 @@ static OpResult ApplyRemove(const Profile *p, const SessionSet *entries, const W
 {
     WCHAR ids[MAX_PROFILES][SESSION_ID_CCH];
     int entry = SessionStore_FindEntry(entries, 0, op->key, NULL), count = 0, i;
-    if (entry < 0) return OP_SAME;
+    BOOL marked;
+    if (entry < 0) {
+        /* Gone after a try that failed (it took the entry away, its mark not
+         * written): the mark still is. Never for one the profile did not have. */
+        if ((op->flags & SYNC_MARKED) && op->tries && !WriteMark(p, dir, op->key, Util_NowMs())) {
+            CannotWrite(report, dir, GetLastError());
+            return OP_FAILED;
+        }
+        return OP_SAME;
+    }
     if (entries->entries[entry].lastActivity > op->seen) {
         Util_Log(L"session %s in %s: kept, used there since", op->key, p->folder);
         return OP_SKIPPED;
@@ -866,9 +843,14 @@ static OpResult ApplyRemove(const Profile *p, const SessionSet *entries, const W
         }
     }
     if (op->flags & SYNC_MARKED) {
-        ULONGLONG now = NowMs();
-        WriteMark(p, dir, op->key, now);
-        for (i = 0; i < count; i++) WriteMark(p, dir, ids[i], now);
+        ULONGLONG now = Util_NowMs();
+        marked = WriteMark(p, dir, op->key, now);
+        for (i = 0; i < count; i++) marked = WriteMark(p, dir, ids[i], now) && marked;
+        if (!marked) {
+            /* Without its mark Claude could take the session in again: tried again. */
+            CannotWrite(report, dir, GetLastError());
+            return OP_FAILED;
+        }
     }
     report->removed++;
     Util_Log(L"session %s in %s: entry removed", op->key, p->folder);
@@ -907,10 +889,10 @@ static OpResult ApplyIndex(const Profile *p, const WCHAR *dir, const char *conte
     if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\" ARCHIVED_INDEX, dir))) return OP_FAILED;
     current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength);
     if (current && currentLength == length && memcmp(current, content, length) == 0) {
-        Free(current);
+        Util_Free(current);
         return OP_SAME;
     }
-    Free(current);
+    Util_Free(current);
     there = Present(path);
     if (SessionLink_Busy(p)) return OP_STOPPED;
     if (there && !BackUp(p, path, FALSE, report)) {
@@ -996,6 +978,7 @@ typedef struct WebPart {
     BOOL         byKey;
 } WebPart;
 #define SIDEBAR_STORE   L"dframe-store"
+#define UNREAD_STORE    L"epitaxy-unread-v1"   /* the sessions unread (Core_UnreadSet) */
 #define PANE_STORE      L"epitaxy.sidePaneStore.v1"
 #define COPY_PREFIX     L"LSS-persisted."
 /* Claude's window keeps the sidebar (dframe-store) per account on its server
@@ -1026,7 +1009,7 @@ static const WebPart kWebParts[] = {
     { "defaultModel", L"default-model", FORM_TEXT, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_MODEL, FALSE },
     { "coworkRecents", L"cowork-picker-recents", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_SETTINGS_RECENTS, FALSE },
     { "pills", L"code-session-pills", FORM_JSON, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_MODEL, FALSE },   /* each session's model, effort */
-    { "unread", L"epitaxy-unread-v1", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_UNREAD, FALSE },
+    { "unread", UNREAD_STORE, FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_UNREAD, FALSE },
     { "railSections", L"epitaxy.sessionRailSections", FORM_STORE, NULL, LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
     { "paneLayout", PANE_STORE, FORM_STORE, "tileLayout", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
     { "paneSizes", PANE_STORE, FORM_STORE, "lastPaneFlexByKind", LAYOUT_ANY, NULL, SYNC_ITEM_DETAILS_PANE, FALSE },
@@ -1113,11 +1096,19 @@ BOOL SessionSync_LayoutPart(int index, LayoutPart *part)
     } else if (index == (int)ARRAYSIZE(kFileParts)) {
         part->name = "sessionPresets";
         part->item = SYNC_ITEM_DETAILS_MODEL;
+        part->mergeOnly = TRUE;
     } else {
         return FALSE;
     }
     part->label = PartLabel(part->name);
     return TRUE;
+}
+
+char *SessionSync_MergePart(const LayoutPart *part, const char *base, size_t baseLength, const char *other, size_t otherLength,
+                            size_t *outLength)
+{
+    *outLength = 0;
+    return part->mergeOnly ? Presets_MergeAccount(base, baseLength, other, otherLength, outLength) : NULL;
 }
 
 /* What ApplyLayout would make of `value` where the member shows `shown`:
@@ -1130,10 +1121,10 @@ BOOL SessionSync_PartHolds(const LayoutPart *part, const char *shown, size_t sho
     size_t mergedLength = 0;
     BOOL holds;
     if (part->ownOnly && !shown) return TRUE;
-    if (!shown || !value || strcmp(part->name, "sessionPresets") != 0) return FALSE;
+    if (!shown || !value || !part->mergeOnly) return FALSE;
     if ((merged = Presets_MergeAccount(shown, shownLength, value, valueLength, &mergedLength)) == NULL) return FALSE;
     holds = mergedLength == shownLength && memcmp(merged, shown, shownLength) == 0;
-    Free(merged);
+    Util_Free(merged);
     return holds;
 }
 
@@ -1153,58 +1144,43 @@ static BOOL LayoutScopeOf(const WCHAR *entriesDir, char *account, size_t account
            SUCCEEDED(StringCchPrintfA(scope, scopeCap, "%s/%s", account, organization));
 }
 
-static char *Duplicate(const char *text, size_t length)
-{
-    char *copy = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1);
-    if (copy) {
-        memcpy(copy, text, length);
-        copy[length] = 0;
-    }
-    return copy;
-}
-
 /* `*json` (a heap block) with the member reached through `keys` set to
  * `length` bytes of `raw`; FALSE, `*json` as it was, when it cannot be. */
 static BOOL SetNested(char **json, size_t *used, const char *const *keys, int depth, const char *raw, size_t length)
 {
     char *text, *out = NULL;
     size_t outLength = 0;
-    if (*json && (text = Duplicate(raw, length)) != NULL) {
+    if (*json && (text = Util_CopyBytes(raw, length)) != NULL) {
         out = Core_JsonSetNested(*json, *used, keys, depth, text, &outLength);
-        Free(text);
+        Util_Free(text);
     }
     if (!out) return FALSE;
-    Free(*json);
+    Util_Free(*json);
     *json = out;
     *used = outLength;
     return TRUE;
 }
 
-/* `json` (a heap block, freed) with its member `key` set to `raw` (`length`
- * bytes); NULL, freed, when it cannot be. */
-static char *SetRaw(char *json, size_t *used, const char *key, const char *raw, size_t length)
+char *SessionSync_SetMember(char *json, size_t *used, const char *key, const char *raw, size_t length)
 {
     const char *keys[1];
     keys[0] = key;
     if (json && SetNested(&json, used, keys, 1, raw, length)) return json;
-    Free(json);
+    Util_Free(json);
     return NULL;
 }
 
 static char *EmptyObject(size_t *used)
 {
     *used = 2;
-    return Duplicate("{}", 2);
+    return Util_CopyBytes("{}", 2);
 }
 
 /* A file's time of last write, in ms since 1970; 0 when unknown. */
 static ULONGLONG WrittenAt(const WCHAR *path)
 {
     WIN32_FILE_ATTRIBUTE_DATA attributes;
-    ULONGLONG ticks;
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) return 0;
-    ticks = ((ULONGLONG)attributes.ftLastWriteTime.dwHighDateTime << 32) | attributes.ftLastWriteTime.dwLowDateTime;
-    return ticks > UNIX_EPOCH_TICKS ? (ticks - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND : 0;
+    return GetFileAttributesExW(path, GetFileExInfoStandard, &attributes) ? Core_FileTimeMs(&attributes.ftLastWriteTime) : 0;
 }
 
 /* A session's own id in a value of Claude's ("local_<id>") that the profile
@@ -1235,7 +1211,7 @@ static BOOL AddListed(void *context, const char *key, size_t keyLength, const ch
     SessionObject *object = (SessionObject *)context;
     char name[SESSION_ID_CCH];
     if (!ListedSession(object->entriesDir, key, keyLength) || FAILED(StringCchCopyNA(name, sizeof name, key, keyLength))) return TRUE;
-    object->json = SetRaw(object->json, &object->used, name, value, valueLength);
+    object->json = SessionSync_SetMember(object->json, &object->used, name, value, valueLength);
     return object->json != NULL;
 }
 
@@ -1257,8 +1233,8 @@ static void AddFamilyValue(void *context, const WCHAR *name)
     id[length - prefix] = 0;
     if (!ListedSession(read->object.entriesDir, id, length - prefix)) return;
     if ((value = WebStore_Get(read->store, name, &valueLength)) != NULL && Core_JsonIsValue(value, valueLength))
-        read->object.json = SetRaw(read->object.json, &read->object.used, id, value, valueLength);
-    Free(value);
+        read->object.json = SessionSync_SetMember(read->object.json, &read->object.used, id, value, valueLength);
+    Util_Free(value);
 }
 
 /* Part `part` of the web storage value `text` (`length` bytes): its JSON text
@@ -1272,7 +1248,7 @@ static char *WebPartOf(const WebPart *part, const char *text, size_t length, con
     if (part->form == FORM_JSON) {
         if (!Core_JsonIsValue(text, length)) return NULL;
         *outLength = length;
-        return Duplicate(text, length);
+        return Util_CopyBytes(text, length);
     }
     if (part->form == FORM_TEXT) {
         WCHAR *wide;
@@ -1284,16 +1260,16 @@ static char *WebPartOf(const WebPart *part, const char *text, size_t length, con
         if ((quoted = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)chars * 12 + 3)) != NULL && Core_JsonQuote(wide, quoted, (size_t)chars * 12 + 3)) {
             *outLength = strlen(quoted);
         } else {
-            Free(quoted);
+            Util_Free(quoted);
             quoted = NULL;
         }
-        Free(wide);
+        Util_Free(wide);
         return quoted;
     }
     if (!Core_JsonMember(text, length, "state", &state, &stateLength)) return NULL;
     if (!part->member) {
         *outLength = length;
-        return Duplicate(text, length);
+        return Util_CopyBytes(text, length);
     }
     if (!Core_JsonMember(state, stateLength, part->member, &inner, &innerLength) ||
         (part->scope == LAYOUT_ORGANIZATION && !Core_JsonMember(inner, innerLength, scope, &inner, &innerLength)))
@@ -1303,14 +1279,14 @@ static char *WebPartOf(const WebPart *part, const char *text, size_t length, con
         object.entriesDir = entriesDir;
         object.json = EmptyObject(&object.used);
         if (!object.json || !Core_JsonEachMember(inner, innerLength, AddListed, &object)) {
-            Free(object.json);
+            Util_Free(object.json);
             return NULL;
         }
         *outLength = object.used;
         return object.json;
     }
     *outLength = innerLength;
-    return Duplicate(inner, innerLength);
+    return Util_CopyBytes(inner, innerLength);
 }
 
 /* The parts of `layout` (a heap block, freed) read from the web storage of
@@ -1332,20 +1308,20 @@ static char *ReadWebParts(const Profile *p, const char *scope, const WCHAR *entr
             family.object.json = EmptyObject(&family.object.used);
             WebStore_EachName(store, kWebParts[i].value, AddFamilyValue, &family);
             if (family.object.json && family.object.used > 2)
-                layout = SetRaw(layout, used, kWebParts[i].part, family.object.json, family.object.used);
-            Free(family.object.json);
+                layout = SessionSync_SetMember(layout, used, kWebParts[i].part, family.object.json, family.object.used);
+            Util_Free(family.object.json);
             continue;
         }
         if (!read || wcscmp(read, kWebParts[i].value) != 0) {
-            Free(text);
+            Util_Free(text);
             text = WebStore_Get(store, kWebParts[i].value, &length);
             read = kWebParts[i].value;
         }
         if ((value = WebPartOf(&kWebParts[i], text, length, scope, entriesDir, &valueLength)) != NULL)
-            layout = SetRaw(layout, used, kWebParts[i].part, value, valueLength);
-        Free(value);
+            layout = SessionSync_SetMember(layout, used, kWebParts[i].part, value, valueLength);
+        Util_Free(value);
     }
-    Free(text);
+    Util_Free(text);
     WebStore_Free(store);
     return layout;
 }
@@ -1397,7 +1373,7 @@ static char *ReadFileParts(const Profile *p, char *layout, size_t *used, ULONGLO
     size_t valueLength, i;
     for (i = 0; i < ARRAYSIZE(kFileParts) && layout; i++) {
         if (!read || wcscmp(read, kFileParts[i].file) != 0) {
-            Free(text);
+            Util_Free(text);
             text = NULL;
             read = kFileParts[i].file;
             if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", p->storageDir, read)) ||
@@ -1406,9 +1382,9 @@ static char *ReadFileParts(const Profile *p, char *layout, size_t *used, ULONGLO
             if (written) *written = max(*written, WrittenAt(path));
         }
         if (text && FileMember(text, length, &kFileParts[i], &value, &valueLength, own, sizeof own))
-            layout = SetRaw(layout, used, kFileParts[i].part, value, valueLength);
+            layout = SessionSync_SetMember(layout, used, kFileParts[i].part, value, valueLength);
     }
-    Free(text);
+    Util_Free(text);
     return layout;
 }
 
@@ -1434,10 +1410,10 @@ char *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *
                 if (SUCCEEDED(StringCchPrintfA(name, sizeof name, "%s%s", part->name, part->scope == LAYOUT_ACCOUNT ? account : "")) &&
                     (part->window ? Core_JsonMember(epitaxy, epitaxyLength, name, &value, &valueLength)
                                   : Core_JsonMember(prefs, prefsLength, name, &value, &valueLength)))
-                    layout = SetRaw(layout, &used, part->part, value, valueLength);
+                    layout = SessionSync_SetMember(layout, &used, part->part, value, valueLength);
             }
         }
-        Free(config);
+        Util_Free(config);
     }
     if (layout) layout = ReadWebParts(p, scope, entriesDir, layout, &used, written);
     if (layout) layout = ReadFileParts(p, layout, &used, written);
@@ -1447,14 +1423,14 @@ char *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *
             size_t presetsLength = 0;
             char *own = Presets_Account(presets, size, account, &presetsLength);
             if (own) {
-                layout = SetRaw(layout, &used, "sessionPresets", own, presetsLength);
+                layout = SessionSync_SetMember(layout, &used, "sessionPresets", own, presetsLength);
                 if (written) *written = max(*written, WrittenAt(path));
             }
-            Free(own); Free(presets);
+            Util_Free(own); Util_Free(presets);
         }
     }
     if (layout && used <= 2) {
-        Free(layout);
+        Util_Free(layout);
         layout = NULL;
     }
     if (layout) *length = used;
@@ -1500,7 +1476,7 @@ static OpResult ApplySettings(const Profile *p, const char *account, const char 
     }
     current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength);
     if (current) {
-        json = Duplicate(current, currentLength);
+        json = Util_CopyBytes(current, currentLength);
         used = currentLength;
     } else {
         json = EmptyObject(&used);
@@ -1522,8 +1498,8 @@ static OpResult ApplySettings(const Profile *p, const char *account, const char 
     } else {
         result = WriteLayoutFile(p, path, current, currentLength, json, used, L"the sidebar's settings", report);
     }
-    Free(json);
-    Free(current);
+    Util_Free(json);
+    Util_Free(current);
     return result;
 }
 
@@ -1568,7 +1544,7 @@ static BOOL SetWebValue(WebStore *store, const WCHAR *name, const char *scope, c
 {
     const char *value;
     size_t valueLength, length = 0, used, i;
-    char *text = WebStore_Get(store, name, &length), *json = text ? Duplicate(text, length) : NULL;
+    char *text = WebStore_Get(store, name, &length), *json = text ? Util_CopyBytes(text, length) : NULL;
     BOOL ok = TRUE, set = FALSE;
     used = length;
     for (i = 0; i < ARRAYSIZE(kWebParts); i++) {
@@ -1581,17 +1557,17 @@ static BOOL SetWebValue(WebStore *store, const WCHAR *name, const char *scope, c
             int bytes;
             if (wide && Core_JsonString(value, valueLength, wide, valueLength + 1) &&
                 (bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL)) > 0) {
-                Free(json);
+                Util_Free(json);
                 if ((json = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)bytes)) != NULL) {
                     WideCharToMultiByte(CP_UTF8, 0, wide, -1, json, bytes, NULL, NULL);
                     used = (size_t)bytes - 1;
                     set = TRUE;
                 }
             }
-            Free(wide);
+            Util_Free(wide);
         } else if (part->form == FORM_JSON || !part->member) {
-            Free(json);
-            json = Duplicate(value, valueLength);
+            Util_Free(json);
+            json = Util_CopyBytes(value, valueLength);
             used = valueLength;
             set = TRUE;
         } else if (json && part->byKey) {
@@ -1612,8 +1588,8 @@ static BOOL SetWebValue(WebStore *store, const WCHAR *name, const char *scope, c
         ok = WebStore_Set(store, name, json, used);
         *changed = TRUE;
     }
-    Free(text);
-    Free(json);
+    Util_Free(text);
+    Util_Free(json);
     return ok;
 }
 
@@ -1642,7 +1618,7 @@ static BOOL SetFamilyValue(void *context, const char *key, size_t keyLength, con
         if (WebStore_Set(write->store, name, value, valueLength)) *write->changed = TRUE;
         else write->ok = FALSE;
     }
-    Free(current);
+    Util_Free(current);
     return TRUE;
 }
 
@@ -1659,7 +1635,7 @@ static BOOL SetWebCopy(WebStore *store, const WCHAR *name, const char *scope, co
     text = WebStore_Get(store, name, &length);
     if (text && Core_JsonMember(text, length, "value", &inner, &innerLength) &&
         (!scope || Core_JsonMember(inner, innerLength, scope, &inner, &innerLength)) && innerLength == valueLength && memcmp(inner, value, valueLength) == 0) {
-        Free(text);
+        Util_Free(text);
         return TRUE;
     }
     if (!text && !make) return TRUE;
@@ -1668,17 +1644,17 @@ static BOOL SetWebCopy(WebStore *store, const WCHAR *name, const char *scope, co
         used = length;
     } else {
         static const char kEmpty[] = "{\"value\":{},\"tabId\":\"\",\"timestamp\":0}";
-        json = Duplicate(kEmpty, sizeof kEmpty - 1);
+        json = Util_CopyBytes(kEmpty, sizeof kEmpty - 1);
         used = sizeof kEmpty - 1;
     }
-    StringCchPrintfA(now, sizeof now, "%I64u", NowMs());
+    StringCchPrintfA(now, sizeof now, "%I64u", Util_NowMs());
     if (json && SetNested(&json, &used, keys, scope ? 2 : 1, value, valueLength) && SetNested(&json, &used, timeKey, 1, now, strlen(now))) {
         ok = WebStore_Set(store, name, json, used);
         *changed = TRUE;
     } else {
         Util_Log(L"web storage %s: kept, not Claude's copy", name);
     }
-    Free(json);
+    Util_Free(json);
     return ok;
 }
 
@@ -1718,10 +1694,10 @@ static OpResult ApplyWeb(const Profile *p, const char *account, const char *scop
             Util_Log(L"the sidebar of %s: its Claude last showed another account; not sent to the server at its next start", p->folder);
         else
             ok = WebStore_Set(store, SIDEBAR_PENDING, scope, strlen(scope));
-        Free(owner);
+        Util_Free(owner);
     }
-    Free(sidebarBefore);
-    Free(sidebarAfter);
+    Util_Free(sidebarBefore);
+    Util_Free(sidebarAfter);
     for (i = 0; i < ARRAYSIZE(kWebParts) && ok; i++) {
         FamilyWrite write;
         if (kWebParts[i].form != FORM_FAMILY || !Core_JsonMember(content, contentLength, kWebParts[i].part, &value, &valueLength)) continue;
@@ -1740,7 +1716,7 @@ static OpResult ApplyWeb(const Profile *p, const char *account, const char *scop
             continue;
         text = WebStore_Get(store, kWebParts[i].value, &length);
         if (text) ok = SetWebCopy(store, copy, scope, value, valueLength, TRUE, &changed);
-        Free(text);
+        Util_Free(text);
     }
     /* The window's own copies of its settings, where it has them. */
     for (i = 0; i < ARRAYSIZE(kSettingParts) && ok; i++) {
@@ -1768,6 +1744,46 @@ static OpResult ApplyWeb(const Profile *p, const char *account, const char *scop
     return result;
 }
 
+/* The sessions of entries `ids` (their own ids, local_<id>) read, or marked
+ * unread as Claude's Mark as unread does, in the web storage of closed
+ * profile `p`, what it replaces backed up first. TRUE when made, or when
+ * nothing was to change (no web storage yet: Claude shows none unread). */
+BOOL SessionSync_SetUnread(const Profile *p, const WCHAR *const *ids, int count, BOOL unread)
+{
+    WebStore *store;
+    SyncReport *report;
+    WCHAR backup[MAX_PATH];
+    char *value, *next;
+    size_t length = 0, nextLength;
+    BOOL ok = TRUE, changed = FALSE;
+    int i;
+    if ((store = WebStore_Open(p)) == NULL) return TRUE;
+    value = WebStore_Get(store, UNREAD_STORE, &length);
+    for (i = 0; i < count && ok; i++) {
+        if (!unread && !Core_UnreadHas(value, length, ids[i])) continue;
+        if ((next = Core_UnreadSet(value, length, ids[i], unread, &nextLength)) == NULL) {
+            ok = FALSE;
+            break;
+        }
+        if (!value || nextLength != length || memcmp(next, value, length) != 0) changed = TRUE;
+        Util_Free(value);
+        value = next;
+        length = nextLength;
+    }
+    if (ok && changed) ok = WebStore_Set(store, UNREAD_STORE, value, length);
+    if (ok && changed) {
+        report = (SyncReport *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *report);
+        ok = report && !SessionLink_Busy(p) && BackupDir(p, report, backup, ARRAYSIZE(backup)) &&
+             SUCCEEDED(StringCchCatW(backup, ARRAYSIZE(backup), L"\\" CLAUDE_WEB_STORAGE)) && WebStore_Commit(store, backup);
+        Util_Free(report);
+        Util_Log(L"the sessions unread in the web storage of %s: %d %s%s", p->folder, count, unread ? L"marked unread" : L"read",
+                 ok ? L"" : L" FAILED");
+    }
+    Util_Free(value);
+    WebStore_Free(store);
+    return ok;
+}
+
 /* The parts of `content` kept in config.json and Chromium's Preferences put
  * in those files of `p`. */
 static OpResult ApplyFiles(const Profile *p, const char *content, size_t contentLength, SyncReport *report)
@@ -1789,7 +1805,7 @@ static OpResult ApplyFiles(const Profile *p, const char *content, size_t content
         if (!any || FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", p->storageDir, kFiles[f])) ||
             (current = Util_ReadFile(path, CONTENT_MAX_BYTES, FALSE, &currentLength)) == NULL)
             continue;
-        json = Duplicate(current, currentLength);
+        json = Util_CopyBytes(current, currentLength);
         used = currentLength;
         for (i = 0; i < ARRAYSIZE(kFileParts) && json; i++) {
             const FilePart *part = &kFileParts[i];
@@ -1806,8 +1822,8 @@ static OpResult ApplyFiles(const Profile *p, const char *content, size_t content
         }
         one = json ? WriteLayoutFile(p, path, current, currentLength, json, used, kFiles[f], report) : OP_FAILED;
         if (one != OP_SAME) result = one;
-        Free(json);
-        Free(current);
+        Util_Free(json);
+        Util_Free(current);
     }
     return result;
 }
@@ -1829,9 +1845,9 @@ static OpResult ApplyPresets(const Profile *p, const char *account, const char *
         CannotWrite(report, path, GetLastError()); return OP_FAILED;
     }
     merged = Presets_Merge(current ? current : "{}", current ? currentLength : 2, account, incoming, incomingLength, &mergedLength);
-    if (!merged) { Free(current); CannotWrite(report, path, ERROR_INVALID_DATA); return OP_FAILED; }
+    if (!merged) { Util_Free(current); CannotWrite(report, path, ERROR_INVALID_DATA); return OP_FAILED; }
     result = WriteLayoutFile(p, path, current, currentLength, merged, mergedLength, L"Session presets", report);
-    Free(merged); Free(current);
+    Util_Free(merged); Util_Free(current);
     return result;
 }
 
@@ -1928,13 +1944,16 @@ static OpResult ApplyOp(const Profile *p, const SessionSet *entries, const WCHAR
     }
     if (g_onChange.step) g_onChange.step(g_onChange.context);
     if (result == OP_SKIPPED && (op->kind == SYNC_PUT || op->kind == SYNC_REMOVE)) report->skipped++;
-    Free(content);
+    Util_Free(content);
     return result;
 }
 
 /* Makes the changes sent to `p` while its Claude is closed, in order; one
- * its Claude overtakes waits with those after it. Returns how many left the
- * plan. A profile with no entries folder yet keeps them: made once it has. */
+ * its Claude overtakes waits with those after it. One that fails stays for
+ * the next time, SYNC_TRIES_MAX times at most: until it is made, the vault
+ * takes it for the profile's entry (a waiting change), so what the profile
+ * still shows is never taken for a change of its own. Returns how many left
+ * the plan. A profile with no entries folder yet keeps them: made once it has. */
 int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
 {
     SyncReport own;
@@ -1942,7 +1961,8 @@ int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
     WCHAR staging[MAX_PATH];
     HANDLE lock = NULL, syncLock = NULL;
     Plan plan;
-    int i = 0, n = 0;
+    int i = 0, n = 0, kept = 0, made = 0;
+    BOOL busy;
     ZeroMemory(&plan, sizeof plan);
     if (!report) {
         ZeroMemory(&own, sizeof own);
@@ -1953,30 +1973,45 @@ int SessionSync_ApplyPending(const Profile *p, SyncReport *report)
         Util_SyncUnlock(syncLock);
         return 0;
     }
-    if (SessionLink_Busy(p) || (n = LoadPlan(p, &plan)) <= 0) {
-        if (!SessionLink_Busy(p) && n < 0) Util_Log(L"sessions sent to %s: the plan cannot be read", p->folder);
+    SessionLink_BeginBatch();
+    if ((busy = SessionLink_Busy(p)) != FALSE || (n = LoadPlan(p, &plan)) <= 0) {
+        if (!busy && n < 0) Util_Log(L"sessions sent to %s: the plan cannot be read", p->folder);
+        SessionLink_EndBatch();
         SessionEdit_Unlock(lock);
         Util_SyncUnlock(syncLock);
-        Free(plan.ops);
+        Util_Free(plan.ops);
         return 0;
     }
-    SessionStore_LoadEntries(&entries, p);
+    if (!SessionStore_LoadEntries(&entries, p)) Util_Log(L"sessions sent to %s: some of its entries cannot be read", p->folder);
     if (!entries.source[0].entriesDir[0]) {
         Util_Log(L"sessions sent to %s: kept, it has no session entries yet", p->folder);
     } else {
         for (i = 0; i < plan.count; i++) {
-            if (ApplyOp(p, &entries, entries.source[0].entriesDir, staging, &plan.ops[i], report) == OP_STOPPED) {
+            OpResult result = ApplyOp(p, &entries, entries.source[0].entriesDir, staging, &plan.ops[i], report);
+            if (result == OP_STOPPED) {
                 Util_Log(L"sessions sent to %s: the rest waits, its Claude started", p->folder);
                 break;
             }
+            if (result == OP_FAILED && ++plan.ops[i].tries < SYNC_TRIES_MAX) {
+                Util_Log(L"sessions sent to %s: session %s waits for another try (%lu)", p->folder, plan.ops[i].key, plan.ops[i].tries);
+                plan.ops[kept++] = plan.ops[i];
+                continue;
+            }
+            if (result == OP_FAILED) Util_Log(L"sessions sent to %s: session %s given up after %d tries", p->folder, plan.ops[i].key, SYNC_TRIES_MAX);
             DeleteContent(staging, &plan.ops[i]);
+            made++;
         }
-        if (i && !SavePlan(p, plan.ops + i, plan.count - i)) Util_Log(L"sessions sent to %s: the plan could not be written", p->folder);
+        /* What failed, then what was not reached, in their order. */
+        if (kept < i) MoveMemory(plan.ops + kept, plan.ops + i, (size_t)(plan.count - i) * sizeof *plan.ops);
+        if ((made || kept) && !SavePlan(p, plan.ops, kept + plan.count - i))
+            Util_Log(L"sessions sent to %s: the plan could not be written", p->folder);
     }
+    SessionLink_EndBatch();
     SessionEdit_Unlock(lock);
     Util_SyncUnlock(syncLock);
     SessionStore_Free(&entries);
-    Free(plan.ops);
+    Util_Free(plan.ops);
+    i = made;
     if (i) Util_Log(L"%d change(s) sent to %s made", i, p->folder);
     return i;
 }
@@ -2068,7 +2103,7 @@ static void Send(Outbox *box, const SessionSet *set, SyncReport *report)
         }
         ResultPart(profile, part, report);
     }
-    Free(part);
+    Util_Free(part);
     Util_SyncUnlock(lock);
 }
 
@@ -2215,13 +2250,6 @@ BOOL SessionSync_Send(const SessionSet *set, const SyncSend *changes, int count,
     return TRUE;
 }
 
-static ULONGLONG NowMs(void)
-{
-    FILETIME now;
-    GetSystemTimeAsFileTime(&now);
-    return ((((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND;
-}
-
 BOOL SessionSync_Remove(const SessionSet *set, DWORD profiles, const int *rows, int rowCount, SyncReport *report)
 {
     Outbox box;
@@ -2296,13 +2324,8 @@ BOOL SessionSync_Share(const SessionSet *set, int from, const int *rows, int row
 
 static BOOL NewEntryId(WCHAR *out, size_t cch)
 {
-    GUID guid;
-    WCHAR text[GUID_TEXT_CCH];
-    size_t i;
-    if (FAILED(CoCreateGuid(&guid)) || StringFromGUID2(&guid, text, ARRAYSIZE(text)) != ARRAYSIZE(text)) return FALSE;
-    text[ARRAYSIZE(text) - 2] = 0;   /* the closing brace */
-    for (i = 1; text[i]; i++) text[i] = (WCHAR)towlower(text[i]);
-    return SUCCEEDED(StringCchPrintfW(out, cch, LOCAL_PREFIX L"%s", text + 1));
+    WCHAR id[SESSION_ID_CCH];
+    return Util_NewId(id, ARRAYSIZE(id), NULL) && SUCCEEDED(StringCchPrintfW(out, cch, LOCAL_PREFIX L"%s", id));
 }
 
 /* The entry of a copy: the original's, under its own id and transcript
@@ -2311,34 +2334,29 @@ static BOOL NewEntryId(WCHAR *out, size_t cch)
  * A heap block; NULL when it cannot be made. */
 static char *CopyEntry(const char *original, size_t length, const WCHAR *copyId, size_t *outLength)
 {
-    static const char *const kOthers[] = { "priorCliSessionIds", "preClearCliSessionId", "unarchivedCliSessionId", "stagedTranscriptPath" };
     WCHAR ownId[SESSION_ID_CCH], cwd[MAX_PATH];
     const char *value;
-    size_t valueLength, i;
+    size_t valueLength;
     char *data, *next;
     if (!NewEntryId(ownId, ARRAYSIZE(ownId)) || (data = WithString(original, length, "sessionId", ownId, &length)) == NULL) return NULL;
     if ((next = WithString(data, length, "cliSessionId", copyId, &length)) == NULL) goto failed;
-    Free(data);
+    Util_Free(data);
     data = next;
     if (SessionEdit_CopiedCwd(copyId, cwd, ARRAYSIZE(cwd))) {
         if ((next = WithString(data, length, "cwd", cwd, &length)) == NULL) goto failed;
-        Free(data);
+        Util_Free(data);
         data = next;
         if (Core_JsonMember(data, length, "originCwd", &value, &valueLength)) {
             if ((next = WithString(data, length, "originCwd", cwd, &length)) == NULL) goto failed;
-            Free(data);
+            Util_Free(data);
             data = next;
         }
     }
-    for (i = 0; i < ARRAYSIZE(kOthers); i++) {
-        size_t shorter;
-        if (!Core_JsonRemoveMember(data, length, kOthers[i], data, length, &shorter)) goto failed;
-        length = shorter;
-    }
+    if (!Core_EntryDropHistory(data, &length)) goto failed;
     *outLength = length;
     return data;
 failed:
-    Free(data);
+    Util_Free(data);
     return NULL;
 }
 
@@ -2397,7 +2415,7 @@ CopyResult SessionSync_Copy(HWND owner, const SessionSet *set, int from, const i
             }
             ZeroMemory(part, sizeof *part);
             ZeroMemory(&one, sizeof one);
-            MakeOp(&op, SYNC_PUT, SYNC_UNDELETE, copyId, MemberNumber(original, length, "lastActivityAt"), 0);
+            MakeOp(&op, SYNC_PUT, SYNC_UNDELETE, copyId, Core_JsonMemberNumber(original, length, "lastActivityAt"), 0);
             entry = CopyEntry(original, length, copyId, &entryLength);
             /* Not sent, the copy is listed nowhere: what it made goes again. */
             if (!entry || !AddSent(&one, &op, entry, entryLength) || !StageSent(&set->profiles.items[t], &one)) {
@@ -2408,10 +2426,10 @@ CopyResult SessionSync_Copy(HWND owner, const SessionSet *set, int from, const i
                 sent |= 1u << t;
             }
             FreeSent(&one);
-            Free(entry);
+            Util_Free(entry);
             ResultPart(&set->profiles.items[t], part, report);
         }
-        Free(original);
+        Util_Free(original);
     }
     for (p = 0; p < set->profiles.count; p++) {
         if (!(sent & (1u << p))) continue;
@@ -2424,177 +2442,40 @@ CopyResult SessionSync_Copy(HWND owner, const SessionSet *set, int from, const i
         }
         ResultPart(&set->profiles.items[p], part, report);
     }
-    Free(part);
+    Util_Free(part);
     return result;
 }
 
 /* ------------------------------------------------------------- archives */
 
-static void Put16(unsigned char *at, DWORD value)
+/* `path` under `root` as an archive's name, claude/<its path under root>, a
+ * folder's ending in '/'. */
+static BOOL ArchiveName(const WCHAR *root, const WCHAR *path, BOOL folder, char *name, size_t cch)
 {
-    at[0] = (unsigned char)value;
-    at[1] = (unsigned char)(value >> 8);
-}
-
-static void Put32(unsigned char *at, DWORD value)
-{
-    Put16(at, value & 0xFFFF);
-    Put16(at + 2, value >> 16);
-}
-
-static DWORD Get16(const unsigned char *at)
-{
-    return (DWORD)at[0] | ((DWORD)at[1] << 8);
-}
-
-static DWORD Get32(const unsigned char *at)
-{
-    return Get16(at) | (Get16(at + 2) << 16);
-}
-
-typedef struct ZipItem {
-    char     *name;          /* UTF-8, '/' between folders; a heap block (writer) or in the directory (reader) */
-    size_t    nameLength;
-    DWORD     crc, size, offset;
-    DWORD     method, flags, packed;
-} ZipItem;
-
-typedef struct ZipWriter {
-    HANDLE    file;
-    ZipItem  *items;
-    int       count, capacity;
-    ULONGLONG offset;
-    WORD      time, date;     /* MS-DOS's, for every file */
-    BOOL      tooBig;
-} ZipWriter;
-
-static BOOL ZipWrite(ZipWriter *zip, const void *data, size_t length)
-{
-    if (zip->offset + length > ZIP_MAX_OFFSET) {
-        zip->tooBig = TRUE;
-        return FALSE;
+    size_t rootLength = wcslen(root), prefix = sizeof ARCHIVE_FILES - 1, i, length;
+    if (cch < prefix + 3 || !Core_PathUnder(path, root) || Core_PathEquals(path, root)) return FALSE;
+    memcpy(name, ARCHIVE_FILES, prefix);
+    if (WideCharToMultiByte(CP_UTF8, 0, path + rootLength + 1, -1, name + prefix, (int)(cch - prefix - 1), NULL, NULL) <= 1) return FALSE;
+    for (i = prefix; name[i]; i++)
+        if (name[i] == '\\') name[i] = '/';
+    if (folder) {
+        length = strlen(name);
+        name[length] = '/';
+        name[length + 1] = 0;
     }
-    if (!WriteWhole(zip->file, (const char *)data, length)) return FALSE;
-    zip->offset += length;
     return TRUE;
 }
 
-/* Whether `name` is in the archive already. */
-static BOOL ZipHas(const ZipWriter *zip, const char *name, size_t length)
-{
-    int i;
-    for (i = 0; i < zip->count; i++)
-        if (zip->items[i].nameLength == length && _strnicmp(zip->items[i].name, name, length) == 0)
-            return TRUE;
-    return FALSE;
-}
-
-/* A file's header, its data then written by the caller: its CRC and size
- * are filled in once it is (ZipEnd). */
-static BOOL ZipBegin(ZipWriter *zip, const char *name, size_t length)
-{
-    unsigned char header[ZIP_LOCAL_BYTES];
-    ZipItem *items, *item;
-    if (zip->count >= (int)ZIP_MAX_ITEMS || length > 0xFFFF) {
-        zip->tooBig = TRUE;
-        return FALSE;
-    }
-    if ((items = (ZipItem *)Grow(zip->items, &zip->capacity, zip->count + 1, sizeof *zip->items)) == NULL) return FALSE;
-    zip->items = items;
-    item = &zip->items[zip->count];
-    ZeroMemory(item, sizeof *item);
-    if ((item->name = (char *)HeapAlloc(GetProcessHeap(), 0, length + 1)) == NULL) return FALSE;
-    memcpy(item->name, name, length);
-    item->name[length] = 0;
-    item->nameLength = length;
-    item->offset = (DWORD)zip->offset;
-    zip->count++;
-    ZeroMemory(header, sizeof header);
-    Put32(header, ZIP_LOCAL_SIGNATURE);
-    Put16(header + 4, ZIP_VERSION);
-    Put16(header + 6, ZIP_UTF8_NAMES);
-    Put16(header + 8, ZIP_STORED);
-    Put16(header + 10, zip->time);
-    Put16(header + 12, zip->date);
-    Put16(header + 26, (DWORD)length);
-    return ZipWrite(zip, header, sizeof header) && ZipWrite(zip, name, length);
-}
-
-/* The latest file's CRC and size, written into its header. */
-static BOOL ZipEnd(ZipWriter *zip, DWORD crc, DWORD size)
-{
-    ZipItem *item = &zip->items[zip->count - 1];
-    unsigned char sizes[12];
-    LARGE_INTEGER at, end;
-    item->crc = crc;
-    item->size = size;
-    Put32(sizes, crc);
-    Put32(sizes + 4, size);
-    Put32(sizes + 8, size);
-    at.QuadPart = (LONGLONG)item->offset + 14;
-    end.QuadPart = (LONGLONG)zip->offset;
-    return SetFilePointerEx(zip->file, at, NULL, FILE_BEGIN) && WriteWhole(zip->file, (const char *)sizes, sizeof sizes) &&
-           SetFilePointerEx(zip->file, end, NULL, FILE_BEGIN);
-}
-
-static BOOL ZipAddData(ZipWriter *zip, const char *name, const char *data, size_t length)
-{
-    return length <= ZIP_MAX_OFFSET && ZipBegin(zip, name, strlen(name)) && ZipWrite(zip, data, length) &&
-           ZipEnd(zip, Core_Crc32(0, data, length), (DWORD)length);
-}
-
-/* The file `path` as `name`, read as it is now: one Claude Code still writes
- * is taken up to where it is. */
-static BOOL ZipAddFile(ZipWriter *zip, const char *name, size_t nameLength, const WCHAR *path, SyncReport *report)
-{
-    WCHAR extended[LONG_PATH_CCH];
-    HANDLE in;
-    char *buffer;
-    DWORD got = 0, crc = 0;
-    ULONGLONG size = 0;
-    BOOL ok;
-    if (ZipHas(zip, name, nameLength)) return TRUE;
-    if (!Extended(path, extended)) {
-        CannotRead(report, path, ERROR_FILENAME_EXCED_RANGE);
-        return FALSE;
-    }
-    in = CreateFileW(extended, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                     FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (in == INVALID_HANDLE_VALUE) {
-        CannotRead(report, path, GetLastError());
-        return FALSE;
-    }
-    if ((buffer = (char *)HeapAlloc(GetProcessHeap(), 0, COPY_CHUNK)) == NULL) {
-        CloseHandle(in);
-        return FALSE;
-    }
-    ok = ZipBegin(zip, name, nameLength);
-    while (ok && ReadFile(in, buffer, COPY_CHUNK, &got, NULL) && got > 0) {
-        crc = Core_Crc32(crc, buffer, got);
-        size += got;
-        ok = ZipWrite(zip, buffer, got);
-    }
-    if (ok && size > ZIP_MAX_OFFSET) {
-        zip->tooBig = TRUE;
-        ok = FALSE;
-    }
-    if (ok) ok = ZipEnd(zip, crc, (DWORD)size);
-    Free(buffer);
-    CloseHandle(in);
-    return ok;
-}
-
 /* `path` (a file, or a folder and what it holds) under `root`, as
- * claude/<its path under root>. */
-static BOOL ZipAddTree(ZipWriter *zip, const WCHAR *root, const WCHAR *path, SyncReport *report)
+ * claude/<its path under root>; one Claude Code still writes is taken up to
+ * where it is. */
+static BOOL ZipAddTree(ZipOut *zip, const WCHAR *root, const WCHAR *path, SyncReport *report)
 {
     WCHAR extended[LONG_PATH_CCH], child[LONG_PATH_CCH];
-    char name[ZIP_NAME_MAX];
+    char name[ARCHIVE_NAME_MAX];
     WIN32_FIND_DATAW found;
     DWORD attributes = 0;
-    size_t rootLength = wcslen(root), prefix = sizeof ARCHIVE_FILES - 1, i;
     HANDLE find;
-    int bytes;
     if (!Core_PathUnder(path, root) || Core_PathEquals(path, root) || !Extended(path, extended) ||
         Util_QueryPath(extended, &attributes) != PATH_PRESENT)
         return TRUE;   /* gone meanwhile */
@@ -2611,55 +2492,55 @@ static BOOL ZipAddTree(ZipWriter *zip, const WCHAR *root, const WCHAR *path, Syn
         FindClose(find);
         return TRUE;
     }
-    memcpy(name, ARCHIVE_FILES, prefix);
-    bytes = WideCharToMultiByte(CP_UTF8, 0, path + rootLength + 1, -1, name + prefix, (int)(sizeof name - prefix), NULL, NULL);
-    if (bytes <= 1) {
+    if (!ArchiveName(root, path, FALSE, name, sizeof name)) {
         CannotRead(report, path, ERROR_FILENAME_EXCED_RANGE);
         return FALSE;
     }
-    for (i = prefix; name[i]; i++)
-        if (name[i] == '\\') name[i] = '/';
-    return ZipAddFile(zip, name, prefix + (size_t)bytes - 1, path, report);
+    if (Zip_Has(zip, name)) return TRUE;
+    if (Zip_AddFile(zip, name, path)) return TRUE;
+    if (Zip_Error(zip) != ERROR_FILE_TOO_LARGE) CannotRead(report, path, Zip_Error(zip));
+    return FALSE;
 }
 
-static BOOL ZipFinish(ZipWriter *zip)
+/* Which of an archive's conversation files are entry `n`'s, as
+ * conversations/<n>.json: the archive names of `paths` (a folder's ending in
+ * '/'), so that an import of some of its entries takes only their files. */
+static BOOL AddConversationMap(ZipOut *zip, const WCHAR *root, int n, WCHAR (*paths)[LONG_PATH_CCH], int count)
 {
-    unsigned char header[ZIP_CENTRAL_BYTES], end[ZIP_END_BYTES];
-    ULONGLONG start = zip->offset;
-    int i;
-    for (i = 0; i < zip->count; i++) {
-        const ZipItem *item = &zip->items[i];
-        ZeroMemory(header, sizeof header);
-        Put32(header, ZIP_CENTRAL_SIGNATURE);
-        Put16(header + 4, ZIP_VERSION);
-        Put16(header + 6, ZIP_VERSION);
-        Put16(header + 8, ZIP_UTF8_NAMES);
-        Put16(header + 10, ZIP_STORED);
-        Put16(header + 12, zip->time);
-        Put16(header + 14, zip->date);
-        Put32(header + 16, item->crc);
-        Put32(header + 20, item->size);
-        Put32(header + 24, item->size);
-        Put16(header + 28, (DWORD)item->nameLength);
-        Put32(header + 42, item->offset);
-        if (!ZipWrite(zip, header, sizeof header) || !ZipWrite(zip, item->name, item->nameLength)) return FALSE;
+    enum { QUOTED_CAP = ARCHIVE_NAME_MAX * 6 + 4 };
+    char name[ARCHIVE_NAME_MAX + 2], mapName[64], *quoted = (char *)Util_Alloc(QUOTED_CAP), *json = (char *)Util_Alloc(256), *grown;
+    WCHAR extended[LONG_PATH_CCH], wide[ARCHIVE_NAME_MAX + 2];
+    size_t used = 1, cap = 256, length;
+    DWORD attributes;
+    int i, names = 0;
+    BOOL ok = quoted && json;
+    if (ok) json[0] = '[';
+    for (i = 0; ok && i < count; i++) {
+        attributes = 0;
+        if (!Extended(paths[i], extended) || Util_QueryPath(extended, &attributes) != PATH_PRESENT) continue;   /* gone meanwhile */
+        if (!ArchiveName(root, paths[i], (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0, name, sizeof name) ||
+            MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, ARRAYSIZE(wide)) <= 0 || !Core_JsonQuote(wide, quoted, QUOTED_CAP))
+            continue;
+        length = strlen(quoted);
+        if (used + length + 2 > cap) {   /* room for a comma and the closing bracket */
+            cap = (used + length + 2) * 2;
+            if ((grown = (char *)HeapReAlloc(GetProcessHeap(), 0, json, cap)) == NULL) {
+                ok = FALSE;
+                break;
+            }
+            json = grown;
+        }
+        if (names++) json[used++] = ',';
+        memcpy(json + used, quoted, length);
+        used += length;
     }
-    ZeroMemory(end, sizeof end);
-    Put32(end, ZIP_END_SIGNATURE);
-    Put16(end + 8, (DWORD)zip->count);
-    Put16(end + 10, (DWORD)zip->count);
-    Put32(end + 12, (DWORD)(zip->offset - start));
-    Put32(end + 16, (DWORD)start);
-    return ZipWrite(zip, end, sizeof end) && FlushFileBuffers(zip->file);
-}
-
-static void FreeZipWriter(ZipWriter *zip)
-{
-    int i;
-    for (i = 0; i < zip->count; i++) Free(zip->items[i].name);
-    Free(zip->items);
-    if (zip->file != INVALID_HANDLE_VALUE && zip->file) CloseHandle(zip->file);
-    ZeroMemory(zip, sizeof *zip);
+    if (ok) {
+        json[used++] = ']';
+        ok = SUCCEEDED(StringCchPrintfA(mapName, sizeof mapName, ARCHIVE_PARTS "%d.json", n)) && Zip_AddData(zip, mapName, json, used);
+    }
+    Util_Free(json);
+    Util_Free(quoted);
+    return ok;
 }
 
 /* Claude Code's folder, where an archive's claude/ goes. */
@@ -2674,31 +2555,25 @@ static BOOL ClaudeCodeRoot(WCHAR *out, size_t cch)
 BOOL SessionSync_Export(const SessionSet *set, int profile, const int *rows, int rowCount, const WCHAR *archive, int *exported,
                         WCHAR *error, size_t errorCch)
 {
-    WCHAR target[LONG_PATH_CCH], temporary[LONG_PATH_CCH], root[LONG_PATH_CCH], listError[LONG_PATH_CCH];
+    WCHAR root[LONG_PATH_CCH], listError[LONG_PATH_CCH];
     WCHAR (*paths)[LONG_PATH_CCH] = NULL;
     char name[64], manifest[256];
     SyncReport report;
-    ZipWriter zip;
-    SYSTEMTIME now;
-    FILETIME local;
+    ZipOut *zip;
+    DWORD code = ERROR_SUCCESS;
     int i, j, pathCount = 0;
     BOOL ok = TRUE;
     *exported = 0;
     error[0] = 0;
     ZeroMemory(&report, sizeof report);
-    ZeroMemory(&zip, sizeof zip);
-    if (!Extended(archive, target) || FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" TEMPORARY_SUFFIX, target)) ||
-        !ClaudeCodeRoot(root, ARRAYSIZE(root))) {
+    if (!ClaudeCodeRoot(root, ARRAYSIZE(root))) {
         StringCchCopyW(error, errorCch, TR(L"The path is too long."));
         return FALSE;
     }
-    zip.file = CreateFileW(temporary, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (zip.file == INVALID_HANDLE_VALUE) {
-        StringCchPrintfW(error, errorCch, TR(L"%s could not be written (error %lu)."), archive, GetLastError());
+    if ((zip = Zip_Create(archive, &code)) == NULL) {
+        StringCchPrintfW(error, errorCch, TR(L"%s could not be written (error %lu)."), archive, code);
         return FALSE;
     }
-    GetLocalTime(&now);
-    if (SystemTimeToFileTime(&now, &local)) FileTimeToDosDateTime(&local, &zip.date, &zip.time);
     for (i = 0; i < rowCount && ok; i++) {
         const SessionRow *row;
         DWORD length = 0;
@@ -2713,376 +2588,230 @@ BOOL SessionSync_Export(const SessionSet *set, int profile, const int *rows, int
             break;
         }
         StringCchPrintfA(name, sizeof name, ARCHIVE_ENTRIES "%d.json", *exported + 1);
-        ok = ZipAddData(&zip, name, entry, length);
-        Free(entry);
+        ok = Zip_AddData(zip, name, entry, length);
+        Util_Free(entry);
         if (ok && !SessionEdit_ListConversation(set, rows[i], &paths, &pathCount, listError, ARRAYSIZE(listError))) {
             StringCchCopyW(report.error, ARRAYSIZE(report.error), listError);
             ok = FALSE;
         }
-        for (j = 0; ok && j < pathCount; j++) ok = ZipAddTree(&zip, root, paths[j], &report);
-        Free(paths);
+        if (ok) ok = AddConversationMap(zip, root, *exported + 1, paths, pathCount);
+        for (j = 0; ok && j < pathCount; j++) ok = ZipAddTree(zip, root, paths[j], &report);
+        Util_Free(paths);
         paths = NULL;
         if (ok) (*exported)++;
     }
     if (ok) {
         StringCchPrintfA(manifest, sizeof manifest, "{\"format\":\"" ARCHIVE_FORMAT "\",\"version\":%d,\"sessions\":%d,\"exported\":%I64u}",
-                         ARCHIVE_VERSION, *exported, NowMs());
-        ok = ZipAddData(&zip, ARCHIVE_MANIFEST, manifest, strlen(manifest)) && ZipFinish(&zip);
+                         ARCHIVE_VERSION, *exported, Util_NowMs());
+        ok = Zip_AddData(zip, ARCHIVE_MANIFEST, manifest, strlen(manifest));
     }
+    code = Zip_Error(zip);
     if (!ok && !report.error[0]) {
-        if (zip.tooBig) StringCchCopyW(report.error, ARRAYSIZE(report.error), TR(L"The archive is too large."));
-        else StringCchPrintfW(report.error, ARRAYSIZE(report.error), TR(L"%s could not be written (error %lu)."), archive, GetLastError());
+        if (code == ERROR_FILE_TOO_LARGE) StringCchCopyW(report.error, ARRAYSIZE(report.error), TR(L"The archive is too large."));
+        else StringCchPrintfW(report.error, ARRAYSIZE(report.error), TR(L"%s could not be written (error %lu)."), archive, code);
     }
-    CloseHandle(zip.file);
-    zip.file = INVALID_HANDLE_VALUE;
-    if (ok && !MoveFileExW(temporary, target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!Zip_Close(zip, ok) && ok) {
         StringCchPrintfW(report.error, ARRAYSIZE(report.error), TR(L"%s could not be written (error %lu)."), archive, GetLastError());
         ok = FALSE;
     }
-    if (!ok) DeleteFileW(temporary);
-    FreeZipWriter(&zip);
     StringCchCopyW(error, errorCch, report.error);
     Util_Log(L"%d session(s) exported to %s%s", *exported, archive, ok ? L"" : L" FAILED");
     return ok;
 }
 
-typedef struct ZipReader {
-    HANDLE         file;
-    ULONGLONG      size;
-    unsigned char *directory;
-    ZipItem       *items;
-    int            count;
-} ZipReader;
-
-static BOOL ReadAt(HANDLE file, ULONGLONG offset, void *buffer, DWORD length)
+static BOOL ItemNamed(const char *name, const char *prefix)
 {
-    LARGE_INTEGER at;
-    DWORD got = 0, n;
-    at.QuadPart = (LONGLONG)offset;
-    if (!SetFilePointerEx(file, at, NULL, FILE_BEGIN)) return FALSE;
-    while (got < length && ReadFile(file, (char *)buffer + got, length - got, &n, NULL) && n > 0) got += n;
-    return got == length;
+    return strncmp(name, prefix, strlen(prefix)) == 0;
 }
 
-/* The archive's directory read, each file's place in it checked. */
-static BOOL ZipOpen(ZipReader *zip, const WCHAR *path)
+/* An entry of the archive: entries/<n>.json, not a folder. */
+static BOOL EntryItem(const ZipIn *zip, int index)
 {
-    WCHAR extended[LONG_PATH_CCH];
-    LARGE_INTEGER size;
-    unsigned char *tail = NULL;
-    DWORD tailLength, i, count, directorySize, directoryOffset, at;
-    BOOL ok = FALSE;
-    ZeroMemory(zip, sizeof *zip);
-    if (!Extended(path, extended)) return FALSE;
-    zip->file = CreateFileW(extended, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (zip->file == INVALID_HANDLE_VALUE || !GetFileSizeEx(zip->file, &size)) return FALSE;
-    zip->size = (ULONGLONG)size.QuadPart;
-    if (zip->size < ZIP_END_BYTES || zip->size > ZIP_MAX_OFFSET + 1) return FALSE;
-    tailLength = (DWORD)min(zip->size, (ULONGLONG)ZIP_END_BYTES + ZIP_COMMENT_MAX);
-    if ((tail = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, tailLength)) == NULL ||
-        !ReadAt(zip->file, zip->size - tailLength, tail, tailLength))
-        goto done;
-    for (i = tailLength - ZIP_END_BYTES + 1; i-- > 0;)
-        if (Get32(tail + i) == ZIP_END_SIGNATURE && i + ZIP_END_BYTES + Get16(tail + i + 20) == tailLength) break;
-    if (i == (DWORD)-1) goto done;
-    count = Get16(tail + i + 10);
-    directorySize = Get32(tail + i + 12);
-    directoryOffset = Get32(tail + i + 16);
-    if (Get16(tail + i + 8) != count || directorySize > ZIP_DIRECTORY_MAX ||
-        (ULONGLONG)directoryOffset + directorySize > zip->size - tailLength + i)
-        goto done;
-    if ((zip->directory = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, (size_t)directorySize + 1)) == NULL ||
-        (zip->items = (ZipItem *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)max(count, 1) * sizeof *zip->items)) == NULL ||
-        !ReadAt(zip->file, directoryOffset, zip->directory, directorySize))
-        goto done;
-    for (at = 0; (DWORD)zip->count < count; zip->count++) {
-        ZipItem *item = &zip->items[zip->count];
-        DWORD nameLength, extra, comment;
-        if (at + ZIP_CENTRAL_BYTES > directorySize || Get32(zip->directory + at) != ZIP_CENTRAL_SIGNATURE) goto done;
-        nameLength = Get16(zip->directory + at + 28);
-        extra = Get16(zip->directory + at + 30);
-        comment = Get16(zip->directory + at + 32);
-        if (at + ZIP_CENTRAL_BYTES + nameLength + extra + comment > directorySize) goto done;
-        item->flags = Get16(zip->directory + at + 8);
-        item->method = Get16(zip->directory + at + 10);
-        item->crc = Get32(zip->directory + at + 16);
-        item->packed = Get32(zip->directory + at + 20);
-        item->size = Get32(zip->directory + at + 24);
-        item->offset = Get32(zip->directory + at + 42);
-        item->name = (char *)zip->directory + at + ZIP_CENTRAL_BYTES;
-        item->nameLength = nameLength;
-        if ((ULONGLONG)item->offset + ZIP_LOCAL_BYTES + item->packed > directoryOffset) goto done;
-        at += ZIP_CENTRAL_BYTES + nameLength + extra + comment;
-    }
-    ok = TRUE;
-done:
-    Free(tail);
-    return ok;
-}
-
-static void ZipClose(ZipReader *zip)
-{
-    if (zip->file && zip->file != INVALID_HANDLE_VALUE) CloseHandle(zip->file);
-    Free(zip->directory);
-    Free(zip->items);
-    ZeroMemory(zip, sizeof *zip);
-}
-
-static BOOL ItemNamed(const ZipItem *item, const char *prefix)
-{
-    size_t length = strlen(prefix);
-    return item->nameLength >= length && memcmp(item->name, prefix, length) == 0;
-}
-
-/* Where a stored, unencrypted file's data starts; 0 for one this reader cannot take. */
-static ULONGLONG DataOffset(const ZipReader *zip, const ZipItem *item)
-{
-    unsigned char header[ZIP_LOCAL_BYTES];
-    ULONGLONG data;
-    if (item->method != ZIP_STORED || (item->flags & ZIP_ENCRYPTED) || item->packed != item->size ||
-        !ReadAt(zip->file, item->offset, header, sizeof header) || Get32(header) != ZIP_LOCAL_SIGNATURE)
-        return 0;
-    data = (ULONGLONG)item->offset + ZIP_LOCAL_BYTES + Get16(header + 26) + Get16(header + 28);
-    return data + item->size <= zip->size ? data : 0;
-}
-
-/* A small file of the archive read whole and checked: a heap block, NULL when it cannot be. */
-static char *ZipReadItem(const ZipReader *zip, const ZipItem *item, DWORD maxBytes)
-{
-    ULONGLONG data = DataOffset(zip, item);
-    char *buffer;
-    if (!data || item->size > maxBytes || (buffer = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)item->size + 1)) == NULL) return NULL;
-    if (!ReadAt(zip->file, data, buffer, item->size) || Core_Crc32(0, buffer, item->size) != item->crc) {
-        Free(buffer);
-        return NULL;
-    }
-    buffer[item->size] = 0;
-    return buffer;
-}
-
-/* A file of the archive written to `path` (not there yet), checked before
- * it takes its name. */
-static BOOL ZipExtract(const ZipReader *zip, const ZipItem *item, const WCHAR *path, SyncReport *report)
-{
-    WCHAR target[LONG_PATH_CCH], temporary[LONG_PATH_CCH];
-    ULONGLONG data = DataOffset(zip, item);
-    HANDLE out;
-    char *buffer;
-    DWORD left = item->size, crc = 0;
-    BOOL ok;
-    if (!data) {
-        StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"The archive is damaged."));
-        report->failed++;
-        return FALSE;
-    }
-    if (!Extended(path, target) || FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" TEMPORARY_SUFFIX, target))) {
-        CannotWrite(report, path, ERROR_FILENAME_EXCED_RANGE);
-        return FALSE;
-    }
-    out = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (out == INVALID_HANDLE_VALUE) {
-        CannotWrite(report, path, GetLastError());
-        return FALSE;
-    }
-    if ((buffer = (char *)HeapAlloc(GetProcessHeap(), 0, COPY_CHUNK)) == NULL) {
-        CloseHandle(out);
-        DeleteFileW(temporary);
-        return OutOfMemory(report);
-    }
-    ok = TRUE;
-    while (ok && left > 0) {
-        DWORD chunk = min(left, COPY_CHUNK);
-        ok = ReadAt(zip->file, data, buffer, chunk) && WriteWhole(out, buffer, chunk);
-        crc = Core_Crc32(crc, buffer, chunk);
-        data += chunk;
-        left -= chunk;
-    }
-    ok = ok && FlushFileBuffers(out);
-    CloseHandle(out);
-    Free(buffer);
-    if (ok && crc != item->crc) {
-        DeleteFileW(temporary);
-        StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"The archive is damaged."));
-        report->failed++;
-        return FALSE;
-    }
-    if (!ok || !MoveFileExW(temporary, target, MOVEFILE_WRITE_THROUGH)) {
-        DWORD code = GetLastError();
-        DeleteFileW(temporary);
-        if (code != ERROR_ALREADY_EXISTS && code != ERROR_FILE_EXISTS) CannotWrite(report, path, code);
-        return FALSE;
-    }
-    return TRUE;
+    const char *name = Zip_Name(zip, index);
+    size_t length = strlen(name);
+    return ItemNamed(name, ARCHIVE_ENTRIES) && length && name[length - 1] != '/';
 }
 
 /* The archive's own: a manifest of ours, of a version this one reads. */
-static BOOL IsSessionArchive(const ZipReader *zip)
+static BOOL IsSessionArchive(const ZipIn *zip)
 {
     WCHAR format[64];
-    char *manifest = NULL;
-    BOOL ours = FALSE;
-    int i;
-    for (i = 0; i < zip->count && !manifest; i++)
-        if (zip->items[i].nameLength == sizeof ARCHIVE_MANIFEST - 1 && ItemNamed(&zip->items[i], ARCHIVE_MANIFEST))
-            manifest = ZipReadItem(zip, &zip->items[i], SESSION_ENTRY_MAX_BYTES);
-    if (manifest) {
-        size_t length = strlen(manifest);
-        ours = MemberText(manifest, length, "format", format, ARRAYSIZE(format)) && wcscmp(format, L"" ARCHIVE_FORMAT) == 0 &&
-               MemberNumber(manifest, length, "version") <= ARCHIVE_VERSION;
-        Free(manifest);
-    }
+    DWORD length = 0;
+    int at = Zip_Find(zip, ARCHIVE_MANIFEST);
+    char *manifest = at >= 0 ? (char *)Zip_Read(zip, at, SESSION_ENTRY_MAX_BYTES, &length) : NULL;
+    BOOL ours = manifest && Core_JsonMemberString(manifest, length, "format", format, ARRAYSIZE(format)) && wcscmp(format, L"" ARCHIVE_FORMAT) == 0 &&
+                Core_JsonMemberNumber(manifest, length, "version") <= ARCHIVE_VERSION;
+    Util_Free(manifest);
     return ours;
 }
 
 BOOL SessionSync_IsArchive(const WCHAR *archive)
 {
-    ZipReader zip;
-    BOOL ours = ZipOpen(&zip, archive) && IsSessionArchive(&zip);
-    ZipClose(&zip);
+    ZipIn *zip = Zip_Open(archive);
+    BOOL ours = zip && IsSessionArchive(zip);
+    Zip_Free(zip);
     return ours;
 }
 
-WCHAR *SessionSync_ImportPreview(const SessionSet *set, const WCHAR *archive, DWORD targets, WCHAR *error, size_t errorCch)
+/* An entry's session: its transcript's id, or its own before its first
+ * message; FALSE for one that names neither as Claude writes them. */
+static BOOL EntryKey(const char *entry, size_t length, WCHAR *own, size_t ownCch, WCHAR *key, size_t keyCch)
 {
-    enum { PREVIEW_CCH = 65536 };
-    ZipReader zip;
-    WCHAR *text = NULL, line[SESSION_TITLE_CCH + LABEL_CCH + 256];
-    int i, p, counts[6] = { 0 }, shown = 0;
-    BOOL ok = TRUE, truncated = FALSE;
-    targets = ValidProfiles(set, targets);
-    error[0] = 0;
-    ZeroMemory(&zip, sizeof zip);
-    for (p = 0; p < set->profiles.count; p++)
-        if ((targets & (1u << p)) && !set->source[p].complete) {
-            StringCchCopyW(error, errorCch, TR(L"Sessions could not be loaded."));
-            return NULL;
-        }
-    if (!ZipOpen(&zip, archive) || !IsSessionArchive(&zip)) {
-        StringCchCopyW(error, errorCch, TR(L"The archive is damaged or its format is not supported."));
-        ZipClose(&zip);
-        return NULL;
-    }
-    text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, PREVIEW_CCH * sizeof(WCHAR));
-    if (!text) { ZipClose(&zip); return NULL; }
-    for (i = 0; i < zip.count && ok; i++) {
-        const ZipItem *item = &zip.items[i];
-        WCHAR key[SESSION_ID_CCH], own[SESSION_ID_CCH], title[SESSION_TITLE_CCH];
-        char *entry;
-        size_t c;
-        if (!ItemNamed(item, ARCHIVE_ENTRIES) || item->name[item->nameLength - 1] == '/') continue;
-        entry = ZipReadItem(&zip, item, SESSION_ENTRY_MAX_BYTES);
-        if (!entry || Core_SessionEntryKind(entry, item->size) != ENTRY_LOCAL ||
-            !MemberText(entry, item->size, "sessionId", own, ARRAYSIZE(own)) || !IsEntryId(own)) {
-            Free(entry);
-            ok = FALSE;
-            break;
-        }
-        if (!MemberText(entry, item->size, "cliSessionId", key, ARRAYSIZE(key)) || !key[0]) StringCchCopyW(key, ARRAYSIZE(key), own);
-        if (!Core_IsUuid(key) && !IsEntryId(key)) { Free(entry); ok = FALSE; break; }
-        if (!MemberText(entry, item->size, "title", title, ARRAYSIZE(title)) || !title[0]) StringCchCopyW(title, ARRAYSIZE(title), key);
-        for (c = 0; title[c]; c++)
-            if (title[c] < L' ') title[c] = L' ';
-        for (p = 0; p < set->profiles.count && ok; p++) {
-            const WCHAR *status;
-            int at, kind = 0;
-            if (!(targets & (1u << p))) continue;
-            at = SessionStore_FindEntry(set, p, key, NULL);
-            if (!set->source[p].entriesDir[0]) kind = 4;
-            else if (at >= 0) {
-                const SessionEntry *current = &set->entries[at];
-                DWORD size = 0;
-                size_t mappedSize = 0;
-                char *bytes = Util_ReadFile(current->file, SESSION_ENTRY_MAX_BYTES, FALSE, &size);
-                char *mapped = WithString(entry, item->size, "sessionId", current->localId, &mappedSize);
-                if (!bytes || !mapped) ok = FALSE;
-                else if (size == mappedSize && memcmp(bytes, mapped, size) == 0) kind = 1;
-                else kind = current->pendingRemove || current->lastActivity >= MemberNumber(entry, item->size, "lastActivityAt") ? 3 : 2;
-                Free(bytes);
-                Free(mapped);
-                if (!ok) break;
-            } else {
-                WCHAR path[LONG_PATH_CCH];
-                PathState state;
-                if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s.json", set->source[p].entriesDir, own))) {
-                    ok = FALSE;
-                    break;
-                }
-                state = Util_QueryPath(path, NULL);
-                if (state == PATH_UNREACHABLE) { ok = FALSE; break; }
-                if (state == PATH_PRESENT) kind = 5;
-            }
-            counts[kind]++;
-            switch (kind) {
-            case 0: status = TR(L"New session"); break;
-            case 1: status = TR(L"Duplicate; keep existing"); break;
-            case 2: status = TR(L"Update; archive is newer"); break;
-            case 3: status = TR(L"Conflict; keep newer or deleted target"); break;
-            case 5: status = TR(L"Conflict; keep existing entry with the same file name"); break;
-            default: status = TR(L"Unavailable; not signed in"); break;
-            }
-            StringCchPrintfW(line, ARRAYSIZE(line), L"%s | %s | %s\r\n", set->profiles.items[p].name, title, status);
-            if (!truncated && wcslen(text) + wcslen(line) + 512 < PREVIEW_CCH) {
-                StringCchCatW(text, PREVIEW_CCH, line);
-                shown++;
-            } else truncated = TRUE;
-        }
-        Free(entry);
-    }
-    ZipClose(&zip);
-    if (!ok) {
-        StringCchCopyW(error, errorCch, TR(L"The archive or a target entry could not be read. Nothing was imported."));
-        Free(text);
-        return NULL;
-    }
-    StringCchPrintfW(line, ARRAYSIZE(line), TR(L"\r\nNew: %d; duplicates: %d; updates: %d; conflicts kept: %d; unavailable: %d."),
-                     counts[0], counts[1], counts[2], counts[3] + counts[5], counts[4]);
-    StringCchCatW(text, PREVIEW_CCH, line);
-    if (truncated) {
-        StringCchPrintfW(line, ARRAYSIZE(line), TR(L"\r\nOnly the first %d rows are shown; the totals include every row."), shown);
-        StringCchCatW(text, PREVIEW_CCH, line);
-    }
-    return text;
+    if (Core_SessionEntryKind(entry, length) != ENTRY_LOCAL || !Core_JsonMemberString(entry, length, "sessionId", own, ownCch) || !IsEntryId(own))
+        return FALSE;
+    if (!Core_JsonMemberString(entry, length, "cliSessionId", key, keyCch) || !key[0]) StringCchCopyW(key, keyCch, own);
+    return Core_IsUuid(key) || IsEntryId(key);
 }
 
-BOOL SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targets, int *sessions, SyncReport *report)
+int SessionSync_ArchiveSessions(const ZipIn *zip, ArchivedSession **out)
 {
-    WCHAR root[LONG_PATH_CCH], path[LONG_PATH_CCH], relative[LONG_PATH_CCH];
-    ZipReader zip;
-    Outbox box;
-    DWORD takers;
-    int i, t, files = 0;
-    *sessions = 0;
-    ZeroMemory(&box, sizeof box);
-    targets = ValidProfiles(set, targets);
-    takers = targets & SessionSync_Takers(set);
-    report->unavailable |= targets & ~takers;
-    ResultTargets(set, targets, takers, report);
-    if (!ClaudeCodeRoot(root, ARRAYSIZE(root))) {
-        StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"The path is too long."));
-        return FALSE;
-    }
-    if (!ZipOpen(&zip, archive) || !IsSessionArchive(&zip)) {
-        StringCchCopyW(report->error, ARRAYSIZE(report->error), zip.file && zip.file != INVALID_HANDLE_VALUE
-                       ? TR(L"This file is not a session archive of " APP_NAME L".") : L"");
-        if (!report->error[0]) StringCchPrintfW(report->error, ARRAYSIZE(report->error), TR(L"%s could not be read (error %lu)."), archive,
-                                                GetLastError());
-        ZipClose(&zip);
-        return FALSE;
-    }
-    {
-        int checked = 0;
-        if (!Zip_Validate(archive, NULL, &checked, report->error, ARRAYSIZE(report->error))) {
-            ZipClose(&zip); return FALSE;
+    ArchivedSession *list = NULL, *grown;
+    int i, count = 0, capacity = 0;
+    *out = NULL;
+    if (!zip || !IsSessionArchive(zip)) return -1;
+    for (i = 0; i < Zip_Count(zip); i++) {
+        WCHAR own[SESSION_ID_CCH];
+        DWORD length = 0;
+        char *entry;
+        size_t c;
+        if (!EntryItem(zip, i)) continue;
+        if ((entry = (char *)Zip_Read(zip, i, SESSION_ENTRY_MAX_BYTES, &length)) == NULL) {
+            Util_Free(list);
+            return -1;
         }
+        if (count == capacity) {
+            capacity = capacity ? capacity * 2 : 32;
+            grown = list ? (ArchivedSession *)HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, list, (size_t)capacity * sizeof *list)
+                         : (ArchivedSession *)Util_Alloc((size_t)capacity * sizeof *list);
+            if (!grown) {
+                Util_Free(entry);
+                Util_Free(list);
+                return -1;
+            }
+            list = grown;
+        }
+        /* One that names its session as Claude never does is left out, as its import leaves it. */
+        if (EntryKey(entry, length, own, ARRAYSIZE(own), list[count].key, ARRAYSIZE(list[count].key))) {
+            if (!Core_JsonMemberString(entry, length, "title", list[count].title, ARRAYSIZE(list[count].title)) || !list[count].title[0])
+                StringCchCopyW(list[count].title, ARRAYSIZE(list[count].title), list[count].key);
+            for (c = 0; list[count].title[c]; c++)
+                if (list[count].title[c] < L' ') list[count].title[c] = L' ';
+            list[count].lastActivity = Core_JsonMemberNumber(entry, length, "lastActivityAt");
+            StringCchCopyW(list[count].own, ARRAYSIZE(list[count].own), own);
+            count++;
+        }
+        Util_Free(entry);
     }
-    /* The conversations first: an entry is sent only once they are there. */
-    for (i = 0; i < zip.count; i++) {
-        const ZipItem *item = &zip.items[i];
-        size_t prefix = sizeof ARCHIVE_FILES - 1, c;
+    *out = list;
+    return count;
+}
+
+/* Whether `pick` takes the session `key`: every one without keys. */
+static BOOL Picked(const SessionPick *pick, const WCHAR *key)
+{
+    int i;
+    if (!pick || !pick->keys) return TRUE;
+    for (i = 0; i < pick->count; i++)
+        if (_wcsicmp(pick->keys[i], key) == 0) return TRUE;
+    return FALSE;
+}
+
+/* The names the conversation maps of the entries `pick` takes list
+ * (AddConversationMap), gathered as Core_JsonEachElement goes. */
+typedef struct PickedFiles {
+    WCHAR **names;
+    int     count, capacity;
+    BOOL    ok;
+} PickedFiles;
+
+static BOOL AddPickedFile(void *context, const char *value, size_t valueLength)
+{
+    PickedFiles *files = (PickedFiles *)context;
+    WCHAR name[ARCHIVE_NAME_MAX + 2];
+    if (!Core_JsonString(value, valueLength, name, ARRAYSIZE(name))) return TRUE;
+    if (files->count == files->capacity) {
+        int capacity = files->capacity ? files->capacity * 2 : 64;
+        WCHAR **grown = files->names ? (WCHAR **)HeapReAlloc(GetProcessHeap(), 0, files->names, (size_t)capacity * sizeof *grown)
+                                     : (WCHAR **)Util_Alloc((size_t)capacity * sizeof *grown);
+        if (!grown) return files->ok = FALSE;
+        files->names = grown;
+        files->capacity = capacity;
+    }
+    if ((files->names[files->count] = (WCHAR *)Util_CopyBytes((const char *)name, (wcslen(name) + 1) * sizeof(WCHAR))) == NULL) return files->ok = FALSE;
+    files->count++;
+    return TRUE;
+}
+
+static void FreePickedFiles(PickedFiles *files)
+{
+    int i;
+    for (i = 0; i < files->count; i++) Util_Free(files->names[i]);
+    Util_Free(files->names);
+    ZeroMemory(files, sizeof *files);
+}
+
+/* The conversation files of the entries `pick` takes, from their maps;
+ * FALSE (every file taken) when one of them has none: an archive of an
+ * earlier version. */
+static BOOL GatherPickedFiles(const ZipIn *zip, const SessionPick *pick, PickedFiles *files)
+{
+    int i;
+    ZeroMemory(files, sizeof *files);
+    files->ok = TRUE;
+    for (i = 0; i < Zip_Count(zip) && files->ok; i++) {
+        WCHAR own[SESSION_ID_CCH], key[SESSION_ID_CCH];
+        char mapName[64];
+        DWORD length = 0;
+        char *entry, *map;
+        int at;
+        if (!EntryItem(zip, i)) continue;
+        entry = (char *)Zip_Read(zip, i, SESSION_ENTRY_MAX_BYTES, &length);
+        if (!entry || !EntryKey(entry, length, own, ARRAYSIZE(own), key, ARRAYSIZE(key)) || !Picked(pick, key)) {
+            Util_Free(entry);
+            continue;
+        }
+        Util_Free(entry);
+        if (FAILED(StringCchPrintfA(mapName, sizeof mapName, ARCHIVE_PARTS "%s", Zip_Name(zip, i) + sizeof ARCHIVE_ENTRIES - 1)) ||
+            (at = Zip_Find(zip, mapName)) < 0 || (map = (char *)Zip_Read(zip, at, SESSION_ENTRY_MAX_BYTES, &length)) == NULL) {
+            files->ok = FALSE;
+            break;
+        }
+        if (!Core_JsonEachElement(map, length, AddPickedFile, files)) files->ok = FALSE;
+        Util_Free(map);
+    }
+    if (!files->ok) FreePickedFiles(files);
+    return files->ok;
+}
+
+/* Whether archive name `name` is one of `files`, or under one of its folders. */
+static BOOL InPickedFiles(const PickedFiles *files, const char *name)
+{
+    WCHAR wide[ARCHIVE_NAME_MAX + 2];
+    int i;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, wide, ARRAYSIZE(wide)) <= 0) return FALSE;
+    for (i = 0; i < files->count; i++) {
+        size_t length = wcslen(files->names[i]);
+        if (length && files->names[i][length - 1] == L'/' ? _wcsnicmp(wide, files->names[i], length) == 0 : _wcsicmp(wide, files->names[i]) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* The conversation files of archive `zip` put under Claude Code's folder
+ * `root`, never over one there; only those of `files` when given; the count
+ * added. A failure is in `report`. */
+static int ExtractConversations(ZipIn *zip, const WCHAR *root, const PickedFiles *only, SyncReport *report)
+{
+    WCHAR path[LONG_PATH_CCH], relative[LONG_PATH_CCH];
+    int i, files = 0;
+    for (i = 0; i < Zip_Count(zip); i++) {
+        const char *name = Zip_Name(zip, i);
+        size_t length = strlen(name), prefix = sizeof ARCHIVE_FILES - 1, c;
         int wide;
-        if (!ItemNamed(item, ARCHIVE_FILES) || item->nameLength == prefix || item->name[item->nameLength - 1] == '/') continue;
-        if (!Core_ArchiveNameSafe(item->name + prefix, item->nameLength - prefix) ||
-            (wide = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, item->name + prefix, (int)(item->nameLength - prefix), relative,
+        if (!ItemNamed(name, ARCHIVE_FILES) || length == prefix || name[length - 1] == '/') continue;
+        if (only && !InPickedFiles(only, name)) continue;
+        if (!Core_ArchiveNameSafe(name + prefix, length - prefix) ||
+            (wide = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name + prefix, (int)(length - prefix), relative,
                                         ARRAYSIZE(relative) - 1)) <= 0) {
             StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"The archive is damaged."));
             report->failed++;
@@ -3104,52 +2833,107 @@ BOOL SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targe
             CannotWrite(report, path, GetLastError());
             continue;
         }
-        if (ZipExtract(&zip, item, path, report)) files++;
+        if (Zip_ExtractTo(zip, i, path, UTIL_PUT_NEW)) {
+            files++;
+        } else {
+            DWORD code = GetLastError();
+            if (code == ERROR_INVALID_DATA) {
+                StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"The archive is damaged."));
+                report->failed++;
+            } else if (code != ERROR_ALREADY_EXISTS && code != ERROR_FILE_EXISTS) {
+                CannotWrite(report, path, code);
+            }
+        }
     }
+    return files;
+}
+
+BOOL SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targets, int *sessions, SyncReport *report)
+{
+    return SessionSync_ImportPicked(set, archive, targets, NULL, sessions, report);
+}
+
+BOOL SessionSync_ImportPicked(const SessionSet *set, const WCHAR *archive, DWORD targets, const SessionPick *pick, int *sessions, SyncReport *report)
+{
+    WCHAR root[LONG_PATH_CCH];
+    ZipIn *zip;
+    Outbox box;
+    PickedFiles only;
+    DWORD takers;
+    BOOL mapped = FALSE;
+    int i, t, files, checked = 0;
+    *sessions = 0;
+    ZeroMemory(&box, sizeof box);
+    targets = ValidProfiles(set, targets);
+    takers = targets & SessionSync_Takers(set);
+    report->unavailable |= targets & ~takers;
+    ResultTargets(set, targets, takers, report);
+    if (!ClaudeCodeRoot(root, ARRAYSIZE(root))) {
+        StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"The path is too long."));
+        return FALSE;
+    }
+    if ((zip = Zip_Open(archive)) == NULL || !IsSessionArchive(zip)) {
+        if (zip || Util_QueryPath(archive, NULL) == PATH_PRESENT)
+            StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"This file is not a session archive of " APP_NAME L"."));
+        else
+            StringCchPrintfW(report->error, ARRAYSIZE(report->error), TR(L"%s could not be read (error %lu)."), archive, GetLastError());
+        Zip_Free(zip);
+        return FALSE;
+    }
+    if (!Zip_Validate(archive, NULL, &checked, report->error, ARRAYSIZE(report->error))) {
+        Zip_Free(zip);
+        return FALSE;
+    }
+    /* The conversations first: an entry is sent only once they are there; of some entries, only theirs. */
+    if (pick && pick->keys) mapped = GatherPickedFiles(zip, pick, &only);
+    files = ExtractConversations(zip, root, mapped ? &only : NULL, report);
+    if (mapped) FreePickedFiles(&only);
     /* A failed extraction must not leave entries pointing at conversations
      * which never arrived. Successfully extracted files can be reused on retry. */
     if (report->failed) {
-        ZipClose(&zip);
+        Zip_Free(zip);
         FreeOutbox(&box);
         return FALSE;
     }
-    for (i = 0; i < zip.count; i++) {
-        const ZipItem *item = &zip.items[i];
+    for (i = 0; i < Zip_Count(zip); i++) {
         WCHAR key[SESSION_ID_CCH], ownId[SESSION_ID_CCH];
+        DWORD length = 0;
         char *entry;
-        size_t length;
-        if (!ItemNamed(item, ARCHIVE_ENTRIES) || item->name[item->nameLength - 1] == '/') continue;
-        if ((entry = Keep(&box, ZipReadItem(&zip, item, SESSION_ENTRY_MAX_BYTES))) == NULL) {
+        if (!EntryItem(zip, i)) continue;
+        if ((entry = Keep(&box, (char *)Zip_Read(zip, i, SESSION_ENTRY_MAX_BYTES, &length))) == NULL) {
             StringCchCopyW(report->error, ARRAYSIZE(report->error), TR(L"The archive is damaged."));
             report->failed++;
             continue;
         }
-        length = item->size;
-        if (Core_SessionEntryKind(entry, length) != ENTRY_LOCAL || !MemberText(entry, length, "sessionId", ownId, ARRAYSIZE(ownId)) ||
-            !IsEntryId(ownId)) {
+        /* One that names its session as Claude never does would make the whole plan unwritable. */
+        if (!EntryKey(entry, length, ownId, ARRAYSIZE(ownId), key, ARRAYSIZE(key))) {
             report->failed++;
             continue;
         }
-        if (!MemberText(entry, length, "cliSessionId", key, ARRAYSIZE(key)) || !key[0]) StringCchCopyW(key, ARRAYSIZE(key), ownId);
+        if (!Picked(pick, key)) continue;
         (*sessions)++;
         for (t = 0; t < set->profiles.count; t++) {
             int there = (takers & (1u << t)) ? SessionStore_FindEntry(set, t, key, NULL) : -1;
+            const char *content;
+            size_t contentLength = 0;
             SyncOp op;
             if (!(takers & (1u << t))) continue;
             if (there >= 0 && set->entries[there].pendingRemove) {
                 ResultSkipped(set, t, report);
                 continue;
             }
-            MakeOp(&op, SYNC_PUT, SYNC_UNDELETE, key, MemberNumber(entry, length, "lastActivityAt"),
+            /* In a "no folder" area, the profile's own, as Share and Merge send it. */
+            content = ContentFor(&box, set, t, entry, length, &contentLength);
+            MakeOp(&op, SYNC_PUT, SYNC_UNDELETE, key, Core_JsonMemberNumber(entry, length, "lastActivityAt"),
                    there >= 0 ? set->entries[there].lastActivity : 0);
-            if (!AddSent(&box.sent[t], &op, entry, length)) {
-                ZipClose(&zip);
+            if (!AddSent(&box.sent[t], &op, content, contentLength)) {
+                Zip_Free(zip);
                 FreeOutbox(&box);
                 return OutOfMemory(report);
             }
         }
     }
-    ZipClose(&zip);
+    Zip_Free(zip);
     Send(&box, set, report);
     FreeOutbox(&box);
     Util_Log(L"%d session(s) imported from %s, %d conversation file(s) added", *sessions, archive, files);

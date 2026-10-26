@@ -29,27 +29,7 @@
 #define TRANSCRIPT_EXTENSION  L".jsonl"
 #define TOMBSTONE_PREFIX      L"deleted_"
 #define TAIL_BYTES            (256u * 1024u)   /* the end of a transcript, where Claude Code writes its title */
-#define UNIX_EPOCH_TICKS      116444736000000000ULL
-#define TICKS_PER_MILLISECOND (TICKS_PER_SECOND / 1000)
 #define HOUR_MS               (3600ULL * 1000ULL)
-
-static void Free(void *block)
-{
-    if (block) HeapFree(GetProcessHeap(), 0, block);
-}
-
-static ULONGLONG FileTimeMs(const FILETIME *time)
-{
-    ULONGLONG ticks = ((ULONGLONG)time->dwHighDateTime << 32) | time->dwLowDateTime;
-    return ticks > UNIX_EPOCH_TICKS ? (ticks - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND : 0;
-}
-
-static ULONGLONG NowMs(void)
-{
-    FILETIME now;
-    GetSystemTimeAsFileTime(&now);
-    return FileTimeMs(&now);
-}
 
 BOOL SessionPurge_CodeFolder(WCHAR *out, size_t cch)
 {
@@ -124,7 +104,7 @@ static void Describe(PurgeItem *item)
         }
         LineMember(line, size, "cwd", item->project, ARRAYSIZE(item->project));
     }
-    Free(tail);
+    Util_Free(tail);
     StringCchCopyW(item->title, ARRAYSIZE(item->title), custom[0] ? custom : summary[0] ? summary : prompt);
 }
 
@@ -151,7 +131,7 @@ int SessionPurge_List(const ProfileList *profiles, PurgeItem **items, WCHAR *err
     SessionSet set;
     VaultIds listed, deleted;
     ProfileList now = *profiles;
-    ULONGLONG recent = NowMs() - PURGE_RECENT_HOURS * HOUR_MS;
+    ULONGLONG recent = Util_NowMs() - PURGE_RECENT_HOURS * HOUR_MS;
     int count = 0, capacity = 0, i, p;
     BOOL complete = TRUE;
     *items = NULL;
@@ -182,7 +162,7 @@ int SessionPurge_List(const ProfileList *profiles, PurgeItem **items, WCHAR *err
             do {
                 WCHAR id[SESSION_ID_CCH];
                 size_t idLength = wcslen(file.cFileName) - (ARRAYSIZE(TRANSCRIPT_EXTENSION) - 1);
-                ULONGLONG written = FileTimeMs(&file.ftLastWriteTime), bytes = ((ULONGLONG)file.nFileSizeHigh << 32) | file.nFileSizeLow;
+                ULONGLONG written = Core_FileTimeMs(&file.ftLastWriteTime), bytes = ((ULONGLONG)file.nFileSizeHigh << 32) | file.nFileSizeLow;
                 PurgeItem *item;
                 BOOL outside = FALSE;
                 int at;
@@ -263,7 +243,7 @@ RemoveResult SessionPurge_Delete(HWND owner, const ProfileList *profiles, const 
     if (count <= 0) return REMOVE_DONE;
     if ((ids = (const WCHAR **)HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof *ids)) == NULL) return REMOVE_FAILED;
     if ((lock = Util_SyncLock()) == NULL) {
-        Free((void *)ids);
+        Util_Free((void *)ids);
         return REMOVE_FAILED;
     }
     /* The dialog can stay open while a session is restored or synced. Read
@@ -285,7 +265,7 @@ RemoveResult SessionPurge_Delete(HWND owner, const ProfileList *profiles, const 
         BOOL pending = FALSE;
         for (k = 0; k < queued; k++)
             if (ops[k].kind == SYNC_PUT) pending = TRUE;
-        Free(ops);
+        Util_Free(ops);
         /* A queued entry can name earlier transcripts as well as its key.
          * Wait for it to be applied before authorizing any cleanup. */
         if (queued < 0 || pending) {
@@ -340,9 +320,9 @@ done:
     SessionVault_FreeIds(&listed);
     SessionVault_FreeIds(&marks);
     Util_SyncUnlock(lock);
-    Free(paths);
-    Free((void *)list);
-    Free((void *)ids);
+    Util_Free(paths);
+    Util_Free((void *)list);
+    Util_Free((void *)ids);
     return result;
 }
 

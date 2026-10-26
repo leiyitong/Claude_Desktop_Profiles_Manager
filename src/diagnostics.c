@@ -2,7 +2,6 @@
  * paths, URLs and log bodies never enter the text copied for sharing. */
 #include "app.h"
 #include "resource.h"
-#include "profiletools.h"
 #include <shellapi.h>
 
 typedef struct TextReview {
@@ -71,7 +70,7 @@ BOOL Diagnostics_Text(const ClaudePackage *pkg, const ProfileList *profiles, WCH
 {
     WCHAR line[256];
     int i;
-    if (FAILED(StringCchPrintfW(out, cch, TR(L"Claude Desktop Profiles Manager %s\r\nClaude Desktop: %s\r\nProfiles: %d\r\n"),
+    if (FAILED(StringCchPrintfW(out, cch, TR(L"Claude Delta %s\r\nClaude Desktop: %s\r\nProfiles: %d\r\n"),
                                 L"" APP_VERSION_DATE, pkg->found ? pkg->version : TR(L"Not found"), profiles->count)))
         return FALSE;
     for (i = 0; i < profiles->count; i++) {
@@ -91,9 +90,8 @@ void Diagnostics_Show(HWND owner)
     Profiles_Load(&profiles, &pkg);
     Claude_UpdateRunning(&profiles);
     if (!Diagnostics_Text(&pkg, &profiles, text, ARRAYSIZE(text))) return;
-    if (Ui_ReviewText(owner, TR(L"Diagnostics"),
-                  TR(L"Only versions and profile status are included. Account names, paths, links and log contents are omitted."), text, TR(L"Local profile tools\x2026")))
-        Gui_ProfileTools(owner, &profiles, NULL);
+    Ui_ReviewText(owner, TR(L"Diagnostics"),
+                  TR(L"Only versions and profile status are included. Account names, paths, links and log contents are omitted."), text, NULL);
 }
 
 void Diagnostics_OpenLogs(HWND owner)

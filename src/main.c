@@ -1,6 +1,7 @@
 /* Command-line dispatch: the roles are listed at the top of app.h. */
 #include "app.h"
 #include <objbase.h>
+#include <ole2.h>
 #include <shellapi.h>
 
 /* Kernel32 only: this decides the DLL search order, so it runs before
@@ -56,7 +57,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR cmdLine, int s
     /* The watcher shows no window of its own: it skips the theme. */
     if (!Core_EqualsI(command, L"--watch")) Theme_Init();
     if (Core_EqualsI(command, L"--launch") && argument) {
-        rc = Launcher_Run(argument);
+        rc = Launcher_Run(argument, argc >= 4 ? argv[3] : NULL);
     } else if (Core_EqualsI(command, L"--url")) {
         rc = Router_Run(argument ? argument : L"");
     } else if (Core_EqualsI(command, L"--install")) {
@@ -77,7 +78,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR cmdLine, int s
         Util_Log(needsFolder ? L"ignored %s without its folder" : L"ignored unknown option %s", command);
         rc = 1;
     } else {
+        /* Profiles dragged out of the list (dragout.c): OLE's drag and drop
+         * fails at once (CO_E_NOTINITIALIZED) on a thread with COM alone. */
+        HRESULT ole = OleInitialize(NULL);
+        if (FAILED(ole)) Util_Log(L"OLE could not be initialized (0x%08lX): profiles cannot be dragged out", (unsigned long)ole);
         rc = Gui_Run(GUI_MANAGER);
+        if (SUCCEEDED(ole)) OleUninitialize();
     }
 
     LocalFree(argv);

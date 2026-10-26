@@ -20,14 +20,13 @@
 #include <stdarg.h>
 
 /* `path` without the \\?\ (or \\?\UNC\) that GetFinalPathNameByHandle puts before it. */
-static void PlainPath(WCHAR *path, size_t cch)
+static void PlainPath(WCHAR *path)
 {
     if (wcsncmp(path, L"\\\\?\\UNC\\", 8) == 0) {
         memmove(path + 2, path + 8, (wcslen(path + 8) + 1) * sizeof(WCHAR));
     } else if (wcsncmp(path, L"\\\\?\\", 4) == 0) {
         memmove(path, path + 4, (wcslen(path + 4) + 1) * sizeof(WCHAR));
     }
-    (void)cch;
 }
 
 /* The folder `path` leads to, links followed; FALSE when it cannot be opened. */
@@ -42,7 +41,7 @@ static BOOL FinalPath(const WCHAR *path, WCHAR *out, size_t cch)
     length = GetFinalPathNameByHandleW(dir, out, (DWORD)cch, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     CloseHandle(dir);
     if (!length || length >= cch) return FALSE;
-    PlainPath(out, cch);
+    PlainPath(out);
     return TRUE;
 }
 
@@ -118,25 +117,93 @@ static void RunningProfile(const WCHAR *dataDir, const ClaudePackage *pkg, Profi
         Profiles_ResolveStorage(p, NULL, NULL);
 }
 
+/* Within a batch of writes (SessionLink_BeginBatch), each profile's entries
+ * folder is resolved once: resolving reads its config.json and lists its
+ * entries, and SessionLink_Busy is asked before and after every write. */
+typedef struct LinkCacheItem {
+    WCHAR dataDir[MAX_PATH];
+    BOOL  ok;
+    WCHAR final[LONG_PATH_CCH];
+} LinkCacheItem;
+typedef struct LinkCache {
+    int           depth, count;
+    BOOL          packageRead;
+    ClaudePackage pkg;
+    LinkCacheItem items[2 * MAX_PROFILES];
+} LinkCache;
+static __declspec(thread) LinkCache *g_cache;
+
+void SessionLink_BeginBatch(void)
+{
+    if (g_cache) {
+        g_cache->depth++;
+        return;
+    }
+    if ((g_cache = (LinkCache *)Util_Alloc(sizeof *g_cache)) != NULL) {
+        ZeroMemory(g_cache, sizeof *g_cache);
+        g_cache->depth = 1;
+    }
+}
+
+void SessionLink_EndBatch(void)
+{
+    if (g_cache && --g_cache->depth == 0) {
+        Util_Free(g_cache);
+        g_cache = NULL;
+    }
+}
+
+/* Where the entries folder of `p` leads (EntriesFolders), from the batch's cache when there is one. */
+static BOOL FinalEntries(const Profile *p, WCHAR *final, size_t cch)
+{
+    WCHAR dir[LONG_PATH_CCH];
+    BOOL ok;
+    int i;
+    for (i = 0; g_cache && i < g_cache->count; i++)
+        if (Core_PathEquals(g_cache->items[i].dataDir, p->dataDir))
+            return g_cache->items[i].ok && SUCCEEDED(StringCchCopyW(final, cch, g_cache->items[i].final));
+    ok = EntriesFolders(p, dir, ARRAYSIZE(dir), final, cch, NULL);
+    if (g_cache && g_cache->count < (int)ARRAYSIZE(g_cache->items)) {
+        LinkCacheItem *item = &g_cache->items[g_cache->count++];
+        StringCchCopyW(item->dataDir, ARRAYSIZE(item->dataDir), p->dataDir);
+        item->ok = ok && SUCCEEDED(StringCchCopyW(item->final, ARRAYSIZE(item->final), final));
+    }
+    return ok;
+}
+
+/* A running Chromium's data folder is a Claude profile's: directly in
+ * %APPDATA% and named as one (rule 3), or the stock folder Claude moved. */
+static BOOL ClaudeFolder(const WCHAR *title, const ClaudePackage *pkg)
+{
+    WCHAR appData[MAX_PATH], local[MAX_PATH], moved[MAX_PATH];
+    const WCHAR *leaf = wcsrchr(title, L'\\');
+    if (leaf && Util_AppData(appData, ARRAYSIZE(appData)) && (size_t)(leaf - title) == Core_TrimmedPathLength(appData) &&
+        CompareStringOrdinal(title, (int)(leaf - title), appData, (int)(leaf - title), TRUE) == CSTR_EQUAL && (Core_EqualsI(leaf + 1, STOCK_FOLDER) || Core_IsProfileFolder(leaf + 1)))
+        return TRUE;
+    return pkg->found && Util_LocalAppData(local, ARRAYSIZE(local)) && Core_MovedStockDir(local, pkg->family, moved, ARRAYSIZE(moved)) &&
+           Core_PathEquals(title, moved);
+}
+
 BOOL SessionLink_Busy(const Profile *p)
 {
-    WCHAR dir[LONG_PATH_CCH], mine[LONG_PATH_CCH], title[MAX_PATH], theirs[LONG_PATH_CCH], theirDir[LONG_PATH_CCH];
-    ClaudePackage pkg;
+    WCHAR mine[LONG_PATH_CCH], title[MAX_PATH], theirs[LONG_PATH_CCH];
+    ClaudePackage own, *pkg = g_cache ? &g_cache->pkg : &own;
+    BOOL *packageRead = g_cache ? &g_cache->packageRead : NULL, read = FALSE;
     HWND window = NULL;
-    BOOL packageRead = FALSE;
+    if (!packageRead) packageRead = &read;
     if (Claude_IsRunning(p)) return TRUE;
-    if (!EntriesFolders(p, dir, ARRAYSIZE(dir), mine, ARRAYSIZE(mine), NULL)) return FALSE;
+    if (!FinalEntries(p, mine, ARRAYSIZE(mine))) return FALSE;
     /* Another running Claude whose entries folder is this one, through a link either way. */
-    while ((window = FindWindowExW(HWND_MESSAGE, window, L"Chrome_MessageWindow", NULL)) != NULL) {
+    while ((window = Claude_NextInstanceWindow(window, title, ARRAYSIZE(title))) != NULL) {
         Profile running;
-        if (GetWindowTextW(window, title, ARRAYSIZE(title)) <= 0 || Core_PathEquals(title, p->dataDir)) continue;
-        if (!packageRead) {
-            Claude_FindPackage(&pkg);
-            packageRead = TRUE;
+        if (Core_PathEquals(title, p->dataDir)) continue;
+        if (!*packageRead) {
+            Claude_FindPackage(pkg);
+            *packageRead = TRUE;
         }
-        RunningProfile(title, &pkg, &running);
-        if (EntriesFolders(&running, theirDir, ARRAYSIZE(theirDir), theirs, ARRAYSIZE(theirs), NULL) && Core_PathEquals(theirs, mine))
-            return TRUE;
+        if (!ClaudeFolder(title, pkg)) continue;
+        RunningProfile(title, pkg, &running);
+        if (FinalEntries(&running, theirs, ARRAYSIZE(theirs)) && Core_PathEquals(theirs, mine)) return TRUE;
     }
     return FALSE;
 }
@@ -152,8 +219,8 @@ static void Fail(WCHAR *error, size_t cch, const WCHAR *format, ...)
 BOOL SessionLink_Remove(const ProfileList *list, int index, WCHAR *error, size_t errorCch)
 {
     const Profile *p = &list->items[index];
-    WCHAR dir[LONG_PATH_CCH], final[LONG_PATH_CCH], extended[LONG_PATH_CCH];
-    DWORD code = 0;
+    WCHAR dir[LONG_PATH_CCH], final[LONG_PATH_CCH], extended[LONG_PATH_CCH], copy[LONG_PATH_CCH], extendedCopy[LONG_PATH_CCH];
+    DWORD code = 0, ignored;
     BOOL signedIn = FALSE, reachable;
     error[0] = 0;
     if (!SessionStore_EntriesDir(p, dir, ARRAYSIZE(dir), &signedIn) || !IsLink(dir)) {
@@ -165,14 +232,29 @@ BOOL SessionLink_Remove(const ProfileList *list, int index, WCHAR *error, size_t
         return FALSE;
     }
     reachable = FinalPath(dir, final, ARRAYSIZE(final));
-    if (!Util_ExtendedPath(dir, extended, ARRAYSIZE(extended)) || !RemoveDirectoryW(extended)) {
-        Fail(error, errorCch, TR(L"%s could not be removed (error %lu)."), dir, GetLastError());
+    /* A folder of its own again, with the sessions it listed while linked:
+     * copied beside the link first, which goes only once they all are. */
+    if (FAILED(StringCchPrintfW(copy, ARRAYSIZE(copy), L"%s" UTIL_TEMPORARY_SUFFIX, dir)) || !Util_ExtendedPath(dir, extended, ARRAYSIZE(extended)) ||
+        !Util_ExtendedPath(copy, extendedCopy, ARRAYSIZE(extendedCopy))) {
+        Fail(error, errorCch, TR(L"The path is too long."));
         return FALSE;
     }
-    /* A folder of its own again, with the sessions it listed while linked. */
-    if (!Util_EnsureDir(dir) || (reachable && !Util_CopyTree(final, dir, FALSE, &code))) {
+    Util_DeleteTree(copy, &ignored);   /* left by a try that stopped */
+    if (!Util_EnsureDir(copy) || (reachable && !Util_CopyTree(final, copy, FALSE, &code))) {
         Fail(error, errorCch, TR(L"The sessions could not be copied back from %s (error %lu)."), reachable ? final : dir,
              code ? code : GetLastError());
+        Util_DeleteTree(copy, &ignored);
+        return FALSE;
+    }
+    if (!RemoveDirectoryW(extended)) {
+        Fail(error, errorCch, TR(L"%s could not be removed (error %lu)."), dir, GetLastError());
+        Util_DeleteTree(copy, &ignored);
+        return FALSE;
+    }
+    if (!MoveFileExW(extendedCopy, extended, 0)) {
+        code = GetLastError();
+        Fail(error, errorCch, TR(L"The sessions are in %s, which could not be moved to %s (error %lu)."), copy, dir, code);
+        Util_Log(L"session folder of %s: the link is gone, the sessions are in %s (error %lu)", p->folder, copy, code);
         return FALSE;
     }
     Util_Log(L"session folder of %s unlinked from %s", p->folder, reachable ? final : L"a folder that is gone");

@@ -34,7 +34,6 @@
 #define TRANSCRIPT_EXTENSION        L".jsonl"
 #define TRANSCRIPT_EXTENSION_LENGTH (ARRAYSIZE(TRANSCRIPT_EXTENSION) - 1)
 #define LOCAL_ID_PREFIX             L"local_"   /* an entry's own id: local_<uuid> */
-#define FIRST_CAPACITY              64    /* items a growing array starts with */
 #define INDEX_FIRST_SLOTS           128   /* the row index, kept at most half full, starts with these */
 #define TITLE_SOURCE_CCH            16    /* "user" or "auto" */
 #define START_TIME_CCH              32    /* a FILETIME in decimal */
@@ -82,35 +81,13 @@ static BOOL Cancelled(HANDLE cancel)
     return cancel && WaitForSingleObject(cancel, 0) == WAIT_OBJECT_0;
 }
 
-static void *Grow(void *items, int *capacity, int need, size_t size)
-{
-    void *bigger;
-    int n;
-    if (need <= *capacity) return items;
-    n = *capacity ? *capacity * 2 : FIRST_CAPACITY;
-    while (n < need) n *= 2;
-    bigger = items ? HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, items, (size_t)n * size)
-                   : HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)n * size);
-    if (!bigger) return NULL;
-    *capacity = n;
-    return bigger;
-}
-
-static BOOL MemberString(const char *json, size_t length, const char *key, WCHAR *out, size_t cch)
-{
-    const char *value;
-    size_t valueLength;
-    out[0] = 0;
-    return Core_JsonMember(json, length, key, &value, &valueLength) && Core_JsonString(value, valueLength, out, cch);
-}
-
 /* A text to show: a value longer than `out` keeps its beginning. */
 static void MemberText(const char *json, size_t length, const char *key, WCHAR *out, size_t cch)
 {
     const char *value;
     size_t valueLength, keep;
     WCHAR *whole;
-    if (MemberString(json, length, key, out, cch) || !Core_JsonMember(json, length, key, &value, &valueLength)) return;
+    if (Core_JsonMemberString(json, length, key, out, cch) || !Core_JsonMember(json, length, key, &value, &valueLength)) return;
     /* A JSON string decodes to at most one character per byte. */
     whole = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (valueLength + 1) * sizeof(WCHAR));
     if (whole && Core_JsonString(value, valueLength, whole, valueLength + 1)) {
@@ -119,22 +96,6 @@ static void MemberText(const char *json, size_t length, const char *key, WCHAR *
         StringCchCopyNW(out, cch, whole, keep);
     }
     if (whole) HeapFree(GetProcessHeap(), 0, whole);
-}
-
-static BOOL MemberTrue(const char *json, size_t length, const char *key)
-{
-    const char *value;
-    size_t valueLength;
-    return Core_JsonMember(json, length, key, &value, &valueLength) && Core_JsonTrue(value, valueLength);
-}
-
-static ULONGLONG MemberNumber(const char *json, size_t length, const char *key)
-{
-    const char *value;
-    size_t valueLength;
-    ULONGLONG number = 0;
-    if (Core_JsonMember(json, length, key, &value, &valueLength)) Core_JsonNumber(value, valueLength, &number);
-    return number;
 }
 
 /* The next string of the JSON array `raw` (as Core_JsonMember gives it),
@@ -221,7 +182,7 @@ static BOOL LoadTranscripts(Transcripts *transcripts, HANDLE cancel)
             if ((file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !Core_EndsWithI(file.cFileName, TRANSCRIPT_EXTENSION)) continue;
             idLength = wcslen(file.cFileName) - TRANSCRIPT_EXTENSION_LENGTH;
             if (idLength == 0 || idLength >= SESSION_ID_CCH) continue;
-            grown = (Transcript *)Grow(transcripts->items, &transcripts->capacity, transcripts->count + 1, sizeof *transcripts->items);
+            grown = (Transcript *)Util_Grow(transcripts->items, &transcripts->capacity, transcripts->count + 1, sizeof *transcripts->items);
             if (!grown) {
                 enough = FALSE;
                 break;
@@ -366,7 +327,7 @@ static BOOL EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn,
     }
     if (SUCCEEDED(StringCchPrintfW(config, ARRAYSIZE(config), L"%s\\" CLAUDE_APP_SETTINGS, p->storageDir)) &&
         (json = Util_ReadFile(config, SESSION_ENTRY_MAX_BYTES, FALSE, &length)) != NULL) {
-        MemberString(json, length, "lastKnownAccountUuid", account, ARRAYSIZE(account));
+        Core_JsonMemberString(json, length, "lastKnownAccountUuid", account, ARRAYSIZE(account));
         HeapFree(GetProcessHeap(), 0, json);
     } else if (Util_QueryPath(config, NULL) != PATH_MISSING) {
         *complete = FALSE;
@@ -475,7 +436,7 @@ static BOOL AddOtherTranscript(SessionSet *set, SessionEntry *entry, const WCHAR
     if (!Core_IsUuid(id) || Core_EqualsI(id, own)) return TRUE;
     for (i = 0; i < entry->otherTranscriptCount; i++)
         if (Core_EqualsI(set->otherTranscriptIds[entry->firstOtherTranscript + i], id)) return TRUE;
-    grown = (WCHAR (*)[SESSION_ID_CCH])Grow(set->otherTranscriptIds, &set->otherTranscriptCapacity, set->otherTranscriptCount + 1,
+    grown = (WCHAR (*)[SESSION_ID_CCH])Util_Grow(set->otherTranscriptIds, &set->otherTranscriptCapacity, set->otherTranscriptCount + 1,
                                             sizeof *set->otherTranscriptIds);
     if (!grown) return FALSE;
     set->otherTranscriptIds = grown;
@@ -484,43 +445,157 @@ static BOOL AddOtherTranscript(SessionSet *set, SessionEntry *entry, const WCHAR
     return TRUE;
 }
 
+/* What AddEntry takes from one entry file, read once (an entry is about
+ * 10 KB of JSON). One block: this, then its text: the ENTRY_STRINGS strings
+ * of EntryStrings one after another, then the ids of the session's other
+ * transcripts and, when the entry lists them, its previous titles, each a
+ * MULTI_SZ. */
+typedef struct EntryRead {
+    SessionEntryKind kind;
+    BOOL      userTitle, autoTitle, starred, archived, damaged;
+    BOOL      previousTitles;          /* listed: the text ends with them */
+    ULONGLONG lastActivity, created;
+    DWORD     environment;
+    PullRequestState pullRequest;
+    int       pullRequestNumber;
+    SessionResult result;
+    size_t    bytes;                   /* the whole block's */
+} EntryRead;
+
+/* Where an entry says its session goes on, besides its SessionEntry. */
+typedef struct EntryPlace {
+    WCHAR cliSessionId[SESSION_ID_CCH], cwd[MAX_PATH], originCwd[MAX_PATH];
+} EntryPlace;
+
+#define ENTRY_STRINGS 9
+
+static WCHAR *EntryText(const EntryRead *read)
+{
+    return (WCHAR *)(read + 1);
+}
+
+/* An entry's strings, in the order an EntryRead's text holds them. */
+static void EntryStrings(SessionEntry *entry, EntryPlace *place, WCHAR *text[ENTRY_STRINGS], size_t cch[ENTRY_STRINGS])
+{
+    text[0] = entry->localId;        cch[0] = ARRAYSIZE(entry->localId);
+    text[1] = entry->title;          cch[1] = ARRAYSIZE(entry->title);
+    text[2] = entry->model;          cch[2] = ARRAYSIZE(entry->model);
+    text[3] = entry->effort;         cch[3] = ARRAYSIZE(entry->effort);
+    text[4] = entry->permissionMode; cch[4] = ARRAYSIZE(entry->permissionMode);
+    text[5] = entry->resultDetail;   cch[5] = ARRAYSIZE(entry->resultDetail);
+    text[6] = place->cliSessionId;   cch[6] = ARRAYSIZE(place->cliSessionId);
+    text[7] = place->cwd;            cch[7] = ARRAYSIZE(place->cwd);
+    text[8] = place->originCwd;      cch[8] = ARRAYSIZE(place->originCwd);
+}
+
+/* Puts `text` and its zero at `out` when not NULL; their length. */
+static size_t PutText(WCHAR *out, const WCHAR *text)
+{
+    size_t length = wcslen(text) + 1;
+    if (out) memcpy(out, text, length * sizeof(WCHAR));
+    return length;
+}
+
+static size_t MultiLength(const WCHAR *list)
+{
+    const WCHAR *at = list;
+    while (*at) at += wcslen(at) + 1;
+    return (size_t)(at - list) + 1;
+}
+
 /* The session's other transcripts, as Claude counts them: those it went on
  * from (priorCliSessionIds), the one before a /clear and one it took up
- * again when the session left the archive. Only UUIDs other than `own`
- * (the session's transcript): they name files. */
-static BOOL AddOtherTranscripts(SessionSet *set, SessionEntry *entry, const char *json, size_t length, const WCHAR *own)
+ * again when the session left the archive. Only UUIDs: they name files. A
+ * MULTI_SZ, put at `out` when not NULL; its length, its last zero counted. */
+static size_t OtherTranscriptIds(const char *json, size_t length, WCHAR *out)
 {
     static const char *const singleIds[] = { "preClearCliSessionId", "unarchivedCliSessionId" };
     WCHAR id[SESSION_ID_CCH];
     const char *value;
-    size_t valueLength, at = 0;
+    size_t valueLength, at = 0, used = 0;
     int i;
-    entry->firstOtherTranscript = set->otherTranscriptCount;
-    entry->otherTranscriptCount = 0;
     for (i = 0; i < (int)ARRAYSIZE(singleIds); i++)
-        if (MemberString(json, length, singleIds[i], id, ARRAYSIZE(id)) && !AddOtherTranscript(set, entry, id, own)) return FALSE;
+        if (Core_JsonMemberString(json, length, singleIds[i], id, ARRAYSIZE(id)) && Core_IsUuid(id)) used += PutText(out ? out + used : NULL, id);
     if (Core_JsonMember(json, length, "priorCliSessionIds", &value, &valueLength))
         while (NextArrayString(value, valueLength, &at, id, ARRAYSIZE(id)))
-            if (!AddOtherTranscript(set, entry, id, own)) return FALSE;
-    return TRUE;
+            if (Core_IsUuid(id)) used += PutText(out ? out + used : NULL, id);
+    if (out) out[used] = 0;
+    return used + 1;
+}
+
+/* What one entry file's JSON says (Util_Free); NULL without memory. */
+static EntryRead *ReadEntry(const char *json, size_t length)
+{
+    SessionEntry entry;
+    EntryPlace place;
+    EntryRead head, *read;
+    WCHAR titleSource[TITLE_SOURCE_CCH], *text[ENTRY_STRINGS], *titles = NULL, *at;
+    size_t cch[ENTRY_STRINGS], strings = 0, ids = 1, titlesLength = 0, valueLength;
+    const char *value;
+    int i;
+    ZeroMemory(&entry, sizeof entry);
+    ZeroMemory(&place, sizeof place);
+    ZeroMemory(&head, sizeof head);
+    titleSource[0] = 0;
+    head.kind = Core_SessionEntryKind(json, length);
+    if (head.kind == ENTRY_LOCAL) {
+        if (!Core_JsonMemberString(json, length, "sessionId", entry.localId, ARRAYSIZE(entry.localId))) entry.localId[0] = 0;
+        MemberText(json, length, "title", entry.title, ARRAYSIZE(entry.title));
+        Core_JsonMemberString(json, length, "titleSource", titleSource, ARRAYSIZE(titleSource));
+        head.userTitle = entry.title[0] && Core_EqualsI(titleSource, L"user");
+        head.autoTitle = entry.title[0] && Core_EqualsI(titleSource, L"auto");
+        head.starred = Core_JsonMemberTrue(json, length, "isStarred");
+        head.archived = Core_JsonMemberTrue(json, length, "isArchived");
+        head.damaged = Core_JsonMemberTrue(json, length, "transcriptUnavailable");
+        head.lastActivity = Core_JsonMemberNumber(json, length, "lastActivityAt");
+        head.created = Core_JsonMemberNumber(json, length, "createdAt");
+        head.environment = Core_SessionEnvironment(json, length);
+        head.pullRequest = Core_SessionPullRequest(json, length, &head.pullRequestNumber);
+        head.result = Core_SessionResult(json, length, entry.resultDetail, ARRAYSIZE(entry.resultDetail));
+        Core_JsonMemberString(json, length, "model", entry.model, ARRAYSIZE(entry.model));
+        Core_JsonMemberString(json, length, "effort", entry.effort, ARRAYSIZE(entry.effort));
+        Core_JsonMemberString(json, length, "permissionMode", entry.permissionMode, ARRAYSIZE(entry.permissionMode));
+        Core_JsonMemberString(json, length, "cliSessionId", place.cliSessionId, ARRAYSIZE(place.cliSessionId));
+        Core_JsonMemberString(json, length, "cwd", place.cwd, ARRAYSIZE(place.cwd));
+        Core_JsonMemberString(json, length, "originCwd", place.originCwd, ARRAYSIZE(place.originCwd));
+        ids = OtherTranscriptIds(json, length, NULL);
+        if (Core_JsonMember(json, length, "previousTitles", &value, &valueLength) && (titles = Core_JsonStringList(value, valueLength)) != NULL)
+            titlesLength = MultiLength(titles);
+    }
+    head.previousTitles = titles != NULL;
+    EntryStrings(&entry, &place, text, cch);
+    for (i = 0; i < ENTRY_STRINGS; i++) strings += wcslen(text[i]) + 1;
+    head.bytes = sizeof head + (strings + ids + titlesLength) * sizeof(WCHAR);
+    if ((read = (EntryRead *)Util_Alloc(head.bytes)) != NULL) {
+        *read = head;
+        at = EntryText(read);
+        for (i = 0; i < ENTRY_STRINGS; i++) at += PutText(at, text[i]);
+        if (head.kind == ENTRY_LOCAL) OtherTranscriptIds(json, length, at);
+        at += ids;
+        if (titles) memcpy(at, titles, titlesLength * sizeof(WCHAR));
+    }
+    if (titles) HeapFree(GetProcessHeap(), 0, titles);
+    return read;
 }
 
 /* Adds an entry of profile `profile` to the row of its session, made when it
  * is the session's first. */
-static EntryOutcome AddEntry(SessionSet *set, int profile, const WCHAR *file, const char *json, size_t length,
-                             const Transcripts *transcripts)
+static EntryOutcome AddEntry(SessionSet *set, int profile, const WCHAR *file, const EntryRead *read, const Transcripts *transcripts)
 {
     SessionEntry entry;
-    WCHAR cliSessionId[SESSION_ID_CCH], titleSource[TITLE_SOURCE_CCH], cwd[MAX_PATH], originCwd[MAX_PATH];
-    const WCHAR *key;
+    EntryPlace place;
+    WCHAR *text[ENTRY_STRINGS];
+    size_t cch[ENTRY_STRINGS];
+    const WCHAR *at, *key, *cwd;
     SessionEntry *entries;
     SessionRow *rows;
-    int row, added, listed;
+    int row, added, listed, i;
 
     ZeroMemory(&entry, sizeof entry);
+    ZeroMemory(&place, sizeof place);
     /* A session run over SSH, in WSL or moved to the cloud keeps its
      * conversation elsewhere: only this PC's sessions are listed. */
-    switch (Core_SessionEntryKind(json, length)) {
+    switch (read->kind) {
     case ENTRY_ELSEWHERE:
         set->source[profile].elsewhere++;
         return ENTRY_COUNTED;
@@ -530,41 +605,41 @@ static EntryOutcome AddEntry(SessionSet *set, int profile, const WCHAR *file, co
     case ENTRY_LOCAL:
         break;
     }
-    if (!MemberString(json, length, "sessionId", entry.localId, ARRAYSIZE(entry.localId)) || !entry.localId[0]) {
+    EntryStrings(&entry, &place, text, cch);
+    for (at = EntryText(read), i = 0; i < ENTRY_STRINGS; at += wcslen(at) + 1, i++) StringCchCopyW(text[i], cch[i], at);
+    if (!entry.localId[0]) {
         set->source[profile].unreadable++;
         return ENTRY_BROKEN;
     }
     StringCchCopyW(entry.file, ARRAYSIZE(entry.file), file);
-    MemberText(json, length, "title", entry.title, ARRAYSIZE(entry.title));
-    MemberString(json, length, "titleSource", titleSource, ARRAYSIZE(titleSource));
-    entry.userTitle = entry.title[0] && Core_EqualsI(titleSource, L"user");
-    entry.autoTitle = entry.title[0] && Core_EqualsI(titleSource, L"auto");
-    entry.starred = MemberTrue(json, length, "isStarred");
-    entry.archived = MemberTrue(json, length, "isArchived");
-    entry.damaged = MemberTrue(json, length, "transcriptUnavailable");
-    entry.lastActivity = MemberNumber(json, length, "lastActivityAt");
-    entry.created = MemberNumber(json, length, "createdAt");
-    entry.environment = Core_SessionEnvironment(json, length);
-    entry.pullRequest = Core_SessionPullRequest(json, length, &entry.pullRequestNumber);
-    entry.result = Core_SessionResult(json, length, entry.resultDetail, ARRAYSIZE(entry.resultDetail));
-    MemberString(json, length, "model", entry.model, ARRAYSIZE(entry.model));
-    MemberString(json, length, "effort", entry.effort, ARRAYSIZE(entry.effort));
-    MemberString(json, length, "permissionMode", entry.permissionMode, ARRAYSIZE(entry.permissionMode));
+    entry.userTitle = read->userTitle;
+    entry.autoTitle = read->autoTitle;
+    entry.starred = read->starred;
+    entry.archived = read->archived;
+    entry.damaged = read->damaged;
+    entry.lastActivity = read->lastActivity;
+    entry.created = read->created;
+    entry.environment = read->environment;
+    entry.pullRequest = read->pullRequest;
+    entry.pullRequestNumber = read->pullRequestNumber;
+    entry.result = read->result;
     entry.pendingStar = -1;
+    entry.pendingUnread = -1;
     entry.duplicate = -1;
-    MemberString(json, length, "cliSessionId", cliSessionId, ARRAYSIZE(cliSessionId));
-    MemberString(json, length, "cwd", cwd, ARRAYSIZE(cwd));
-    MemberString(json, length, "originCwd", originCwd, ARRAYSIZE(originCwd));
-    key = cliSessionId[0] ? cliSessionId : entry.localId;
-    if (!AddOtherTranscripts(set, &entry, json, length, key)) return ENTRY_NO_MEMORY;
+    key = place.cliSessionId[0] ? place.cliSessionId : entry.localId;
+    cwd = place.originCwd[0] ? place.originCwd : place.cwd;
+    entry.firstOtherTranscript = set->otherTranscriptCount;
+    for (; *at; at += wcslen(at) + 1)
+        if (!AddOtherTranscript(set, &entry, at, key)) return ENTRY_NO_MEMORY;
+    at++;
 
-    entries = (SessionEntry *)Grow(set->entries, &set->entryCap, set->entryCount + 1, sizeof *set->entries);
+    entries = (SessionEntry *)Util_Grow(set->entries, &set->entryCap, set->entryCount + 1, sizeof *set->entries);
     if (!entries) return ENTRY_NO_MEMORY;
     set->entries = entries;
     row = SessionStore_FindRow(set, key);
     if (row < 0) {
-        const Transcript *transcript = cliSessionId[0] ? FindTranscript(transcripts, cliSessionId) : NULL;
-        rows = (SessionRow *)Grow(set->rows, &set->rowCap, set->rowCount + 1, sizeof *set->rows);
+        const Transcript *transcript = place.cliSessionId[0] ? FindTranscript(transcripts, place.cliSessionId) : NULL;
+        rows = (SessionRow *)Util_Grow(set->rows, &set->rowCap, set->rowCount + 1, sizeof *set->rows);
         if (!rows) return ENTRY_NO_MEMORY;
         set->rows = rows;
         row = set->rowCount++;
@@ -589,18 +664,16 @@ static EntryOutcome AddEntry(SessionSet *set, int profile, const WCHAR *file, co
         entry.duplicate = set->entries[listed].duplicate;
         set->entries[listed].duplicate = added;
     }
-    {
-        const char *titles;
-        size_t titlesLength;
-        if (Core_JsonMember(json, length, "previousTitles", &titles, &titlesLength))
-            entry.previousTitles = Core_JsonStringList(titles, titlesLength);
+    if (read->previousTitles) {
+        size_t bytes = MultiLength(at) * sizeof(WCHAR);
+        if ((entry.previousTitles = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, bytes)) != NULL) memcpy(entry.previousTitles, at, bytes);
     }
     set->entries[added] = entry;
     /* The folder of the latest entry: after Claude Code moved a session to
      * another folder, that is where it goes on. */
     if (entry.lastActivity >= set->rows[row].lastActivity) {
         set->rows[row].lastActivity = entry.lastActivity;
-        StringCchCopyW(set->rows[row].cwd, ARRAYSIZE(set->rows[row].cwd), originCwd[0] ? originCwd : cwd);
+        StringCchCopyW(set->rows[row].cwd, ARRAYSIZE(set->rows[row].cwd), cwd);
     }
     return ENTRY_LISTED;
 }
@@ -658,6 +731,107 @@ static void LogSource(const Profile *p, const SessionSource *source)
              environment ? L"; Claude Code variables set in Claude's settings (a CLAUDE_CONFIG_DIR there is not followed)" : L"");
 }
 
+/* The entries read, by file, while the file keeps its size and last write
+ * time as the folder lists them: a load lists each entries folder and reads
+ * only the files that changed, where reading and parsing every entry took
+ * most of a second. A file written in the last seconds is read every time:
+ * a second write within the same tick of the clock could keep both. */
+#define ENTRY_CACHE_BUCKETS 4096
+#define ENTRY_CACHE_MAX     65536
+#define ENTRY_SETTLED_MS    2000
+
+typedef struct CachedEntry {
+    struct CachedEntry *next;
+    ULONGLONG  path, dir;              /* hashes of the file's path and of its folder's */
+    ULONGLONG  size, written;
+    LONG       load;                   /* the last load that listed it */
+    EntryRead *read;
+} CachedEntry;
+
+static CachedEntry *g_entryCache[ENTRY_CACHE_BUCKETS];
+static int          g_entryCacheCount;
+static LONG         g_entryLoads;
+static SRWLOCK      g_entryCacheLock = SRWLOCK_INIT;
+
+/* A copy of what file `path` said when it was as it is now (Util_Free); NULL when not kept. */
+static EntryRead *CachedRead(ULONGLONG path, ULONGLONG size, ULONGLONG written, LONG load)
+{
+    CachedEntry *item;
+    EntryRead *copy = NULL;
+    AcquireSRWLockExclusive(&g_entryCacheLock);
+    for (item = g_entryCache[path % ENTRY_CACHE_BUCKETS]; item && item->path != path; item = item->next) {}
+    if (item && item->size == size && item->written == written && (copy = (EntryRead *)Util_Alloc(item->read->bytes)) != NULL) {
+        memcpy(copy, item->read, item->read->bytes);
+        item->load = load;
+    }
+    ReleaseSRWLockExclusive(&g_entryCacheLock);
+    return copy;
+}
+
+/* Keeps `read` (its owner from now on) for file `path` as it is now, in place of what it said before. */
+static void KeepRead(ULONGLONG path, ULONGLONG dir, ULONGLONG size, ULONGLONG written, LONG load, EntryRead *read)
+{
+    CachedEntry **at, *item = (CachedEntry *)Util_Alloc(sizeof *item), *old = NULL;
+    if (!item) {
+        Util_Free(read);
+        return;
+    }
+    item->path = path;
+    item->dir = dir;
+    item->size = size;
+    item->written = written;
+    item->load = load;
+    item->read = read;
+    AcquireSRWLockExclusive(&g_entryCacheLock);
+    for (at = &g_entryCache[path % ENTRY_CACHE_BUCKETS]; *at && (*at)->path != path; at = &(*at)->next) {}
+    if (*at) {
+        old = *at;
+        item->next = old->next;
+        *at = item;
+    } else if (g_entryCacheCount < ENTRY_CACHE_MAX) {
+        *at = item;
+        g_entryCacheCount++;
+    } else {
+        old = item;
+    }
+    ReleaseSRWLockExclusive(&g_entryCacheLock);
+    if (old) {
+        Util_Free(old->read);
+        Util_Free(old);
+    }
+}
+
+/* Forgets the files of folder `dir` that load `load`, which listed it whole, did not list. */
+static void ForgetUnlisted(ULONGLONG dir, LONG load)
+{
+    CachedEntry *gone = NULL, **at, *item;
+    int b;
+    AcquireSRWLockExclusive(&g_entryCacheLock);
+    for (b = 0; b < ENTRY_CACHE_BUCKETS; b++)
+        for (at = &g_entryCache[b]; (item = *at) != NULL;) {
+            if (item->dir == dir && item->load != load) {
+                *at = item->next;
+                item->next = gone;
+                gone = item;
+                g_entryCacheCount--;
+            } else {
+                at = &item->next;
+            }
+        }
+    ReleaseSRWLockExclusive(&g_entryCacheLock);
+    while ((item = gone) != NULL) {
+        gone = item->next;
+        Util_Free(item->read);
+        Util_Free(item);
+    }
+}
+
+/* What an entry file says, kept: a file Claude cut short is read again. */
+static BOOL KeptRead(const EntryRead *read)
+{
+    return read->kind == ENTRY_ELSEWHERE || (read->kind == ENTRY_LOCAL && EntryText(read)[0]);
+}
+
 /* One profile's entries. Complete when an entries folder was found and
  * listed to its end, and every entry in it read as one: an entry Claude cut
  * short leaves it partial, as one that cannot be read. */
@@ -669,7 +843,9 @@ static EntriesRead LoadProfileEntries(SessionSet *set, int profile, const Transc
     WIN32_FIND_DATAW found;
     HANDLE entries;
     EntriesRead read = ENTRIES_COMPLETE;
-    BOOL located = TRUE, complete;
+    ULONGLONG started, dir;
+    LONG load;
+    BOOL located = TRUE, complete, stopped = FALSE;
     if (!EntriesDir(p, source->entriesDir, ARRAYSIZE(source->entriesDir), &source->signedIn, cancel, &complete)) {
         source->entriesDir[0] = 0;
         located = FALSE;
@@ -683,32 +859,66 @@ static EntriesRead LoadProfileEntries(SessionSet *set, int profile, const Transc
     if (!p->formerDir[0] ||
         !Core_ScratchDirFor(p->formerDir, source->entriesDir, source->formerScratchDir, ARRAYSIZE(source->formerScratchDir)))
         source->formerScratchDir[0] = 0;
+    load = InterlockedIncrement(&g_entryLoads);
+    started = Util_NowMs();
+    dir = Core_HashText(CORE_HASH_START, source->entriesDir);
     entries = Util_FindFiles(source->entriesDir, L"local_*.json", &found, FALSE);
-    if (entries == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND ? read : ENTRIES_PARTIAL;
+    if (entries == INVALID_HANDLE_VALUE) {
+        if (GetLastError() != ERROR_FILE_NOT_FOUND) return ENTRIES_PARTIAL;
+        ForgetUnlisted(dir, load);
+        return read;
+    }
     do {
+        ULONGLONG file, size, written;
         DWORD length;
         char *json;
+        EntryRead *entry;
         EntryOutcome outcome;
+        BOOL fresh;
         if (Cancelled(cancel)) {
             read = ENTRIES_PARTIAL;
+            stopped = TRUE;
             break;
         }
         if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", source->entriesDir, found.cFileName)) ||
-            (json = Util_ReadFile(path, SESSION_ENTRY_MAX_BYTES, FALSE, &length)) == NULL) {
+        if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", source->entriesDir, found.cFileName))) {
             source->unreadable++;
             read = ENTRIES_PARTIAL;
             continue;
         }
-        outcome = AddEntry(set, profile, path, json, length, transcripts);
-        HeapFree(GetProcessHeap(), 0, json);
+        file = Core_HashText(CORE_HASH_START, path);
+        size = ((ULONGLONG)found.nFileSizeHigh << 32) | found.nFileSizeLow;
+        written = ((ULONGLONG)found.ftLastWriteTime.dwHighDateTime << 32) | found.ftLastWriteTime.dwLowDateTime;
+        entry = CachedRead(file, size, written, load);
+        fresh = entry == NULL;
+        if (fresh) {
+            if ((json = Util_ReadFile(path, SESSION_ENTRY_MAX_BYTES, FALSE, &length)) == NULL) {
+                source->unreadable++;
+                read = ENTRIES_PARTIAL;
+                continue;
+            }
+            entry = ReadEntry(json, length);
+            HeapFree(GetProcessHeap(), 0, json);
+            if (!entry) {
+                read = ENTRIES_NO_MEMORY;
+                stopped = TRUE;
+                break;
+            }
+        }
+        outcome = AddEntry(set, profile, path, entry, transcripts);
+        if (fresh && KeptRead(entry) && Core_FileTimeMs(&found.ftLastWriteTime) + ENTRY_SETTLED_MS <= started)
+            KeepRead(file, dir, size, written, load, entry);
+        else
+            Util_Free(entry);
         if (outcome == ENTRY_NO_MEMORY) {
             read = ENTRIES_NO_MEMORY;
+            stopped = TRUE;
             break;
         }
         if (outcome == ENTRY_BROKEN) read = ENTRIES_PARTIAL;
     } while (FindNextFileW(entries, &found));
-    if (read == ENTRIES_COMPLETE && GetLastError() != ERROR_NO_MORE_FILES) read = ENTRIES_PARTIAL;
+    if (!stopped && GetLastError() == ERROR_NO_MORE_FILES) ForgetUnlisted(dir, load);
+    else if (read == ENTRIES_COMPLETE) read = ENTRIES_PARTIAL;
     FindClose(entries);
     return read;
 }
@@ -853,10 +1063,104 @@ static void LoadAllPending(SessionSet *set, HANDLE cancel)
             if (edits[i].op == PENDING_TITLE || (edits[i].op == PENDING_TITLE_AUTO && edits[i].value[0]))
                 StringCchCopyW(entry->pendingTitle, ARRAYSIZE(entry->pendingTitle), edits[i].value);
             else if (edits[i].op == PENDING_STAR) entry->pendingStar = edits[i].value[0] == L'1';
-            else entry->pendingRemove = TRUE;
+            else if (edits[i].op == PENDING_READ) entry->pendingUnread = edits[i].value[0] == L'0';
+            else if (edits[i].op == PENDING_REMOVE) entry->pendingRemove = TRUE;
         }
     }
     HeapFree(GetProcessHeap(), 0, edits);
+}
+
+/* The unread list read last from each profile's web storage, by the files
+ * it was read from (their names, sizes and times): read again only when
+ * one changed, as every load would otherwise parse the whole storage. */
+#define UNREAD_CACHE 16
+static struct {
+    WCHAR     dir[MAX_PATH];
+    ULONGLONG stamp;
+    char     *value;            /* NULL: none stored */
+    size_t    length;
+    DWORD     used;             /* the oldest is reused */
+} g_unreadCache[UNREAD_CACHE];
+static SRWLOCK g_unreadLock = SRWLOCK_INIT;
+static DWORD   g_unreadClock;
+
+/* What the storage folder holds now; 0 when it cannot be listed. */
+static ULONGLONG StorageStamp(const WCHAR *dir)
+{
+    WCHAR pattern[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    ULONGLONG stamp = CORE_HASH_START;
+    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\*", dir)) ||
+        (find = FindFirstFileW(pattern, &found)) == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        stamp = Core_HashText(stamp, found.cFileName);
+        stamp = Core_HashBytes(stamp, &found.nFileSizeLow, sizeof found.nFileSizeLow);
+        stamp = Core_HashBytes(stamp, &found.ftLastWriteTime, sizeof found.ftLastWriteTime);
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    return stamp ? stamp : 1;
+}
+
+/* Profile `p`'s unread list (a heap copy, Util_Free), from the cache while its storage has not changed. */
+static char *UnreadValue(const Profile *p, size_t *length)
+{
+    WCHAR dir[MAX_PATH];
+    ULONGLONG stamp;
+    WebStore *store;
+    char *value = NULL, *copy;
+    int i, slot = 0;
+    *length = 0;
+    if (FAILED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\" CLAUDE_WEB_STORAGE, p->storageDir[0] ? p->storageDir : p->dataDir)) ||
+        (stamp = StorageStamp(dir)) == 0)
+        return NULL;
+    AcquireSRWLockExclusive(&g_unreadLock);
+    for (i = 0; i < UNREAD_CACHE; i++)
+        if (g_unreadCache[i].stamp == stamp && Core_EqualsI(g_unreadCache[i].dir, dir)) {
+            g_unreadCache[i].used = ++g_unreadClock;
+            if (g_unreadCache[i].value && (value = (char *)Util_Alloc(g_unreadCache[i].length + 1)) != NULL) {
+                memcpy(value, g_unreadCache[i].value, g_unreadCache[i].length + 1);
+                *length = g_unreadCache[i].length;
+            }
+            ReleaseSRWLockExclusive(&g_unreadLock);
+            return value;
+        }
+    ReleaseSRWLockExclusive(&g_unreadLock);
+    store = WebStore_Open(p);
+    value = store ? WebStore_Get(store, L"epitaxy-unread-v1", length) : NULL;
+    WebStore_Free(store);
+    if (!store) return value;   /* not read: not kept, tried again the next time */
+    copy = value ? (char *)Util_Alloc(*length + 1) : NULL;
+    if (copy) memcpy(copy, value, *length), copy[*length] = 0;
+    AcquireSRWLockExclusive(&g_unreadLock);
+    for (i = 0; i < UNREAD_CACHE && !Core_EqualsI(g_unreadCache[i].dir, dir); i++)   /* its own place, else the oldest */
+        if (g_unreadCache[i].used < g_unreadCache[slot].used) slot = i;
+    if (i < UNREAD_CACHE) slot = i;
+    Util_Free(g_unreadCache[slot].value);
+    StringCchCopyW(g_unreadCache[slot].dir, MAX_PATH, dir);
+    g_unreadCache[slot].stamp = stamp;
+    g_unreadCache[slot].value = copy;
+    g_unreadCache[slot].length = copy ? *length : 0;
+    g_unreadCache[slot].used = ++g_unreadClock;
+    ReleaseSRWLockExclusive(&g_unreadLock);
+    return value;
+}
+
+/* The sessions each profile's Claude shows unread, as its web storage says
+ * (read only: a running Claude's latest writes may not be on disk yet). */
+static void LoadUnread(SessionSet *set, HANDLE cancel)
+{
+    int p, r, e;
+    for (p = 0; p < set->profiles.count && !Cancelled(cancel); p++) {
+        size_t length = 0;
+        char *value = UnreadValue(&set->profiles.items[p], &length);
+        if (value)
+            for (r = 0; r < set->rowCount; r++)
+                for (e = set->rows[r].entry[p]; e >= 0; e = set->entries[e].duplicate)
+                    set->entries[e].unread = Core_UnreadHas(value, length, set->entries[e].localId);
+        Util_Free(value);
+    }
 }
 
 /* ------------------------------------------------------------------- live */
@@ -883,7 +1187,7 @@ static void VisitLiveSessions(LiveSessionVisitor visit, void *context, HANDLE ca
         process.dwSize = sizeof process;
         if (Process32FirstW(snapshot, &process)) {
             do {
-                ProcessParent *grown = (ProcessParent *)Grow(parents, &capacity, count + 1, sizeof *parents);
+                ProcessParent *grown = (ProcessParent *)Util_Grow(parents, &capacity, count + 1, sizeof *parents);
                 if (!grown) break;
                 parents = grown;
                 parents[count].process = process.th32ProcessID;
@@ -905,10 +1209,10 @@ static void VisitLiveSessions(LiveSessionVisitor visit, void *context, HANDLE ca
             FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", dir, found.cFileName)) ||
             (json = Util_ReadFile(path, SESSION_ENTRY_MAX_BYTES, FALSE, &length)) == NULL)
             continue;
-        MemberString(json, length, "sessionId", id, ARRAYSIZE(id));
+        Core_JsonMemberString(json, length, "sessionId", id, ARRAYSIZE(id));
         /* The process's creation time (a FILETIME), written as a string. */
-        started = MemberString(json, length, "procStart", start, ARRAYSIZE(start)) ? _wcstoui64(start, NULL, 10)
-                                                                                 : MemberNumber(json, length, "procStart");
+        started = Core_JsonMemberString(json, length, "procStart", start, ARRAYSIZE(start)) ? _wcstoui64(start, NULL, 10)
+                                                                                 : Core_JsonMemberNumber(json, length, "procStart");
         HeapFree(GetProcessHeap(), 0, json);
         if ((running = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) != NULL) {
             alive = GetProcessTimes(running, &created, &exited, &kernel, &user) &&
@@ -988,7 +1292,7 @@ static int CreateGroup(SessionSet *set, const SessionRow *row, int owner)
 {
     SessionGroup *groups, *group;
     const WCHAR *leaf;
-    groups = (SessionGroup *)Grow(set->groups, &set->groupCap, set->groupCount + 1, sizeof *set->groups);
+    groups = (SessionGroup *)Util_Grow(set->groups, &set->groupCap, set->groupCount + 1, sizeof *set->groups);
     if (!groups) return -1;
     set->groups = groups;
     group = &set->groups[set->groupCount];
@@ -1137,6 +1441,7 @@ BOOL SessionStore_LoadProfilesCancel(SessionSet *set, const ProfileList *profile
     /* Sorting moved the rows: index them again before resolving pending and live ids. */
     FreeIndex(set);
     for (r = 0; r < set->rowCount && !Cancelled(cancel); r++) IndexRow(set, r);
+    LoadUnread(set, cancel);
     LoadAllPending(set, cancel);
     if (!Cancelled(cancel)) LoadLive(set, cancel);
     if (Cancelled(cancel)) {

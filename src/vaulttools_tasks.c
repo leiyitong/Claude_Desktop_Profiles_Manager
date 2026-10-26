@@ -8,12 +8,6 @@
 #include <wchar.h>
 #define TASK_MAX (8u * 1024u * 1024u)
 #define REGISTRY_MAX (16u * 1024u * 1024u)
-static void Free(void *p) { if (p) HeapFree(GetProcessHeap(), 0, p); }
-static char *Copy(const char *text, size_t n)
-{
-    char *out = (char *)HeapAlloc(GetProcessHeap(), 0, n + 1);
-    if (out) { memcpy(out, text, n); out[n] = 0; } return out;
-}
 static BOOL Text(const char *json, size_t n, const char *key, WCHAR *out, size_t cch)
 {
     const char *value; size_t length;
@@ -24,14 +18,14 @@ static BOOL Set(char **json, size_t *length, const char *key, const char *value)
     const char *keys[1] = { key }; size_t n = 0;
     char *out = Core_JsonSetNested(*json, *length, keys, 1, value, &n);
     if (!out) return FALSE;
-    Free(*json); *json = out; *length = n; return TRUE;
+    Util_Free(*json); *json = out; *length = n; return TRUE;
 }
 static BOOL SetText(char **json, size_t *length, const char *key, const WCHAR *text)
 {
     char *quoted = (char *)HeapAlloc(GetProcessHeap(), 0, wcslen(text) * 6 + 3); BOOL ok;
     if (!quoted) return FALSE;
     ok = Core_JsonQuote(text, quoted, wcslen(text) * 6 + 3) && Set(json, length, key, quoted);
-    Free(quoted); return ok;
+    Util_Free(quoted); return ok;
 }
 static BOOL SafeId(const WCHAR *id)
 {
@@ -85,9 +79,13 @@ static BOOL AddTask(void *context, const char *json, size_t n)
     WCHAR id[129], raw[LONG_PATH_CCH], path[LONG_PATH_CCH]; char idA[129], name[256];
     const char *place, *existing; size_t placeLength, existingLength;
     const char *status = "missing";
+    /* One the backup cannot name, or one named twice, counts as missing: the others are kept. */
     if (!Core_JsonIsValue(json, n) || !Text(json, n, "id", id, ARRAYSIZE(id)) || !SafeId(id) ||
         !WideCharToMultiByte(CP_UTF8, 0, id, -1, idA, sizeof idA, NULL, NULL) ||
-        Core_JsonMember(a->coverage, a->used, idA, &existing, &existingLength)) return a->ok = FALSE;
+        Core_JsonMember(a->coverage, a->used, idA, &existing, &existingLength)) {
+        a->missing++;
+        return TRUE;
+    }
     if (Core_JsonMember(json, n, "place", &place, &placeLength) && !(placeLength == 4 && memcmp(place, "null", 4) == 0)) { status = "remote"; a->remote++; }
     else if (Text(json, n, "filePath", raw, ARRAYSIZE(raw)) && TaskPath(a->profile, id, raw, a->code, path, ARRAYSIZE(path))) {
         WIN32_FILE_ATTRIBUTE_DATA data;
@@ -107,12 +105,16 @@ BOOL VaultTasks_AddRegistry(ZipOut *zip, const Profile *profile, const WCHAR *re
     DWORD n = 0; const char *tasks; size_t taskLength;
     char *json = Util_ReadFile(registryPath, REGISTRY_MAX, FALSE, &n), prefix[96], name[160], *coverage = NULL;
     size_t coverageLength = 2; AddTasks a; BOOL ok = FALSE;
-    if (!json || !Core_JsonIsValue(json, n) || !Core_JsonMember(json, n, "scheduledTasks", &tasks, &taskLength) || !Prefix(registryMember, prefix, sizeof prefix)) goto done;
-    ZeroMemory(&a, sizeof a); a.zip = zip; a.profile = profile; a.prefix = prefix; a.code = code; a.coverage = Copy("{}", 2); a.used = 2; a.ok = a.coverage != NULL;
-    if (!a.ok || !Core_JsonEachElement(tasks, taskLength, AddTask, &a) || !a.ok) { Free(a.coverage); goto done; }
-    coverage = Copy("{}", 2);
-    if (!coverage || !Set(&coverage, &coverageLength, "definitions", a.coverage)) { Free(a.coverage); goto done; }
-    Free(a.coverage);
+    if (!json || !Core_JsonIsValue(json, n) || !Prefix(registryMember, prefix, sizeof prefix)) goto done;
+    if (!Core_JsonMember(json, n, "scheduledTasks", &tasks, &taskLength)) {   /* none yet */
+        tasks = "[]";
+        taskLength = 2;
+    }
+    ZeroMemory(&a, sizeof a); a.zip = zip; a.profile = profile; a.prefix = prefix; a.code = code; a.coverage = Util_CopyBytes("{}", 2); a.used = 2; a.ok = a.coverage != NULL;
+    if (!a.ok || !Core_JsonEachElement(tasks, taskLength, AddTask, &a) || !a.ok) { Util_Free(a.coverage); goto done; }
+    coverage = Util_CopyBytes("{}", 2);
+    if (!coverage || !Set(&coverage, &coverageLength, "definitions", a.coverage)) { Util_Free(a.coverage); goto done; }
+    Util_Free(a.coverage);
     {
         char counts[32]; WCHAR member[1024];
         if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, registryMember, -1, member, ARRAYSIZE(member)) ||
@@ -139,7 +141,7 @@ BOOL VaultTasks_AddRegistry(ZipOut *zip, const Profile *profile, const WCHAR *re
     ok = Zip_AddData(zip, name, coverage, coverageLength);
 done:
     if (!ok && error && cch) StringCchCopyW(error, cch, TR(L"Scheduled task definitions could not be collected. The backup was not saved."));
-    Free(json); Free(coverage); return ok;
+    Util_Free(json); Util_Free(coverage); return ok;
 }
 static BOOL HasFiles(const WCHAR *root)
 {
@@ -158,7 +160,7 @@ static BOOL TaskRoot(const Profile *p, BOOL code, WCHAR *out, size_t cch)
     if (FAILED(StringCchPrintfW(config, ARRAYSIZE(config), L"%s\\" CLAUDE_DESKTOP_SETTINGS, p->storageDir))) return FALSE;
     json = Util_ReadFile(config, REGISTRY_MAX, FALSE, &n);
     if (json && Text(json, n, "coworkUserFilesPath", value, ARRAYSIZE(value))) found = Core_ProfileFilePath(p, value, out, cch);
-    Free(json);
+    Util_Free(json);
     if (!found) {
         PWSTR home = NULL, documents = NULL;
         if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Profile, KF_FLAG_DONT_VERIFY, NULL, &home))) {
@@ -184,7 +186,7 @@ static BOOL AppendTask(RestoreTasksState *r, const char *value, size_t length)
     char *next = (char *)HeapAlloc(GetProcessHeap(), 0, r->used + length + 3); size_t n = r->used;
     if (!next) return FALSE;
     memcpy(next, r->array, n); if (n > 1) next[n++] = ','; memcpy(next + n, value, length); n += length;
-    next[n] = 0; Free(r->array); r->array = next; r->used = n; return TRUE;
+    next[n] = 0; Util_Free(r->array); r->array = next; r->used = n; return TRUE;
 }
 static BOOL RestoreTask(void *context, const char *value, size_t length)
 {
@@ -192,10 +194,10 @@ static BOOL RestoreTask(void *context, const char *value, size_t length)
         "userSelectedFolders", "userSelectedFiles", "userSelectedProjectUuids", "spaceId", "notifySessionId", "dispatchSubscribed", "observedToolUse", "watcher", "lastScheduledFor", "missedRunScanFloor" };
     RestoreTasksState *r = (RestoreTasksState *)context;
     WCHAR id[129], chosen[129], path[LONG_PATH_CCH], dir[LONG_PATH_CCH]; char idA[129], name[256];
-    char *task = Copy(value, length); size_t used = length, i;
+    char *task = Util_CopyBytes(value, length); size_t used = length, i;
     DWORD bytes = 0; void *definition = NULL; int at;
     const char *place; size_t placeLength;
-    if (SessionLink_Busy(r->profile)) { r->error = ERROR_BUSY; Free(task); return r->ok = FALSE; }
+    if (SessionLink_Busy(r->profile)) { r->error = ERROR_BUSY; Util_Free(task); return r->ok = FALSE; }
     if (!task || !Text(task, used, "id", id, ARRAYSIZE(id)) || !SafeId(id) || !Set(&task, &used, "enabled", "false")) goto failed;
     for (i = 0; i < ARRAYSIZE(approvals); i++) if (!Core_JsonRemoveMember(task, used, approvals[i], task, used + 1, &used)) goto failed;
     task[used] = 0;
@@ -216,7 +218,7 @@ static BOOL RestoreTask(void *context, const char *value, size_t length)
                 current = Util_ReadFile(path, TASK_MAX, FALSE, &currentLength);
                 if (current) {
                     BOOL same = currentLength == bytes && memcmp(current, definition, bytes) == 0;
-                    Free(current); if (same) break; else continue;
+                    Util_Free(current); if (same) break; else continue;
                 }
                 if (Util_QueryPath(path, NULL) != PATH_MISSING || !Util_EnsureDir(dir) || !PlainPath(dir, FALSE) || !WriteNew(path, definition, bytes)) goto failed;
                 break;
@@ -225,10 +227,10 @@ static BOOL RestoreTask(void *context, const char *value, size_t length)
                 !Set(&task, &used, "ownFile", "true")) goto failed;
         }
     }
-    r->ok = AppendTask(r, task, used); Free(task); Free(definition); return r->ok;
+    r->ok = AppendTask(r, task, used); Util_Free(task); Util_Free(definition); return r->ok;
 failed:
     r->error = GetLastError(); if (!r->error) r->error = ERROR_INVALID_DATA;
-    Free(task); Free(definition); return r->ok = FALSE;
+    Util_Free(task); Util_Free(definition); return r->ok = FALSE;
 }
 char *VaultTasks_RestoreRegistry(const ZipIn *zip, const Profile *profile, const char *registryMember, const char *json, size_t length,
                                 BOOL code, BOOL *aware, size_t *outLength, DWORD *error)
@@ -241,18 +243,18 @@ char *VaultTasks_RestoreRegistry(const ZipIn *zip, const Profile *profile, const
     if (Zip_Find(zip, manifest) < 0) return NULL;
     *aware = TRUE;
     if (!VaultTasks_ValidateCoverage(zip, manifest)) { *error = ERROR_INVALID_DATA; return NULL; }
-    ZeroMemory(&r, sizeof r); r.zip = zip; r.profile = profile; r.prefix = prefix; r.array = Copy("[", 1); r.used = 1; r.ok = r.array != NULL;
-    if (!TaskRoot(profile, code, r.root, ARRAYSIZE(r.root))) { *error = ERROR_BAD_PATHNAME; Free(r.array); return NULL; }
+    ZeroMemory(&r, sizeof r); r.zip = zip; r.profile = profile; r.prefix = prefix; r.array = Util_CopyBytes("[", 1); r.used = 1; r.ok = r.array != NULL;
+    if (!TaskRoot(profile, code, r.root, ARRAYSIZE(r.root))) { *error = ERROR_BAD_PATHNAME; Util_Free(r.array); return NULL; }
     if (!r.ok || !Core_JsonMember(json, length, "scheduledTasks", &tasks, &taskLength) ||
         !Core_JsonEachElement(tasks, taskLength, RestoreTask, &r) || !r.ok) goto done;
     array = (char *)HeapReAlloc(GetProcessHeap(), 0, r.array, r.used + 2);
     if (!array) goto done;
     r.array = array; r.array[r.used++] = ']'; r.array[r.used] = 0;
-    out = Copy(json, length); *outLength = length;
-    if (!out || !Set(&out, outLength, "scheduledTasks", r.array)) { Free(out); out = NULL; }
+    out = Util_CopyBytes(json, length); *outLength = length;
+    if (!out || !Set(&out, outLength, "scheduledTasks", r.array)) { Util_Free(out); out = NULL; }
 done:
     if (!out) *error = r.error ? r.error : ERROR_INVALID_DATA;
-    Free(r.array); return out;
+    Util_Free(r.array); return out;
 }
 BOOL VaultTasks_IsCoverage(const char *name)
 {
@@ -302,7 +304,7 @@ BOOL VaultTasks_ValidateCoverage(const ZipIn *zip, const char *name)
         !Core_JsonEachMember(v.definitions, v.definitionsLength, CountDefinition, &definitions)) goto done;
     ok = definitions == v.count && (ULONGLONG)v.saved == counts[0] && (ULONGLONG)v.missing == counts[1] && (ULONGLONG)v.remote == counts[2];
 done:
-    Free(coverage); Free(registry); return ok;
+    Util_Free(coverage); Util_Free(registry); return ok;
 }
 
 typedef struct DescribeState { WCHAR *out; size_t cch; } DescribeState;
@@ -333,5 +335,5 @@ BOOL VaultTasks_Describe(const ZipIn *zip, const char *name, WCHAR *out, size_t 
         DescribeState d; d.out = out; d.cch = cch;
         ok = Core_JsonEachMember(v, k, DescribeMissing, &d);
     }
-    Free(json); return ok;
+    Util_Free(json); return ok;
 }

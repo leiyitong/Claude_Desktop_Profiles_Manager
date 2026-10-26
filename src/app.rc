@@ -12,6 +12,9 @@ IDI_APP ICON "app.ico"
 IDR_CHANGELOG_EN RCDATA "..\\CHANGELOG.md"
 IDR_CHANGELOG_ZH RCDATA "..\\CHANGELOG.zh-CN.md"
 
+// windows-mcp-delta's source, zipped by build.cmd before the resources are compiled, extracted and run by uvx.
+IDR_WINDOWS_MCP_DELTA RCDATA "..\\build\\windows-mcp-delta.zip"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
  PRODUCTVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
@@ -26,12 +29,12 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "Freenitial"
-            VALUE "FileDescription", "Claude Desktop Profiles Manager"
+            VALUE "FileDescription", "Claude Delta"
             VALUE "FileVersion", APP_VERSION_STR
             VALUE "InternalName", "ClaudeDesktopProfilesManager"
             VALUE "LegalCopyright", "Copyright (c) 2026 Freenitial"
             VALUE "OriginalFilename", "ClaudeDesktopProfilesManager.exe"
-            VALUE "ProductName", "Claude Desktop Profiles Manager"
+            VALUE "ProductName", "Claude Delta"
             VALUE "ProductVersion", APP_VERSION_STR
         END
     END
@@ -44,7 +47,7 @@ END
 IDD_MAIN DIALOGEX 0, 0, 420, 282
 STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_CLIPCHILDREN
 CLASS APP_WINDOW_CLASS_NAME
-CAPTION "Claude Desktop Profiles Manager"
+CAPTION "Claude Delta"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     DEFPUSHBUTTON   "&Open", IDC_OPEN, 10, 6, 40, 15
@@ -62,25 +65,80 @@ BEGIN
     CONTROL         "", IDC_LIST, "SysListView32", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 28, 280, 246
     PUSHBUTTON      "Sessions &view", IDC_SESSIONS, 296, 28, 114, 15
     PUSHBUTTON      L"S&ync settings\x2026", IDC_SYNC, 296, 51, 114, 15
-    PUSHBUTTON      L"&Backup && Restore\x2026", IDC_BACKUP, 296, 70, 114, 15
+    PUSHBUTTON      L"E&xport\x2026", IDC_BACKUP, 296, 70, 55, 15
+    PUSHBUTTON      L"&Import\x2026", IDC_RESTORE_BACKUP, 355, 70, 55, 15
     PUSHBUTTON      "Rep&air", IDC_REPAIR, 296, 89, 114, 15
-    PUSHBUTTON      "Search profiles", IDC_PROFILE_FIND, 296, 108, 114, 15
+    PUSHBUTTON      "Windows &MCP", IDC_WINDOWS_MCP, 296, 108, 114, 15
+    PUSHBUTTON      "&SearXNG search", IDC_SEARXNG, 296, 127, 114, 15
+    PUSHBUTTON      "Remove &Cowork", IDC_COWORK, 296, 146, 114, 15
+    PUSHBUTTON      "Search profiles", IDC_PROFILE_FIND, 296, 165, 114, 15
     LTEXT           "", IDC_NOTE, 296, 130, 114, 42, SS_NOPREFIX
     LTEXT           "", IDC_STATUS, 296, 186, 114, 20, SS_NOPREFIX
     CONTROL         "", IDC_PROGRESS, "Static", SS_OWNERDRAW | SS_NOPREFIX | NOT WS_VISIBLE, 296, 191, 114, 15
     PUSHBUTTON      "", IDC_STATUS_ACTION, 296, 210, 114, 15, NOT WS_VISIBLE
-    LTEXT           "", IDC_VERSION, 296, 240, 114, 10, SS_NOPREFIX
+    LTEXT           "", IDC_VERSION, 296, 240, 114, 10, SS_NOPREFIX | SS_NOTIFY
     PUSHBUTTON      "&Update", IDC_UPDATE, 296, 259, 114, 15, NOT WS_VISIBLE
     LISTBOX         IDC_S_PROFILES, 10, 28, 96, 246, LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP | NOT WS_BORDER | NOT WS_VISIBLE
-    EDITTEXT        IDC_S_SEARCH, 112, 28, 100, 14, ES_AUTOHSCROLL | NOT WS_VISIBLE
+    PUSHBUTTON      "Co&llapse all", IDC_S_FOLD, 112, 28, 14, 14, NOT WS_VISIBLE
+    EDITTEXT        IDC_S_SEARCH, 130, 28, 82, 14, ES_AUTOHSCROLL | NOT WS_VISIBLE
     PUSHBUTTON      "Search o&ptions", IDC_S_FIND, 216, 28, 14, 14, NOT WS_VISIBLE
     PUSHBUTTON      "F&ilter", IDC_S_FILTER, 234, 28, 14, 14, NOT WS_VISIBLE
     CONTROL         "", IDC_S_TREE, "SysTreeView32", TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_FULLROWSELECT | TVS_NOHSCROLL | TVS_INFOTIP | TVS_NONEVENHEIGHT | TVS_TRACKSELECT | WS_BORDER | WS_TABSTOP | NOT WS_VISIBLE, 112, 46, 178, 228
+    PUSHBUTTON      "Shield", IDC_SHIELD, 392, 258, 16, 16
 END
 
-IDD_PROFILE DIALOGEX 0, 0, 268, 222
+IDD_SHIELD DIALOGEX 0, 0, 500, 266
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Shield"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_H_STATE, 10, 10, 230, 20, SS_NOPREFIX
+    AUTOCHECKBOX    "Turn the shield &on", IDC_H_ENABLE, 10, 34, 150, 10
+    PUSHBUTTON      L"Check &now", IDC_H_RECHECK, 180, 32, 60, 14
+    LTEXT           "", IDC_H_EXIT, 10, 52, 230, 22, SS_NOPREFIX
+    LTEXT           "", IDC_H_FACTS, 10, 76, 230, 124, SS_NOPREFIX
+    LTEXT           "", IDC_H_AVAIL, 10, 204, 230, 20, SS_NOPREFIX
+    LTEXT           "End Claude when the exit breaks a rule:", IDC_H_RULES, 256, 10, 234, 10
+    AUTOCHECKBOX    "is a &datacenter IP (not a home connection)", IDC_H_NO_DC, 256, 24, 234, 10
+    AUTOCHECKBOX    "&leaks DNS to another region", IDC_H_NO_DNS, 256, 37, 234, 10
+    AUTOCHECKBOX    "leaks &UDP by another IP (WebRTC)", IDC_H_NO_UDP, 256, 50, 234, 10
+    AUTOCHECKBOX    "has a public IP&v6 that could leak", IDC_H_NO_IPV6, 256, 63, 234, 10
+    AUTOCHECKBOX    "has no &tunnel adapter up", IDC_H_STOP_TUN, 256, 76, 234, 10
+    AUTOCHECKBOX    "has no &proxy app running", IDC_H_STOP_PROXY, 256, 89, 234, 10
+    AUTOCHECKBOX    "cannot be &read (offline or blocked)", IDC_H_STOP_UNKNOWN, 256, 102, 234, 10
+    LTEXT           "is below trust &score:", IDC_H_SCORE_LABEL, 256, 119, 90, 10
+    EDITTEXT        IDC_H_SCORE, 348, 116, 30, 14, ES_NUMBER | ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Only &warn; do not end Claude", IDC_H_WARN, 256, 135, 234, 10
+    LTEXT           "Pro&file:", IDC_H_PROFILE_LABEL, 256, 154, 40, 10
+    COMBOBOX        IDC_H_PROFILE, 298, 151, 192, 200, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "only from re&gions:", IDC_H_REGIONS_LABEL, 256, 172, 80, 10
+    EDITTEXT        IDC_H_REGIONS, 338, 169, 152, 14, ES_AUTOHSCROLL
+    LTEXT           "Recent events:", IDC_H_LOG_LABEL, 256, 190, 234, 10
+    EDITTEXT        IDC_H_LOG, 256, 202, 234, 38, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | NOT WS_TABSTOP
+    DEFPUSHBUTTON   "Close", IDOK, 440, 245, 50, 15
+END
+
+IDD_PROFILE DIALOGEX 0, 0, 540, 252
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Profile"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    CONTROL         "", IDC_P_PREVIEW, "Static", SS_ICON | SS_REALSIZEIMAGE, 10, 8, 32, 32
+    LTEXT           "", IDC_P_FOLDER, 48, 8, 482, 32, SS_NOPREFIX
+    LTEXT           "", IDC_P_ERROR, 48, 8, 482, 32, SS_NOPREFIX | NOT WS_VISIBLE
+    CONTROL         "", IDC_P_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 46, 280, 176
+    LTEXT           "Preview pane", IDC_PANE_LABEL, 298, 46, 110, 10, SS_NOPREFIX
+    RTEXT           "", IDC_PANE_TITLE, 410, 46, 120, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    EDITTEXT        IDC_PANE_SEARCH, 298, 58, 214, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Search o&ptions", IDC_PANE_FIND, 514, 58, 16, 14, WS_TABSTOP
+    CONTROL         "", IDC_PANE_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 298, 76, 232, 146
+    DEFPUSHBUTTON   "OK", IDOK, 426, 230, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 480, 230, 50, 15
+END
+
+IDD_PROFILE_NEW DIALOGEX 0, 0, 268, 222
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "New profile"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     LTEXT           "&Name:", IDC_P_NAME_LABEL, 10, 13, 40, 10
@@ -98,12 +156,13 @@ BEGIN
     EDITTEXT        IDC_P_NOTE, 52, 94, 206, 14, ES_AUTOHSCROLL
     LTEXT           "S&ync:", IDC_P_SYNC_LABEL, 10, 118, 40, 10
     COMBOBOX        IDC_P_SYNC, 52, 115, 132, 200, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      L"Wha&t to sync\x2026", IDC_P_SYNC_ITEMS, 188, 114, 70, 14
+    PUSHBUTTON      L"Wha&t to sync\x2026", IDC_P_SYNC_ITEMS, 188, 115, 70, 14
     LTEXT           "", IDC_P_FOLDER, 10, 134, 248, 18, SS_NOPREFIX
     LTEXT           "", IDC_P_ERROR, 10, 134, 248, 18, SS_NOPREFIX | NOT WS_VISIBLE
     AUTOCHECKBOX    "Open at &Windows sign-in", IDC_P_STARTUP, 10, 156, 200, 10
     AUTOCHECKBOX    "", IDC_P_COPY, 10, 169, 248, 10
     AUTOCHECKBOX    "&Open it now to sign in", IDC_P_OPEN, 10, 182, 140, 10
+    PUSHBUTTON      "Save and si&gn in now", IDC_P_SIGN_IN, 10, 200, 100, 15
     DEFPUSHBUTTON   "OK", IDOK, 154, 200, 50, 15
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 200, 50, 15
 END
@@ -119,7 +178,7 @@ BEGIN
     EDITTEXT        IDC_SIGNIN_URL, 10, 94, 390, 14, ES_AUTOHSCROLL
     LTEXT           "&Browser:", IDC_SIGNIN_BROWSER_LABEL, 10, 116, 60, 10
     COMBOBOX        IDC_SIGNIN_BROWSER, 74, 113, 200, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Each opening uses a separate browser folder. Close its windows, then use Open browser folders to remove those folders manually. They are kept when this window or the manager closes.", IDC_SIGNIN_CLEANUP, 10, 136, 390, 40, SS_NOPREFIX
+    LTEXT           "Each opening uses a separate browser folder. The sign-in window's goes once it closes. Edge's and Chrome's stay: close their windows, then use Open browser folders to remove them.", IDC_SIGNIN_CLEANUP, 10, 136, 390, 40, SS_NOPREFIX
     LTEXT           "", IDC_SIGNIN_STATUS, 10, 182, 390, 40, SS_NOPREFIX
     PUSHBUTTON      "Open browser &folders", IDC_SIGNIN_FOLDERS, 10, 237, 124, 15
     DEFPUSHBUTTON   "&Open private browser", IDC_SIGNIN_OPEN, 176, 237, 166, 15
@@ -147,22 +206,17 @@ BEGIN
     DEFPUSHBUTTON   "Close", IDCANCEL, 360, 258, 50, 15
 END
 
-IDD_SETTINGS DIALOGEX 0, 0, 320, 127
+IDD_SETTINGS DIALOGEX 0, 0, 520, 322
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "&Language", IDC_G_LANGUAGE_LABEL, 10, 10, 300, 10
-    COMBOBOX        IDC_G_LANGUAGE, 10, 24, 120, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Session vault", IDC_G_VAULT, 10, 38, 300, 10
-    LTEXT           "&Keep versions for:", IDC_G_DAYS_LABEL, 10, 55, 80, 10
-    EDITTEXT        IDC_G_DAYS, 92, 52, 30, 14, ES_NUMBER | ES_AUTOHSCROLL
-    LTEXT           "days (0: keep them all)", IDC_G_DAYS_UNIT, 128, 55, 182, 10
-    LTEXT           "Claude Code", IDC_G_CODE, 10, 73, 300, 10
-    AUTOCHECKBOX    "Back up once a &week", IDC_G_WEEKLY, 10, 87, 300, 10
-    DEFPUSHBUTTON   "OK", IDOK, 152, 105, 50, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 206, 105, 50, 15
-    PUSHBUTTON      "&Apply", IDC_G_APPLY, 260, 105, 50, 15, WS_DISABLED
+    EDITTEXT        IDC_G_SEARCH, 10, 10, 140, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "", IDC_G_LIST, 10, 30, 140, 262, SS_NOPREFIX
+    LTEXT           "", IDC_G_PAGE, 160, 10, 350, 282, SS_NOPREFIX
+    DEFPUSHBUTTON   "OK", IDOK, 352, 300, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 406, 300, 50, 15
+    PUSHBUTTON      "&Apply", IDC_G_APPLY, 460, 300, 50, 15, WS_DISABLED
 END
 
 IDD_PASSWORD DIALOGEX 0, 0, 268, 110
@@ -179,18 +233,57 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 88, 50, 15
 END
 
+IDD_SEARXNG DIALOGEX 0, 0, 300, 142
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "SearXNG search"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_SX_TEXT, 10, 10, 280, 28, SS_NOPREFIX
+    LTEXT           "&Address:", IDC_SX_URL_LABEL, 10, 47, 50, 10
+    EDITTEXT        IDC_SX_URL, 62, 44, 228, 14, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Let it reach &private network addresses", IDC_SX_PRIVATE, 10, 67, 280, 10
+    LTEXT           "Needed when the instance is on your own network, or when a proxy's fake IPs give its address a private range.", IDC_SX_NOTE, 22, 80, 268, 20
+    PUSHBUTTON      "&Remove", IDC_SX_REMOVE, 10, 118, 60, 15
+    DEFPUSHBUTTON   "Set up", IDOK, 186, 118, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 240, 118, 50, 15
+END
+
+IDD_UPDATE DIALOGEX 0, 0, 380, 250
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "New version"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_U_TEXT, 10, 10, 360, 20, SS_NOPREFIX
+    CONTROL         "", IDC_U_NOTES, "RICHEDIT50W", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 10, 34, 360, 186
+    DEFPUSHBUTTON   "&Update now", IDOK, 256, 228, 60, 15
+    PUSHBUTTON      "&Later", IDCANCEL, 320, 228, 50, 15
+END
+
 IDD_ABOUT DIALOGEX 0, 0, 480, 300
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "About"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "Claude Desktop Profiles Manager", IDC_W_NAME, 10, 10, 460, 10, SS_NOPREFIX
+    LTEXT           "Claude Delta", IDC_W_NAME, 10, 10, 460, 10, SS_NOPREFIX
     LTEXT           "", IDC_W_VERSION, 10, 22, 460, 10, SS_NOPREFIX
     CONTROL         "", IDC_W_TOPICS, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 38, 160, 236
     CONTROL         "", IDC_W_TEXT, "RICHEDIT50W", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 176, 38, 294, 236
     PUSHBUTTON      "Open &logs", IDC_W_LOGS, 10, 280, 85, 15
     PUSHBUTTON      L"&Diagnostics\x2026", IDC_W_DIAGNOSTICS, 101, 280, 90, 15
     DEFPUSHBUTTON   "Close", IDCANCEL, 420, 280, 50, 15
+END
+
+IDD_TRANSFER DIALOGEX 0, 0, 300, 104
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Export"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_TR_TEXT, 10, 10, 280, 20, SS_NOPREFIX
+    CONTROL         "", IDC_TR_PROGRESS, "Static", SS_OWNERDRAW, 10, 36, 280, 12
+    LTEXT           "", IDC_TR_STATUS, 10, 54, 280, 20, SS_NOPREFIX
+    PUSHBUTTON      "&Pause", IDC_TR_PAUSE, 106, 82, 60, 15
+    PUSHBUTTON      "&Later", IDC_TR_LATER, 170, 82, 60, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 234, 82, 56, 15
 END
 
 IDD_TEXTVIEW DIALOGEX 0, 0, 480, 290
@@ -207,11 +300,12 @@ END
 
 IDD_MESSAGE DIALOGEX 0, 0, 282, 70
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Claude Desktop Profiles Manager"
+CAPTION "Claude Delta"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     CONTROL         "", IDC_M_ICON, "Static", SS_ICON | SS_REALSIZEIMAGE, 10, 10, 20, 20
     LTEXT           "", IDC_M_TEXT, 40, 12, 232, 24, SS_NOPREFIX | SS_EDITCONTROL
+    PUSHBUTTON      "", IDC_M_OTHER, 108, 48, 52, 15, NOT WS_VISIBLE
     DEFPUSHBUTTON   "OK", IDOK, 164, 48, 52, 15
     PUSHBUTTON      "Cancel", IDCANCEL, 220, 48, 52, 15
 END
@@ -241,16 +335,23 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 138, 50, 15
 END
 
-IDD_BACKUP DIALOGEX 0, 0, 268, 242
+IDD_BACKUP DIALOGEX 0, 0, 388, 240
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Back up"
+CAPTION "Export"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "", IDC_B_TEXT, 10, 10, 248, 20, SS_NOPREFIX
-    CONTROL         "", IDC_B_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, 10, 34, 248, 130
-    LTEXT           "Sign-in on this PC restores only here, for this Windows user; for any PC, its key goes behind a password. Anyone who has the file can use the account: keep it safe.", IDC_B_NOTE, 10, 170, 248, 40
-    DEFPUSHBUTTON   "OK", IDOK, 154, 220, 50, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 208, 220, 50, 15
+    LTEXT           "", IDC_B_TEXT, 10, 10, 368, 20, SS_NOPREFIX
+    CONTROL         "", IDC_B_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 34, 184, 178
+    LTEXT           "Preview pane", IDC_PANE_LABEL, 202, 34, 80, 10, SS_NOPREFIX
+    RTEXT           "", IDC_PANE_TITLE, 284, 34, 94, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    EDITTEXT        IDC_PANE_SEARCH, 202, 46, 158, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Search o&ptions", IDC_PANE_FIND, 362, 46, 16, 14, WS_TABSTOP
+    CONTROL         "", IDC_PANE_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 202, 64, 176, 148
+    PUSHBUTTON      "Select &all", IDC_B_ALL, 10, 218, 54, 15
+    PUSHBUTTON      "Select &none", IDC_B_NONE, 68, 218, 54, 15
+    PUSHBUTTON      "&Invert", IDC_B_INVERT, 126, 218, 54, 15
+    DEFPUSHBUTTON   "OK", IDOK, 274, 218, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 328, 218, 50, 15
 END
 
 IDD_RESTORE DIALOGEX 0, 0, 268, 214
@@ -314,63 +415,32 @@ BEGIN
     PUSHBUTTON      "Later", IDCANCEL, 360, 254, 50, 15
 END
 
-IDD_SYNC_SETUP DIALOGEX 0, 0, 268, 236
+IDD_SYNC_SETUP DIALOGEX 0, 0, 380, 256
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Sync settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "", IDC_Z_TEXT, 10, 10, 248, 10, SS_NOPREFIX
-    CONTROL         "", IDC_Z_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, 10, 24, 248, 60
-    LTEXT           "&What they sync:", IDC_Z_ITEMS_LABEL, 10, 90, 248, 10
-    CONTROL         "", IDC_Z_ITEMS, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 102, 248, 84
-    LTEXT           "Each sync goes both ways: what changed in one profile goes to the others. What two changed each their own way waits for you to choose.", IDC_Z_NOTE, 10, 190, 248, 20
-    PUSHBUTTON      "&Sync now", IDC_Z_SYNC_NOW, 10, 214, 60, 15
-    DEFPUSHBUTTON   "OK", IDOK, 154, 214, 50, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 208, 214, 50, 15
-END
-
-IDD_HISTORY DIALOGEX 0, 0, 540, 274
-STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Backup history"
-FONT 9, "Segoe UI", 400, 0, 0x1
-BEGIN
-    LTEXT           "The latest 64 profile ZIP locations saved by this version. Available means the file exists; archive contents have not been checked.", IDC_HISTORY_NOTE, 10, 10, 520, 30, SS_NOPREFIX
-    CONTROL         "", IDC_HISTORY_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 46, 520, 196
-    PUSHBUTTON      "&Refresh", IDC_HISTORY_REFRESH, 10, 249, 72, 15
-    PUSHBUTTON      "Open &folder", IDC_HISTORY_OPEN, 88, 249, 98, 15, WS_DISABLED
-    PUSHBUTTON      "&Validate", IDC_HISTORY_VALIDATE, 192, 249, 78, 15, WS_DISABLED
-    PUSHBUTTON      "Close", IDCANCEL, 480, 249, 50, 15
-END
-
-IDD_BACKUP_HUB DIALOGEX 0, 0, 268, 239
-STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Backup & Restore"
-FONT 9, "Segoe UI", 400, 0, 0x1
-BEGIN
-    LTEXT           "", IDC_H_PROFILE, 10, 10, 248, 10, SS_NOPREFIX
-    PUSHBUTTON      L"&Back up\x2026", IDC_H_BACKUP, 10, 24, 121, 15
-    PUSHBUTTON      L"&Restore from backup\x2026", IDC_H_RESTORE, 137, 24, 121, 15
-    LTEXT           "Sessions", IDC_H_SESSIONS, 10, 48, 248, 10
-    PUSHBUTTON      L"E&xport sessions\x2026", IDC_H_EXPORT, 10, 62, 121, 15
-    PUSHBUTTON      L"&Import sessions\x2026", IDC_H_IMPORT, 137, 62, 121, 15
-    PUSHBUTTON      L"Reco&ver sessions\x2026", IDC_H_RECOVER, 10, 81, 121, 15
-    PUSHBUTTON      L"C&lean up sessions\x2026", IDC_H_PURGE, 137, 81, 121, 15
-    LTEXT           "Claude Code", IDC_H_CODE_LABEL, 10, 105, 248, 10
-    PUSHBUTTON      L"Back up .&claude\x2026", IDC_H_CODE, 10, 119, 121, 15
-    AUTOCHECKBOX    "Back up once a &week", IDC_H_WEEKLY, 137, 122, 121, 10
-    PUSHBUTTON      L"Backup &history\x2026", IDC_H_HISTORY, 10, 142, 121, 15
-    PUSHBUTTON      "Validate &archive", IDC_H_VALIDATE, 137, 142, 121, 15
-    PUSHBUTTON      L"Local profile tools\x2026", 6320, 10, 163, 248, 15
-    LTEXT           "Each backup asks what it keeps. What a restore or a recovery replaces is kept in a backup first.", IDC_H_NOTE, 10, 186, 248, 20
-    PUSHBUTTON      "Close", IDCANCEL, 208, 217, 50, 15
+    LTEXT           "", IDC_Z_TEXT, 10, 10, 360, 10, SS_NOPREFIX
+    LTEXT           "", IDC_Z_LIST, 10, 24, 360, 12, SS_NOPREFIX
+    LTEXT           "&What they sync:", IDC_Z_ITEMS_LABEL, 10, 44, 178, 10
+    CONTROL         "", IDC_Z_ITEMS, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 56, 178, 136
+    LTEXT           "Preview pane", IDC_PANE_LABEL, 194, 44, 86, 10, SS_NOPREFIX
+    RTEXT           "", IDC_PANE_TITLE, 282, 44, 88, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    EDITTEXT        IDC_PANE_SEARCH, 194, 56, 158, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Search o&ptions", IDC_PANE_FIND, 354, 56, 16, 14, WS_TABSTOP
+    CONTROL         "", IDC_PANE_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 194, 74, 176, 118
+    LTEXT           "Each sync goes both ways: what changed in one profile goes to the others. What two changed each their own way waits for you to choose.", IDC_Z_NOTE, 10, 198, 360, 28
+    PUSHBUTTON      "&Sync now", IDC_Z_SYNC_NOW, 10, 234, 60, 15
+    DEFPUSHBUTTON   "OK", IDOK, 266, 234, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 320, 234, 50, 15
 END
 
 IDD_UNINSTALL DIALOGEX 0, 0, 292, 206
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Uninstall Claude Desktop Profiles Manager"
+CAPTION "Uninstall Claude Delta"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "This removes Claude Desktop Profiles Manager, its shortcuts, its taskbar pins and its claude:// link handler, and gives claude:// links back to Claude.", -1, 10, 10, 272, 30
+    LTEXT           "This removes Claude Delta, its shortcuts, its taskbar pins and its claude:// link handler, and gives claude:// links back to Claude.", -1, 10, 10, 272, 30
     LTEXT           "", IDC_U_KEEP, 10, 44, 272, 20, SS_NOPREFIX
     LTEXT           "Keep the data of these profiles (unchecked ones go to the Recycle Bin):", IDC_U_LABEL, 10, 70, 272, 10
     CONTROL         "", IDC_U_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, 10, 82, 272, 68
@@ -379,7 +449,6 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 232, 182, 50, 15
 END
 
-#include "profiletools.rc"
 
 #include "sessiontools.rc"
 

@@ -272,13 +272,23 @@ static BOOL ManagerLinkIn(const WCHAR *dir, WCHAR *out, size_t cch)
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_NAME L".lnk", dir));
 }
 
-/* The Start menu folder of Claude Desktop Profiles Manager: its own shortcut and
+/* The Start menu folder of Claude Delta: its own shortcut and
  * the profiles added to the Start menu. */
 BOOL Shortcut_StartMenuDir(WCHAR *out, size_t cch)
 {
     WCHAR programs[MAX_PATH];
     return Util_KnownFolder(&FOLDERID_Programs, programs, ARRAYSIZE(programs)) &&
-           SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_NAME, programs));
+           SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_FOLDER, programs));
+}
+
+/* The manager's shortcut under its earlier name, in `dir`, gone: the one under its name takes its place. */
+static void RemoveEarlierLink(const WCHAR *dir)
+{
+    WCHAR lnk[MAX_PATH];
+    LinkInfo info;
+    if (SUCCEEDED(StringCchPrintfW(lnk, ARRAYSIZE(lnk), L"%s\\" APP_FOLDER L".lnk", dir)) && Shortcut_Read(lnk, &info) &&
+        Core_IsOurExe(info.target) && !info.args[0])
+        DeleteLink(lnk);
 }
 
 /* The manager's own shortcut, and the folder it is in. */
@@ -298,6 +308,7 @@ HRESULT Shortcut_CreateManagerLink(const WCHAR *exe)
     hr = WriteLink(lnk, exe, L"", exe, ManagerDescription(), installDir, APP_MANAGER_AUMID);
     if (FAILED(hr)) return hr;
     SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, lnk, NULL);
+    RemoveEarlierLink(folder);
     /* A manager shortcut straight in Programs would show it twice. */
     if (Util_KnownFolder(&FOLDERID_Programs, programs, ARRAYSIZE(programs)) && ManagerLinkIn(programs, duplicate, ARRAYSIZE(duplicate)) &&
         Shortcut_Read(duplicate, &info) && Core_IsOurExe(info.target) && !info.args[0])
@@ -318,6 +329,7 @@ HRESULT Shortcut_RestoreManagerLink(const WCHAR *exe)
     if (!ManagerLinkPath(lnk, ARRAYSIZE(lnk), folder, ARRAYSIZE(folder))) return E_FAIL;
     state = Util_QueryPath(lnk, NULL);
     if (state == PATH_MISSING) return Shortcut_CreateManagerLink(exe);
+    RemoveEarlierLink(folder);
     if (state == PATH_UNREACHABLE || !Shortcut_Read(lnk, &info) || !Core_IsOurExe(info.target)) return S_FALSE;
     hr = UpdateLink(lnk, exe, ManagerDescription());
     if (hr == S_OK) SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, lnk, NULL);
@@ -335,20 +347,20 @@ void Shortcut_RemoveManagerLink(void)
     LinkInfo info;
     if (!ManagerLinkPath(lnk, ARRAYSIZE(lnk), folder, ARRAYSIZE(folder))) return;
     if (Shortcut_Read(lnk, &info) && Core_IsOurExe(info.target)) DeleteLink(lnk);
+    RemoveEarlierLink(folder);
     if (RemoveDirectoryW(folder)) SHChangeNotify(SHCNE_RMDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, folder, NULL);
 }
 
 /* -------------------------------------------------------------- names */
 
-/* A free "Claude (<label>).lnk", else "Claude (<label>) (n).lnk", in `dir`. */
-static BOOL FreeLinkPath(const WCHAR *dir, const WCHAR *label, WCHAR *out, size_t cch)
+BOOL Shortcut_FreePath(const WCHAR *dir, const WCHAR *label, WCHAR *out, size_t cch)
 {
     WCHAR name[MAX_PATH];
     int copy;
     for (copy = 1; copy <= MAX_LINK_COPIES; copy++) {
         Core_ShortcutFileName(label, copy, name, ARRAYSIZE(name));
         if (FAILED(StringCchPrintfW(out, cch, L"%s\\%s", dir, name))) return FALSE;
-        if (GetFileAttributesW(out) == INVALID_FILE_ATTRIBUTES) return TRUE;
+        if (Util_QueryPath(out, NULL) == PATH_MISSING) return TRUE;
     }
     return FALSE;
 }
@@ -356,7 +368,7 @@ static BOOL FreeLinkPath(const WCHAR *dir, const WCHAR *label, WCHAR *out, size_
 BOOL Shortcut_DesktopPathFor(const Profile *profile, WCHAR *out, size_t cch)
 {
     WCHAR desktop[MAX_PATH];
-    return Util_KnownFolder(&FOLDERID_Desktop, desktop, ARRAYSIZE(desktop)) && FreeLinkPath(desktop, profile->name, out, cch);
+    return Util_KnownFolder(&FOLDERID_Desktop, desktop, ARRAYSIZE(desktop)) && Shortcut_FreePath(desktop, profile->name, out, cch);
 }
 
 /* "Claude (<label>).lnk" or "Claude (<label>) (n).lnk": a name we gave it. */
@@ -638,7 +650,7 @@ static BOOL AddToList(const WCHAR *path, const LinkInfo *info, BOOL recorded, vo
     return list->count < list->capacity;
 }
 
-/* The profile's shortcuts that Claude Desktop Profiles Manager keeps up to
+/* The profile's shortcuts that Claude Delta keeps up to
  * date (recorded ones, and ours on the desktop and in the Start menu), taskbar
  * pins excepted. */
 DWORD Shortcut_ListOurs(const WCHAR *folder, WCHAR (*paths)[MAX_PATH], DWORD capacity)
@@ -727,7 +739,7 @@ HRESULT Shortcut_AddToStartMenu(const ClaudePackage *pkg, const Profile *profile
 {
     WCHAR folder[MAX_PATH], lnk[MAX_PATH];
     if (!Shortcut_StartMenuDir(folder, ARRAYSIZE(folder)) || !Util_EnsureDir(folder)) return E_FAIL;
-    if (!FreeLinkPath(folder, profile->name, lnk, ARRAYSIZE(lnk))) return HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
+    if (!Shortcut_FreePath(folder, profile->name, lnk, ARRAYSIZE(lnk))) return HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
     return Shortcut_CreateForProfile(pkg, profile, lnk);
 }
 
@@ -813,7 +825,7 @@ HRESULT Shortcut_SetStartup(const ClaudePackage *pkg, const Profile *profile, BO
     if (!SearchStartup(profile, !on, &search)) return E_FAIL;
     if (!on) return search.result;
     if (search.found) return S_OK;
-    if (!FreeLinkPath(search.dir, profile->name, lnk, ARRAYSIZE(lnk))) return HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
+    if (!Shortcut_FreePath(search.dir, profile->name, lnk, ARRAYSIZE(lnk))) return HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
     return Shortcut_CreateForProfile(pkg, profile, lnk);
 }
 

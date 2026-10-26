@@ -4,7 +4,7 @@ Guidance for AI assistants working in this repository.
 
 ## What this is
 
-Claude Desktop Profiles Manager: one Win32 C executable that runs several Claude Desktop
+Claude Delta: one Win32 C executable that runs several Claude Desktop
 accounts side by side on Windows. It never modifies Claude Desktop; it starts the
 installed MSIX app with a separate `--user-data-dir` per profile, routes
 `claude://` links to the right window, and manages shortcuts. User-facing
@@ -122,7 +122,7 @@ Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project s
 build.cmd
 ```
 
-Builds `build\ClaudeDesktopProfilesManager.exe` and runs the nine test programs of `tests\`; the exe
+Builds `build\ClaudeDesktopProfilesManager.exe` and runs the eleven test programs of `tests\`; the exe
 is put in `build\` only once they all pass (`test_claude` is skipped without Claude; `test_theme` and
 `test_layout` show windows and check what is drawn, so they need an unlocked desktop session). Manual
 checks on a real machine: install (`build\ClaudeDesktopProfilesManager.exe --install`), create

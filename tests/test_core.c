@@ -94,12 +94,34 @@ static void TestPrivateSignIn(void)
     for (i = wcslen(longUrl); i < ARRAYSIZE(longUrl) - 1; i++) longUrl[i] = L'a';
     longUrl[ARRAYSIZE(longUrl) - 1] = 0;
     Check("private sign-in: overlong URL refused", !Core_PrivateSignInUrl(longUrl, url, ARRAYSIZE(url)));
-    Check("private browser: Edge arguments", Core_PrivateBrowserArgs(TRUE, folder, L"https://claude.ai/login?state=x%22y", args, ARRAYSIZE(args)));
+    Check("private browser: Edge arguments", Core_PrivateBrowserArgs(CORE_BROWSER_EDGE, folder, L"https://claude.ai/login?state=x%22y", args, ARRAYSIZE(args)));
     CheckStr("private browser: isolated Edge path and URL each quoted",
         L"--user-data-dir=\"C:\\Users\\Example User\\Private Sign In\\{test}\" --inprivate --new-window --no-first-run --no-default-browser-check \"https://claude.ai/login?state=x%22y\"", args);
-    Check("private browser: Chrome arguments", Core_PrivateBrowserArgs(FALSE, L"C:\\private\\", L"https://claude.ai/login", args, ARRAYSIZE(args)));
+    Check("private browser: Chrome arguments", Core_PrivateBrowserArgs(CORE_BROWSER_CHROMIUM, L"C:\\private\\", L"https://claude.ai/login", args, ARRAYSIZE(args)));
     CheckStr("private browser: Chrome uses incognito and strips the path's trailing slash",
         L"--user-data-dir=\"C:\\private\" --incognito --new-window --no-first-run --no-default-browser-check \"https://claude.ai/login\"", args);
+    {
+        WCHAR link[URL_CCH], email[64];
+        /* someone@example.com in base64 */
+        Check("magic link: read, with the address it is for",
+              Core_MagicLink(L" https://claude.ai/magic-link#0123456789abcdef0123456789ABCDEF:c29tZW9uZUBleGFtcGxlLmNvbQ== ", link, ARRAYSIZE(link), email, ARRAYSIZE(email)) &&
+              wcscmp(email, L"someone@example.com") == 0 &&
+              wcscmp(link, L"https://claude.ai/magic-link#0123456789abcdef0123456789ABCDEF:c29tZW9uZUBleGFtcGxlLmNvbQ==") == 0);
+        Check("magic link: unpadded base64 is read too",
+              Core_MagicLink(L"https://claude.ai/magic-link#0123456789abcdef0123456789abcdef:c29tZW9uZUBleGFtcGxlLmNvbQ", NULL, 0, email, ARRAYSIZE(email)) &&
+              wcscmp(email, L"someone@example.com") == 0);
+        Check("magic link: another host, a short code, no address, or more after it is refused",
+              !Core_MagicLink(L"https://claude.ai.example.com/magic-link#0123456789abcdef0123456789abcdef:c29tZW9uZUBleGFtcGxlLmNvbQ==", NULL, 0, NULL, 0) &&
+              !Core_MagicLink(L"https://claude.ai/magic-link#0123456789abcdef:c29tZW9uZUBleGFtcGxlLmNvbQ==", NULL, 0, NULL, 0) &&
+              !Core_MagicLink(L"https://claude.ai/magic-link#0123456789abcdef0123456789abcdef:aGVsbG8=", NULL, 0, NULL, 0) &&
+              !Core_MagicLink(L"https://claude.ai/magic-link#0123456789abcdef0123456789abcdef:c29tZW9uZUBleGFtcGxlLmNvbQ==&x=1", NULL, 0, NULL, 0));
+        Check("magic link: a sign-in link private sign-in opens",
+              Core_PrivateSignInUrl(L"https://claude.ai/magic-link#0123456789abcdef0123456789abcdef:c29tZW9uZUBleGFtcGxlLmNvbQ==", link, ARRAYSIZE(link)) &&
+              !Core_PrivateSignInUrl(L"https://claude.ai/magic-link#zz", link, ARRAYSIZE(link)));
+    }
+    Check("private browser: Firefox arguments", Core_PrivateBrowserArgs(CORE_BROWSER_FIREFOX, L"C:\\private", L"https://claude.ai/login", args, ARRAYSIZE(args)));
+    CheckStr("private browser: Firefox opens a private window in a profile of its own",
+        L"-no-remote -profile \"C:\\private\" -private-window \"https://claude.ai/login\"", args);
     Check("private browser: untrusted URL refused", !Core_PrivateBrowserArgs(TRUE, folder, L"https://example.com", args, ARRAYSIZE(args)));
     Check("private browser: quoted directory refused", !Core_PrivateBrowserArgs(TRUE, L"C:\\private\" --foo", L"https://claude.ai/login", args, ARRAYSIZE(args)));
     Check("private browser: control in directory refused", !Core_PrivateBrowserArgs(TRUE, L"C:\\private\n", L"https://claude.ai/login", args, ARRAYSIZE(args)));
@@ -519,6 +541,36 @@ static void TestShortcuts(void)
     CheckStr("shortcut file name, DEL and C1 controls replaced", L"Claude (a_b_c_).lnk", out);
     Core_ShortcutFileName(NULL, 1, out, ARRAYSIZE(out));
     CheckStr("shortcut file name without a label", L"Claude ().lnk", out);
+
+    {
+        SYSTEMTIME day;
+        WCHAR longTitle[200];
+        size_t i;
+        ZeroMemory(&day, sizeof day);
+        day.wYear = 2026;
+        day.wMonth = 10;
+        day.wDay = 5;
+        Core_SessionsArchiveName(L"Fix the build", L"Claude sessions", &day, 1, out, ARRAYSIZE(out));
+        CheckStr("sessions archive: one session, its title", L"Fix the build.zip", out);
+        Core_SessionsArchiveName(L"a/b:c?", L"Claude sessions", &day, 2, out, ARRAYSIZE(out));
+        CheckStr("sessions archive: characters a name cannot hold, second copy", L"a_b_c_ (2).zip", out);
+        Core_SessionsArchiveName(L"  Notes. . ", L"Claude sessions", &day, 1, out, ARRAYSIZE(out));
+        CheckStr("sessions archive: spaces around and dots after taken off", L"Notes.zip", out);
+        Core_SessionsArchiveName(NULL, L"Claude sessions", &day, 1, out, ARRAYSIZE(out));
+        CheckStr("sessions archive: several, named after the day", L"Claude sessions 2026-10-05.zip", out);
+        Core_SessionsArchiveName(L" . ", L"Claude \x4F1A\x8BDD", &day, 3, out, ARRAYSIZE(out));
+        CheckStr("sessions archive: a title of nothing, the name given, third copy", L"Claude \x4F1A\x8BDD 2026-10-05 (3).zip", out);
+        Core_SessionsArchiveName(L"con", L"Claude sessions", &day, 1, out, ARRAYSIZE(out));
+        CheckStr("sessions archive: a device name kept apart", L"con_.zip", out);
+        Core_SessionsArchiveName(L"LPT1", L"Claude sessions", &day, 1, out, ARRAYSIZE(out));
+        CheckStr("sessions archive: LPT1 too", L"LPT1_.zip", out);
+        Core_SessionsArchiveName(L"COM10", L"Claude sessions", &day, 1, out, ARRAYSIZE(out));
+        CheckStr("sessions archive: COM10 is a name", L"COM10.zip", out);
+        for (i = 0; i < ARRAYSIZE(longTitle) - 1; i++) longTitle[i] = L'x';
+        longTitle[ARRAYSIZE(longTitle) - 1] = 0;
+        Core_SessionsArchiveName(longTitle, L"Claude sessions", &day, 1, out, ARRAYSIZE(out));
+        Check("sessions archive: a long title cut to 80", wcslen(out) == 80 + 4 && Core_EndsWithI(out, L".zip"));
+    }
 }
 
 static void TestMisc(void)
@@ -537,6 +589,28 @@ static void TestMisc(void)
         Check("an icon the user chose stays while its file is there", !Core_TakesCurrentIcon(L"C:\\Users\\X\\Desktop\\69A9.ico", TRUE, current));
         Check("an icon in a folder below ours is not ours", !Core_TakesCurrentIcon(L"C:\\Users\\X\\AppData\\Local\\M\\icons\\old\\a.ico", TRUE, current));
     }
+    {
+        FILETIME time = Core_MsFileTime(1760000000123ULL);
+        FILETIME before = { 0, 0 };
+        Check("ms since 1970 to a FILETIME and back", Core_FileTimeMs(&time) == 1760000000123ULL && Core_FileTimeMs(&before) == 0);
+    }
+    {
+        static const char kEntry[] = "{\"title\":\"Plan\",\"lastActivityAt\":1760000000123,\"isArchived\":true,\"n\":\"x\"}";
+        WCHAR title[16];
+        Check("member text, number and truth", Core_JsonMemberString(kEntry, sizeof kEntry - 1, "title", title, ARRAYSIZE(title)) &&
+              wcscmp(title, L"Plan") == 0 && Core_JsonMemberNumber(kEntry, sizeof kEntry - 1, "lastActivityAt") == 1760000000123ULL &&
+              Core_JsonMemberTrue(kEntry, sizeof kEntry - 1, "isArchived"));
+        Check("member absent or of another kind", !Core_JsonMemberString(kEntry, sizeof kEntry - 1, "lastActivityAt", title, ARRAYSIZE(title)) &&
+              title[0] == 0 && Core_JsonMemberNumber(kEntry, sizeof kEntry - 1, "n") == 0 && !Core_JsonMemberTrue(kEntry, sizeof kEntry - 1, "x"));
+    }
+    {
+        char entry[] = "{\"sessionId\":\"local_1\",\"priorCliSessionIds\":[\"a\"],\"title\":\"T\",\"stagedTranscriptPath\":\"x\"}";
+        size_t length = sizeof entry - 1;
+        Check("a new session's entry leaves the original's other transcripts out",
+              Core_EntryDropHistory(entry, &length) && length == strlen("{\"sessionId\":\"local_1\",\"title\":\"T\"}") &&
+              memcmp(entry, "{\"sessionId\":\"local_1\",\"title\":\"T\"}", length) == 0);
+    }
+    Check("bit count", Core_BitCount(0) == 0 && Core_BitCount(0x80000001u) == 2 && Core_BitCount(~0u) == 32);
     Check("ends with", Core_EndsWithI(L"x\\APP\\claude.EXE", L"\\app\\Claude.exe"));
     Check("contains", Core_ContainsI(L"abc --User-Data-Dir=x", L"--user-data-dir"));
     Check("our exe by name", Core_IsOurExe(L"D:\\portable\\claudedesktopprofilesmanager.exe"));
@@ -805,6 +879,23 @@ static void TestJsonAndVersions(void)
               Core_JsonIsValue("\"en-US\"", 7) && Core_JsonIsValue("null", 4));
         Check("json value: plain text, two values or a cut one refused",
               !Core_JsonIsValue("en-US x", 7) && !Core_JsonIsValue("{\"a\":1} 2", 9) && !Core_JsonIsValue("{\"a\":1", 6) && !Core_JsonIsValue("  ", 2));
+        {
+            static const char *const kValid[] = { "{\"a\":[1,2.5e-3,-0,true,false,null,\"x\\u00e9\\n\\\"\"]}", "[]", "{}", " \"s\" ", "-0.5E+2",
+                                                  "[ [ ] , { } ]", "{\"\":0}" };
+            static const char *const kInvalid[] = { "{]", "[1,,2]", "{\"a\":}", "{\"a\" 1}", "[1,]", "{\"a\":1,}", "en-US", "\"\\x\"",
+                                                    "\"a\tb\"", "01", "1.", ".5", "tru", "[truex]", "{1:2}", "\"\\u12g4\"", "[1 2]", "-" };
+            char deep[2 * 300 + 1];
+            size_t k;
+            BOOL all = TRUE;
+            for (k = 0; k < ARRAYSIZE(kValid); k++) all = all && Core_JsonIsValue(kValid[k], strlen(kValid[k]));
+            Check("json value: every form JSON has", all);
+            for (k = 0, all = TRUE; k < ARRAYSIZE(kInvalid); k++) all = all && !Core_JsonIsValue(kInvalid[k], strlen(kInvalid[k]));
+            Check("json value: misplaced or missing parts, bare words, bad escapes and numbers are none", all);
+            memset(deep, '[', 300);
+            memset(deep + 300, ']', 300);
+            deep[600] = 0;
+            Check("json value: nesting past the limit is refused", !Core_JsonIsValue(deep, 600) && Core_JsonIsValue(deep + 100, 400));
+        }
     }
 
     Check("version: v1.2.3", Core_ParseVersion(L"v1.2.3", a) && a[0] == 1 && a[1] == 2 && a[2] == 3 && a[3] == 0);
@@ -983,6 +1074,16 @@ static void TestSealedSecret(void)
           Core_SealSecret(kSecret, sizeof kSecret, L"pw", 1000, sealed, sizeof sealed) && Core_SealSecret(kSecret, sizeof kSecret, L"pw", 1000, other, sizeof other) &&
           strcmp(sealed, other) != 0);
     Check("sealed: no password, nothing", !Core_SealSecret(kSecret, sizeof kSecret, L"", 1000, sealed, sizeof sealed) && sealed[0] == 0);
+    {
+        /* A changed file asking for endless work is refused before any of it is done. */
+        ULONGLONG started = GetTickCount64();
+        char *at;
+        Core_SealSecret(kSecret, sizeof kSecret, L"pw", 1000, sealed, sizeof sealed);
+        at = strstr(sealed, "\"iterations\":1000");
+        StringCchPrintfA(other, sizeof other, "%.*s\"iterations\":4000000000%s", (int)(at - sealed), sealed, at + strlen("\"iterations\":1000"));
+        Check("sealed: too many iterations asked, it does not open, at once",
+              !Core_OpenSecret(other, strlen(other), L"pw", opened, sizeof opened, &length) && GetTickCount64() - started < 2000);
+    }
 }
 
 static void TestTranscriptLines(void)
@@ -1208,7 +1309,15 @@ static void TestSessionSync(void)
     Check("sync plan: read back", Core_SyncOpParse(text, &back) && back.kind == SYNC_PUT && back.flags == op.flags &&
           back.time == op.time && back.seen == op.seen && wcscmp(back.key, kId) == 0 && wcscmp(back.content, L"3.json") == 0);
     Check("sync plan: a mark, with nothing to write", Core_SyncOpParse(L"mark\t0\t5\t0\tk\t", &back) && back.kind == SYNC_MARK &&
-          back.time == 5 && !back.content[0]);
+          back.time == 5 && !back.content[0] && !back.tries);
+    op.tries = 2;
+    Check("sync plan: the tries of one that failed come after", Core_SyncOpFormat(&op, text, ARRAYSIZE(text)) &&
+          wcscmp(text, L"put\t3\t1790639580461\t1790639000000\t0b6a3a3e-1111-4222-8333-944445555666\t3.json\t2") == 0 &&
+          Core_SyncOpParse(text, &back) && back.tries == 2 && wcscmp(back.content, L"3.json") == 0);
+    Check("sync plan: tries are a count past zero, the last field",
+          !Core_SyncOpParse(L"put\t0\t1\t0\tk\t3.json\t0", &back) && !Core_SyncOpParse(L"put\t0\t1\t0\tk\t3.json\tx", &back) &&
+          !Core_SyncOpParse(L"put\t0\t1\t0\tk\t3.json\t2\t", &back) && !Core_SyncOpParse(L"put\t0\t1\t0\tk\t3.json\t", &back));
+    op.tries = 0;
     Check("sync plan: the largest numbers", Core_SyncOpParse(L"put\t4294967295\t18446744073709551615\t0\tk\t", &back) &&
           back.flags == MAXDWORD && back.time == _UI64_MAX);
     Check("sync plan: broken lines are refused",
@@ -1295,6 +1404,12 @@ static void TestSessionSync(void)
           !Core_ArchiveNameSafe("a:stream", 8) && !Core_ArchiveNameSafe("a/b.", 4) && !Core_ArchiveNameSafe("a/b ", 4) &&
           !Core_ArchiveNameSafe("a\x01" "b", 3) && !Core_ArchiveNameSafe("a*b", 3) && !Core_ArchiveNameSafe("a?b", 3));
     Check("archive name: its length, not its terminator", !Core_ArchiveNameSafe("ab\0/../x", 8) && Core_ArchiveNameSafe("ab/../x", 2));
+    Check("archive name: dots inside a name are a name", Core_ArchiveNameSafe("cowork/draft..v2.md", 19) &&
+          Core_ArchiveNameSafe("a/..b/c", 7) && !Core_ArchiveNameSafe("a/b../c", 7));
+    Check("archive name: no device, whatever follows its name",
+          !Core_ArchiveNameSafe("CON", 3) && !Core_ArchiveNameSafe("a/nul.txt", 9) && !Core_ArchiveNameSafe("a/Com1.json", 11) &&
+          !Core_ArchiveNameSafe("lpt9", 4) && !Core_ArchiveNameSafe("aux .x", 6) && !Core_ArchiveNameSafe("COM\xC2\xB9", 5) &&
+          Core_ArchiveNameSafe("COM0", 4) && Core_ArchiveNameSafe("console.log", 11) && Core_ArchiveNameSafe("a/nulls", 7));
 
     StringCchPrintfW(path, ARRAYSIZE(path), L"projects\\C--work\\%s.jsonl", kId);
     Check("conversation file: a transcript", Core_ConversationFileName(path));
@@ -1487,6 +1602,35 @@ static void TestSessionsKeptTheSame(void)
           length == strlen(set));
     if (set) HeapFree(GetProcessHeap(), 0, set);
     Check("json nested: no object on the way, nothing", Core_JsonSetNested("{\"preferences\":[1]}", 19, keys, 3, "1", &length) == NULL);
+    {
+        static const char *const env[] = { "env", "DISABLE_TELEMETRY" }, *const top[] = { "spinnerTipsEnabled" };
+        StringCchCopyA(text, sizeof text, "{\"env\":{\"A\":\"1\",\"DISABLE_TELEMETRY\":\"1\"},\"model\":\"opus\"}");
+        set = Core_JsonSetPath(text, strlen(text), env, 2, NULL, &length);
+        Check("json path: a nested member removed, the rest kept",
+              set && strcmp(set, "{\"env\":{\"A\":\"1\"},\"model\":\"opus\"}") == 0 && length == strlen(set));
+        if (set) HeapFree(GetProcessHeap(), 0, set);
+        set = Core_JsonSetPath("{\"model\":\"opus\"}", 16, env, 2, NULL, &length);
+        Check("json path: a member already missing leaves the text as it is, nothing made",
+              set && strcmp(set, "{\"model\":\"opus\"}") == 0);
+        if (set) HeapFree(GetProcessHeap(), 0, set);
+        set = Core_JsonSetPath("{}", 2, env, 2, "\"1\"", &length);
+        Check("json path: set as Core_JsonSetNested sets", set && strcmp(set, "{\"env\":{\"DISABLE_TELEMETRY\":\"1\"}}") == 0);
+        if (set) HeapFree(GetProcessHeap(), 0, set);
+        StringCchCopyA(text, sizeof text, "{\"spinnerTipsEnabled\":false,\"a\":1}");
+        set = Core_JsonSetPath(text, strlen(text), top, 1, NULL, &length);
+        Check("json path: a top-level member removed", set && strcmp(set, "{\"a\":1}") == 0);
+        if (set) HeapFree(GetProcessHeap(), 0, set);
+        Check("json path: removing from no object fails", Core_JsonSetPath("[1]", 3, top, 1, NULL, &length) == NULL &&
+              Core_JsonSetPath("{\"env\":3}", 9, env, 2, NULL, &length) == NULL);
+        Check("env switch: on for 1, true, yes and on, in any case and as a bare value",
+              Core_EnvSwitch("\"1\"", 3) == 1 && Core_EnvSwitch("\"TRUE\"", 6) == 1 && Core_EnvSwitch("\"yes\"", 5) == 1 &&
+              Core_EnvSwitch("\"On\"", 4) == 1 && Core_EnvSwitch("1", 1) == 1 && Core_EnvSwitch("true", 4) == 1);
+        Check("env switch: off for 0, false, no and off",
+              Core_EnvSwitch("\"0\"", 3) == 0 && Core_EnvSwitch("\"false\"", 7) == 0 && Core_EnvSwitch("\"NO\"", 4) == 0 &&
+              Core_EnvSwitch("\"off\"", 5) == 0 && Core_EnvSwitch("false", 5) == 0);
+        Check("env switch: anything else is neither", Core_EnvSwitch("\"\"", 2) == -1 && Core_EnvSwitch("\"2\"", 3) == -1 &&
+              Core_EnvSwitch("\"\\u00e9\"", 8) == -1 && Core_EnvSwitch(NULL, 0) == -1 && Core_EnvSwitch("{}", 2) == -1);
+    }
 
     StringCchCopyA(text, sizeof text, "{\"local_9\":[\"local_1\",\"code:local_2\",\"x\\\"local_3\"],\"n\":1}");
     mapped = Core_JsonMapStrings(text, strlen(text), MapCodeIds, NULL, &length);
@@ -1825,6 +1969,43 @@ static BOOL MergeTwo(const char *base, const char *a, const char *b, ULONGLONG w
     return ok;
 }
 
+/* `json` (NULL: none) with `id` read or marked unread, as Core_UnreadSet makes it. */
+static void CheckUnread(const char *name, const char *json, const WCHAR *id, BOOL unread, const char *expected)
+{
+    size_t length = 0;
+    char *set = Core_UnreadSet(json, json ? strlen(json) : 0, id, unread, &length);
+    BOOL ok = set && length == strlen(expected) && strcmp(set, expected) == 0;
+    if (!ok) printf("    got %s\n", set ? set : "(null)");
+    Check(name, ok);
+    if (set) HeapFree(GetProcessHeap(), 0, set);
+}
+
+/* Claude's sessions unread (epitaxy-unread-v1): found in either list, read
+ * out of both, marked unread as its Mark as unread does. */
+static void TestUnreadMarks(void)
+{
+    static const char kClaude[] = "{\"state\":{\"unreadIds\":[\"local_509c1a37-c07d-463f-a86a-d56c9e3953cb\"],\"explicitUnreadIds\":[]},\"version\":0}";
+    static const char kBoth[] = "{\"state\":{\"unreadIds\":[\"local_a\",\"local_b\"],\"explicitUnreadIds\":[\"local_a\",\"local_c\"]},\"version\":0}";
+    PendingEdit back;
+    Check("unread: a session Claude marked", Core_UnreadHas(kClaude, strlen(kClaude), L"local_509c1a37-c07d-463f-a86a-d56c9e3953cb"));
+    Check("unread: one marked by hand", Core_UnreadHas(kBoth, strlen(kBoth), L"local_c"));
+    Check("unread: one in neither list, or no value", !Core_UnreadHas(kBoth, strlen(kBoth), L"local_d") && !Core_UnreadHas(NULL, 0, L"local_a") &&
+                                                     !Core_UnreadHas(kBoth, strlen(kBoth), L""));
+    CheckUnread("unread: read takes it out of both lists, the others kept in their order", kBoth, L"local_a", FALSE,
+                "{\"state\":{\"unreadIds\":[\"local_b\"],\"explicitUnreadIds\":[\"local_c\"]},\"version\":0}");
+    CheckUnread("unread: Claude's own mark read", kClaude, L"local_509c1a37-c07d-463f-a86a-d56c9e3953cb", FALSE,
+                "{\"state\":{\"unreadIds\":[],\"explicitUnreadIds\":[]},\"version\":0}");
+    CheckUnread("unread: marked unread by hand, once", kBoth, L"local_c", TRUE,
+                "{\"state\":{\"unreadIds\":[\"local_a\",\"local_b\"],\"explicitUnreadIds\":[\"local_a\",\"local_c\"]},\"version\":0}");
+    CheckUnread("unread: marked unread, Claude's own mark kept", kClaude, L"local_x", TRUE,
+                "{\"state\":{\"unreadIds\":[\"local_509c1a37-c07d-463f-a86a-d56c9e3953cb\"],\"explicitUnreadIds\":[\"local_x\"]},\"version\":0}");
+    CheckUnread("unread: no value yet: one made", NULL, L"local_x", TRUE,
+                "{\"state\":{\"unreadIds\":[],\"explicitUnreadIds\":[\"local_x\"]},\"version\":0}");
+    CheckUnread("unread: a list missing is made, the store's other members kept", "{\"state\":{\"unreadIds\":[\"local_a\"],\"other\":1},\"version\":2}",
+                L"local_a", FALSE, "{\"state\":{\"unreadIds\":[],\"other\":1,\"explicitUnreadIds\":[]},\"version\":2}");
+    Check("pending: a session read", Core_PendingParse(L"read\tk\t1", &back) && back.op == PENDING_READ && back.value[0] == L'1');
+}
+
 /* `base` joined with `other`'s scheduledTasks, as Core_JsonArrayUnion does; `expected` NULL: no result. */
 static void CheckUnion(const char *name, const char *base, const char *other, const char *expected)
 {
@@ -1911,6 +2092,67 @@ static void TestSafeStorage(void)
     sealed[1] = '1';
     Check("safe storage: too short, nothing", !Core_OpenSafeStorage(sealed, 30, key, sizeof key, plain, sizeof plain, &opened));
     Check("safe storage: no room, nothing", !Core_OpenSafeStorage(sealed, length, key, sizeof key, plain, 4, &opened));
+
+    /* Sealing is the inverse: what Core_SealSafeStorage writes, Core_OpenSafeStorage opens, with the same key. */
+    {
+        BYTE resealed[256];
+        size_t resealedLength = 0, reopened = 0;
+        Check("safe storage: sealed again by Core_SealSafeStorage",
+              Core_SealSafeStorage((const BYTE *)text, strlen(text), key, sizeof key, resealed, sizeof resealed, &resealedLength) &&
+              resealedLength == strlen(text) + 31 && memcmp(resealed, "v10", 3) == 0);
+        Check("safe storage: and opened back to the same text",
+              Core_OpenSafeStorage(resealed, resealedLength, key, sizeof key, plain, sizeof plain, &reopened) &&
+              reopened == strlen(text) && memcmp(plain, text, reopened) == 0);
+        Check("safe storage: two seals differ (a random nonce)",
+              Core_SealSafeStorage((const BYTE *)text, strlen(text), key, sizeof key, sealed, sizeof sealed, &opened) &&
+              memcmp(resealed + 3, sealed + 3, 12) != 0);
+        Check("safe storage: no room to seal, nothing",
+              !Core_SealSafeStorage((const BYTE *)text, strlen(text), key, sizeof key, resealed, 10, &resealedLength) && resealedLength == 0);
+        Check("safe storage: a wrong key length seals nothing",
+              !Core_SealSafeStorage((const BYTE *)text, strlen(text), key, 16, resealed, sizeof resealed, &resealedLength));
+    }
+}
+
+/* Claude's token cache, opened: what it says of the sign-in, never a token;
+ * its members keyed by account, client, organization, API and scopes. */
+static void TestTokenCache(void)
+{
+    const char *cache = "{\"acct:a-1|c-1:o-1:https://api.anthropic.com:user:inference user:profile\":"
+                        "{\"token\":\"sk-1\",\"refreshToken\":\"rt-1\",\"expiresAt\":1794041189656,\"subscriptionType\":\"max\",\"rateLimitTier\":\"tier_20x\"},"
+                        "\"acct:a-1|c-2:o-1:https://api.anthropic.com:user:office\":{\"token\":\"sk-2\",\"expiresAt\":1822886130157,\"subscriptionType\":null},"
+                        "\"not a token\":{\"expiresAt\":1}}";
+    CoreSignIn signIn;
+    WCHAR size[32];
+    ZeroMemory(&signIn, sizeof signIn);
+    Core_ReadTokenCache(cache, strlen(cache), &signIn);
+    Check("token cache: its account, organization, plan and tier",
+          wcscmp(signIn.account, L"a-1") == 0 && wcscmp(signIn.organization, L"o-1") == 0 && wcscmp(signIn.plan, L"max") == 0 &&
+          wcscmp(signIn.tier, L"tier_20x") == 0);
+    Check("token cache: each token's scopes, until when, whether it renews; another member none",
+          signIn.tokenCount == 2 && wcscmp(signIn.tokens[0].scopes, L"user:inference user:profile") == 0 && signIn.tokens[0].expires == 1794041189656ull &&
+          signIn.tokens[0].renews && wcscmp(signIn.tokens[1].scopes, L"user:office") == 0 && !signIn.tokens[1].renews);
+    Core_FormatSize(40960, size, ARRAYSIZE(size));
+    Check("size: kilobytes", wcscmp(size, L"40 KB") == 0);
+    Core_FormatSize(3435973ull, size, ARRAYSIZE(size));
+    Check("size: megabytes, a tenth", wcscmp(size, L"3.2 MB") == 0);
+    Core_FormatSize(20010000000ull, size, ARRAYSIZE(size));
+    Check("size: gigabytes from one, a tenth", wcscmp(size, L"18.6 GB") == 0);
+    {
+        static const WCHAR kNotes[] = L"> Unsigned build. \x672A\x7B7E\x540D\r\n\r\n> Run several accounts.\r\n\r\nWhat the day brings.\r\n\r\n"
+                                      L"## Improvements\r\n\r\n1. Faster\r\n\r\n---\r\n\r\n> \x591A\x8D26\x53F7\r\n\r\n\x6458\x8981\r\n\r\n"
+                                      L"## \x4F18\x5316\x6539\x8FDB\r\n\r\n1. \x66F4\x5FEB\r\n\r\n\r\n---\r\n\r\n## \xD83D\xDCE5 Installation / \x5B89\x88C5\r\n";
+        size_t start = 0, length = 0;
+        Check("release notes: the English, from its summary to the rule, quotes and footer left out",
+              Core_ReleaseNotesIn(kNotes, FALSE, &start, &length) &&
+              wcsncmp(kNotes + start, L"What the day brings.\r\n\r\n## Improvements\r\n\r\n1. Faster", length) == 0 &&
+              length == wcslen(L"What the day brings.\r\n\r\n## Improvements\r\n\r\n1. Faster"));
+        Check("release notes: the Chinese, between the rules",
+              Core_ReleaseNotesIn(kNotes, TRUE, &start, &length) &&
+              wcsncmp(kNotes + start, L"\x6458\x8981\r\n\r\n## \x4F18\x5316\x6539\x8FDB\r\n\r\n1. \x66F4\x5FEB", length) == 0 &&
+              length == wcslen(L"\x6458\x8981\r\n\r\n## \x4F18\x5316\x6539\x8FDB\r\n\r\n1. \x66F4\x5FEB"));
+        Check("release notes: without the rules, not split", !Core_ReleaseNotesIn(L"Just notes\n", TRUE, &start, &length) &&
+              !Core_ReleaseNotesIn(NULL, FALSE, &start, &length));
+    }
 }
 
 static void TestJsonMerge(void)
@@ -2231,6 +2473,247 @@ static void TestSessionMetadataHelpers(void)
           Core_RegexSearchEnd(&regex, L"Alpha Beta12 later", 18, &end) && end >= 11 && end <= 12);
 }
 
+/* The shield's facts: the regions Claude serves, Cloudflare's trace, each
+ * IP service's answer as it gives it (8.8.8.8's, read on 2026-10-24), a
+ * STUN server's, and the rules on them. */
+static void TestReleases(void)
+{
+    static const char list[] =
+        "[{\"isDraft\":false,\"isLatest\":false,\"tagName\":\"build-143\"},{\"isDraft\":false,\"isLatest\":false,\"tagName\":\"v2026.10.25\"},"
+        "{\"isDraft\":true,\"isLatest\":false,\"tagName\":\"v2026.12.01\"},{\"isDraft\":false,\"isLatest\":true,\"tagName\":\"v2026.10.26\"},"
+        "{\"isDraft\":false,\"isLatest\":false,\"tagName\":\"v1.1.0\"}]";
+    static const char noLatest[] = "[{\"tagName\":\"v2026.10.25\"},{\"tagName\":\"v2026.10.27\"},{\"tagName\":\"v2026.10.26\"}]";
+    static const char refs[] =
+        "1111111111111111111111111111111111111111\trefs/tags/build-143\n"
+        "2222222222222222222222222222222222222222\trefs/tags/v2026.10.25\r\n"
+        "3333333333333333333333333333333333333333\trefs/tags/v2026.10.26\n"
+        "4444444444444444444444444444444444444444\trefs/tags/v2026.10.26^{}\n"
+        "5555555555555555555555555555555555555555\trefs/heads/v2026.12.31\n"
+        "6666666666666666666666666666666666666666\trefs/tags/v1.1.0";
+    WCHAR tag[64], version[16], commit[48];
+    Check("releases: a day's tag", Core_ReleaseVersion(L"v2026.10.26", version, ARRAYSIZE(version)) && wcscmp(version, L"2026.10.26") == 0);
+    Check("releases: other tags are none", !Core_ReleaseVersion(L"build-143", version, ARRAYSIZE(version)) && version[0] == 0 &&
+          !Core_ReleaseVersion(L"v1.1.0", NULL, 0) && !Core_ReleaseVersion(L"v2026.10.2", NULL, 0) && !Core_ReleaseVersion(L"2026.10.26", NULL, 0) &&
+          !Core_ReleaseVersion(L"v2026.1a.26", NULL, 0) && !Core_ReleaseVersion(NULL, NULL, 0));
+    Check("releases: the one marked latest, drafts and other tags left out", Core_NewestRelease(list, sizeof list - 1, tag, ARRAYSIZE(tag)) &&
+          wcscmp(tag, L"v2026.10.26") == 0);
+    Check("releases: none marked latest, the newest day's", Core_NewestRelease(noLatest, sizeof noLatest - 1, tag, ARRAYSIZE(tag)) &&
+          wcscmp(tag, L"v2026.10.27") == 0);
+    Check("releases: none", !Core_NewestRelease("[{\"tagName\":\"build-1\"}]", 23, tag, ARRAYSIZE(tag)) && tag[0] == 0 &&
+          !Core_NewestRelease(NULL, 0, tag, ARRAYSIZE(tag)));
+    Check("releases: the newest tag git lists, with the commit an annotated tag names",
+          Core_NewestReleaseRef(refs, sizeof refs - 1, tag, ARRAYSIZE(tag), commit, ARRAYSIZE(commit)) && wcscmp(tag, L"v2026.10.26") == 0 &&
+          wcscmp(commit, L"4444444444444444444444444444444444444444") == 0);
+    {
+        static const char light[] = "1111111111111111111111111111111111111111\trefs/tags/build-143\n"
+                                    "2222222222222222222222222222222222222222\trefs/tags/v2026.10.25\r\n";
+        Check("releases: a light tag's own commit", Core_NewestReleaseRef(light, sizeof light - 1, tag, ARRAYSIZE(tag), commit, ARRAYSIZE(commit)) &&
+              wcscmp(tag, L"v2026.10.25") == 0 && wcscmp(commit, L"2222222222222222222222222222222222222222") == 0);
+    }
+    Check("releases: git lists none", !Core_NewestReleaseRef("abc\trefs/tags/v1\n", 17, tag, ARRAYSIZE(tag), commit, ARRAYSIZE(commit)) &&
+          tag[0] == 0 && commit[0] == 0);
+    Check("releases: commits alike cut short", Core_SameCommit(L"c9814e9", L"c9814E9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e") &&
+          !Core_SameCommit(L"c9814e9", L"ebdbf7e0000") && !Core_SameCommit(L"", L"c9814e9") && !Core_SameCommit(L"c98", L"c98"));
+}
+
+static void TestSearXng(void)
+{
+    WCHAR url[URL_CCH];
+    char entry[2048];
+    BOOL priv = TRUE;
+    Check("searxng: an address as typed", Core_SearXngUrl(L"  https://searx.example.com/  ", url, ARRAYSIZE(url)) &&
+          wcscmp(url, L"https://searx.example.com") == 0);
+    Check("searxng: a path kept, a results page's /search dropped", Core_SearXngUrl(L"http://10.0.0.5:8080/sx/search", url, ARRAYSIZE(url)) &&
+          wcscmp(url, L"http://10.0.0.5:8080/sx") == 0);
+    Check("searxng: a bare host is https's", Core_SearXngUrl(L"searx.example.com/", url, ARRAYSIZE(url)) && wcscmp(url, L"https://searx.example.com") == 0);
+    Check("searxng: another scheme, refused", !Core_SearXngUrl(L"ftp://searx.example.com", url, ARRAYSIZE(url)) && url[0] == 0);
+    Check("searxng: no host, refused", !Core_SearXngUrl(L"https://", url, ARRAYSIZE(url)) && !Core_SearXngUrl(L"https:///x", url, ARRAYSIZE(url)));
+    Check("searxng: a query, a quote or a space, refused", !Core_SearXngUrl(L"https://s.example.com/?q=1", url, ARRAYSIZE(url)) &&
+          !Core_SearXngUrl(L"https://s.example.com/\"x", url, ARRAYSIZE(url)) && !Core_SearXngUrl(L"https://s.ex ample.com", url, ARRAYSIZE(url)));
+    Check("searxng: the entry", Core_SearXngEntry(L"C:\\Program Files\\nodejs\\npx.cmd", L"https://searx.example.com", FALSE, entry, sizeof entry) &&
+          strcmp(entry, "{\"command\":\"C:\\\\Program Files\\\\nodejs\\\\npx.cmd\",\"args\":[\"-y\",\"mcp-searxng\"],"
+                        "\"env\":{\"SEARXNG_URL\":\"https://searx.example.com\"}}") == 0);
+    Check("searxng: read back, private off", Core_SearXngServer(entry, strlen(entry), url, ARRAYSIZE(url), &priv) &&
+          wcscmp(url, L"https://searx.example.com") == 0 && !priv);
+    Check("searxng: the entry with private addresses", Core_SearXngEntry(L"npx.cmd", L"https://s", TRUE, entry, sizeof entry) &&
+          strstr(entry, "\"MCP_HTTP_ALLOW_PRIVATE_URLS\":\"true\"") != NULL &&
+          Core_SearXngServer(entry, strlen(entry), url, ARRAYSIZE(url), &priv) && priv);
+    Check("searxng: a pinned version is ours too",
+          Core_SearXngServer("{\"command\":\"npx\",\"args\":[\"-y\",\"mcp-searxng@0.9.1\"]}", sizeof "{\"command\":\"npx\",\"args\":[\"-y\",\"mcp-searxng@0.9.1\"]}" - 1, NULL, 0, NULL));
+    Check("searxng: another server is not",
+          !Core_SearXngServer("{\"command\":\"npx\",\"args\":[\"-y\",\"mcp-searxng-fork\"]}", sizeof "{\"command\":\"npx\",\"args\":[\"-y\",\"mcp-searxng-fork\"]}" - 1, url, ARRAYSIZE(url), &priv) &&
+          url[0] == 0 && !priv);
+    Check("searxng: no room, nothing", !Core_SearXngEntry(L"npx.cmd", L"https://s", FALSE, entry, 20) && entry[0] == 0);
+}
+
+/* Cowork is off only where Claude's preferences say false, as Claude reads them. */
+static void TestCowork(void)
+{
+    static const char off[] = "{\"mcpServers\":{},\"preferences\":{\"menuBarEnabled\":true,\"secureVmFeaturesEnabled\":false}}";
+    static const char on[] = "{\"preferences\":{\"secureVmFeaturesEnabled\":true}}";
+    static const char elsewhere[] = "{\"secureVmFeaturesEnabled\":false,\"preferences\":{\"coworkWebSearchEnabled\":false}}";
+    static const char quoted[] = "{\"preferences\":{\"secureVmFeaturesEnabled\":\"false\"}}";
+    Check("cowork: off where the preference is false", Core_CoworkOff(off, sizeof off - 1));
+    Check("cowork: on where it is true", !Core_CoworkOff(on, sizeof on - 1));
+    Check("cowork: on without it, or with it outside the preferences", !Core_CoworkOff("{}", 2) && !Core_CoworkOff(elsewhere, sizeof elsewhere - 1));
+    Check("cowork: a string \"false\" is not false", !Core_CoworkOff(quoted, sizeof quoted - 1));
+}
+
+static void TestShieldFacts(void)
+{
+    static const char kTrace[] = "fl=123f45\r\nh=claude.ai\r\nip=203.0.113.7\r\nts=1761300000.1\r\nvisit_scheme=https\r\nloc=jp\r\ntls=TLSv1.3\r\n";
+    static const char kNetCoffee[] = "{\"ip\": \"8.8.8.8\", \"cidr\": \"8.8.8.0/24\", \"is_datacenter\": true, \"isResidential\": false, \"isBroadcast\": null, "
+                                     "\"is_vpn\": true, \"is_proxy\": false, \"is_tor\": false, \"is_crawler\": false, \"is_abuser\": true, \"is_mobile\": false, "
+                                     "\"company_type\": \"hosting\", \"company_name\": \"Google LLC\", \"asn\": 15169, \"asOrganization\": \"Google LLC\", "
+                                     "\"country\": \"United States\", \"countryCode\": \"us\", \"region\": \"\", \"city\": \"\", \"timezone\": \"America/Los_Angeles\", "
+                                     "\"trust_score\": 63}";
+    static const char kIpApiIs[] = "{\"ip\":\"8.8.8.8\",\"is_datacenter\":true,\"is_tor\":false,\"is_proxy\":false,\"is_vpn\":\"NordVPN\",\"is_abuser\":false,"
+                                   "\"is_mobile\":false,\"company\":{\"name\":\"Google LLC\",\"type\":\"hosting\"},\"asn\":{\"asn\":15169,\"org\":\"Google LLC\"},"
+                                   "\"location\":{\"country\":\"United States\",\"country_code\":\"US\",\"state\":\"California\",\"city\":\"Mountain View\","
+                                   "\"timezone\":\"America/Los_Angeles\"}}";
+    static const char kIpApiCom[] = "{\"status\":\"success\",\"country\":\"United States\",\"countryCode\":\"US\",\"regionName\":\"Virginia\",\"city\":\"Ashburn\","
+                                    "\"timezone\":\"America/New_York\",\"isp\":\"Google LLC\",\"org\":\"Google Public DNS\",\"as\":\"AS15169 Google LLC\","
+                                    "\"mobile\":false,\"proxy\":true,\"hosting\":true}";
+    static const char kProxyCheck[] = "{\"status\": \"ok\", \"8.8.8.8\": {\"asn\": \"AS15169\", \"provider\": \"Google LLC\", \"country\": \"United States\", "
+                                      "\"isocode\": \"US\", \"region\": \"California\", \"timezone\": \"America/Los_Angeles\", \"city\": \"Mountain View\", "
+                                      "\"proxy\": \"no\", \"type\": \"Residential\"}}";
+    static const BYTE kTransaction[12] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    WCHAR ip[64], loc[8];
+    CoreIpRisk risk;
+    BYTE request[32], response[64];
+    CoreShieldFacts facts;
+    CoreShieldRules rules;
+    size_t n;
+
+    Check("shield: Claude works in the US, Japan, Taiwan, Ukraine", Core_ClaudeRegionSupported(L"US", NULL) && Core_ClaudeRegionSupported(L"jp", L"") &&
+          Core_ClaudeRegionSupported(L"TW", NULL) && Core_ClaudeRegionSupported(L"UA", L"Kyiv City"));
+    Check("shield: and in a listed country's territory", Core_ClaudeRegionSupported(L"PR", NULL) && Core_ClaudeRegionSupported(L"GU", NULL));
+    Check("shield: not in China, Hong Kong, Macao, Russia", !Core_ClaudeRegionSupported(L"CN", NULL) && !Core_ClaudeRegionSupported(L"HK", NULL) &&
+          !Core_ClaudeRegionSupported(L"MO", NULL) && !Core_ClaudeRegionSupported(L"ru", NULL));
+    Check("shield: nor in Ukraine's occupied regions", !Core_ClaudeRegionSupported(L"UA", L"Autonomous Republic of Crimea") &&
+          !Core_ClaudeRegionSupported(L"UA", L"Donetsk Oblast") && !Core_ClaudeRegionSupported(L"UA", L"Zaporizhzhia"));
+    Check("shield: Cloudflare's own codes and odd ones are no region", !Core_ClaudeRegionSupported(L"T1", NULL) &&
+          !Core_ClaudeRegionSupported(L"XX", NULL) && !Core_ClaudeRegionSupported(L"", NULL) && !Core_ClaudeRegionSupported(L"USA", NULL) &&
+          !Core_ClaudeRegionSupported(L"S ", NULL) && !Core_ClaudeRegionSupported(NULL, NULL));
+
+    Check("shield: the trace gives the IP and the country", Core_ParseTrace(kTrace, sizeof kTrace - 1, ip, ARRAYSIZE(ip), loc, ARRAYSIZE(loc)) &&
+          wcscmp(ip, L"203.0.113.7") == 0 && wcscmp(loc, L"JP") == 0);
+    Check("shield: an IPv6 trace", Core_ParseTrace("ip=2001:db8::1\nloc=US", 21, ip, ARRAYSIZE(ip), loc, ARRAYSIZE(loc)) &&
+          wcscmp(ip, L"2001:db8::1") == 0 && wcscmp(loc, L"US") == 0);
+    Check("shield: no IP, or one with other characters, is none", !Core_ParseTrace("h=claude.ai\nloc=US\n", 19, ip, ARRAYSIZE(ip), loc, ARRAYSIZE(loc)) &&
+          !Core_ParseTrace("ip=1.2.3.4<x\n", 13, ip, ARRAYSIZE(ip), loc, ARRAYSIZE(loc)));
+
+    Check("shield: ip.net.coffee's answer", Core_ParseIpRisk(SHIELD_SOURCE_NETCOFFEE, kNetCoffee, sizeof kNetCoffee - 1, L"8.8.8.8", &risk) &&
+          wcscmp(risk.countryCode, L"US") == 0 && risk.trustScore == 63 && risk.datacenter == 1 && risk.residential == 0 && risk.vpn == 1 &&
+          risk.proxy == 0 && risk.tor == 0 && risk.abuser == 1 && risk.asn == 15169 && wcscmp(risk.isp, L"Google LLC") == 0 &&
+          wcscmp(risk.timezone, L"America/Los_Angeles") == 0);
+    Check("shield: ipapi.is's answer, a flag given as a name", Core_ParseIpRisk(SHIELD_SOURCE_IPAPIIS, kIpApiIs, sizeof kIpApiIs - 1, L"8.8.8.8", &risk) &&
+          wcscmp(risk.countryCode, L"US") == 0 && wcscmp(risk.region, L"California") == 0 && risk.trustScore == -1 && risk.datacenter == 1 &&
+          risk.residential == 0 && risk.vpn == 1 && risk.tor == 0 && risk.asn == 15169);
+    Check("shield: ip-api.com's answer", Core_ParseIpRisk(SHIELD_SOURCE_IPAPICOM, kIpApiCom, sizeof kIpApiCom - 1, L"8.8.8.8", &risk) &&
+          wcscmp(risk.city, L"Ashburn") == 0 && risk.datacenter == 1 && risk.proxy == 1 && risk.vpn == -1 && risk.tor == -1 && risk.asn == 15169);
+    Check("shield: proxycheck.io's answer, keyed by the IP", Core_ParseIpRisk(SHIELD_SOURCE_PROXYCHECK, kProxyCheck, sizeof kProxyCheck - 1, L"8.8.8.8", &risk) &&
+          wcscmp(risk.countryCode, L"US") == 0 && risk.residential == 1 && risk.datacenter == 0 && risk.proxy == 0 && risk.asn == 15169);
+    Check("shield: an answer for another IP, a failure or no JSON is none",
+          !Core_ParseIpRisk(SHIELD_SOURCE_PROXYCHECK, kProxyCheck, sizeof kProxyCheck - 1, L"1.1.1.1", &risk) &&
+          !Core_ParseIpRisk(SHIELD_SOURCE_IPAPICOM, "{\"status\":\"fail\",\"message\":\"private range\"}", 43, L"10.0.0.1", &risk) &&
+          !Core_ParseIpRisk(SHIELD_SOURCE_NETCOFFEE, "<html>", 6, L"8.8.8.8", &risk) && !Core_ParseIpRisk(SHIELD_SOURCES, "{}", 2, L"8.8.8.8", &risk));
+
+    n = Core_StunRequest(request, sizeof request, kTransaction);
+    Check("shield: a STUN Binding request", n == 20 && request[0] == 0 && request[1] == 1 && request[2] == 0 && request[3] == 0 &&
+          request[4] == 0x21 && request[7] == 0x42 && memcmp(request + 8, kTransaction, 12) == 0);
+    /* 203.0.113.5:54321 as XOR-MAPPED-ADDRESS, after an attribute of another kind. */
+    memset(response, 0, sizeof response);
+    response[0] = 0x01; response[1] = 0x01; response[3] = 20;
+    memcpy(response + 4, request + 4, 16);
+    response[20] = 0x80; response[21] = 0x22; response[23] = 4; memcpy(response + 24, "test", 4);   /* SOFTWARE */
+    response[28] = 0x00; response[29] = 0x20; response[31] = 8;
+    response[33] = 0x01; response[34] = (BYTE)(0xD4 ^ 0x21); response[35] = (BYTE)(0x31 ^ 0x12);
+    response[36] = (BYTE)(203 ^ 0x21); response[37] = (BYTE)(0 ^ 0x12); response[38] = (BYTE)(113 ^ 0xA4); response[39] = (BYTE)(5 ^ 0x42);
+    Check("shield: a STUN response gives the address the server saw", Core_StunMappedAddress(response, 40, kTransaction, ip, ARRAYSIZE(ip)) &&
+          wcscmp(ip, L"203.0.113.5") == 0);
+    response[19] ^= 0xFF;
+    Check("shield: another request's response is none", !Core_StunMappedAddress(response, 40, kTransaction, ip, ARRAYSIZE(ip)));
+    response[19] ^= 0xFF;
+    Check("shield: a response cut short is none", !Core_StunMappedAddress(response, 36, kTransaction, ip, ARRAYSIZE(ip)));
+
+    ZeroMemory(&facts, sizeof facts);
+    ZeroMemory(&rules, sizeof rules);
+    facts.exitKnown = facts.supported = facts.riskKnown = facts.profileAllowed = TRUE;
+    facts.trustScore = 90;
+    facts.datacenter = facts.dnsLeak = facts.udpLeak = facts.ipv6Leak = 0;
+    facts.tunUp = facts.proxyApp = 1;
+    rules.allowIpv6Leak = TRUE;
+    Check("shield: a clean exit stops nothing and concerns nothing", Core_ShieldVerdict(&facts, &rules) == 0 && Core_ShieldConcerns(&facts) == 0);
+    facts.supported = FALSE;
+    Check("shield: an exit where Claude does not work stops it", Core_ShieldVerdict(&facts, &rules) == SHIELD_STOP_REGION);
+    facts.supported = TRUE;
+    facts.datacenter = 1;
+    Check("shield: a datacenter IP stops Claude unless allowed", Core_ShieldVerdict(&facts, &rules) == SHIELD_STOP_DATACENTER);
+    rules.allowDatacenter = TRUE;
+    Check("shield: allowed, it is only a concern", Core_ShieldVerdict(&facts, &rules) == 0 && Core_ShieldConcerns(&facts) == SHIELD_STOP_DATACENTER);
+    facts.datacenter = 0;
+    facts.dnsLeak = facts.udpLeak = 1;
+    rules.allowUdpLeak = TRUE;
+    Check("shield: a DNS leak stops Claude, an allowed UDP one does not", Core_ShieldVerdict(&facts, &rules) == SHIELD_STOP_DNS);
+    facts.dnsLeak = facts.udpLeak = 0;
+    rules.minScore = 95;
+    Check("shield: under the lowest score allowed", Core_ShieldVerdict(&facts, &rules) == SHIELD_STOP_SCORE);
+    facts.trustScore = -1;
+    Check("shield: a score no one gave stops nothing without the unknown rule", Core_ShieldVerdict(&facts, &rules) == 0);
+    rules.stopWhenUnknown = TRUE;
+    Check("shield: with it, it does", Core_ShieldVerdict(&facts, &rules) == SHIELD_STOP_UNKNOWN);
+    rules.minScore = 0;
+    facts.exitKnown = FALSE;
+    facts.tunUp = 0;
+    rules.stopWhenTunDown = TRUE;
+    Check("shield: no exit read and the TUN adapter down", Core_ShieldVerdict(&facts, &rules) == (SHIELD_STOP_UNKNOWN | SHIELD_STOP_TUN) &&
+          Core_ShieldConcerns(&facts) == SHIELD_STOP_UNKNOWN);
+    rules.stopWhenUnknown = FALSE;
+    Check("shield: no exit read, without the unknown rule, stops only for the TUN adapter", Core_ShieldVerdict(&facts, &rules) == SHIELD_STOP_TUN);
+
+    ZeroMemory(&facts, sizeof facts);
+    ZeroMemory(&rules, sizeof rules);
+    facts.exitKnown = facts.supported = facts.riskKnown = facts.profileAllowed = TRUE;
+    facts.trustScore = 90;
+    facts.datacenter = facts.dnsLeak = facts.udpLeak = facts.ipv6Leak = 0;
+    facts.tunUp = facts.proxyApp = 1;
+    rules.allowIpv6Leak = FALSE;
+    facts.ipv6Leak = 1;
+    Check("shield: a public IPv6 that could leak stops Claude unless allowed", Core_ShieldVerdict(&facts, &rules) == SHIELD_STOP_IPV6);
+    rules.warnOnly = TRUE;
+    Check("shield: warn-only turns every stop into none, red but not ending Claude",
+          Core_ShieldVerdict(&facts, &rules) == 0 && (Core_ShieldConcerns(&facts) & SHIELD_STOP_IPV6));
+    rules.warnOnly = FALSE;
+    rules.allowIpv6Leak = TRUE;
+    facts.ipv6Leak = 0;
+    facts.profileAllowed = FALSE;
+    Check("shield: an exit outside the profile's allowed regions stops it", Core_ShieldVerdict(&facts, &rules) == SHIELD_STOP_PROFILE);
+    facts.profileAllowed = TRUE;
+    facts.tzMismatch = facts.langMismatch = facts.cfSplit = 1;
+    Check("shield: a time-zone, language or split-exit mismatch is a concern, never a stop",
+          Core_ShieldVerdict(&facts, &rules) == 0 &&
+          (Core_ShieldConcerns(&facts) & (SHIELD_CONCERN_TZ | SHIELD_CONCERN_LANG | SHIELD_CONCERN_SPLIT)) ==
+          (SHIELD_CONCERN_TZ | SHIELD_CONCERN_LANG | SHIELD_CONCERN_SPLIT));
+
+    Check("shield: a time zone's offset, by IANA name or country", Core_TimezoneOffsetMinutes(L"America/Los_Angeles") == -480 &&
+          Core_TimezoneOffsetMinutes(L"US") == -300 && Core_TimezoneOffsetMinutes(L"Asia/Shanghai") == 480 &&
+          Core_TimezoneOffsetMinutes(L"JP") == 540 && Core_TimezoneOffsetMinutes(L"Asia/Kolkata") == 330);
+    Check("shield: an unknown zone has no offset", Core_TimezoneOffsetMinutes(L"Mars/Olympus") == INT_MIN && Core_TimezoneOffsetMinutes(L"") == INT_MIN);
+    Check("shield: a region's languages", Core_RegionLanguageMatches(L"JP", L"ja") && Core_RegionLanguageMatches(L"CA", L"fr") &&
+          Core_RegionLanguageMatches(L"US", L"en-US") && !Core_RegionLanguageMatches(L"JP", L"en") && !Core_RegionLanguageMatches(L"CN", L"en"));
+    Check("shield: a region not in the table claims no language mismatch", Core_RegionLanguageMatches(L"ZZ", L"en") && Core_RegionLanguageMatches(L"US", NULL));
+    Check("shield: a profile's allowed regions", Core_RegionAllowed(L"US", L"US, JP") && Core_RegionAllowed(L"jp", L"US,JP") &&
+          !Core_RegionAllowed(L"CN", L"US JP") && Core_RegionAllowed(L"CN", L"") && Core_RegionAllowed(L"CN", NULL));
+    Check("shield: a list being typed, or holding no whole code, allows any region",
+          Core_RegionAllowed(L"US", L"U") && Core_RegionAllowed(L"CN", L"USA") && Core_RegionAllowed(L"CN", L" , ") &&
+          !Core_RegionAllowed(L"CN", L"U, JP"));
+    Check("shield: a list of regions is two-letter codes only, or nothing",
+          Core_RegionCodes(L"US, jp;TW") && Core_RegionCodes(L"US\x3001JP\xFF0CTW") && Core_RegionAllowed(L"JP", L"US\x3001JP") &&
+          Core_RegionCodes(L"") && Core_RegionCodes(L" , ") && Core_RegionCodes(NULL) &&
+          !Core_RegionCodes(L"USA") && !Core_RegionCodes(L"US, J") && !Core_RegionCodes(L"\x7F8E\x56FD") && !Core_RegionCodes(L"U1"));
+}
+
 int wmain(void)
 {
     Check("session order: natural names ascend", Core_CompareSessionOrder(L"Chat 2", 100, L"Chat 10", 200, TRUE, FALSE) < 0);
@@ -2255,8 +2738,10 @@ int wmain(void)
     }
     TestSessionSearch();
     TestJsonMerge();
+    TestUnreadMarks();
     TestJsonArrayUnion();
     TestSafeStorage();
+    TestTokenCache();
     TestLevelDb();
     TestSessionEntries();
     TestSessionMetadataHelpers();
@@ -2283,6 +2768,10 @@ int wmain(void)
     TestPathsAndTimes();
     TestProfileFilePaths();
     TestJsonAndVersions();
+    TestShieldFacts();
+    TestSearXng();
+    TestCowork();
+    TestReleases();
     printf("Core tests: %d checks, %d failure(s).\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

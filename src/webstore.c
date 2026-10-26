@@ -35,18 +35,14 @@ struct WebStore {
     BYTE      prefix[64];             /* "_https://claude.ai" and a zero: claude.ai's keys start so */
     size_t    prefixLength;
     ULONGLONG lastSequence, logNumber, prevLogNumber, nextFile, maxFile;
-    ULONGLONG tables[64];
+    ULONGLONG tables[512];
     int       tableCount;
+    BOOL      tablesLost;             /* more live tables than `tables` holds: its reads would miss some */
     WCHAR     log[LONG_PATH_CCH];     /* the log a batch goes to; empty: a new one */
     ULONGLONG logFile;                /* its number */
     size_t    logLength, logClean;    /* its size; where its last whole record ends */
     ULONGLONG written;                /* the newest file's time, ms since 1970 */
 };
-
-static void Free(void *memory)
-{
-    if (memory) HeapFree(GetProcessHeap(), 0, memory);
-}
 
 static BYTE *Copy(const BYTE *data, size_t length)
 {
@@ -74,7 +70,7 @@ static BOOL TakeEntry(void *context, ULONGLONG sequence, const CoreLevelOp *op)
     if ((at = FindEntry(store, op->key, op->keyLength)) >= 0) {
         entry = &store->entries[at];
         if (entry->sequence > sequence) return TRUE;
-        Free(entry->value);
+        Util_Free(entry->value);
         entry->value = NULL;
     } else {
         if (store->count == store->capacity) {
@@ -111,7 +107,10 @@ static void TakeTable(void *context, ULONGLONG number, BOOL added)
     WebStore *store = (WebStore *)context;
     int i;
     for (i = 0; i < store->tableCount && store->tables[i] != number; i++) {}
-    if (added && i == store->tableCount && store->tableCount < (int)ARRAYSIZE(store->tables)) store->tables[store->tableCount++] = number;
+    if (added && i == store->tableCount) {
+        if (store->tableCount < (int)ARRAYSIZE(store->tables)) store->tables[store->tableCount++] = number;
+        else store->tablesLost = TRUE;
+    }
     if (!added && i < store->tableCount) store->tables[i] = store->tables[--store->tableCount];
 }
 
@@ -141,10 +140,7 @@ static BYTE *ReadFileOf(const WebStore *store, const WCHAR *name, DWORD *length)
 
 static void NoteWritten(WebStore *store, const FILETIME *time)
 {
-    ULARGE_INTEGER ticks;
-    ticks.LowPart = time->dwLowDateTime;
-    ticks.HighPart = time->dwHighDateTime;
-    if (ticks.QuadPart > 116444736000000000ULL) store->written = max(store->written, (ticks.QuadPart - 116444736000000000ULL) / 10000);
+    store->written = max(store->written, Core_FileTimeMs(time));
 }
 
 /* The manifest: the live tables, the log and the last sequence number. */
@@ -160,14 +156,18 @@ static BOOL ReadManifest(WebStore *store)
     if (!data) return FALSE;
     for (i = 0; i < length && i < sizeof current - 1 && data[i] != '\n' && data[i] != '\r'; i++) current[i] = (char)data[i];
     current[i] = 0;
-    Free(data);
+    Util_Free(data);
     if (strncmp(current, "MANIFEST-", 9) != 0 || MultiByteToWideChar(CP_UTF8, 0, current, -1, name, ARRAYSIZE(name)) <= 0) return FALSE;
     if ((data = ReadFileOf(store, name, &length)) == NULL) return FALSE;
     ZeroMemory(&manifest, sizeof manifest);
     manifest.onTable = TakeTable;
     manifest.context = store;
     ok = Core_LevelLogRecords(data, length, TakeEdit, &manifest, &clean) && manifest.hasLog;
-    Free(data);
+    Util_Free(data);
+    if (store->tablesLost) {
+        Util_Log(L"web storage %s: more tables than this version reads; not read", store->dir);
+        ok = FALSE;
+    }
     store->logNumber = manifest.logNumber;
     store->prevLogNumber = manifest.prevLogNumber;
     store->nextFile = manifest.nextFile;
@@ -224,7 +224,7 @@ static BOOL ReadLogs(WebStore *store)
             store->logLength = length;
             store->logClean = clean;
         }
-        Free(data);
+        Util_Free(data);
     }
     return ok;
 }
@@ -243,7 +243,7 @@ static BOOL ReadTables(WebStore *store)
             if ((data = ReadFileOf(store, name, &length)) == NULL) return FALSE;
         }
         ok = Core_LevelTableRead(data, length, TakeEntry, store);
-        Free(data);
+        Util_Free(data);
         if (!ok) return FALSE;
     }
     return TRUE;
@@ -274,11 +274,11 @@ void WebStore_Free(WebStore *store)
     int i;
     if (!store) return;
     for (i = 0; i < store->count; i++) {
-        Free(store->entries[i].key);
-        Free(store->entries[i].value);
+        Util_Free(store->entries[i].key);
+        Util_Free(store->entries[i].value);
     }
-    Free(store->entries);
-    Free(store);
+    Util_Free(store->entries);
+    Util_Free(store);
 }
 
 ULONGLONG WebStore_Written(const WebStore *store)
@@ -308,7 +308,7 @@ char *WebStore_Get(const WebStore *store, const WCHAR *name, size_t *length)
         utf8[bytes] = 0;
         *length = (size_t)bytes;
     }
-    Free(text);
+    Util_Free(text);
     return utf8;
 }
 
@@ -344,11 +344,11 @@ BOOL WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, size_t l
     if ((text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, ((size_t)chars + 1) * sizeof(WCHAR))) == NULL) return FALSE;
     if (length) MultiByteToWideChar(CP_UTF8, 0, utf8, (int)length, text, chars);
     if ((value = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 1 + 2 * (size_t)chars)) == NULL) {
-        Free(text);
+        Util_Free(text);
         return FALSE;
     }
     valueLength = Core_WebStorageValue(text, (size_t)chars, value, 1 + 2 * (size_t)chars);
-    Free(text);
+    Util_Free(text);
     ZeroMemory(&op, sizeof op);
     op.put = TRUE;
     op.key = key;
@@ -356,10 +356,10 @@ BOOL WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, size_t l
     op.value = value;
     op.valueLength = valueLength;
     if (!valueLength || !TakeEntry(store, store->lastSequence, &op) || (at = FindEntry(store, key, keyLength)) < 0) {
-        Free(value);
+        Util_Free(value);
         return FALSE;
     }
-    Free(value);
+    Util_Free(value);
     store->entries[at].changed = TRUE;
     return TRUE;
 }
@@ -421,9 +421,10 @@ BOOL WebStore_Commit(WebStore *store, const WCHAR *backup)
     BYTE *batch = NULL, *bytes = NULL;
     size_t batchLength = 0, capacity = 64, appended, start;
     HANDLE file = INVALID_HANDLE_VALUE;
+    LARGE_INTEGER size;
     DWORD written = 0;
     int i, count = 0;
-    BOOL ok = FALSE;
+    BOOL ok = FALSE, newLog = FALSE;
     if (!store) return FALSE;
     for (i = 0; i < store->count; i++)
         if (store->entries[i].changed) {
@@ -464,11 +465,24 @@ BOOL WebStore_Commit(WebStore *store, const WCHAR *backup)
         goto done;
     appended += start - store->logLength;
     if (!store->log[0]) {   /* no log LevelDB would replay: a new one, numbered after every file */
+        newLog = TRUE;
         store->logFile = max(store->nextFile, store->maxFile + 1);
         StringCchPrintfW(store->log, ARRAYSIZE(store->log), L"%s\\%06llu.log", store->dir, store->logFile);
     }
-    file = CreateFileW(store->log, FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) goto done;
+    /* The log as it was read, or a new one: a log that changed since, or one
+     * of that name made meanwhile, is not LevelDB's as it was read, and the
+     * batch's place in its blocks would be wrong. */
+    file = CreateFileW(store->log, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_SHARE_READ, NULL,
+                       newLog ? CREATE_NEW : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        if (newLog) store->log[0] = 0;
+        goto done;
+    }
+    if (!newLog && (!GetFileSizeEx(file, &size) || (ULONGLONG)size.QuadPart != store->logLength)) {
+        CloseHandle(file);
+        SetLastError(ERROR_INVALID_DATA);
+        goto done;
+    }
     ok = WriteFile(file, bytes, (DWORD)appended, &written, NULL) && written == appended && FlushFileBuffers(file);
     CloseHandle(file);
     if (ok) {
@@ -480,8 +494,8 @@ BOOL WebStore_Commit(WebStore *store, const WCHAR *backup)
     }
 done:
     if (!ok) Util_Log(L"web storage %s not written (error %lu)", store->dir, GetLastError());
-    Free(ops);
-    Free(batch);
-    Free(bytes);
+    Util_Free(ops);
+    Util_Free(batch);
+    Util_Free(bytes);
     return ok;
 }

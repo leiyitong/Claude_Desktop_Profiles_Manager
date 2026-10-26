@@ -9,6 +9,10 @@
 
 #define IDD_MAIN          100
 #define IDD_PROFILE       101
+#define IDD_PROFILE_NEW   121   /* a new profile: a form, not the property list */
+#define IDD_SHIELD        122   /* the shield's dialog */
+#define IDD_SEARXNG       123   /* SearXNG search set up in the profiles selected */
+#define IDD_UPDATE        124   /* a release of main to update to, offered (ghupdate.c) */
 #define IDD_UNINSTALL     102
 #define IDD_MESSAGE       103
 #define IDD_TITLE         104
@@ -20,25 +24,28 @@
 #define IDD_SYNC_ITEMS    110
 #define IDD_CONFLICTS     111
 #define IDD_SYNC_SETUP    112
-#define IDD_BACKUP_HUB    113
 #define IDD_PREVIEW       114
 #define IDD_SETTINGS      115
 #define IDD_ABOUT         116
 #define IDD_PASSWORD      117
-#define IDD_HISTORY       119
 #define IDD_TEXTVIEW      120
+#define IDD_TRANSFER      119
+#define IDC_TR_TEXT       3000
+#define IDC_TR_PROGRESS   3001
+#define IDC_TR_STATUS     3002
+#define IDC_TR_PAUSE      3003
+#define IDC_TR_LATER      3004
+/* The pane beside a property list (checklist.c), the same in every dialog that has one. */
+#define IDC_PANE_TITLE    3010
+#define IDC_PANE_LIST     3011
+#define IDC_PANE_LABEL    3012
+#define IDC_PANE_SEARCH   3013   /* the pane's search, below its title */
+#define IDC_PANE_FIND     3014   /* its options, beside it */
 #define IDC_W_LOGS        2900
 #define IDC_W_DIAGNOSTICS 2901
 #define IDC_T_NOTE        2910
 #define IDC_T_TEXT        2911
 #define IDC_T_COPY        2912
-#define IDC_HISTORY_LIST  2920
-#define IDC_HISTORY_NOTE  2921
-#define IDC_HISTORY_OPEN  2922
-#define IDC_HISTORY_REFRESH 2923
-#define IDC_H_HISTORY     2412
-#define IDC_H_VALIDATE    2413
-#define IDC_HISTORY_VALIDATE 2924
 #define IDD_SIGNIN        118
 
 /* Private sign-in helper (ids are local to this dialog). */
@@ -56,6 +63,8 @@
 /* the changelogs, embedded (RCDATA): CHANGELOG.md and CHANGELOG.zh-CN.md */
 #define IDR_CHANGELOG_EN  200
 #define IDR_CHANGELOG_ZH  201
+/* windows-mcp-delta's source, a ZIP, embedded (RCDATA): extracted and run by uvx (windowsmcp.c) */
+#define IDR_WINDOWS_MCP_DELTA 202
 
 /* main window; the ids of the commands its menus give are the buttons' they stand for */
 #define IDC_STATUS         1000
@@ -82,7 +91,8 @@
 #define IDC_PROGRESS       1032
 #define IDC_COPY_ALL       1033   /* the list's menu */
 #define IDC_MOVE_ALL       1034
-#define IDC_BACKUP         1038   /* Backup & Restore, in the column */
+#define IDC_BACKUP         1038   /* Back up, in the column */
+#define IDC_RESTORE_BACKUP 1048   /* Restore, beside it */
 #define IDC_SHORTCUTS      1039   /* its menu, at the toolbar's end */
 #define IDC_SYNC_NOW       1041   /* the list's menu */
 #define IDC_SETTINGS       1042   /* the gear at the toolbar's end */
@@ -91,6 +101,10 @@
 #define IDC_PROFILE_SEARCH_LABEL 1045
 #define IDC_PROFILE_FIND   1047
 #define IDC_PRIVATE_SIGNIN 1046   /* the profile list's menu */
+#define IDC_WINDOWS_MCP    1049   /* Windows-MCP added or taken away, in the column */
+#define IDC_SHIELD         1050   /* the shield: a floating badge at the window's bottom-right corner */
+#define IDC_SEARXNG        1051   /* SearXNG search added or taken away, in the column */
+#define IDC_COWORK         1052   /* Cowork removed from Claude or restored, in the column */
 
 /* sessions view of the main window */
 #define IDC_S_SEARCH      1400
@@ -98,17 +112,19 @@
 #define IDC_S_TREE        1403
 #define IDC_S_FIND        1406   /* the search options, beside the search box */
 #define IDC_S_FILTER      1407   /* the filter menu's button */
+#define IDC_S_FOLD        1408   /* every heading folded, or opened when all are: before the search box */
 
 /* rename session dialog */
 #define IDC_T_LABEL       1500
 #define IDC_T_TITLE       1501
 
 /* profile dialog */
-#define IDC_P_NAME        1100
-#define IDC_P_COLOR       1101
+#define IDC_P_LIST        1100
 #define IDC_P_PREVIEW     1102
 #define IDC_P_FOLDER      1103
 #define IDC_P_ERROR       1104
+/* the new profile's form (IDD_PROFILE_NEW), around the same preview and folder line */
+#define IDC_P_COLOR       1101
 #define IDC_P_OPEN        1105
 #define IDC_P_STARTUP     1106
 #define IDC_P_COPY        1107
@@ -125,6 +141,8 @@
 #define IDC_P_TITLE       1118
 #define IDC_P_NOTE_LABEL  1119
 #define IDC_P_NOTE        1120
+#define IDC_P_NAME        1121
+#define IDC_P_SIGN_IN     1122
 
 /* uninstall dialog */
 #define IDC_U_KEEP        1200
@@ -147,6 +165,9 @@
 #define IDC_B_TEXT        1800
 #define IDC_B_LIST        1801
 #define IDC_B_NOTE        1802
+#define IDC_B_ALL         1803   /* every box checked */
+#define IDC_B_NONE        1804   /* none */
+#define IDC_B_INVERT      1805   /* each turned over */
 
 /* sessions recovered from the vault */
 #define IDC_R_TEXT          1900
@@ -178,20 +199,7 @@
 #define IDC_Z_ITEMS       2303
 #define IDC_Z_NOTE        2304
 #define IDC_Z_SYNC_NOW    2305
-
-/* Backup & Restore: each button the command it stands for */
-#define IDC_H_PROFILE     2400
-#define IDC_H_SESSIONS    2401
-#define IDC_H_CODE_LABEL  2402
-#define IDC_H_BACKUP      2403
-#define IDC_H_RESTORE     2404
-#define IDC_H_EXPORT      2405
-#define IDC_H_IMPORT      2406
-#define IDC_H_RECOVER     2407
-#define IDC_H_PURGE       2408
-#define IDC_H_CODE        2409
-#define IDC_H_NOTE        2410
-#define IDC_H_WEEKLY      2411   /* not a command: it sets SETTING_WEEKLY_BACKUP */
+#define IDC_Z_PROFILE     2310   /* the profiles to sync with, a check box each (SyncUi_PartnerBoxes), to + MAX_PROFILES */
 
 /* conflicts of a sync, settled */
 #define IDC_X_TEXT        2200
@@ -206,14 +214,12 @@
 #define IDC_V_TEXT        2501
 
 /* settings: the language and the vault's days */
-#define IDC_G_CODE        2604
-#define IDC_G_WEEKLY      2605   /* SETTING_WEEKLY_BACKUP, as Backup & Restore's IDC_H_WEEKLY */
-#define IDC_G_VAULT       2600
-#define IDC_G_DAYS_LABEL  2601
-#define IDC_G_DAYS        2602
-#define IDC_G_DAYS_UNIT   2603
-#define IDC_G_LANGUAGE_LABEL 2607
-#define IDC_G_LANGUAGE    2608
+#define IDC_G_PURGE       2612   /* Clean up sessions: an action of the page, no control of its own */
+#define IDC_G_CODE_COPY   2613   /* Back up .claude: likewise */
+#define IDC_G_LIST        2629   /* the kinds of settings, on the left (settings.c draws them; the template holds their place) */
+#define IDC_G_PAGE        2631   /* the page of the kind chosen (settings.c draws it; the template holds its place) */
+#define IDC_G_SEARCH      2632   /* above the kinds: the page shows the settings that match instead */
+#define IDC_G_ZOOM        2615   /* SETTING_ZOOM changed: what the dialog's owner does then */
 #define IDC_G_APPLY       2609
 
 /* a password: a backup's sign-in for any PC */
@@ -229,8 +235,44 @@
 #define IDC_W_NAME        2702
 #define IDC_W_VERSION     2703
 
+/* shield dialog */
+#define IDC_H_STATE       3100   /* the state line, with its badge */
+#define IDC_H_EXIT        3101   /* Claude's exit IP and country */
+#define IDC_H_FACTS       3102   /* the IP's properties and the leak checks */
+#define IDC_H_ENABLE      3103   /* turn the shield on or off */
+#define IDC_H_RECHECK     3104   /* check now */
+#define IDC_H_RULES       3105   /* the rules heading */
+#define IDC_H_NO_DC       3106   /* end Claude when the exit is a datacenter IP */
+#define IDC_H_NO_DNS      3107
+#define IDC_H_NO_UDP      3108
+#define IDC_H_STOP_TUN    3109   /* end Claude when no tunnel adapter is up */
+#define IDC_H_STOP_PROXY  3110   /* end Claude when no proxy app runs */
+#define IDC_H_STOP_UNKNOWN 3111  /* end Claude when the exit cannot be read */
+#define IDC_H_SCORE_LABEL 3112
+#define IDC_H_SCORE       3113   /* the lowest trust score allowed */
+#define IDC_H_NO_IPV6     3114   /* end Claude when a public IPv6 could leak */
+#define IDC_H_WARN        3115   /* warn only: never end Claude */
+#define IDC_H_PROFILE_LABEL 3116
+#define IDC_H_PROFILE     3117   /* a profile to set allowed regions for */
+#define IDC_H_REGIONS     3118   /* that profile's allowed country codes */
+#define IDC_H_LOG         3119   /* the shield's event log */
+#define IDC_H_AVAIL       3120   /* Claude availability and service status */
+#define IDC_H_REGIONS_LABEL 3121
+#define IDC_H_LOG_LABEL   3122
+/* IDD_SEARXNG */
+#define IDC_SX_TEXT        3200
+#define IDC_SX_URL_LABEL   3201
+#define IDC_SX_URL         3202
+#define IDC_SX_PRIVATE     3203
+#define IDC_SX_NOTE        3204
+#define IDC_SX_REMOVE      3205
+/* IDD_UPDATE */
+#define IDC_U_TEXT         3210
+#define IDC_U_NOTES        3211
+
 /* message box */
 #define IDC_M_ICON        1300
 #define IDC_M_TEXT        1301
+#define IDC_M_OTHER       1302   /* Ui_Choose's second choice, between OK and Cancel */
 
 #endif

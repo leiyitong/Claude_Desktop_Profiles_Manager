@@ -3,7 +3,6 @@
 #include <string.h>
 #include <wchar.h>
 
-static void Free(void *p) { if (p) HeapFree(GetProcessHeap(), 0, p); }
 typedef struct ArchiveBuild { const WCHAR *id; char *out; size_t used, cap; BOOL ok; } ArchiveBuild;
 static BOOL KeepArchived(void *context, const char *value, size_t length)
 {
@@ -37,7 +36,7 @@ char *VaultTools_ArchiveSet(const char *json, size_t length, const WCHAR *id, BO
         b.out[b.used++] = ']'; b.out[b.used] = 0;
         out = Core_JsonSetNested(json, length, keys, 1, b.out, outLength);
     }
-    Free(b.out); return out;
+    Util_Free(b.out); return out;
 }
 
 typedef struct PickState { const VaultRestoreItem *items; int count; BOOL *chosen, filling, syncGroup; HWND rows; } PickState;
@@ -101,17 +100,15 @@ static INT_PTR CALLBACK PickProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
         Fill(dialog, s); Theme_SmoothView(s->rows); return TRUE;
     }
     if (!s) return FALSE;
-    if (message == WM_NOTIFY && ((NMHDR *)lp)->hwndFrom == s->rows && ((NMHDR *)lp)->code == LVN_ITEMCHANGED && !s->filling) {
+    if (message == WM_NOTIFY && !s->filling && Theme_CheckRowChanged((const NMHDR *)lp, s->rows)) {
         const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
-        if ((change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK)) {
-            s->filling = TRUE;
-            if (change->iItem >= 0) {
-                LVITEMW item; ZeroMemory(&item, sizeof item); item.mask = LVIF_PARAM; item.iItem = change->iItem;
-                if (ListView_GetItem(s->rows, &item) && item.lParam >= 0 && item.lParam < s->count && s->items[item.lParam].status >= 3)
-                    ListView_SetCheckState(s->rows, change->iItem, FALSE);
-            }
-            s->filling = FALSE; ReadChecks(dialog, s);
+        s->filling = TRUE;
+        if (change->iItem >= 0) {
+            LVITEMW item; ZeroMemory(&item, sizeof item); item.mask = LVIF_PARAM; item.iItem = change->iItem;
+            if (ListView_GetItem(s->rows, &item) && item.lParam >= 0 && item.lParam < s->count && s->items[item.lParam].status >= 3)
+                ListView_SetCheckState(s->rows, change->iItem, FALSE);
         }
+        s->filling = FALSE; ReadChecks(dialog, s);
         return TRUE;
     }
     if (message == WM_COMMAND) {

@@ -175,7 +175,7 @@ static void LoadDetails(ToolDialog *state, const WCHAR *file, int page)
     HeapFree(GetProcessHeap(), 0, json);
 }
 
-static void ExportReading(HWND owner, const WCHAR *source);
+static void ExportReading(HWND owner, const WCHAR *source, int format);
 
 static void PreviewHistorical(HWND owner, const WCHAR *path)
 {
@@ -287,7 +287,7 @@ static INT_PTR CALLBACK ToolsProc(HWND dialog, UINT msg, WPARAM wp, LPARAM lp)
             LRESULT at = SendMessageW(state->list, LB_GETCURSEL, 0, 0), index = at >= 0 ? SendMessageW(state->list, LB_GETITEMDATA, (WPARAM)at, 0) : -1;
             if (index >= 0 && index < state->count && state->items[index].transcript) {
                 if (LOWORD(wp) == IDC_ST_PREVIEW) PreviewHistorical(dialog, state->items[index].transcript);
-                else ExportReading(dialog, state->items[index].transcript);
+                else ExportReading(dialog, state->items[index].transcript, READING_MARKDOWN);
             }
             return TRUE;
         }
@@ -528,7 +528,61 @@ static BOOL WriteText(HANDLE file, const WCHAR *text)
     return ok;
 }
 
-static BOOL ExportLine(HANDLE output, const char *line, size_t length, BOOL markdown, DWORD *messages, DWORD *omitted)
+/* `text` written with what HTML reads as markup escaped. */
+static BOOL WriteHtml(HANDLE file, const WCHAR *text)
+{
+    WCHAR chunk[1024];
+    size_t used = 0;
+    const WCHAR *c;
+    for (c = text; *c; c++) {
+        const WCHAR *entity = *c == L'<' ? L"&lt;" : *c == L'>' ? L"&gt;" : *c == L'&' ? L"&amp;" : *c == L'"' ? L"&quot;" : NULL;
+        size_t n = entity ? wcslen(entity) : 1;
+        if (used + n + 1 > ARRAYSIZE(chunk)) {
+            chunk[used] = 0;
+            if (!WriteText(file, chunk)) return FALSE;
+            used = 0;
+        }
+        if (entity) {
+            memcpy(chunk + used, entity, n * sizeof(WCHAR));
+            used += n;
+        } else {
+            chunk[used++] = *c;
+        }
+    }
+    chunk[used] = 0;
+    return WriteText(file, chunk);
+}
+
+/* What a reading copy starts with, before its first message; and ends with. */
+static BOOL ExportStart(HANDLE output, int format)
+{
+    const WCHAR *note = TR(L"Reading copy of the current transcript only. Other transcripts and branches, thinking, tool results, metadata and side chains are excluded. Tool calls are summaries. Records over 8 MiB are omitted and counted below.\r\n\r\n");
+    if (format == READING_JSON) return WriteText(output, L"{\"messages\":[");
+    if (format == READING_HTML)
+        return WriteText(output, L"<!doctype html>\n<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">"
+                                 L"<title>Claude</title><style>"
+                                 L":root{color-scheme:light dark;font-family:\"Segoe UI\",system-ui,sans-serif;line-height:1.55}"
+                                 L"body{max-width:860px;margin:0 auto;padding:24px}p.note{opacity:.65;font-size:.9em}"
+                                 L"section{margin:0 0 18px;padding:12px 16px;border-radius:10px;background:rgba(127,127,127,.08)}"
+                                 L"section.you{background:rgba(70,130,220,.12)}h2{margin:0 0 6px;font-size:.95em;opacity:.8}"
+                                 L"div.text{white-space:pre-wrap;word-wrap:break-word}</style></head><body>\n<p class=\"note\">") &&
+               WriteHtml(output, note) && WriteText(output, L"</p>\n");
+    return WriteText(output, note);
+}
+
+static BOOL ExportEnd(HANDLE output, int format, DWORD messages, DWORD omitted)
+{
+    WCHAR footer[256];
+    if (format == READING_JSON) {
+        StringCchPrintfW(footer, ARRAYSIZE(footer), L"],\"exported\":%lu,\"omitted\":%lu}\n", messages, omitted);
+        return WriteText(output, footer);
+    }
+    StringCchPrintfW(footer, ARRAYSIZE(footer), TR(L"\r\nExported messages: %lu. Omitted records: %lu.\r\n"), messages, omitted);
+    if (format == READING_HTML) return WriteText(output, L"<p class=\"note\">") && WriteHtml(output, footer) && WriteText(output, L"</p></body></html>\n");
+    return WriteText(output, footer);
+}
+
+static BOOL ExportLine(HANDLE output, const char *line, size_t length, int format, DWORD *messages, DWORD *omitted)
 {
     WCHAR *message = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (length + 8) * sizeof(WCHAR));
     TranscriptRole role;
@@ -538,8 +592,21 @@ static BOOL ExportLine(HANDLE output, const char *line, size_t length, BOOL mark
     if (role == TRANSCRIPT_NONE) (*omitted)++;
     else {
         const WCHAR *heading = role == TRANSCRIPT_USER ? TR(L"You") : L"Claude";
-        ok = (!markdown || WriteText(output, L"## ")) && WriteText(output, heading) && WriteText(output, L"\r\n\r\n") &&
-             WriteText(output, message) && WriteText(output, L"\r\n\r\n");
+        if (format == READING_JSON) {
+            size_t cap = wcslen(message) * 6 + 3;
+            char *quoted = (char *)HeapAlloc(GetProcessHeap(), 0, cap);
+            ok = quoted && Core_JsonQuote(message, quoted, cap) &&
+                 WriteText(output, *messages ? L",\n{\"role\":\"" : L"\n{\"role\":\"") &&
+                 WriteText(output, role == TRANSCRIPT_USER ? L"user" : L"assistant") && WriteText(output, L"\",\"text\":") &&
+                 WriteBytes(output, quoted, (DWORD)strlen(quoted)) && WriteText(output, L"}");   /* quoted, the text is UTF-8 already */
+            if (quoted) HeapFree(GetProcessHeap(), 0, quoted);
+        } else if (format == READING_HTML) {
+            ok = WriteText(output, role == TRANSCRIPT_USER ? L"<section class=\"you\"><h2>" : L"<section><h2>") && WriteHtml(output, heading) &&
+                 WriteText(output, L"</h2><div class=\"text\">") && WriteHtml(output, message) && WriteText(output, L"</div></section>\n");
+        } else {
+            ok = (format != READING_MARKDOWN || WriteText(output, L"## ")) && WriteText(output, heading) && WriteText(output, L"\r\n\r\n") &&
+                 WriteText(output, message) && WriteText(output, L"\r\n\r\n");
+        }
         if (ok) (*messages)++;
     }
     HeapFree(GetProcessHeap(), 0, message);
@@ -558,7 +625,7 @@ static BOOL SameOutputFile(HANDLE source, const WCHAR *target)
 
 /* Stream one current transcript into a staged UTF-8 reading copy. Oversize
  * records are counted, never exported as apparently complete messages. */
-BOOL SessionTools_ExportFile(const WCHAR *source, const WCHAR *target, BOOL markdown, DWORD *messages, DWORD *omitted)
+BOOL SessionTools_ExportFile(const WCHAR *source, const WCHAR *target, int format, DWORD *messages, DWORD *omitted)
 {
     WCHAR inputPath[LONG_PATH_CCH], outputPath[LONG_PATH_CCH], staged[LONG_PATH_CCH], stagePath[LONG_PATH_CCH];
     HANDLE input = INVALID_HANDLE_VALUE, output = INVALID_HANDLE_VALUE;
@@ -583,7 +650,7 @@ BOOL SessionTools_ExportFile(const WCHAR *source, const WCHAR *target, BOOL mark
     stageCreated = TRUE;
     line = (char *)HeapAlloc(GetProcessHeap(), 0, TOOLS_LINE_MAX);
     if (!line) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); goto done; }
-    if (!WriteText(output, TR(L"Reading copy of the current transcript only. Other transcripts and branches, thinking, tool results, metadata and side chains are excluded. Tool calls are summaries. Records over 8 MiB are omitted and counted below.\r\n\r\n"))) goto done;
+    if (!ExportStart(output, format)) goto done;
     for (;;) {
         if (!ReadFile(input, block, sizeof block, &bytes, NULL)) goto done;
         if (!bytes) break;
@@ -592,7 +659,7 @@ BOOL SessionTools_ExportFile(const WCHAR *source, const WCHAR *target, BOOL mark
         for (i = 0; i < bytes; i++) {
             if (block[i] == '\n') {
                 if (skipping) (*omitted)++;
-                else if (used && !ExportLine(output, line, used, markdown, messages, omitted)) goto done;
+                else if (used && !ExportLine(output, line, used, format, messages, omitted)) goto done;
                 used = 0;
                 skipping = FALSE;
             } else if (!skipping) {
@@ -602,12 +669,8 @@ BOOL SessionTools_ExportFile(const WCHAR *source, const WCHAR *target, BOOL mark
         }
     }
     if (skipping) (*omitted)++;
-    else if (used && !ExportLine(output, line, used, markdown, messages, omitted)) goto done;
-    {
-        WCHAR footer[256];
-        StringCchPrintfW(footer, ARRAYSIZE(footer), TR(L"\r\nExported messages: %lu. Omitted records: %lu.\r\n"), *messages, *omitted);
-        if (!WriteText(output, footer) || !FlushFileBuffers(output)) goto done;
-    }
+    else if (used && !ExportLine(output, line, used, format, messages, omitted)) goto done;
+    if (!ExportEnd(output, format, *messages, *omitted) || !FlushFileBuffers(output)) goto done;
     if (!GetFileInformationByHandle(input, &after) || before.nFileSizeLow != after.nFileSizeLow || before.nFileSizeHigh != after.nFileSizeHigh ||
         CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime)) { SetLastError(ERROR_RETRY); goto done; }
     CloseHandle(output);
@@ -623,39 +686,142 @@ done:
     return ok;
 }
 
-static void ExportReading(HWND owner, const WCHAR *source)
+/* A path the person chose to save to, its type `name` (`pattern`, `extension`); FALSE when none. */
+static BOOL ChooseSavePath(HWND owner, const WCHAR *typeName, const WCHAR *pattern, const WCHAR *extension, const WCHAR *fileName,
+                           WCHAR *out, size_t cch)
 {
     IFileDialog *dialog = NULL;
     IShellItem *item = NULL;
     PWSTR chosen = NULL;
-    COMDLG_FILTERSPEC filters[] = { { TR(L"Markdown (*.md)"), L"*.md" }, { TR(L"Plain text (*.txt)"), L"*.txt" } };
-    HRESULT hr;
-    UINT type = 1;
-    DWORD options, messages, omitted;
+    COMDLG_FILTERSPEC filter;
+    DWORD options;
     BOOL ok = FALSE;
-    hr = CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileDialog, (void **)&dialog);
-    if (FAILED(hr)) return;
+    filter.pszName = typeName;
+    filter.pszSpec = pattern;
+    if (FAILED(CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileDialog, (void **)&dialog))) return FALSE;
     IFileDialog_SetTitle(dialog, TR(L"Export reading copy"));
-    IFileDialog_SetFileTypes(dialog, ARRAYSIZE(filters), filters);
-    IFileDialog_SetDefaultExtension(dialog, L"md");
-    IFileDialog_SetFileName(dialog, TR(L"Claude conversation.md"));
+    IFileDialog_SetFileTypes(dialog, 1, &filter);
+    IFileDialog_SetDefaultExtension(dialog, extension);
+    IFileDialog_SetFileName(dialog, fileName);
     if (SUCCEEDED(IFileDialog_GetOptions(dialog, &options))) IFileDialog_SetOptions(dialog, options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_OVERWRITEPROMPT);
-    hr = IFileDialog_Show(dialog, owner);
-    if (SUCCEEDED(hr) && SUCCEEDED(IFileDialog_GetResult(dialog, &item)) && SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &chosen))) {
-        IFileDialog_GetFileTypeIndex(dialog, &type);
-        ok = SessionTools_ExportFile(source, chosen, type == 1, &messages, &omitted);
-        if (!ok) {
-            DWORD error = GetLastError();
-            if (error == ERROR_FILE_TOO_LARGE) Ui_Message(owner, MB_ICONWARNING, TR(L"Reading export supports transcripts up to 512 MiB. No existing output was replaced."));
-            else Ui_Message(owner, MB_ICONWARNING, TR(L"The reading copy could not be saved (error %lu). No existing output was replaced."), error);
-        } else Ui_Message(owner, MB_ICONINFORMATION, TR(L"Reading copy saved. Messages: %lu. Omitted records: %lu. Other transcripts and branches are excluded."), messages, omitted);
-    }
+    if (SUCCEEDED(IFileDialog_Show(dialog, owner)) && SUCCEEDED(IFileDialog_GetResult(dialog, &item)) &&
+        SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &chosen)))
+        ok = SUCCEEDED(StringCchCopyW(out, cch, chosen));
     if (chosen) CoTaskMemFree(chosen);
     if (item) IShellItem_Release(item);
     IFileDialog_Release(dialog);
+    return ok;
 }
 
-void SessionTools_Export(HWND owner, const SessionSet *set, int row)
+/* `path`, a file or a folder whole, into `zip` under `name` (UTF-8, "/" between folders). */
+static BOOL ZipPath(ZipOut *zip, const WCHAR *path, const char *name)
 {
-    if (row >= 0 && row < set->rowCount && set->rows[row].transcript) ExportReading(owner, set->rows[row].transcriptPath);
+    WCHAR pattern[LONG_PATH_CCH], child[LONG_PATH_CCH];
+    char childName[LONG_PATH_CCH * 3];
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    BOOL ok = TRUE;
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES) return TRUE;   /* gone meanwhile */
+    if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) return Zip_Has(zip, name) || Zip_AddFile(zip, name, path);
+    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\*", path)) ||
+        (find = FindFirstFileW(pattern, &found)) == INVALID_HANDLE_VALUE)
+        return TRUE;
+    do {
+        char leaf[MAX_PATH * 3];
+        if (wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0 || (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (!WideCharToMultiByte(CP_UTF8, 0, found.cFileName, -1, leaf, (int)sizeof leaf, NULL, NULL) ||
+            FAILED(StringCchPrintfW(child, ARRAYSIZE(child), L"%s\\%s", path, found.cFileName)) ||
+            FAILED(StringCchPrintfA(childName, sizeof childName, "%s/%s", name, leaf))) {
+            ok = FALSE;
+            break;
+        }
+        ok = ZipPath(zip, child, childName);
+    } while (ok && FindNextFileW(find, &found));
+    FindClose(find);
+    return ok;
+}
+
+/* The session's own files as Claude Code keeps them: one alone copied, several in a ZIP archive. */
+static void ExportOriginal(HWND owner, const SessionSet *set, int row)
+{
+    WCHAR (*paths)[LONG_PATH_CCH] = NULL, error[LONG_PATH_CCH + 64], chosen[LONG_PATH_CCH];
+    int count = 0, i;
+    BOOL single, ok = FALSE;
+    DWORD code = 0;
+    if (!SessionEdit_ListConversation(set, row, &paths, &count, error, ARRAYSIZE(error)) || count == 0) {
+        if (paths) HeapFree(GetProcessHeap(), 0, paths);
+        Ui_Message(owner, MB_ICONWARNING, L"%s", error[0] ? error : TR(L"The session has no files to export."));
+        return;
+    }
+    single = count == 1 && !(GetFileAttributesW(paths[0]) & FILE_ATTRIBUTE_DIRECTORY);
+    if (single ? ChooseSavePath(owner, TR(L"Claude Code transcript (*.jsonl)"), L"*.jsonl", L"jsonl", wcsrchr(paths[0], L'\\') + 1, chosen, ARRAYSIZE(chosen))
+               : ChooseSavePath(owner, TR(L"ZIP archive (*.zip)"), L"*.zip", L"zip", TR(L"Claude conversation.zip"), chosen, ARRAYSIZE(chosen))) {
+        if (single) {
+            ok = CopyFileW(paths[0], chosen, FALSE);
+            if (!ok) code = GetLastError();
+        } else {
+            ZipOut *zip = Zip_Create(chosen, &code);
+            ok = zip != NULL;
+            for (i = 0; ok && i < count; i++) {
+                char name[MAX_PATH * 3];
+                const WCHAR *leaf = wcsrchr(paths[i], L'\\');
+                ok = WideCharToMultiByte(CP_UTF8, 0, leaf ? leaf + 1 : paths[i], -1, name, (int)sizeof name, NULL, NULL) > 0 && ZipPath(zip, paths[i], name);
+            }
+            if (zip) {
+                if (!ok) code = Zip_Error(zip);
+                ok = Zip_Close(zip, ok) && ok;
+            }
+        }
+        if (ok) Ui_Message(owner, MB_ICONINFORMATION, TR(L"The session's files were exported."));
+        else Ui_Message(owner, MB_ICONWARNING, TR(L"The session's files could not be exported (error %lu)."), code ? code : ERROR_GEN_FAILURE);
+    }
+    HeapFree(GetProcessHeap(), 0, paths);
+}
+
+static void ExportReading(HWND owner, const WCHAR *source, int format)
+{
+    WCHAR chosen[LONG_PATH_CCH];
+    DWORD messages, omitted;
+    BOOL picked;
+    switch (format) {
+    case READING_MARKDOWN:
+        picked = ChooseSavePath(owner, TR(L"Markdown (*.md)"), L"*.md", L"md", TR(L"Claude conversation.md"), chosen, ARRAYSIZE(chosen));
+        break;
+    case READING_HTML:
+        picked = ChooseSavePath(owner, TR(L"Web page (*.html)"), L"*.html", L"html", TR(L"Claude conversation.html"), chosen, ARRAYSIZE(chosen));
+        break;
+    case READING_JSON:
+        picked = ChooseSavePath(owner, TR(L"JSON (*.json)"), L"*.json", L"json", TR(L"Claude conversation.json"), chosen, ARRAYSIZE(chosen));
+        break;
+    default:
+        picked = ChooseSavePath(owner, TR(L"Plain text (*.txt)"), L"*.txt", L"txt", TR(L"Claude conversation.txt"), chosen, ARRAYSIZE(chosen));
+        break;
+    }
+    if (!picked) return;
+    if (!SessionTools_ExportFile(source, chosen, format, &messages, &omitted)) {
+        DWORD error = GetLastError();
+        if (error == ERROR_FILE_TOO_LARGE) Ui_Message(owner, MB_ICONWARNING, TR(L"Reading export supports transcripts up to 512 MiB. No existing output was replaced."));
+        else Ui_Message(owner, MB_ICONWARNING, TR(L"The reading copy could not be saved (error %lu). No existing output was replaced."), error);
+    } else {
+        Ui_Message(owner, MB_ICONINFORMATION, TR(L"Reading copy saved. Messages: %lu. Omitted records: %lu. Other transcripts and branches are excluded."), messages, omitted);
+    }
+}
+
+void SessionTools_Export(HWND owner, const SessionSet *set, int row, int format)
+{
+    if (row < 0 || row >= set->rowCount) return;
+    if (format == READING_ORIGINAL) ExportOriginal(owner, set, row);
+    else if (set->rows[row].transcript) ExportReading(owner, set->rows[row].transcriptPath, format);
+}
+
+/* The session as a web page in the state folder, for the preview (webview.c): `out` its path. */
+BOOL SessionTools_PreviewPage(const SessionSet *set, int row, WCHAR *out, size_t cch)
+{
+    WCHAR state[MAX_PATH];
+    DWORD messages, omitted;
+    if (row < 0 || row >= set->rowCount || !set->rows[row].transcript || !Util_StateDir(state, ARRAYSIZE(state)) ||
+        FAILED(StringCchPrintfW(out, cch, L"%s\\preview.html", state)))
+        return FALSE;
+    return SessionTools_ExportFile(set->rows[row].transcriptPath, out, READING_HTML, &messages, &omitted);
 }

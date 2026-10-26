@@ -290,7 +290,7 @@ static BOOL WindowsSupported(void)
 }
 
 /* The user started this copy, so the manager may come to the front. After a
- * first install it offers to make Claude Desktop Profiles Manager the app for
+ * first install it offers to make Claude Delta the app for
  * claude:// links, which only the user can do (in Windows Settings); an
  * update does not ask again. */
 static BOOL StartInstalledManager(const WCHAR *exe, BOOL update)
@@ -344,7 +344,7 @@ BOOL Install_Run(BOOL openManager)
         return FALSE;
     }
     if (!Util_SelfExe(self, ARRAYSIZE(self)) || !Util_InstallExe(exe, ARRAYSIZE(exe)) || !Util_InstallDir(dir, ARRAYSIZE(dir))) {
-        Ui_Message(NULL, MB_ICONERROR, TR(L"The install folder %%LOCALAPPDATA%%\\Programs\\" APP_NAME L" is not available."));
+        Ui_Message(NULL, MB_ICONERROR, TR(L"The install folder %%LOCALAPPDATA%%\\Programs\\" APP_FOLDER L" is not available."));
         return FALSE;
     }
     if (!Util_EnsureDir(dir)) {
@@ -401,6 +401,26 @@ static void RepairRegistration(const WCHAR *exe, const WCHAR *dir)
     else if (link == S_OK) Util_Log(L"wrote the manager's shortcut again");
 }
 
+/* What no version reads any more in the manager's folder: the files of tools
+ * taken out (snapshots, backup history, operation results), and the backups
+ * a drag of profiles handed out when the manager ended during it. */
+static void RemoveRetiredState(void)
+{
+    static const WCHAR *const files[] = { L"backup-history.dat", L"backup-history.dat.tmp", L"operation-history.dat", L"operation-history.dat.tmp" };
+    static const WCHAR *const folders[] = { L"config-snapshots", L"outgoing" };
+    WCHAR state[MAX_PATH], path[MAX_PATH];
+    DWORD error = 0;
+    size_t i;
+    if (!Util_StateDir(state, ARRAYSIZE(state))) return;
+    for (i = 0; i < ARRAYSIZE(files); i++)
+        if (Util_JoinPath(state, files[i], path, ARRAYSIZE(path))) DeleteFileW(path);
+    for (i = 0; i < ARRAYSIZE(folders); i++)
+        if (Util_JoinPath(state, folders[i], path, ARRAYSIZE(path)) && Util_DirExists(path)) {
+            if (Util_DeleteTree(path, &error)) Util_Log(L"removed %s, which no version reads any more", path);
+            else Util_Log(L"could not remove %s (error %lu)", path, error);
+        }
+}
+
 /* Every time the manager opens from the installed copy: re-assert everything
  * Windows or Claude might have changed since. Idempotent. */
 void Install_Repair(void)
@@ -409,6 +429,7 @@ void Install_Repair(void)
     if (!Util_InstallExe(exe, ARRAYSIZE(exe)) || !Util_InstallDir(dir, ARRAYSIZE(dir))) return;
     RepairRegistration(exe, dir);
     RemoveLeftovers(dir);
+    RemoveRetiredState();
     Update_RemoveDownload();
 }
 

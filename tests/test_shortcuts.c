@@ -226,6 +226,7 @@ static void WINAPI FixtureShellNotice(LONG event, UINT flags, LPCVOID first, LPC
 #define Shortcut_CreateManagerLink FixtureShortcutCreateManagerLink
 #define Shortcut_RestoreManagerLink FixtureShortcutRestoreManagerLink
 #define Shortcut_DesktopPathFor FixtureShortcutDesktopPathFor
+#define Shortcut_FreePath FixtureShortcutFreePath
 #define Shortcut_IsOnDesktop FixtureShortcutIsOnDesktop
 #define Shortcut_Update FixtureShortcutUpdate
 #define Shortcut_ListOurs FixtureShortcutListOurs

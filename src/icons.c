@@ -26,7 +26,6 @@
 
 #define MAX_ICON_SIZE        256
 #define MIN_ICON_SIZE        8
-#define MIN_BADGE_SIZE       4
 #define MIN_LETTER_SIZE      24   /* a smaller badge has no room for a legible initial */
 #define TRAY_LIGHTEN_PERCENT 35   /* on a dark taskbar the darker colors of the palette fade into it */
 #define WHITE                RGB(255, 255, 255)
@@ -38,10 +37,6 @@
 #define BADGE_SHARE            0.54
 #define SMALL_ICON_BADGE_SHARE 0.62
 #define BADGE_RING_DIVISOR     22.0   /* a large icon's ring: its size / this */
-/* The badge alone (Icons_CreateBadge) fills its square, with a thicker ring
- * from LONE_BADGE_THICK_RING_SIZE. */
-#define LONE_BADGE_RING_DIVISOR     11.0
-#define LONE_BADGE_THICK_RING_SIZE  22
 /* The initial's ink: as high as this share of the disc inside the ring, and
  * at most as wide as the other one (W, M). */
 #define LETTER_HEIGHT_SHARE    0.56
@@ -84,8 +79,6 @@ static const int kIcoSizes[] = { 16, 20, 24, 28, 30, 32, 36, 40, 42, 48, 54, 56,
 
 /* -------------------------------------------------------------- pixels */
 
-static void *Alloc(size_t bytes) { return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes); }
-static void Free(void *memory) { if (memory) HeapFree(GetProcessHeap(), 0, memory); }
 
 static COLORREF PaletteColor(int index)
 {
@@ -125,13 +118,13 @@ static BOOL IconToPixels(HICON icon, int size, DWORD *pixels)
             for (i = 0; i < count && !hasAlpha; i++) hasAlpha = (pixels[i] >> 24) != 0;
             if (!hasAlpha) {
                 /* Old-style icon: opacity lives in the AND mask. */
-                DWORD *mask = (DWORD *)Alloc((size_t)count * sizeof(DWORD));
+                DWORD *mask = (DWORD *)Util_Alloc((size_t)count * sizeof(DWORD));
                 if (mask && parts.hbmMask && GetDIBits(screen, parts.hbmMask, 0, (UINT)size, mask, &info, DIB_RGB_COLORS) == size) {
                     for (i = 0; i < count; i++) pixels[i] = (mask[i] & 0xFFFFFF) ? 0 : (pixels[i] | 0xFF000000);
                 } else {
                     for (i = 0; i < count; i++) pixels[i] |= 0xFF000000;
                 }
-                Free(mask);
+                Util_Free(mask);
             }
         }
         ReleaseDC(NULL, screen);
@@ -264,7 +257,7 @@ static BOOL RasterizeLetter(const WCHAR *text, Glyph *glyph)
         glyph->width = right - left + 1;
         glyph->height = bottom - top + 1;
         stride = glyph->width + 1;
-        glyph->sum = (DWORD *)Alloc((size_t)stride * (glyph->height + 1) * sizeof(DWORD));
+        glyph->sum = (DWORD *)Util_Alloc((size_t)stride * (glyph->height + 1) * sizeof(DWORD));
         if (glyph->sum) {
             for (y = 0; y < glyph->height; y++) {
                 DWORD row = 0;
@@ -299,7 +292,7 @@ static void LoadGlyph(const WCHAR *text, Glyph *glyph)
     for (i = 0; i < GLYPH_CACHE && !cached; i++)
         if (g_glyphCache[i].sum && wcscmp(g_glyphCache[i].text, text) == 0) cached = &g_glyphCache[i];
     if (!cached && RasterizeLetter(text, &drawn)) {
-        Free(g_glyphCache[g_glyphCacheNext].sum);
+        Util_Free(g_glyphCache[g_glyphCacheNext].sum);
         g_glyphCache[g_glyphCacheNext] = drawn;
         cached = &g_glyphCache[g_glyphCacheNext];
         g_glyphCacheNext = (g_glyphCacheNext + 1) % GLYPH_CACHE;
@@ -558,8 +551,8 @@ static BOOL WriteIconFile(const WCHAR *path, const WCHAR *artExe, const Profile 
     ZeroMemory(&glyph, sizeof glyph);
     Icons_BadgeText(profile, badge, ARRAYSIZE(badge));
     for (i = 0; i < count; i++) total += IcoImageBytes(kIcoSizes[i]);
-    file = (BYTE *)Alloc(total);
-    pixels = (DWORD *)Alloc((size_t)MAX_ICON_SIZE * MAX_ICON_SIZE * sizeof(DWORD));
+    file = (BYTE *)Util_Alloc(total);
+    pixels = (DWORD *)Util_Alloc((size_t)MAX_ICON_SIZE * MAX_ICON_SIZE * sizeof(DWORD));
     if (!file || !pixels) {
         if (FirstIconFailure()) Util_Log(L"could not make icon %s: not enough memory", path);
         goto done;
@@ -610,9 +603,9 @@ static BOOL WriteIconFile(const WCHAR *path, const WCHAR *artExe, const Profile 
     ok = SaveIconFile(path, file, (DWORD)total, &error) || Util_FileExists(path);
     if (!ok && FirstIconFailure()) Util_Log(L"could not write icon %s (error %lu)", path, error);
 done:
-    Free(glyph.sum);
-    Free(file);
-    Free(pixels);
+    Util_Free(glyph.sum);
+    Util_Free(file);
+    Util_Free(pixels);
     return ok;
 }
 
@@ -715,7 +708,7 @@ BOOL Icons_Ensure(const ClaudePackage *pkg, const Profile *profile, WCHAR *out, 
     /* Claude's artwork could not be read: the manager's, under its own name,
      * so that Icons_IsStale offers Claude's again later. */
     else ok = IconFilePath(directory, profile, FALSE, out, cch) && (Util_FileExists(out) || WriteIconFile(out, NULL, profile, picture));
-    Free(picture);
+    Util_Free(picture);
     return ok;
 }
 
@@ -736,7 +729,7 @@ static HICON PixelsToIcon(const DWORD *pixels, int size)
     ReleaseDC(NULL, screen);
     if (!color || !bits) goto done;
     memcpy(bits, pixels, (size_t)size * size * sizeof(DWORD));
-    maskBits = (BYTE *)Alloc(maskRowBytes * size);
+    maskBits = (BYTE *)Util_Alloc(maskRowBytes * size);
     if (!maskBits) goto done;
     BuildAndMask(pixels, size, maskBits, maskRowBytes, FALSE);
     mask = CreateBitmap(size, size, 1, 1, maskBits);
@@ -749,7 +742,7 @@ static HICON PixelsToIcon(const DWORD *pixels, int size)
 done:
     if (color) DeleteObject(color);
     if (mask) DeleteObject(mask);
-    Free(maskBits);
+    Util_Free(maskBits);
     return icon;
 }
 
@@ -760,7 +753,7 @@ HICON Icons_CreateWith(const ClaudePackage *pkg, const Profile *profile, const D
     HICON icon = NULL;
     Glyph glyph;
     if (size < MIN_ICON_SIZE || size > MAX_ICON_SIZE) return NULL;
-    pixels = (DWORD *)Alloc((size_t)size * size * sizeof(DWORD));
+    pixels = (DWORD *)Util_Alloc((size_t)size * size * sizeof(DWORD));
     if (!pixels) return NULL;
     ZeroMemory(&glyph, sizeof glyph);
     Icons_BadgeText(profile, badge, ARRAYSIZE(badge));
@@ -768,8 +761,8 @@ HICON Icons_CreateWith(const ClaudePackage *pkg, const Profile *profile, const D
     if ((ClaudeArtExe(pkg, artExe, ARRAYSIZE(artExe)) && RenderProfileIcon(artExe, profile, picture, size, pixels, &glyph)) ||
         RenderProfileIcon(NULL, profile, picture, size, pixels, &glyph))
         icon = PixelsToIcon(pixels, size);
-    Free(glyph.sum);
-    Free(pixels);
+    Util_Free(glyph.sum);
+    Util_Free(pixels);
     return icon;
 }
 
@@ -777,22 +770,7 @@ HICON Icons_Create(const ClaudePackage *pkg, const Profile *profile, int size)
 {
     DWORD *picture = Icons_LoadPicture(profile);
     HICON icon = Icons_CreateWith(pkg, profile, picture, size);
-    Free(picture);
-    return icon;
-}
-
-/* The badge alone, filling a size x size square, without the initial. */
-HICON Icons_CreateBadge(int color, int size)
-{
-    DWORD *pixels;
-    HICON icon;
-    if (size < MIN_BADGE_SIZE || size > MAX_ICON_SIZE) return NULL;
-    pixels = (DWORD *)Alloc((size_t)size * size * sizeof(DWORD));
-    if (!pixels) return NULL;
-    DrawDisc(pixels, size, size / 2.0, size / 2.0, size / 2.0,
-             size >= LONE_BADGE_THICK_RING_SIZE ? size / LONE_BADGE_RING_DIVISOR : 1.0, PaletteColor(color));
-    icon = PixelsToIcon(pixels, size);
-    Free(pixels);
+    Util_Free(picture);
     return icon;
 }
 
@@ -820,13 +798,13 @@ HICON Icons_CreateTray(const ClaudePackage *pkg, const Profile *profile, int siz
     if (profile->picture && (icon = Icons_Create(pkg, profile, size)) != NULL) return icon;
     if (darkTaskbar) color = Lighten(color, TRAY_LIGHTEN_PERCENT);
     tint = ((DWORD)GetRValue(color) << 16) | ((DWORD)GetGValue(color) << 8) | GetBValue(color);
-    pixels = (DWORD *)Alloc((size_t)size * size * sizeof(DWORD));
+    pixels = (DWORD *)Util_Alloc((size_t)size * size * sizeof(DWORD));
     if (pixels && Tray_ClaudeImagePath(pkg, FALSE, path, ARRAYSIZE(path)) &&
         TakeIconPixels((HICON)LoadImageW(NULL, path, IMAGE_ICON, size, size, LR_LOADFROMFILE), size, pixels)) {
         for (i = 0; i < size * size; i++) pixels[i] = (pixels[i] & 0xFF000000) | tint;
         icon = PixelsToIcon(pixels, size);
     }
-    Free(pixels);
+    Util_Free(pixels);
     return icon ? icon : Icons_Create(pkg, profile, size);
 }
 
@@ -891,7 +869,7 @@ void Icons_DeleteStale(const Profile *profile, const WCHAR *keep)
 
 /* ------------------------------------------------------------- pictures */
 
-static BOOL PicturePath(const WCHAR *folder, WCHAR *out, size_t cch)
+BOOL Icons_PicturePath(const WCHAR *folder, WCHAR *out, size_t cch)
 {
     WCHAR state[MAX_PATH];
     return folder && folder[0] && Util_StateDir(state, ARRAYSIZE(state)) &&
@@ -994,7 +972,7 @@ DWORD *Icons_ReadPicture(const WCHAR *path, HRESULT *result)
         if (FAILED(hr) && mode != WICBitmapInterpolationModeFant)
             hr = IWICBitmapScaler_Initialize(scaler, (IWICBitmapSource *)clipper, PICTURE_SIZE, PICTURE_SIZE, WICBitmapInterpolationModeFant);
     }
-    if (SUCCEEDED(hr) && (pixels = (DWORD *)Alloc(bytes)) == NULL) hr = E_OUTOFMEMORY;
+    if (SUCCEEDED(hr) && (pixels = (DWORD *)Util_Alloc(bytes)) == NULL) hr = E_OUTOFMEMORY;
     if (SUCCEEDED(hr)) hr = IWICBitmapScaler_CopyPixels(scaler, NULL, stride, bytes, (BYTE *)pixels);
     if (SUCCEEDED(hr)) {
         /* Straight alpha, as every pixel buffer here. */
@@ -1007,7 +985,7 @@ DWORD *Icons_ReadPicture(const WCHAR *path, HRESULT *result)
                 pixels[i] = 0;
         }
     } else {
-        Free(pixels);
+        Util_Free(pixels);
         pixels = NULL;
     }
     if (scaler) IWICBitmapScaler_Release(scaler);
@@ -1039,10 +1017,10 @@ static DWORD *ReadSavedPicture(const WCHAR *path)
     if (SUCCEEDED(hr)) hr = WICConvertBitmapSource(&GUID_WICPixelFormat32bppBGRA, (IWICBitmapSource *)frame, &converted);
     if (SUCCEEDED(hr)) hr = IWICBitmapSource_GetSize(converted, &width, &height);
     if (SUCCEEDED(hr) && (width != PICTURE_SIZE || height != PICTURE_SIZE)) hr = WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
-    if (SUCCEEDED(hr) && (pixels = (DWORD *)Alloc(bytes)) == NULL) hr = E_OUTOFMEMORY;
+    if (SUCCEEDED(hr) && (pixels = (DWORD *)Util_Alloc(bytes)) == NULL) hr = E_OUTOFMEMORY;
     if (SUCCEEDED(hr)) hr = IWICBitmapSource_CopyPixels(converted, NULL, stride, bytes, (BYTE *)pixels);
     if (FAILED(hr)) {
-        Free(pixels);
+        Util_Free(pixels);
         pixels = NULL;
     }
     if (converted) IWICBitmapSource_Release(converted);
@@ -1082,16 +1060,16 @@ DWORD *Icons_LoadPicture(const Profile *profile)
         if (g_pictureCache[i].pixels && g_pictureCache[i].stamp == profile->picture && Core_EqualsI(g_pictureCache[i].folder, profile->folder))
             pixels = CopyPicture(g_pictureCache[i].pixels);
     ReleaseSRWLockShared(&g_pictureLock);
-    if (pixels || !PicturePath(profile->folder, path, ARRAYSIZE(path))) return pixels;
+    if (pixels || !Icons_PicturePath(profile->folder, path, ARRAYSIZE(path))) return pixels;
     /* Another picture than the one the profile names (written since, by
      * another process) is not shown under its stamp. */
     read = ReadSavedPicture(path);
     if (!read || PictureStamp(read) != profile->picture) {
-        Free(read);
+        Util_Free(read);
         return NULL;
     }
     AcquireSRWLockExclusive(&g_pictureLock);
-    Free(g_pictureCache[g_pictureCacheNext].pixels);
+    Util_Free(g_pictureCache[g_pictureCacheNext].pixels);
     g_pictureCache[g_pictureCacheNext].pixels = CopyPicture(read);
     g_pictureCache[g_pictureCacheNext].stamp = profile->picture;
     StringCchCopyW(g_pictureCache[g_pictureCacheNext].folder, FOLDER_CCH, profile->folder);
@@ -1133,7 +1111,7 @@ BOOL Icons_SavePicture(const WCHAR *folder, const DWORD *pixels, DWORD *stamp)
     Codecs codecs;
     HRESULT hr;
     if (stamp) *stamp = 0;
-    if (!pixels || !PicturePath(folder, path, ARRAYSIZE(path)) || FAILED(StringCchCopyW(directory, ARRAYSIZE(directory), path)) ||
+    if (!pixels || !Icons_PicturePath(folder, path, ARRAYSIZE(path)) || FAILED(StringCchCopyW(directory, ARRAYSIZE(directory), path)) ||
         (slash = wcsrchr(directory, L'\\')) == NULL ||
         FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s.%lu" TEMPORARY_EXTENSION, path, GetCurrentProcessId())))
         return FALSE;
@@ -1160,7 +1138,7 @@ BOOL Icons_SavePicture(const WCHAR *folder, const DWORD *pixels, DWORD *stamp)
 void Icons_DeletePicture(const WCHAR *folder)
 {
     WCHAR path[MAX_PATH];
-    if (PicturePath(folder, path, ARRAYSIZE(path)) && !DeleteFileW(path) && GetLastError() != ERROR_FILE_NOT_FOUND &&
+    if (Icons_PicturePath(folder, path, ARRAYSIZE(path)) && !DeleteFileW(path) && GetLastError() != ERROR_FILE_NOT_FOUND &&
         GetLastError() != ERROR_PATH_NOT_FOUND)
         Util_Log(L"could not delete %s (error %lu)", path, GetLastError());
 }

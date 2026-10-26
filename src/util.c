@@ -32,7 +32,7 @@ BOOL Util_InstallDir(WCHAR *out, size_t cch)
 {
     WCHAR base[MAX_PATH];
     return Util_KnownFolder(&FOLDERID_UserProgramFiles, base, ARRAYSIZE(base)) &&
-           SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_NAME, base));
+           SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_FOLDER, base));
 }
 
 BOOL Util_InstallExe(WCHAR *out, size_t cch)
@@ -56,7 +56,7 @@ BOOL Util_StateDir(WCHAR *out, size_t cch)
     WCHAR base[MAX_PATH];
     if (g_stateDirOverride[0]) return SUCCEEDED(StringCchCopyW(out, cch, g_stateDirOverride));
     return Util_LocalAppData(base, ARRAYSIZE(base)) &&
-           SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_NAME, base));
+           SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_FOLDER, base));
 }
 
 /* `path` as the file functions take it past MAX_PATH: \\?\C:\... or
@@ -551,6 +551,156 @@ char *Util_ReadFile(const WCHAR *path, DWORD maxBytes, BOOL tail, DWORD *len)
     return buffer;
 }
 
+/* ------------------------------------------------- memory and whole files */
+
+ULONGLONG Util_NowMs(void)
+{
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    return Core_FileTimeMs(&now);
+}
+
+BOOL Util_FormatWhen(ULONGLONG ms, DWORD timeFlags, WCHAR *date, size_t dateCch, WCHAR *time, size_t timeCch)
+{
+    FILETIME utc = Core_MsFileTime(ms);
+    SYSTEMTIME universal, local;
+    date[0] = time[0] = 0;
+    return ms && FileTimeToSystemTime(&utc, &universal) && SystemTimeToTzSpecificLocalTime(NULL, &universal, &local) &&
+           GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local, NULL, date, (int)dateCch, NULL) &&
+           GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, timeFlags, &local, NULL, time, (int)timeCch);
+}
+
+void *Util_Grow(void *items, int *capacity, int need, size_t size)
+{
+    void *bigger;
+    int n;
+    if (need <= *capacity) return items;
+    for (n = *capacity > 0 ? *capacity : 16; n < need; n *= 2)
+        if (n > INT_MAX / 2) return NULL;
+    if (!size || (size_t)n > (size_t)-1 / size) return NULL;
+    bigger = items ? HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, items, (size_t)n * size)
+                   : HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)n * size);
+    if (bigger) *capacity = n;
+    return bigger;
+}
+
+BOOL Util_NewId(WCHAR *out, size_t cch, DWORD *random)
+{
+    GUID guid;
+    WCHAR text[39];   /* {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} */
+    size_t i;
+    if (FAILED(CoCreateGuid(&guid)) || StringFromGUID2(&guid, text, ARRAYSIZE(text)) != ARRAYSIZE(text)) return FALSE;
+    text[ARRAYSIZE(text) - 2] = 0;   /* the closing brace */
+    for (i = 1; text[i]; i++) text[i] = (WCHAR)towlower(text[i]);
+    if (random) *random = guid.Data1;
+    return SUCCEEDED(StringCchCopyW(out, cch, text + 1));
+}
+
+void *Util_Alloc(size_t bytes)
+{
+    return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes ? bytes : 1);
+}
+
+void Util_Free(void *block)
+{
+    if (block) HeapFree(GetProcessHeap(), 0, block);
+}
+
+char *Util_CopyBytes(const char *data, size_t length)
+{
+    char *copy = (char *)Util_Alloc(length + 1);
+    if (!copy) return NULL;
+    if (length) CopyMemory(copy, data, length);
+    copy[length] = 0;
+    return copy;
+}
+
+BOOL Util_JoinPath(const WCHAR *dir, const WCHAR *name, WCHAR *out, size_t cch)
+{
+    size_t length;
+    if (!dir || !name || !out || !cch) return FALSE;
+    length = wcslen(dir);
+    while (length && (dir[length - 1] == L'\\' || dir[length - 1] == L'/')) length--;
+    return SUCCEEDED(StringCchPrintfW(out, cch, L"%.*s\\%s", (int)length, dir, name));
+}
+
+#define WRITE_CHUNK_MAX 0x40000000u   /* bytes given to one WriteFile */
+
+BOOL Util_WriteAll(HANDLE file, const void *data, size_t length)
+{
+    const BYTE *at = (const BYTE *)data;
+    while (length > 0) {
+        DWORD written = 0, chunk = length > WRITE_CHUNK_MAX ? WRITE_CHUNK_MAX : (DWORD)length;
+        if (!WriteFile(file, at, chunk, &written, NULL) || written == 0) return FALSE;
+        at += written;
+        length -= written;
+    }
+    return TRUE;
+}
+
+/* `data` written whole and flushed to the file beside `path` named with
+ * UTIL_TEMPORARY_SUFFIX, which `temporary` names (in its \\?\ form). Nothing
+ * of it is left on failure; GetLastError tells why. */
+BOOL Util_WriteTemporary(const WCHAR *path, const char *data, size_t length, WCHAR *temporary, size_t cch)
+{
+    WCHAR target[LONG_PATH_CCH];
+    HANDLE file;
+    DWORD error = ERROR_SUCCESS;
+    BOOL ok;
+    if (!Util_ExtendedPath(path, target, ARRAYSIZE(target)) ||
+        FAILED(StringCchPrintfW(temporary, cch, L"%s" UTIL_TEMPORARY_SUFFIX, target))) {
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return FALSE;
+    }
+    file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    ok = Util_WriteAll(file, data, length) && FlushFileBuffers(file);
+    if (!ok) error = GetLastError();
+    CloseHandle(file);
+    if (!ok) {
+        DeleteFileW(temporary);
+        SetLastError(error ? error : ERROR_WRITE_FAULT);
+    }
+    return ok;
+}
+
+/* The `temporary` file (Util_WriteTemporary) put in place of `path`, as
+ * `how` says: UTIL_PUT_NEW only where there is none, UTIL_PUT_REPLACE over
+ * any, UTIL_PUT_OVER only over one there, keeping its attributes and
+ * security (ReplaceFileW). The temporary file is gone on failure;
+ * GetLastError tells why. */
+BOOL Util_PutInPlace(const WCHAR *temporary, const WCHAR *path, UtilPut how)
+{
+    WCHAR target[LONG_PATH_CCH];
+    DWORD error = ERROR_SUCCESS;
+    BOOL ok;
+    if (!Util_ExtendedPath(path, target, ARRAYSIZE(target))) {
+        DeleteFileW(temporary);
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return FALSE;
+    }
+    if (how == UTIL_PUT_OVER) {
+        ok = ReplaceFileW(target, temporary, NULL, REPLACEFILE_IGNORE_MERGE_ERRORS, NULL, NULL);
+        if (!ok) error = GetLastError();
+        /* ReplaceFileW took the old one away but could not put the new one in its place. */
+        if (!ok && error == ERROR_UNABLE_TO_MOVE_REPLACEMENT && MoveFileExW(temporary, target, MOVEFILE_WRITE_THROUGH)) ok = TRUE;
+    } else {
+        ok = MoveFileExW(temporary, target, MOVEFILE_WRITE_THROUGH | (how == UTIL_PUT_REPLACE ? MOVEFILE_REPLACE_EXISTING : 0));
+        if (!ok) error = GetLastError();
+    }
+    if (!ok) {
+        DeleteFileW(temporary);
+        SetLastError(error);
+    }
+    return ok;
+}
+
+BOOL Util_WriteFileAtomic(const WCHAR *path, const char *data, size_t length, UtilPut how)
+{
+    WCHAR temporary[LONG_PATH_CCH];
+    return Util_WriteTemporary(path, data, length, temporary, ARRAYSIZE(temporary)) && Util_PutInPlace(temporary, path, how);
+}
+
 /* A junction or directory symlink (other reparse points, cloud placeholders
  * say, are ordinary folders). */
 BOOL Util_IsDirectoryLink(const WCHAR *path)
@@ -733,5 +883,20 @@ BOOL Util_SetSettingList(const WCHAR *section, const WCHAR (*items)[MAX_PATH], i
     buffer[used] = 0;   /* the list's end: an empty line */
     ok = WritePrivateProfileSectionW(section, buffer, path);
     HeapFree(GetProcessHeap(), 0, buffer);
+    return ok;
+}
+
+BOOL Util_ClipboardText(WCHAR *out, size_t cch)
+{
+    HANDLE data;
+    const WCHAR *text;
+    BOOL ok = FALSE;
+    if (!cch || !IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(NULL)) return FALSE;
+    if ((data = GetClipboardData(CF_UNICODETEXT)) != NULL && (text = (const WCHAR *)GlobalLock(data)) != NULL) {
+        ok = SUCCEEDED(StringCchCopyW(out, cch, text));
+        GlobalUnlock(data);
+    }
+    CloseClipboard();
+    if (!ok) out[0] = 0;
     return ok;
 }

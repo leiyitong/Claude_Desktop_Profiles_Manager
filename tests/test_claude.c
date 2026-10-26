@@ -392,8 +392,6 @@ int wmain(int argc, WCHAR **argv)
         { "artifact metadata holds a URL and optional sourcePath", "typeof \x01.url!=\"string\"", "sourcePath!==void 0" },
         { "session presets use the ccd-session-presets store keyed byAccount", "name:\"ccd-session-presets\"", "\"byAccount\"" },
         { "each account preset catalog has presets and optional builtIns", "Array.isArray(\x01.presets)&&\x01.presets.every", "builtIns===void 0" },
-        { "plan-usage-history.json maps five-hour and seven-day utilization to fh and sd", "plan-usage-history.json", "five_hour:\"fh\",seven_day:\"sd\"" },
-        { "usage history version 2 stores samples with timestamp, nullable organization and utilization map", "t:\x01(),org:\x01().nullable(),u:\x01(\x01(),\x01())", "version:\x01(2),samples:" },
         { "window-state.json follows window move, resize and maximize events", "window-state.json", "\"resize\",\"move\",\"maximize\"" },
         { "window-state reads saved width and height", "[window-state] ignoring unreadable saved state", "width:\x01.width,height:\x01.height" },
         { "developer_settings.json accepts allowDevTools", "developer_settings.json", "allowDevTools:" },

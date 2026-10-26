@@ -10,8 +10,10 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      - 'windows-mcp-delta/**'
       - 'tools/check-localization.py'
       - 'tools/changelog.py'
+      - 'tools/pack-delta.ps1'
       - 'CHANGELOG.md'
       - 'CHANGELOG.zh-CN.md'
       - 'build.cmd'
@@ -21,8 +23,10 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      - 'windows-mcp-delta/**'
       - 'tools/check-localization.py'
       - 'tools/changelog.py'
+      - 'tools/pack-delta.ps1'
       - 'CHANGELOG.md'
       - 'CHANGELOG.zh-CN.md'
       - 'build.cmd'
@@ -66,11 +70,12 @@ jobs:
           path: build/ClaudeDesktopProfilesManager.exe
           if-no-files-found: error
 
-  # Every build of main, unsigned, as a pre-release of its own, its notes its version's
-  # lines in the changelogs. Pre-releases are not "latest": the README's download link and
-  # the update check of installed copies (update.c, releases/latest) keep finding the
-  # signed release only.
-  prerelease:
+  # A day's builds of main make one release, as a day's commits make one version: tagged and named
+  # after the day (v<APP_VERSION_DATE>), unsigned, the latest release, its notes that version's lines
+  # in the changelogs. Each push of the day replaces it with its build, unless main has moved on
+  # meanwhile (that later push's build replaces it then). update.c checks the upstream's signed
+  # releases; ghupdate.c offers this one to copies whose PC signs in to GitHub, by its commit.
+  release:
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -85,19 +90,25 @@ jobs:
         with:
           name: ClaudeDesktopProfilesManager
 
-      - name: Publish the build as a pre-release
+      - name: Publish the build as the day's release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: build-${{ github.run_number }}
         run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main is at $head now: its own build publishes the day's release."
+            exit 0
+          fi
           short=$(echo "$GITHUB_SHA" | cut -c1-7)
           version=$(sed -n 's/^#define APP_VERSION_DATE *"\([^"]*\)".*/\1/p' src/version.h)
+          tag="v$version"
           {
-            echo "> ⚠️ Unsigned build of \`$short\` on main, made by GitHub Actions: an installed copy does not update to it, its update check takes signed releases only. 未签名的 main 构建：已安装的程序不会自动更新到它。"
+            echo "> Unsigned build of \`$short\` on main, made by GitHub Actions; a copy installed on a PC signed in to GitHub (gh, or git's credential) offers it when it opens. 未签名的 main 构建：在登录了 GitHub（gh 或 git 凭据）的电脑上，已安装的程序打开时会提示更新到它。"
             echo
             python3 tools/changelog.py --notes latest
           } > notes.md
-          gh release create "$TAG" ClaudeDesktopProfilesManager.exe \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --latest=false \
-            --title "Claude Desktop Profiles Manager v$version (build $GITHUB_RUN_NUMBER)" \
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$tag" ClaudeDesktopProfilesManager.exe \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "Claude Delta v$version" \
             --notes-file notes.md

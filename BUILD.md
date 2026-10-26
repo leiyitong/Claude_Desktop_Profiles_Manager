@@ -65,7 +65,7 @@ if ($LASTEXITCODE -eq 0) { gh release create v1.1.0 build\ClaudeDesktopProfilesM
 
 ## Changelog
 
-A day's commits make one version, named after that day: `APP_VERSION_DATE` in `src\version.h` ("2026.10.12"), which the manager shows as its version. `CHANGELOG.md` and `CHANGELOG.zh-CN.md` hold one heading per version, newest first, `## v<day>`, and under it, as a release page has it, a sentence or two on what that day brought, then its changes in sections, in this order and each only with some: `### New features`, `### Improvements`, `### Bug fixes`, `### Breaking changes`, `### Upgrade guide` (新增功能, 优化改进, Bug 修复, 破坏性变更, 升级指南), one line per change numbered from 1 in its section ("1. ...", which `--stamp` numbers again); the two files with the same versions, sections and numbers of lines. Before a commit that changes the program, `python tools/changelog.py --stamp` sets `APP_VERSION_DATE` to today and puts today's heading on top of both files when it is not there yet; the commit's lines go under it. `build.cmd` runs `python tools/changelog.py --check`: both files in this form and in step, one version per day, newest first, the newest `src\version.h`'s, no line of 4000 bytes or more, and, where git has the commit before, that the last commit, when it changed `src/`, wrote both files and is the version of the day it was made. `--notes latest` prints the newest version's release notes (the program in a line, the summary and the sections, in English then Chinese, then how to install it and where its documents are), main's pre-releases' notes, under the title "Claude Desktop Profiles Manager v<day> (build N)"; `--release` prints every version since the last `v*` tag the same way. The exe embeds both files (`src/app.rc`, RCDATA); **About** lists the versions of the interface language's one on the left, folded by month, and shows what the one chosen changed (Changelog: every version, a month: its own) (`Core_ChangelogRead` reads the Markdown).
+A day's commits make one version, named after that day: `APP_VERSION_DATE` in `src\version.h` ("2026.10.12"), which the manager shows as its version. `CHANGELOG.md` and `CHANGELOG.zh-CN.md` hold one heading per version, newest first, `## v<day>`, and under it, as a release page has it, a sentence or two on what that day brought, then its changes in sections, in this order and each only with some: `### New features`, `### Improvements`, `### Bug fixes`, `### Breaking changes`, `### Upgrade guide` (新增功能, 优化改进, Bug 修复, 破坏性变更, 升级指南), one line per change numbered from 1 in its section ("1. ...", which `--stamp` numbers again); the two files with the same versions, sections and numbers of lines. Before a commit that changes the program, `python tools/changelog.py --stamp` sets `APP_VERSION_DATE` to today and puts today's heading on top of both files when it is not there yet; the commit's lines go under it. `build.cmd` runs `python tools/changelog.py --check`: both files in this form and in step, one version per day, newest first, the newest `src\version.h`'s, no line of 4000 bytes or more, and, where git has the commit before, that the last commit, when it changed `src/`, wrote both files and is the version of the day it was made. `--notes latest` prints the newest version's release notes (the program in a line, the summary and the sections, in English then Chinese, then how to install it and where its documents are), main's pre-releases' notes, under the title "Claude Delta v<day> (build N)"; `--release` prints every version since the last `v*` tag the same way. The exe embeds both files (`src/app.rc`, RCDATA); **About** lists the versions of the interface language's one on the left, folded by month, and shows what the one chosen changed (Changelog: every version, a month: its own) (`Core_ChangelogRead` reads the Markdown).
 
 ## Project structure
 
@@ -96,10 +96,13 @@ src/taskbar-pin.c             taskbar pins: pin, update, repair, removal at unin
 src/tray.c                    notification-area icon in the profile's color
 src/handler.c                 claude:// registration and default-app check
 src/install.c                 install, repair, uninstall
+src/cookies.c                 writes claude.ai sign-in cookies into a profile's Chromium cookie store (winsqlite3)
+src/shield.c                  the shield: watches Claude's exit IP and network, ends Claude when the exit breaks a rule
+src/ghupdate.c                builds of main offered through gh or git's GitHub credential (no sign-in: a copied copy, its version in red)
 src/update.c                  new release check (GitHub API, WinHTTP) and one-click update
 src/router.c                  --launch (shortcuts) and --url (claude:// links, the dialog choosing their profile)
 src/notifyguard.c             in each watcher: a notification clicked in the notification center goes to its profile
-src/gui.c                     manager window, its menus and dialogs, Backup & Restore, its open, quit, restart and sync jobs
+src/gui.c                     manager window, its menus and dialogs, export and import, its open, quit, restart and sync jobs
                               and their progress
 src/sessionstore.c            every profile's Claude Code sessions: entries, transcripts, projects, sessions in use (read only)
 src/sessionedit.c             session actions: open, copy, entry changes (made when an open profile closes), what clean-up removes
@@ -116,27 +119,34 @@ src/sessionpurge.c            conversations no profile lists, cleaned up or rest
 src/sessionlink.c             session folders linked by earlier versions: read, and taken away
 src/backup.c                  a profile backed up to one archive and restored from it, an item at a time (the same list as
                               what to sync, its content added); several backups restored into one profile, their
-                              conflicts chosen; the sign-in's key behind a password
+                              conflicts chosen; the sign-in with its key; the profile's own name, note, icon and title
 src/zip.c                     ZIP archives written and read (stored or deflated), for backups
-src/checklist.c               a list whose groups fold, with check boxes: what to sync, what a backup keeps
+src/checklist.c               a list whose groups fold, with check boxes: what to sync, what a backup keeps; values
+                              of a group's own (a property list), changed in place: a profile's own, its sessions
+                              and settings in a backup, the profile dialog; read-only, the conflicts' versions; a
+                              setting's list or object as values of its own below it, written back from them; the
+                              pane beside it, a list of its own over the same values: what the row selected holds,
+                              searched; the list beside it an overview
 src/syncui.c                  the dialog choosing the profiles that take part, and the summary of what was done; the
                               recover, clean-up, sync settings and sync conflicts dialogs; what to sync's groups and
-                              items, which a backup's list builds on
+                              items, which a backup's list and the profile dialog build on, and the settings as values
 src/settings.c                the Settings dialog: the interface language and the session vault's days
 src/about.c                   the About dialog: this version, help, and the changelog the program embeds
-src/sessions.c                the sessions view of the manager window: profiles, tree, filter menu and search, menus, several sessions
+src/sessions.c                the sessions view of the manager window, as Claude's sidebar: profiles, tree, filter menu and search, menus, several sessions
 src/sessionsearch.c           the sessions view's search in the conversations themselves, on a thread of its own
-src/signin.c                  private Edge/Chrome sessions for manual account registration and Desktop authorization
-src/backuphistory.c           the last 64 successful profile ZIP locations and their current availability
+src/signin.c                  private sign-in: a WebView2 window of its own, or Edge/Chrome, for account registration and Desktop authorization
+src/webview.c                 that WebView2 window: the runtime Windows ships, started without its loader DLL; the claude:// link caught for the profile
+src/windowsmcp.c              Windows-MCP in a profile's mcpServers, run by uv's uvx (its full path); uv installed by its own installer when missing; SearXNG search (mcp-searxng, run by npx)
 src/presets.c/.h              account-scoped preset validation and merge while preserving unrelated scopes and extensions
 src/vaulttools.c/.h/.rc       search/check historical entries for selective recovery; official-resume target picker
 src/vaulttools_tasks.c/.h     task definition collection, declared coverage, safe mapping and disabled restoration
-src/profiletools.c/.h/.rc     local usage, cancellable storage and scoped health/configuration-difference tools
-src/profileconfig.c          versioned manager configuration ZIPs, explicit existing-profile mapping and PNG migration
-src/profilesnapshots.c        bounded event-driven typed UI-configuration snapshots and backed-up selective restoration
-src/operationhistory.c/.h     bounded local operation counts, wait status, error summaries and backup references
 src/sessiontools.c/.h/.rc     local hit context, reading-copy export, lineage/artifacts, historical and remote metadata browsers
 src/diagnostics.c             text previews, log-folder entry and a deliberately limited diagnostic summary
+src/dragout.c                 profiles dragged out of the list as their backups: where they are dropped (a marker the folder
+                              copies, the shell's notice of it), then what they hold, then their transfer; files dragged
+                              onto the window, through a drop target that refuses a drag of ours
+src/transfer.c                files the program writes elsewhere itself: made, then copied through a hidden part, resumed
+                              from it after a close or an error; the window that shows, pauses, leaves or cancels it
 src/sessionundo.c             what the manager did to sessions, undone and done again (Ctrl+Z, Ctrl+Y) while it runs
 src/main.c                    command-line dispatch
 src/app.rc, src/resource.h    dialogs, version info, control ids
@@ -150,10 +160,7 @@ tests/test_sessions.c         sessionstore.c, sessionedit.c, sessionsync.c, sess
                               transcripts and state folder
 tests/test_presets.c          account mapping, default/built-in preset handling, unknown-field preservation and malformed data
 tests/test_backupfeatures.inc vault subset recovery, preset backup/sync, task coverage and full-ZIP validation fixtures
-tests/test_profiletools.c     GUID-private files and HKCU override: usage, space, migration, PNGs, safe snapshots and health
-tests/test_operationhistory.c bounded operation results, per-profile counts and corrupt-history preservation
 tests/test_sessiontools.c    metadata privacy, artifact URL policy, hit context and reading-copy export limits
-tests/test_backuphistory.c    backup-history ordering, Unicode, concurrent appends and failed/corrupt reads on private state
 tests/test_platform.c         update, install, watcher, routing and removal failures (sources included with fixtures
                               in place of their system calls; their exported functions renamed Tested<Name>)
 tests/test_shortcuts.c        shortcuts.c on private files and registry records, with COM failure fixtures
@@ -163,6 +170,7 @@ tests/test_claude.c           the installed Claude Desktop still works as HOW-IT
 tools/make-icon.ps1           regenerates src/app.ico
 tools/check-localization.py   checks the catalog: keys used and translated, formats, punctuation, command wording
 tools/changelog.py            stamps a new version, checks the two changelogs, prints a version's or a release's notes
+tools/read-webstore.py        prints names and values of a profile's web storage (Local Storage), read-only
 CHANGELOG.md                  every version (a day's commits, named after the day) and what it changed (CHANGELOG.zh-CN.md: in Simplified Chinese)
                               and access keys per language
 ```
@@ -173,7 +181,7 @@ CHANGELOG.md                  every version (a day's commits, named after the da
 - **Static CRT** - `/MT` and system DLLs only (listed in `build.cmd`; About's rich edit, `msftedit.dll`, is loaded from System32 when About opens): the exe runs on a bare Windows 10 1809+
 - **Tests** - Pure logic goes in `src/core.c`, with a test in `tests/test_core.c`; the pin entry helpers are tested in `tests/test_pin.c`; `tests/test_theme.c`, linked with the program's manifest, compares what `src/theme.c` draws (rows and their three blues, separators and tree arrows, list headers, edits and their printing, drop-down buttons and their width, the color swatches of a drop-down list, buttons with icons, the program's own menu and its keyboard, side bar colors, scroll bars at the edges and following the wheel, off-screen drawing) with what Windows draws, in the mode Windows is set to, and checks the views that scroll lists by the pixel (paging, keeping their place on refills and resizes, following only the keyboard and the program, the keys that scroll a tree, the wheel and what stops it, lists taller than a native control can scroll), push buttons, tooltips and info tips, the last column's width, the focus cue and secondary text, names never cut inside a character, and that every resource is freed after destruction; `tests/test_claude.c` looks up in the installed Claude Desktop each fact the program relies on (skipped where Claude is not installed, as on GitHub Actions), so a Claude update that changes one fails the build
 - **Manual checks** - Use a throwaway profile (`%APPDATA%\Claude-<test>`) and delete it afterwards; never test with the Claude windows in daily use
-- **Session fixtures** - `tests/test_sessions.c` runs through `build.cmd` without launching Claude. It covers real and virtualized Main storage, account selection, filesystem notifications, concurrent pending edits, unreadable queue files, complete deletion plans, scratch copies, settings-copy exclusions, and sessions merged, copied and moved, shared with a running profile, exported and imported, and groups of profiles kept the same (the sidebar's pins and groups, sessions without a folder, sessions continued apart). Its profiles, transcripts, log and queued changes stay in a unique temporary directory, which it removes afterwards; deletion plans do not send user files to the Recycle Bin.
+- **Session fixtures** - `tests/test_sessions.c` runs through `build.cmd` without launching Claude, beside the tests that follow it (the longest to run; its output shows once they are done). It covers real and virtualized Main storage, account selection, filesystem notifications, concurrent pending edits, unreadable queue files, complete deletion plans, scratch copies, settings-copy exclusions, and sessions merged, copied and moved, shared with a running profile, exported and imported, and groups of profiles kept the same (the sidebar's pins and groups, sessions without a folder, sessions continued apart). Its profiles, transcripts, log and queued changes stay in a unique temporary directory, which it removes afterwards; deletion plans do not send user files to the Recycle Bin.
 - **Platform fixtures** - `tests/test_platform.c` includes `update.c`, `install.c`, `taskbar.c`, `gui.c`, `router.c`, `util.c` and `profiles.c` with fixtures in place of their system calls. It checks the release check and the download against a fixture server (URLs, HTTPS, status, the `MZ` header and size limits); the download's verification (the signature checked on the opened file, its version read as data, a refused download deleted, `Update_Run` starting only a verified file, once); the atomic install (`<exe>.new` then a rename, retries, rollback, leftovers removed, an unsupported Windows refused first); the uninstall (the download, registry keys and state folder removed, linked profile folders never removed, running profiles refused); the wait for a profile's Claude (its process, the folder watch with its lock file then its window, quit and handover); the router's watchers and its link dialog (the profile suggested and the one chosen, a cancel, a dialog that cannot show); the manager's update messages; and the Recycle Bin results. It runs on private files, a faked WinHTTP, faked registry writes and recorded hooks, without stopping the user's watchers or launching an installation.
 - **Shortcut fixtures** - `tests/test_shortcuts.c` checks setup, allocation, reading and property-store failures (every COM interface released on each path), the saved target, arguments and AppUserModelID, updates, renames, the recorded shortcuts and their removal. Its shortcuts stay in a private temporary directory, their records in a private volatile registry key, and their targets are never launched.
 - **Interface fixtures** - `tests/test_layout.c`, linked with the program's manifest, measures native controls and compares rendered sidebar text in both languages and four simulated scales (font and geometry scaled on top of the monitor's DPI; a scale whose window does not fit the work area is skipped and printed), including repeated language changes in the same window. It also drives the sessions view on private profiles: refills that keep the selection, folded folders and the top row, the folder watcher, a steady stream of transcript writes, double clicks. It checks the real message box in both languages, the real Settings dialog: the language box lists the languages with the one in use chosen, and a language applied with **Apply** (enabled by a change only) is followed by the open dialog; the vault's days are left as they are, so nothing is written; and the real About dialog: this version shown and chosen in the changelog, and each help question showing its own answer. Its log and queued session changes stay in a private folder, and its manager window uses a class of its own, so a running manager never finds it. It briefly shows windows; its maximized window, profile dialog and message boxes take the foreground. Physical monitor changes and the perceived menu animation still need manual checks.
@@ -181,10 +189,9 @@ CHANGELOG.md                  every version (a day's commits, named after the da
 
 ### Local data feature checks
 
-`build.cmd` compiles the local data modules with the same `/W4 /WX /sdl` flags and runs their isolated tests. Manager migration tests override HKCU with a GUID-private registry root before invoking any profile setter; setting only `Util_SetStateDir` is not sufficient registry isolation. New resource dialogs are included in the existing English/Simplified Chinese layout and language round-trip checks. The localization checker scans every `src/*.rc` fragment as well as the C call sites. `comdlg32.lib` supplies the native ZIP filename picker; it is a Windows system DLL.
+`build.cmd` compiles the local data modules with the same `/W4 /WX /sdl` flags and runs their isolated tests. New resource dialogs are included in the existing English/Simplified Chinese layout and language round-trip checks. The localization checker scans every `src/*.rc` fragment as well as the C call sites. `comdlg32.lib` supplies the native ZIP filename picker; it is a Windows system DLL.
 
-Manager configuration packages contain `manager-config-v1.dat` (a versioned Win32 UTF-16 metadata record) and actual `pictures/NN.png` files, not machine-specific registry exports or taskbar pin blobs. Imports validate all selected image data before changing metadata, back up existing configuration, and rebuild synchronization group IDs from mapped members. UI snapshots keep only typed, measured `window-state.json` geometry/display bounds and `developer_settings.json`'s `allowDevTools`; `source-presence.json` distinguishes an absent source file from collected values. Unknown fields and credentials never enter these snapshots. A snapshot does not preserve conversation bodies or promise a complete profile rollback.
 
 Vault subset recovery changes selected entries and their archived marks, preserving the remaining current sidebar and deletion rules; it does not store or rewind historical transcript bodies. Task backups record coverage for local definitions and external/remote omissions. For definition-aware backups, restoration maps collected local definition paths, disables the restored tasks and excludes saved authorization grants so Claude can request fresh permission. Older backup formats keep their existing restore behavior. A valid unlisted local transcript is opened through `SessionEdit_Open` and `claude://resume`, never by a new direct entry writer.
 
-`Zip_ValidateAll` validates names, local headers, sizes and checksums on the already-open `ZipIn` handle, including members a caller does not otherwise use. Manager configuration import and UI snapshot restore invoke it before target changes; the existing typed backup/session validation adds manifest, nested-session and task-coverage checks. Tests construct invalid extra-member CRCs and locked later profile pictures to check preflight and rollback behavior.
+`Zip_ValidateAll` validates names, local headers, sizes and checksums on the already-open `ZipIn` handle, including members a caller does not otherwise use. An import invokes it before target changes; the typed backup/session validation adds manifest, nested-session and task-coverage checks. Tests construct invalid extra-member CRCs to check preflight behavior.

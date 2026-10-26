@@ -163,40 +163,43 @@ static INT_PTR CALLBACK LinkProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp
     return FALSE;
 }
 
-/* The profile the user chose for the link, `suggested` selected at first; -1
- * when none was. A dialog that cannot be shown leaves the suggestion. */
+/* The profile the user chose in the dialog `choice` describes, `suggested`
+ * selected at first; -1 when none was. A dialog that cannot be shown leaves
+ * the suggestion. */
+static int AskChoice(LinkChoice *choice, int suggested)
+{
+    INT_PTR result;
+    choice->chosen = suggested;
+    result = Ui_Dialog(NULL, IDD_LINK, LinkProc, (LPARAM)choice);
+    if (result == -1) return suggested;
+    return result == IDOK ? choice->chosen : -1;
+}
+
+/* The profile the user chose for the link (AskChoice). */
 static int ChooseProfile(const ClaudePackage *pkg, const ProfileList *list, int suggested, BOOL signIn, int starter,
                          const WCHAR *shown)
 {
     LinkChoice choice;
-    INT_PTR result;
     ZeroMemory(&choice, sizeof choice);
     choice.pkg = pkg;
     choice.list = list;
     choice.shown = shown;
     choice.signIn = signIn;
     choice.starter = starter;
-    choice.chosen = suggested;
-    result = Ui_Dialog(NULL, IDD_LINK, LinkProc, (LPARAM)&choice);
-    if (result == -1) return suggested;
-    return result == IDOK ? choice.chosen : -1;
+    return AskChoice(&choice, suggested);
 }
 
 int Router_ChooseNotification(const ClaudePackage *pkg, const ProfileList *list, int suggested)
 {
     LinkChoice choice;
-    INT_PTR result;
     ZeroMemory(&choice, sizeof choice);
     choice.pkg = pkg;
     choice.list = list;
     choice.shown = L"";
     choice.notification = TRUE;
     choice.starter = -1;
-    choice.chosen = suggested;
     Theme_Init();   /* the watcher that asks shows no window of its own otherwise */
-    result = Ui_Dialog(NULL, IDD_LINK, LinkProc, (LPARAM)&choice);
-    if (result == -1) return suggested;
-    return result == IDOK ? choice.chosen : -1;
+    return AskChoice(&choice, suggested);
 }
 
 /* The manager, from this same program. */
@@ -250,6 +253,13 @@ static HRESULT Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *url
     Profile watched = *p;
     DWORD launched = 0;
     HRESULT hr;
+    /* The shield, when it is on, holds a link back if the exit is in a
+     * region Claude does not serve or one this profile does not allow: a bad
+     * exit must not open a session that gets the account risk-controlled. */
+    if (Shield_QuickBlock(pkg, p)) {
+        Util_Log(L"shield: held back opening %s: the exit is not safe", p->folder);
+        return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+    }
     Claude_RefreshRunning(&watched);
     if (!watched.running) {
         SessionEdit_ApplyPending(NULL, p);
@@ -276,15 +286,24 @@ HRESULT Launcher_OpenSynced(const ClaudePackage *pkg, const Profile *p, DWORD *p
     return Open(pkg, p, NULL, pid, identity, FALSE);
 }
 
-int Launcher_Run(const WCHAR *folder)
+/* A profile opened (a shortcut's --launch), with a claude:// link when one is
+ * given (--launch <folder> <link>: windows-mcp-delta's OpenSession), in that
+ * profile and no other: nothing is asked. */
+int Launcher_Run(const WCHAR *folder, const WCHAR *rawUrl)
 {
     ProfileList list;
     ClaudePackage pkg;
-    BOOL identity = FALSE, havePackage = Claude_FindPackage(&pkg);
+    WCHAR url[URL_CCH], redactedUrl[REDACTED_URL_CCH];
+    BOOL identity = FALSE, havePackage;
     DWORD pid = 0;
     HRESULT hr;
     int i;
 
+    if (rawUrl && !Core_SanitizeUrl(rawUrl, url, ARRAYSIZE(url))) {
+        Util_Log(L"ignored a link that is not a claude:// link, for %s", folder);
+        return 1;
+    }
+    havePackage = Claude_FindPackage(&pkg);
     Profiles_Load(&list, &pkg);
     i = Profiles_Find(&list, folder);
     if (i < 0) {
@@ -301,13 +320,18 @@ int Launcher_Run(const WCHAR *folder)
         ReportMissingClaude();
         return 1;
     }
-    hr = Launcher_Open(&pkg, &list.items[i], NULL, &pid, &identity);
+    hr = Launcher_Open(&pkg, &list.items[i], rawUrl ? url : NULL, &pid, &identity);
     if (FAILED(hr)) {
         Util_Log(L"could not open %s (0x%08lX)", list.items[i].folder, (unsigned long)hr);
         Ui_Message(NULL, MB_ICONERROR, TR(L"Claude could not be started (error 0x%08lX)."), (unsigned long)hr);
         return 1;
     }
-    Util_Log(L"opened %s (pid %lu)%s", list.items[i].folder, pid, identity ? L"" : L" without package identity");
+    if (rawUrl) {
+        Redact(url, redactedUrl, ARRAYSIZE(redactedUrl));
+        Util_Log(L"link %s -> %s (named)%s", redactedUrl, list.items[i].folder, identity ? L"" : L" without package identity");
+    } else {
+        Util_Log(L"opened %s (pid %lu)%s", list.items[i].folder, pid, identity ? L"" : L" without package identity");
+    }
     return 0;
 }
 

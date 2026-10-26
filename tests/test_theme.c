@@ -628,6 +628,45 @@ static void TestReportGlyphs(void)
         Check(i ? "report glyphs: SUBITEMIMAGES displays the subitem asset" : "report glyphs: disabling SUBITEMIMAGES hides the subitem asset",
               copied && (i ? subitemGreen > 100 : subitemGreen == 0));
     }
+    {
+        /* A switch's value in a cell (THEME_CELL_BOX): the theme's check box, its check the only change, within the cell. */
+        Canvas checkedCell = { 0 };
+        RECT subitem, changed;
+        SIZE box = { 0, 0 };
+        HTHEME theme = OpenThemeData(list, L"Button");
+        HDC dc = GetDC(list);
+        int changes = 0;
+        BOOL copied;
+        if (theme && dc) GetThemePartSize(theme, dc, BP_CHECKBOX, CBS_CHECKEDNORMAL, NULL, TS_DRAW, &box);
+        if (theme) CloseThemeData(theme);
+        if (dc) ReleaseDC(list, dc);
+        item.mask = LVIF_IMAGE;
+        item.iItem = 0;
+        item.iSubItem = 1;
+        item.iImage = THEME_CELL_BOX;
+        ListView_SetItem(list, &item);
+        RedrawWindow(list, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        ListView_GetSubItemRect(list, 0, 1, LVIR_BOUNDS, &subitem);
+        copied = CopyClient(list, &painted);
+        item.iImage = THEME_CELL_BOX + THEME_CELL_BOX_CHECKED;
+        ListView_SetItem(list, &item);
+        RedrawWindow(list, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        copied = CanvasOpen(&checkedCell, client.right, client.bottom, RGB(1, 2, 3)) && CopyClient(list, &checkedCell) && copied;
+        SetRect(&changed, painted.width, painted.height, 0, 0);
+        for (y = 0; copied && y < painted.height; y++)
+            for (x = 0; x < painted.width; x++)
+                if (PixelAt(&painted, x, y) != PixelAt(&checkedCell, x, y)) {
+                    changes++;
+                    changed.left = min(changed.left, x);
+                    changed.top = min(changed.top, y);
+                    changed.right = max(changed.right, x + 1);
+                    changed.bottom = max(changed.bottom, y + 1);
+                }
+        Check("report glyphs: a cell's check box is checked within its cell, the theme's size at most",
+              copied && changes > 0 && changed.left >= subitem.left && changed.right <= subitem.right && changed.top >= subitem.top &&
+              changed.bottom <= subitem.bottom && (!box.cx || (changed.right - changed.left <= box.cx && changed.bottom - changed.top <= box.cy)));
+        CanvasClose(&checkedCell);
+    }
     CanvasClose(&painted);
     ListView_SetImageList(list, NULL, LVSIL_SMALL);
     DestroyWindow(list);
@@ -1502,7 +1541,7 @@ static void TestCheckBoxMetrics(void)
 /* -------------------------------------------------------------- tooltips */
 
 static HFONT g_tipHeading;
-static int g_tipRequests, g_tipReserved;
+static int g_tipRequests, g_tipReserved, g_tableTipRequests;
 
 /* The tree's parent, as sessions.c is: details for each session's info tip;
  * a heading (a negative item value) in its own font; asked to measure a row
@@ -1513,6 +1552,14 @@ static LRESULT CALLBACK ProbeTreeTip(HWND host, UINT message, WPARAM wp, LPARAM 
 {
     HWND tree = (HWND)reference;
     (void)id;
+    if (message == WM_NOTIFY && lp && ((const NMHDR *)lp)->hwndFrom != tree && ((const NMHDR *)lp)->code == LVN_GETINFOTIPW) {
+        /* A table's, as the profile list's owner answers: after a cut cell's text, a line of its own. */
+        NMLVGETINFOTIPW *info = (NMLVGETINFOTIPW *)lp;
+        g_tableTipRequests++;
+        if (info->pszText[0]) StringCchCatW(info->pszText, (size_t)info->cchTextMax, L"\n");
+        StringCchCatW(info->pszText, (size_t)info->cchTextMax, L"Usage: 5h 10%");
+        return 0;
+    }
     if (message == WM_NOTIFY && lp && ((const NMHDR *)lp)->hwndFrom == tree && ((const NMHDR *)lp)->code == TVN_GETINFOTIPW) {
         NMTVGETINFOTIPW *info = (NMTVGETINFOTIPW *)lp;
         g_tipRequests++;
@@ -1706,6 +1753,25 @@ static void TestCellTips(void)
     Check("cell tips: a pointer move cannot reopen a disabled owner's tooltip", !IsWindowVisible(tips));
     EnableWindow(host, TRUE);
 
+    {
+        /* A table with info tips (the profile list): its owner's tip once the pointer rests on a row, after a cut cell's text. */
+        RECT fits, cut;
+        ListView_SetExtendedListViewStyle(list, LVS_EX_LABELTIP | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
+        ListView_GetSubItemRect(list, 1, 1, LVIR_BOUNDS, &fits);
+        ListView_GetSubItemRect(list, 1, 0, LVIR_LABEL, &cut);
+        g_tableTipRequests = 0;
+        HoverCell(list, &fits);
+        Check("cell tips: a table cell that fits waits for the pointer to rest for its row's info tip", !IsWindowVisible(tips) && g_tableTipRequests == 0);
+        RestOnCell(list, &fits);
+        Check("cell tips: resting on a table row shows its owner's info tip",
+              IsWindowVisible(tips) && g_tableTipRequests == 1 && TipReads(tips, L"Usage: 5h 10%"));
+        SendMessageW(list, WM_MOUSELEAVE, 0, 0);
+        HoverCell(list, &cut);
+        Check("cell tips: a cut table cell's tip is its text, then the row's info tip",
+              IsWindowVisible(tips) && TipReads(tips, L"A long profile name that exceeds its cell\nUsage: 5h 10%"));
+        SendMessageW(list, WM_MOUSELEAVE, 0, 0);
+        ListView_SetExtendedListViewStyle(list, LVS_EX_LABELTIP | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    }
     TreeView_GetItemRect(tree, node, &treeCell, FALSE);
     TreeView_GetItemRect(tree, next, &nextCell, FALSE);
     g_tipRequests = 0;
@@ -5025,6 +5091,8 @@ static void TestGlyphButtons(void)
 typedef struct MenuProbe {
     RECT  box;                      /* the button it opens below */
     BOOL  found, ownWindow, below, wideEnough, field, lit, framed;
+    BOOL  red;                      /* an item that deletes drawn red */
+    int   shown;                    /* the program's menus open at once */
     BOOL  clickOutside;             /* then a press outside it */
 } MenuProbe;
 
@@ -5039,6 +5107,14 @@ static BOOL CALLBACK FindOwnMenu(HWND window, LPARAM found)
     return FALSE;
 }
 
+static BOOL CALLBACK CountOwnMenus(HWND window, LPARAM count)
+{
+    WCHAR name[64];
+    GetClassNameW(window, name, ARRAYSIZE(name));
+    if (wcscmp(name, L"ClaudeDesktopProfilesManager.Menu") == 0 && IsWindowVisible(window)) (*(int *)count)++;
+    return TRUE;
+}
+
 static LRESULT CALLBACK ProbeOwnMenu(HWND host, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR reference)
 {
     MenuProbe *probe = (MenuProbe *)reference;
@@ -5050,6 +5126,8 @@ static LRESULT CALLBACK ProbeOwnMenu(HWND host, UINT message, WPARAM wp, LPARAM 
         int x, y, field = 0, lit = 0;
         EnumThreadWindows(GetCurrentThreadId(), FindOwnMenu, (LPARAM)&popup);
         probe->found = popup != NULL;
+        probe->shown = 0;
+        EnumThreadWindows(GetCurrentThreadId(), CountOwnMenus, (LPARAM)&probe->shown);
         if (popup && GetWindowRect(popup, &frame)) {
             WCHAR name[64];
             GetClassNameW(popup, name, ARRAYSIZE(name));
@@ -5062,6 +5140,7 @@ static LRESULT CALLBACK ProbeOwnMenu(HWND host, UINT message, WPARAM wp, LPARAM 
                     COLORREF color = PixelAt(&shown, x, y);
                     if (color == Theme_Color(THEME_FIELD)) field++;
                     if (color == Theme_Color(THEME_PALE_BLUE)) lit++;
+                    if (color == Theme_TintColor(THEME_TINT_RED)) probe->red = TRUE;
                 }
                 probe->field = field > 0;
                 probe->lit = lit > 0 || HighContrastOn();
@@ -5144,6 +5223,72 @@ static void TestOwnMenu(void)
 
     RemoveWindowSubclass(host, ProbeOwnMenu, MENU_PROBE_SUBCLASS);
     DestroyMenu(menu);
+    DestroyWindow(button);
+    ShowWindow(host, SW_HIDE);
+    DeleteObject(font);
+}
+
+/* A submenu of the program's own menu: Right opens it beside its item, the
+ * first of its items lit, and Return chooses there; Left and Escape go back
+ * to the menu that opened it, a second Escape closes that one too. An item
+ * that deletes is red. */
+static void TestOwnSubmenu(void)
+{
+    HWND host = ThemedHost(), button;
+    HFONT font = DialogFont();
+    HMENU menu = CreatePopupMenu(), sub = CreatePopupMenu();
+    MenuProbe probe;
+    button = host ? CreateWindowExW(0, WC_BUTTONW, L"Menu", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 10, 160, 30, host, NULL,
+                                    GetModuleHandleW(NULL), NULL) : NULL;
+    Check("own submenu: a button and menus made", button && menu && sub);
+    if (!button || !menu || !sub) {
+        if (menu) DestroyMenu(menu);
+        if (sub) DestroyMenu(sub);
+        DeleteObject(font);
+        return;
+    }
+    SendMessageW(button, WM_SETFONT, (WPARAM)font, FALSE);
+    AppendMenuW(sub, MF_STRING, 11, L"&Inner");
+    AppendMenuW(sub, MF_STRING, 12, L"In&ner too");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, L"&Open in");
+    AppendMenuW(menu, MF_STRING, 2, L"&Second\tF2");
+    AppendMenuW(menu, MF_STRING, 3, L"&Delete\tDel");
+    Theme_SetMenuDanger(menu, 3);
+    ShowWindow(host, SW_SHOWNOACTIVATE);
+    ZeroMemory(&probe, sizeof probe);
+    GetWindowRect(button, &probe.box);
+    SetWindowSubclass(host, ProbeOwnMenu, MENU_PROBE_SUBCLASS, (DWORD_PTR)&probe);
+
+    PostMessageW(button, WM_KEYDOWN, VK_DOWN, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_RIGHT, 0);
+    PostMessageW(host, WM_MENU_PROBE, 0, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_DOWN, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_RETURN, 0);
+    Check("own submenu: Right opens it, its choice is the menu's", Theme_TrackMenu(button, menu, &probe.box) == 12 && probe.shown == 2);
+    {
+        HWND left = NULL;
+        EnumThreadWindows(GetCurrentThreadId(), FindOwnMenu, (LPARAM)&left);
+        Check("own submenu: both closed once chosen", left == NULL);
+    }
+    PostMessageW(button, WM_KEYDOWN, VK_DOWN, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_RIGHT, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_LEFT, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_DOWN, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_RETURN, 0);
+    Check("own submenu: Left goes back to the menu that opened it", Theme_TrackMenu(button, menu, &probe.box) == 2);
+    PostMessageW(button, WM_KEYDOWN, VK_DOWN, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_RETURN, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_ESCAPE, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_ESCAPE, 0);
+    Check("own submenu: Return opens it too, Escape closes one menu at a time", Theme_TrackMenu(button, menu, &probe.box) == 0);
+    probe.red = FALSE;
+    PostMessageW(host, WM_MENU_PROBE, 0, 0);
+    PostMessageW(button, WM_KEYDOWN, VK_ESCAPE, 0);
+    Theme_TrackMenu(button, menu, &probe.box);
+    Check("own submenu: an item that deletes is red", probe.red || HighContrastOn());
+
+    RemoveWindowSubclass(host, ProbeOwnMenu, MENU_PROBE_SUBCLASS);
+    DestroyMenu(menu);   /* its submenu with it */
     DestroyWindow(button);
     ShowWindow(host, SW_HIDE);
     DeleteObject(font);
@@ -5586,6 +5731,7 @@ int wmain(void)
     TestSidebarNoteCuts();
     TestBuffer();
     TestOwnMenu();
+    TestOwnSubmenu();
     TestGlyphImages();
     TestResourceLifetime();
     if (g_themedHost) DestroyWindow(g_themedHost);

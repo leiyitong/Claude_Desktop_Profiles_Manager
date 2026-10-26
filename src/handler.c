@@ -19,7 +19,7 @@
 #define REG_TOASTS  L"Software\\Microsoft\\Windows\\CurrentVersion\\ApplicationAssociationToasts"
 #define TOAST_VALUE PROGID_NAME L"_claude"
 
-/* The ProgId and capabilities that list Claude Desktop Profiles Manager as an
+/* The ProgId and capabilities that list Claude Delta as an
  * app for claude://. Windows is told only when something changed (the notice
  * refreshes Explorer). */
 BOOL Handler_Register(const WCHAR *exe)
@@ -38,7 +38,7 @@ BOOL Handler_Register(const WCHAR *exe)
                                       TR(L"Opens claude:// links in the right Claude Desktop profile"), &changed) &&
          Util_RegSetStringIfDifferent(HKEY_CURRENT_USER, REG_CAPABILITIES, L"ApplicationIcon", icon, &changed) &&
          Util_RegSetStringIfDifferent(HKEY_CURRENT_USER, REG_CAPABILITIES L"\\URLAssociations", L"claude", PROGID_NAME, &changed) &&
-         Util_RegSetStringIfDifferent(HKEY_CURRENT_USER, REG_REGISTERED, APP_NAME, REG_CAPABILITIES, &changed);
+         Util_RegSetStringIfDifferent(HKEY_CURRENT_USER, REG_REGISTERED, APP_FOLDER, REG_CAPABILITIES, &changed);
     if (ok && !Util_RegValueExists(HKEY_CURRENT_USER, REG_TOASTS, TOAST_VALUE)) {
         if (Util_RegSetDword(HKEY_CURRENT_USER, REG_TOASTS, TOAST_VALUE, 0))
             changed = TRUE;
@@ -102,7 +102,7 @@ void Handler_Unregister(void)
     if (Handler_UserChoice() == USERCHOICE_OURS) ForgetChoice();
     if ((status = Util_RegDeleteTree(HKEY_CURRENT_USER, REG_PROGID)) != ERROR_SUCCESS)
         Util_Log(L"could not remove the key %s (error %ld)", REG_PROGID, status);
-    RemoveValue(REG_REGISTERED, APP_NAME);
+    RemoveValue(REG_REGISTERED, APP_FOLDER);
     RemoveValue(REG_TOASTS, TOAST_VALUE);
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
 }

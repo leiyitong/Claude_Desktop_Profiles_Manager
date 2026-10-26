@@ -29,7 +29,6 @@
  */
 #include "../src/app.h"
 #include "../src/resource.h"
-#include "../src/profiletools.h"
 #include "../src/sessiontools.h"
 #include "../src/vaulttools.h"
 #include <commctrl.h>
@@ -340,10 +339,18 @@ static void LinkCaptions(HWND dialog, const WCHAR *name)
 
 /* The backup dialog's parts, as backup.c lists them: check boxes in one
  * column the view sizes, sign-in left unchecked. */
+static CheckList *g_backupParts;   /* the backup dialog's list, as PopulateBackupParts filled it last */
+static const char *g_backupLayout;   /* an import's settings, NULL: its sample's */
+static size_t g_backupLayoutLength;
+static CheckList *g_profileList;   /* the profile dialog's, as FillMock filled it last */
+
+static BOOL g_backupImport;   /* the backup dialog filled as an import, its sessions one by one */
+
 static void PopulateBackupParts(HWND dialog)
 {
     HWND list = GetDlgItem(dialog, IDC_B_LIST);
-    Backup_FillPartsList(list, 1234);
+    g_backupParts = g_backupLayout ? Backup_FillLayoutList(list, g_backupLayout, g_backupLayoutLength)
+                    : g_backupImport ? Backup_FillImportList(list) : Backup_FillPartsList(list, 1234);
     Theme_SmoothView(list);
 }
 
@@ -369,54 +376,24 @@ static void SyncItemsCaptions(HWND dialog, const WCHAR *name)
 static void SyncSetupCaptions(HWND dialog, const WCHAR *name, BOOL fill)
 {
     static const WCHAR *const kPartners[] = { L"Work", L"Personal" };
+    static const BOOL kChecked[] = { TRUE, FALSE };
     WCHAR text[256];
-    LVCOLUMNW column;
-    LVITEMW item;
-    HWND lists[2];
-    int i;
+    HWND items;
     StringCchPrintfW(text, ARRAYSIZE(text), TR(L"\x201C%s\x201D syncs with:"), name);
     SetDlgItemTextW(dialog, IDC_Z_TEXT, text);
     if (!fill) return;
-    lists[0] = GetDlgItem(dialog, IDC_Z_LIST);
-    lists[1] = GetDlgItem(dialog, IDC_Z_ITEMS);
-    ListView_SetExtendedListViewStyle(lists[0], LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-    ZeroMemory(&column, sizeof column);
-    ListView_InsertColumn(lists[0], 0, &column);
-    for (i = 0; i < (int)ARRAYSIZE(kPartners); i++) {
-        ZeroMemory(&item, sizeof item);
-        item.mask = LVIF_TEXT;
-        item.iItem = i;
-        item.pszText = (LPWSTR)kPartners[i];
-        ListView_InsertItem(lists[0], &item);
-        ListView_SetCheckState(lists[0], i, i == 0);
-    }
-    Theme_SmoothView(lists[0]);
+    SyncUi_PartnerBoxes(dialog, kPartners, kChecked, (int)ARRAYSIZE(kPartners));
+    items = GetDlgItem(dialog, IDC_Z_ITEMS);
     /* The items as the what-to-sync dialog shows them. */
-    SyncUi_FillItemsList(lists[1], SYNC_ITEMS_DEFAULT);
-    Theme_SmoothView(lists[1]);
-}
-
-/* Backup & Restore as gui.c fills it: the profile selected named, its headings semibold. */
-static void BackupHubCaptions(HWND dialog, const WCHAR *name, BOOL fill)
-{
-    static const int kHeadings[] = { IDC_H_PROFILE, IDC_H_SESSIONS, IDC_H_CODE_LABEL };
-    WCHAR text[256];
-    size_t i;
-    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Profile \x201C%s\x201D"), name);
-    SetDlgItemTextW(dialog, IDC_H_PROFILE, text);
-    if (!fill) return;
-    for (i = 0; i < ARRAYSIZE(kHeadings); i++) Theme_SetStrong(GetDlgItem(dialog, kHeadings[i]));
+    SyncUi_FillItemsList(items, SYNC_ITEMS_DEFAULT);
+    Theme_SmoothView(items);
 }
 
 /* The conflicts of a sync as syncui.c lists them: a heading, two elements, a column per profile. */
 static void ConflictsCaptions(HWND dialog, const WCHAR *name, BOOL fill)
 {
-    static const WCHAR *const kLabels[] = { L"Name of group \x201C%s\x201D", L"Group of \x201C%s\x201D" };
     HWND list = GetDlgItem(dialog, IDC_X_LIST);
     WCHAR text[512], names[LABEL_CCH * 2 + 32];
-    LVCOLUMNW column;
-    LVITEMW item;
-    int i;
     StringCchPrintfW(names, ARRAYSIZE(names), L"%s%s%s", name, TR(L" and "), L"Personal");
     StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s changed these each their own way since the last sync. Choose the version to keep of each:"), names);
     SetDlgItemTextW(dialog, IDC_X_TEXT, text);
@@ -425,32 +402,7 @@ static void ConflictsCaptions(HWND dialog, const WCHAR *name, BOOL fill)
     SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)name);
     SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_ADDSTRING, 0, (LPARAM)L"Personal");
     SendDlgItemMessageW(dialog, IDC_X_PROFILE, CB_SETCURSEL, 0, 0);
-    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_SUBITEMIMAGES);
-    ZeroMemory(&column, sizeof column);
-    column.mask = LVCF_TEXT | LVCF_WIDTH;
-    column.cx = 200;
-    column.pszText = (LPWSTR)TR(L"Changed");
-    ListView_InsertColumn(list, 0, &column);
-    column.cx = 120;
-    column.pszText = (LPWSTR)name;
-    ListView_InsertColumn(list, 1, &column);
-    column.pszText = (LPWSTR)L"Personal";
-    ListView_InsertColumn(list, 2, &column);
-    ZeroMemory(&item, sizeof item);
-    item.mask = LVIF_TEXT;
-    item.pszText = (LPWSTR)TR(L"Sidebar");
-    ListView_InsertItem(list, &item);
-    for (i = 0; i < (int)ARRAYSIZE(kLabels); i++) {
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(kLabels[i]), L"A private conversation");
-        ZeroMemory(&item, sizeof item);
-        item.mask = LVIF_TEXT;
-        item.iItem = i + 1;
-        item.pszText = text;
-        ListView_InsertItem(list, &item);
-        ListView_SetItemText(list, i + 1, 1, (LPWSTR)L"Work");
-        ListView_SetItemText(list, i + 1, 2, (LPWSTR)L"Personal work");
-    }
-    ListView_SetItemState(list, 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    SyncUi_FillConflictsList(list, name);
     Theme_SmoothView(list);
 }
 
@@ -552,17 +504,56 @@ static void MainCaptions(HWND dialog, const LayoutFixture *fixture)
     ShowWindow(GetDlgItem(dialog, IDC_UPDATE), fixture->version != MAIN_VERSION_BUILD && !fixture->sessions ? SW_SHOW : SW_HIDE);
 }
 
-/* The profile dialog's choices for its sessions, as gui.c fills them. */
-static void SessionChoices(HWND dialog, const WCHAR *name)
+/* The profile dialog's captions as gui.c sets them for an edit of Claude's
+ * own profile while it runs: its title, the folder line at its longest. */
+static void ProfileCaptions(HWND dialog)
 {
-    HWND combo = GetDlgItem(dialog, IDC_P_SYNC);
+    WCHAR text[512];
+    SetWindowTextW(dialog, TR(L"Edit profile"));
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Data folder: %%APPDATA%%\\%s%s"), L"Claude", TR(L"\nThe regular Claude icon opens this profile."));
+    StringCchCatW(text, ARRAYSIZE(text), L"\n");
+    StringCchCatW(text, ARRAYSIZE(text), TR(L"Its Claude is open: close it to change its settings."));
+    SetDlgItemTextW(dialog, IDC_P_FOLDER, text);
+}
+
+/* The new profile's form as gui.c fills it, at its longest: a long name,
+ * every color, the sessions synced with two profiles, every check box. */
+static void NewProfileCaptions(HWND dialog, const WCHAR *name)
+{
+    HWND combo = GetDlgItem(dialog, IDC_P_COLOR);
     WCHAR text[LABEL_CCH * 3 + 64], names[LABEL_CCH * 2 + 8];
+    int color;
+    SetWindowTextW(dialog, TR(L"New profile"));
+    SetDlgItemTextW(dialog, IDC_P_NAME, name);
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (color = 0; color < PALETTE_SIZE; color++) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(g_ColorNames[color]));
+    SendMessageW(combo, CB_SETCURSEL, 0, 0);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Its data will be kept in %%APPDATA%%\\%s."), L"Claude-Private profile");
+    SetDlgItemTextW(dialog, IDC_P_FOLDER, text);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Copy &settings from \x201C%s\x201D"), name);
+    SetDlgItemTextW(dialog, IDC_P_COPY, text);
+    CheckDlgButton(dialog, IDC_P_STARTUP, BST_CHECKED);
+    CheckDlgButton(dialog, IDC_P_COPY, BST_CHECKED);
+    CheckDlgButton(dialog, IDC_P_OPEN, BST_CHECKED);
+    combo = GetDlgItem(dialog, IDC_P_SYNC);
     SendMessageW(combo, CB_RESETCONTENT, 0, 0);
     SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(L"Not synced"));
     StringCchPrintfW(names, ARRAYSIZE(names), L"%s, %s", name, L"Work");
     StringCchPrintfW(text, ARRAYSIZE(text), TR(L"With %s"), names);
     SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)text);
     SendMessageW(combo, CB_SETCURSEL, 1, 0);
+}
+
+/* The export's window as transfer.c fills it, at its longest: one of several, stopped by an error. */
+static void TransferCaptions(HWND dialog, const WCHAR *name)
+{
+    WCHAR text[512];
+    SetWindowTextW(dialog, TR(L"Export"));
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%d of %d: \x201C%s\x201D to %s"), 2, 3, name, L"C:\\Users\\Private\\Desktop\\Exports");
+    SetDlgItemTextW(dialog, IDC_TR_TEXT, text);
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Stopped: %s What was copied is kept; Retry goes on from there."), L"There is not enough space on the disk.");
+    SetDlgItemTextW(dialog, IDC_TR_STATUS, text);
+    SetDlgItemTextW(dialog, IDC_TR_PAUSE, TR(L"&Retry"));
 }
 
 static void FillMock(HWND dialog, const LayoutFixture *fixture)
@@ -576,42 +567,22 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         SetDlgItemTextW(dialog, IDC_NOTE, text);
         PopulateProfileTable(GetDlgItem(dialog, IDC_LIST), name);
         break;
-    case IDD_PROFILE: {
-        HWND combo = GetDlgItem(dialog, IDC_P_COLOR);
-        int color;
-        SetWindowTextW(dialog, TR(L"Edit profile"));
-        SetDlgItemTextW(dialog, IDC_P_NAME, name);
-        for (color = 0; color < PALETTE_SIZE; color++) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(g_ColorNames[color]));
-        SendMessageW(combo, CB_SETCURSEL, 0, 0);
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Data folder: %%APPDATA%%\\%s%s"), L"Claude",
-                         TR(L"\nThe regular Claude icon opens this profile."));
-        SetDlgItemTextW(dialog, IDC_P_FOLDER, text);
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Copy &settings from \x201C%s\x201D"), name);
-        SetDlgItemTextW(dialog, IDC_P_COPY, text);
-        CheckDlgButton(dialog, IDC_P_STARTUP, BST_CHECKED);
-        CheckDlgButton(dialog, IDC_P_COPY, BST_CHECKED);
-        CheckDlgButton(dialog, IDC_P_OPEN, BST_CHECKED);
-        SessionChoices(dialog, name);
+    case IDD_PROFILE:
+        ProfileCaptions(dialog);
+        g_profileList = Gui_FillProfileList(GetDlgItem(dialog, IDC_P_LIST));
+        Theme_SmoothView(GetDlgItem(dialog, IDC_P_LIST));
         break;
-    }
+    case IDD_PROFILE_NEW:
+        NewProfileCaptions(dialog, name);
+        break;
     case IDD_TITLE:
         StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Title in \x201C%s\x201D:"), name);
         SetDlgItemTextW(dialog, IDC_T_LABEL, text);
         SetDlgItemTextW(dialog, IDC_T_TITLE, L"A private mock session title that remains user data in every language");
         break;
-    case IDD_SETTINGS: {
-        HWND languages = GetDlgItem(dialog, IDC_G_LANGUAGE);
-        int language;
-        Theme_SetStrong(GetDlgItem(dialog, IDC_G_LANGUAGE_LABEL));
-        Theme_SetStrong(GetDlgItem(dialog, IDC_G_VAULT));
-        Theme_SetStrong(GetDlgItem(dialog, IDC_G_CODE));
-        CheckDlgButton(dialog, IDC_G_WEEKLY, BST_CHECKED);
-        for (language = -1; language < Localize_LanguageCount(); language++)
-            SendMessageW(languages, CB_ADDSTRING, 0, (LPARAM)Localize_LanguageName(language));
-        SendMessageW(languages, CB_SETCURSEL, 0, 0);
-        SetDlgItemTextW(dialog, IDC_G_DAYS, L"30");
+    case IDD_SETTINGS:
+        SendDlgItemMessageW(dialog, IDC_G_SEARCH, EM_SETCUEBANNER, TRUE, (LPARAM)TR(L"Search settings"));
         break;
-    }
     case IDD_ABOUT: {
         HWND topics = GetDlgItem(dialog, IDC_W_TOPICS);
         WCHAR chosen[CHANGELOG_NAME_CCH] = L"";
@@ -633,19 +604,6 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
         SetDlgItemTextW(dialog, IDC_SIGNIN_URL, L"https://claude.ai/login");
         SetDlgItemTextW(dialog, IDC_SIGNIN_STATUS,
             TR(L"A separate private browser was started. Complete registration or sign-in yourself. If this is a Desktop sign-in, allow the claude:// link and choose this profile."));
-        break;
-    case IDD_PROFILE_TOOLS:
-        SendDlgItemMessageW(dialog, IDC_PT_PROFILE, CB_ADDSTRING, 0, (LPARAM)name);
-        SendDlgItemMessageW(dialog, IDC_PT_PROFILE, CB_SETCURSEL, 0, 0);
-        break;
-    case IDD_PT_MAPPING:
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Source profile: %s (%s)\r\nChoose an existing destination. Its data directory will not be renamed or moved. Skip leaves it unmapped."), name, L"Claude-private-fixture");
-        SetDlgItemTextW(dialog, IDC_PT_MAP_NOTE, text);
-        SendDlgItemMessageW(dialog, IDC_PT_MAP_TARGET, CB_ADDSTRING, 0, (LPARAM)name);
-        SendDlgItemMessageW(dialog, IDC_PT_MAP_TARGET, CB_SETCURSEL, 0, 0);
-        break;
-    case IDD_PT_SNAPSHOTS:
-        SendDlgItemMessageW(dialog, IDC_PT_SNAPSHOT_LIST, LB_ADDSTRING, 0, (LPARAM)L"20261020-235959-999-00000001-12345678.zip");
         break;
     case IDD_SESSIONTOOLS:
         SetDlgItemTextW(dialog, IDC_ST_NOTE, L"Private fixture session details");
@@ -696,12 +654,12 @@ static void FillMock(HWND dialog, const LayoutFixture *fixture)
     case IDD_SYNC_SETUP:
         SyncSetupCaptions(dialog, name, TRUE);
         break;
-    case IDD_BACKUP_HUB:
-        BackupHubCaptions(dialog, name, TRUE);
-        break;
     case IDD_PASSWORD:
         SetWindowTextW(dialog, TR(L"Password"));
-        SetDlgItemTextW(dialog, IDC_K_TEXT, TR(L"Choose the password that opens the sign-in on another PC. Without it, the backup's sign-in restores on this PC only."));
+        SetDlgItemTextW(dialog, IDC_K_TEXT, TR(L"The sign-in was backed up on another PC. Enter the password chosen for it then:"));
+        break;
+    case IDD_TRANSFER:
+        TransferCaptions(dialog, name);
         break;
     }
 }
@@ -720,16 +678,9 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         Theme_SetMainGlyph(dialog, IDC_SESSIONS, fixture->sessions);
         MainCaptions(dialog, fixture);
     } else if (fixture->resource == IDD_PROFILE) {
-        HWND combo = GetDlgItem(dialog, IDC_P_COLOR);
-        int color;
-        SetWindowTextW(dialog, TR(L"Edit profile"));
-        SetDlgItemTextW(dialog, IDC_P_NAME, L"Private profile");
-        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Copy &settings from \x201C%s\x201D"), L"Private profile");
-        SetDlgItemTextW(dialog, IDC_P_COPY, text);
-        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-        for (color = 0; color < PALETTE_SIZE; color++) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)TR(g_ColorNames[color]));
-        SendMessageW(combo, CB_SETCURSEL, 0, 0);
-        SessionChoices(dialog, L"Private profile");
+        ProfileCaptions(dialog);
+    } else if (fixture->resource == IDD_PROFILE_NEW) {
+        NewProfileCaptions(dialog, L"Private profile");
     } else if (fixture->resource == IDD_TITLE) {
         SetDlgItemTextW(dialog, IDC_T_TITLE, L"Private user text");
     } else if (fixture->resource == IDD_MESSAGE) {
@@ -751,8 +702,6 @@ static void TransitionCaptions(HWND dialog, const LayoutFixture *fixture)
         ConflictsCaptions(dialog, L"Private profile", FALSE);
     } else if (fixture->resource == IDD_SYNC_SETUP) {
         SyncSetupCaptions(dialog, L"Private profile", FALSE);
-    } else if (fixture->resource == IDD_BACKUP_HUB) {
-        BackupHubCaptions(dialog, L"Private profile", FALSE);
     }
 }
 
@@ -783,8 +732,9 @@ static void LayoutMockNote(HWND dialog, const LayoutFixture *fixture)
  * them, without sessions.c: theme.c places every control of both views. */
 static void ShowMockSessions(HWND dialog)
 {
-    static const int kProfileControls[] = { IDC_PROFILE_SEARCH_LABEL, IDC_PROFILE_SEARCH, IDC_PROFILE_FIND, IDC_LIST, IDC_SYNC, IDC_BACKUP, IDC_REPAIR, IDC_NOTE };
-    static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_SEARCH, IDC_S_FIND, IDC_S_FILTER, IDC_S_TREE };
+    static const int kProfileControls[] = { IDC_PROFILE_SEARCH_LABEL, IDC_PROFILE_SEARCH, IDC_PROFILE_FIND, IDC_LIST, IDC_SYNC, IDC_BACKUP, IDC_RESTORE_BACKUP,
+                                            IDC_REPAIR, IDC_WINDOWS_MCP, IDC_SEARXNG, IDC_COWORK, IDC_NOTE };
+    static const int kSessionControls[] = { IDC_S_PROFILES, IDC_S_FOLD, IDC_S_SEARCH, IDC_S_FIND, IDC_S_FILTER, IDC_S_TREE };
     static const int kFootControls[] = { IDC_STATUS, IDC_PROGRESS, IDC_STATUS_ACTION, IDC_VERSION, IDC_UPDATE };   /* the view has no column */
     size_t i;
     for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
@@ -869,7 +819,7 @@ static INT_PTR CALLBACK FixtureProc(HWND dialog, UINT message, WPARAM wp, LPARAM
         switch (message) {
         case WM_APP_SESSIONS:
             fixture->reloadRequests++;
-            SessionsView_Reload();
+            SessionsView_Notified();
             return TRUE;
         case WM_APP_SESSIONS_READY:
             SessionsView_Ready(TRUE);
@@ -1282,8 +1232,9 @@ static void CheckText(const LayoutFixture *fixture, HWND control)
 /* The toolbar in one row above the body, left to right, one gap between
  * the buttons of a group and a wider one between groups, its icons the last
  * group; the column beside the list (or the sessions' panes): the view's
- * button level with the body's top, the status above the version, the foot
- * (the version, or Update) on the body's bottom. */
+ * button level with the body's top, the status above the version, the
+ * shield's badge at the end of the version's row, the foot (the version and
+ * the badge, or Update) on the body's bottom. */
 static void CheckMainBands(HWND dialog, const LayoutFixture *fixture)
 {
     static const int kToolbar[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SHORTCUTS, IDC_SETTINGS, IDC_ABOUT };
@@ -1330,9 +1281,16 @@ static void CheckMainBands(HWND dialog, const LayoutFixture *fixture)
         } else Check(fixture, GetDlgItem(dialog, IDC_LIST), "hidden search takes no row above the table",
                      view.top == body.top && !(GetWindowLongW(GetDlgItem(dialog, IDC_PROFILE_SEARCH_LABEL), GWL_STYLE) & WS_VISIBLE));
     }
-    Check(fixture, GetDlgItem(dialog, IDC_STATUS), "the status sits above the version, in the column",
-          status.bottom <= version.top && status.left == view.left && version.left == view.left && version.right == view.right);
-    Check(fixture, GetDlgItem(dialog, IDC_VERSION), "the column's foot ends on the body's bottom", last.bottom == body.bottom);
+    {
+        RECT shield = RelativeRect(dialog, GetDlgItem(dialog, IDC_SHIELD));
+        BOOL updating = (GetWindowLongW(update, GWL_STYLE) & WS_VISIBLE) != 0;
+        Check(fixture, GetDlgItem(dialog, IDC_STATUS), "the status sits above the version, in the column",
+              status.bottom <= version.top && status.left == view.left && version.left == view.left);
+        Check(fixture, GetDlgItem(dialog, IDC_SHIELD), "the shield's badge ends the version's row, beside it",
+              version.right < shield.left && shield.right == view.right && shield.top < version.bottom && shield.bottom > version.top);
+        Check(fixture, GetDlgItem(dialog, IDC_VERSION), "the column's foot ends on the body's bottom",
+              (updating ? last.bottom : max(version.bottom, shield.bottom)) == body.bottom);
+    }
 }
 
 static void CheckFieldCaption(HWND dialog, const LayoutFixture *fixture, int captionId, int fieldId)
@@ -1366,6 +1324,7 @@ static void CheckGeometry(HWND dialog, const LayoutFixture *fixture)
     for (child = GetWindow(dialog, GW_CHILD); child && count < (int)ARRAYSIZE(controls); child = GetWindow(child, GW_HWNDNEXT)) {
         RECT rect;
         if (!(GetWindowLongW(child, GWL_STYLE) & WS_VISIBLE)) continue;
+        if (GetDlgCtrlID(child) == IDC_SHIELD) continue;   /* a floating badge, on top of the corner by design */
         rect = RelativeRect(dialog, child);
         Check(fixture, child, "visible control stays inside dialog client", rect.left >= 0 && rect.top >= 0 &&
               rect.right <= client.right && rect.bottom <= client.bottom);
@@ -1383,7 +1342,7 @@ static void CheckGeometry(HWND dialog, const LayoutFixture *fixture)
     }
     if (fixture->resource == IDD_MAIN) CheckMainBands(dialog, fixture);
     switch (fixture->resource) {
-    case IDD_PROFILE:
+    case IDD_PROFILE_NEW:
         CheckFieldCaption(dialog, fixture, IDC_P_NAME_LABEL, IDC_P_NAME);
         CheckFieldCaption(dialog, fixture, IDC_P_COLOR_LABEL, IDC_P_COLOR);
         CheckFieldCaption(dialog, fixture, IDC_P_BADGE_LABEL, IDC_P_BADGE);
@@ -1397,18 +1356,14 @@ static void CheckGeometry(HWND dialog, const LayoutFixture *fixture)
         CheckFieldCaption(dialog, fixture, IDC_C_ALL, IDC_C_PROFILE);
         break;
     case IDD_CONFLICTS: CheckFieldCaption(dialog, fixture, IDC_X_LABEL, IDC_X_PROFILE); break;
-    case IDD_SETTINGS:
-        CheckFieldCaption(dialog, fixture, IDC_G_DAYS_LABEL, IDC_G_DAYS);
-        CheckFieldCaption(dialog, fixture, IDC_G_DAYS_UNIT, IDC_G_DAYS);
         break;
     case IDD_PASSWORD:
         CheckFieldCaption(dialog, fixture, IDC_K_LABEL, IDC_K_PASSWORD);
         CheckFieldCaption(dialog, fixture, IDC_K_AGAIN_LABEL, IDC_K_AGAIN);
         break;
     case IDD_SIGNIN: CheckFieldCaption(dialog, fixture, IDC_SIGNIN_BROWSER_LABEL, IDC_SIGNIN_BROWSER); break;
-    case IDD_BACKUP_HUB: CheckFieldCaption(dialog, fixture, IDC_H_WEEKLY, IDC_H_CODE); break;
     }
-    if (fixture->resource == IDD_PROFILE && (GetWindowLongW(GetDlgItem(dialog, IDC_P_SYNC), GWL_STYLE) & WS_VISIBLE)) {
+    if (fixture->resource == IDD_PROFILE_NEW) {
         RECT combo = RelativeRect(dialog, GetDlgItem(dialog, IDC_P_SYNC));
         RECT action = RelativeRect(dialog, GetDlgItem(dialog, IDC_P_SYNC_ITEMS));
         RECT label = RelativeRect(dialog, GetDlgItem(dialog, IDC_P_SYNC_LABEL));
@@ -1773,9 +1728,10 @@ static void CheckReopenedModal(HWND owner, LayoutFixture *fixture, const LayoutS
  * and controls come back exactly. */
 static void CheckLanguageRoundTrips(void)
 {
-    static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
-                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS,
-                                      IDD_ABOUT, IDD_PASSWORD, IDD_SIGNIN, IDD_HISTORY, IDD_TEXTVIEW, IDD_PROFILE_TOOLS, IDD_PT_PROGRESS, IDD_PT_MAPPING, IDD_PT_SNAPSHOTS, IDD_SESSIONTOOLS, IDD_SESSIONFILTER, IDD_SESSIONSEARCH, IDD_VAULT_PICK, IDD_PURGE_OPEN };
+    static const int kResources[] = { IDD_MAIN, IDD_PROFILE, IDD_PROFILE_NEW, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP,
+                                      IDD_RESTORE, IDD_PURGE, IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_PREVIEW, IDD_SETTINGS,
+                                      IDD_ABOUT, IDD_PASSWORD, IDD_SIGNIN, IDD_TEXTVIEW, IDD_SESSIONTOOLS, IDD_SESSIONFILTER, IDD_SESSIONSEARCH, IDD_VAULT_PICK, IDD_PURGE_OPEN,
+                                      IDD_TRANSFER, IDD_SHIELD, IDD_SEARXNG, IDD_UPDATE };
     static const WCHAR *const kVisited[] = { L"zh-CN" };
     size_t resource, scale, visited;
     int view, round, french = Language(L"en");
@@ -1857,20 +1813,18 @@ typedef struct HiddenRowsCase {
     const char *name;
 } HiddenRowsCase;
 
-/* Rows a dialog hides close up, the gap above them kept: the profile dialog
- * without "Copy settings" (no profile to copy), without "Open it now" (no
- * Claude) or without both (a profile edited), the uninstall dialog without
- * its profiles (only Claude's own). Every row below the band moves up by it,
- * the rows above stay; a second fit changes nothing. */
+/* Rows a dialog hides close up, the gap above them kept: the new profile's
+ * form without "Copy settings" (no profile to copy), without "Open it now"
+ * (no Claude) or without both, the uninstall dialog without its profiles
+ * (only Claude's own). Every row below the band moves up by it, the rows
+ * above stay; a second fit changes nothing. */
 static void CheckHiddenRows(void)
 {
     static const HiddenRowsCase kCases[] = {
-        { IDD_PROFILE, IDC_P_STARTUP, { IDC_P_COPY, IDC_P_OPEN, 0 }, 2, "the profile dialog without its last check boxes" },
-        { IDD_PROFILE, IDC_P_STARTUP, { IDC_P_COPY, 0, 0 }, 1, "the profile dialog without Copy settings" },
-        { IDD_PROFILE, IDC_P_COPY, { IDC_P_OPEN, 0, 0 }, 1, "the profile dialog without Open it now" },
+        { IDD_PROFILE_NEW, IDC_P_STARTUP, { IDC_P_COPY, IDC_P_OPEN, 0 }, 2, "the new profile's form without its last check boxes" },
+        { IDD_PROFILE_NEW, IDC_P_STARTUP, { IDC_P_COPY, 0, 0 }, 1, "the new profile's form without Copy settings" },
+        { IDD_PROFILE_NEW, IDC_P_COPY, { IDC_P_OPEN, 0, 0 }, 1, "the new profile's form without Open it now" },
         { IDD_UNINSTALL, IDC_U_KEEP, { IDC_U_LABEL, IDC_U_LIST, IDC_U_HINT }, 3, "the uninstall dialog without its profiles" },
-        /* The label is centered on the drop-down list: at some scales it ends below it. */
-        { IDD_PROFILE, IDC_P_NOTE, { IDC_P_SYNC_LABEL, IDC_P_SYNC, IDC_P_SYNC_ITEMS }, 3, "the profile dialog without its sessions" },
     };
     size_t i, scale;
     for (i = 0; i < ARRAYSIZE(kCases); i++) for (scale = 0; scale < ARRAYSIZE(kFontScales); scale++) {
@@ -1960,13 +1914,13 @@ static int ReadGroupedRows(HWND list, int *group, WCHAR (*text)[128])
 
 /* What a backup keeps and what profiles sync are one list: the backup's is
  * built on what to sync's groups and items (syncui.c), its own content added.
- * Every group opened, the same headings come in the same order (Account the
- * backup's own, last), and under the settings side's groups the same items,
+ * Every group opened, the same headings come in the same order (Account and
+ * Profile the backup's own, last), and under the settings side's groups the same items,
  * the Settings group's MCP servers added at its end. */
 static void CheckSharedItemLists(void)
 {
-    static const WCHAR opened[9][MAX_PATH] = { L"sessions", L"sidebar", L"details", L"appearance", L"language", L"model", L"settings", L"permissions",
-                                               L"account" };
+    static const WCHAR opened[10][MAX_PATH] = { L"sessions", L"sidebar", L"details", L"appearance", L"language", L"model", L"settings", L"permissions",
+                                                L"account", L"profile" };
     static WCHAR syncText[SHARED_ROWS_MAX][128], backupText[SHARED_ROWS_MAX][128];
     int syncGroup[SHARED_ROWS_MAX], backupGroup[SHARED_ROWS_MAX], syncRows, backupRows, s, b, g, syncHeads = 0, backupHeads = 0;
     BOOL headingsSame = TRUE, itemsSame = TRUE;
@@ -1977,7 +1931,7 @@ static void CheckSharedItemLists(void)
     fixture.language = Language(L"en");
     Localize_SetLanguage(fixture.language, FALSE);
     Util_SetSettingList(L"SyncItemsOpened", opened, 8);
-    Util_SetSettingList(L"BackupPartsOpened", opened, 9);
+    Util_SetSettingList(L"BackupPartsOpened", opened, 10);
     parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 400, 400, NULL, NULL, g_hInst, NULL);
     sync = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL, 0, 0, 300, 300, parent, NULL, g_hInst, NULL);
     backup = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL, 0, 0, 300, 300, parent, NULL, g_hInst, NULL);
@@ -1997,8 +1951,8 @@ static void CheckSharedItemLists(void)
         }
         for (b = 0; b < backupRows; b++)
             if (backupGroup[b] == -1) backupHeads++;
-        Check(&fixture, NULL, "shared lists: the same headings in the same order, Account added last",
-              headingsSame && backupHeads == syncHeads + 1 && syncHeads == 8);
+        Check(&fixture, NULL, "shared lists: the same headings in the same order, Account and Profile added last",
+              headingsSame && backupHeads == syncHeads + 2 && syncHeads == 8);
         /* The settings side's groups (all but Sessions): the same items, the backup's MCP servers last in Settings. */
         for (g = 1; g < syncHeads; g++) {
             int syncItems = 0, backupItems = 0;
@@ -2021,12 +1975,584 @@ static void CheckSharedItemLists(void)
     Util_SetSettingList(L"BackupPartsOpened", NULL, 0);
 }
 
+/* The row whose lParam is `param`, -1 for none. */
+static int RowOfParam(HWND list, LPARAM param)
+{
+    LVFINDINFOW find;
+    ZeroMemory(&find, sizeof find);
+    find.flags = LVFI_PARAM;
+    find.lParam = param;
+    return ListView_FindItem(list, -1, &find);
+}
+
+/* Row `row` selected, as a click selects it: the list's owner told. */
+static void SelectValueRow(CheckList *checks, HWND owner, int row)
+{
+    NMLISTVIEW change;
+    LRESULT result;
+    ListView_SetItemState(checks->list, -1, 0, LVIS_SELECTED);
+    ListView_SetItemState(checks->list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ZeroMemory(&change, sizeof change);
+    change.hdr.hwndFrom = checks->list;
+    change.hdr.code = LVN_ITEMCHANGED;
+    change.iItem = row;
+    change.uChanged = LVIF_STATE;
+    change.uNewState = LVIS_SELECTED;
+    CheckList_Notify(checks, owner, &change.hdr, &result);
+}
+
+/* A property list (the profile's own in a backup's list): its values in the
+ * second column; the selected one's editor over that column, as tall as its
+ * row, writing the value as it changes; a choice's drop-down holding its
+ * choices; a switch with no editor; the group's box taking the values too. */
+static void CheckValueRows(void)
+{
+    static const WCHAR opened[1][MAX_PATH] = { L"profile" };
+    LayoutFixture fixture;
+    CheckList *checks;
+    HWND parent, list;
+    RECT cell, editor;
+    WCHAR text[64];
+    int name, color, picture, heading;
+    ZeroMemory(&fixture, sizeof fixture);
+    fixture.resource = IDD_BACKUP;
+    fixture.language = Language(L"en");
+    Localize_SetLanguage(fixture.language, FALSE);
+    Util_SetSettingList(L"BackupPartsOpened", opened, 1);
+    parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 500, 500, NULL, NULL, g_hInst, NULL);
+    list = parent ? CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                    0, 0, 400, 400, parent, NULL, g_hInst, NULL)
+                  : NULL;
+    checks = list ? Backup_FillPartsList(list, 3) : NULL;
+    Check(&fixture, NULL, "value rows: made", checks != NULL);
+    if (checks) {
+        name = RowOfParam(list, CHECK_VALUE_BASE + 0);
+        color = RowOfParam(list, CHECK_VALUE_BASE + 2);
+        picture = RowOfParam(list, CHECK_VALUE_BASE + 5);
+        text[0] = 0;
+        if (name >= 0) ListView_GetItemText(list, name, 1, text, ARRAYSIZE(text));
+        Check(&fixture, NULL, "value rows: the profile's own below its heading, values in the second column",
+              name > 0 && color > name && picture > color && wcscmp(text, L"Work") == 0 &&
+              (ListView_GetItemState(list, name, LVIS_STATEIMAGEMASK) >> 12) == 2);
+        if (name > 0) SelectValueRow(checks, parent, name);
+        Check(&fixture, NULL, "value rows: a text's editor is an edit over its value, as tall as its row",
+              checks->editor && checks->editing == 0 && GetParent(checks->editor) == list && (GetWindowLongW(checks->editor, GWL_STYLE) & WS_VISIBLE) &&
+              ListView_GetSubItemRect(list, name, 1, LVIR_BOUNDS, &cell) && GetWindowRect(checks->editor, &editor) &&
+              MapWindowPoints(NULL, list, (POINT *)&editor, 2) >= 0 && editor.top == cell.top && editor.bottom == cell.bottom &&
+              editor.left >= cell.left && editor.right <= cell.right && GetWindowTextW(checks->editor, text, ARRAYSIZE(text)) && wcscmp(text, L"Work") == 0);
+        if (checks->editor) SetWindowTextW(checks->editor, L"Home");
+        text[0] = 0;
+        if (name > 0) ListView_GetItemText(list, name, 1, text, ARRAYSIZE(text));
+        Check(&fixture, NULL, "value rows: what is typed is the value and its row's", wcscmp(checks->values[0].text, L"Home") == 0 && wcscmp(text, L"Home") == 0);
+        if (color > 0) SelectValueRow(checks, parent, color);
+        Check(&fixture, NULL, "value rows: a choice's editor is a drop-down of its choices, the value chosen",
+              checks->editor && checks->editing == 2 && SendMessageW(checks->editor, CB_GETCOUNT, 0, 0) == PALETTE_SIZE &&
+              SendMessageW(checks->editor, CB_GETCURSEL, 0, 0) == 2 && ListView_GetSubItemRect(list, color, 1, LVIR_BOUNDS, &cell) &&
+              GetWindowRect(checks->editor, &editor) && editor.bottom - editor.top == cell.bottom - cell.top);
+        if (picture > 0) SelectValueRow(checks, parent, picture);
+        Check(&fixture, NULL, "value rows: a box alone has no editor", !checks->editor && checks->editing == -1);
+        heading = name > 0 ? name - 1 : -1;
+        CheckList_Toggle(checks, heading);
+        Check(&fixture, NULL, "value rows: the group's box takes its values",
+              heading >= 0 && !checks->values[0].taken && !checks->values[5].taken &&
+              (ListView_GetItemState(list, heading, LVIS_STATEIMAGEMASK) >> 12) == 1 &&
+              (ListView_GetItemState(list, name, LVIS_STATEIMAGEMASK) >> 12) == 1);
+    }
+    if (parent) DestroyWindow(parent);
+    /* An import's: its sessions one by one under their item, each with when it was last used. */
+    {
+        static const WCHAR sessionsOpened[1][MAX_PATH] = { L"sessions" };
+        int first = -1, row, rows, dated = 0;
+        Util_SetSettingList(L"BackupPartsOpened", sessionsOpened, 1);
+        parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 500, 500, NULL, NULL, g_hInst, NULL);
+        list = parent ? CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                        0, 0, 400, 400, parent, NULL, g_hInst, NULL)
+                      : NULL;
+        checks = list ? Backup_FillImportList(list) : NULL;
+        rows = list ? ListView_GetItemCount(list) : 0;
+        for (row = 0; row < rows; row++) {
+            WCHAR label[64] = L"", when[64] = L"";
+            ListView_GetItemText(list, row, 0, label, ARRAYSIZE(label));
+            ListView_GetItemText(list, row, 1, when, ARRAYSIZE(when));
+            if (wcscmp(label, L"Fix the sign-in page") == 0) first = row;
+            if (Theme_RowParam(list, row) >= CHECK_VALUE_BASE && when[0]) dated++;
+        }
+        Check(&fixture, NULL, "value rows: an import's sessions one by one below their item, each with when it was last used",
+              checks && first > 1 && dated == 3 && (ListView_GetItemState(list, first, LVIS_STATEIMAGEMASK) >> 12) == 2 &&
+              (ListView_GetItemState(list, first - 1, LVIS_STATEIMAGEMASK) >> 12) == 2);
+        if (checks && first > 1) CheckList_Toggle(checks, first);
+        Check(&fixture, NULL, "value rows: a session left out leaves its item mixed",
+              checks && first > 1 && (ListView_GetItemState(list, first - 1, LVIS_STATEIMAGEMASK) >> 12) == 3);
+        if (parent) DestroyWindow(parent);
+    }
+    Util_SetSettingList(L"BackupPartsOpened", NULL, 0);
+}
+
+/* What a property list's owner does: its notifications to the list, a box
+ * turned over through it, and each value change counted. */
+static int g_valueChanges;
+
+static LRESULT CALLBACK PropertyHost(HWND host, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref)
+{
+    CheckList *checks = (CheckList *)ref;
+    LRESULT result;
+    BOOL toggled;
+    (void)id;
+    if (message == WM_NOTIFY && lp && CheckList_Notify(checks, host, (const NMHDR *)lp, &result)) return result;
+    if (CheckList_Message(checks, host, message, wp, lp, &toggled)) return 0;
+    if (message == WM_CHECKLIST_VALUE) g_valueChanges++;
+    return DefSubclassProc(host, message, wp, lp);
+}
+
+/* A click on cell (`row`, `column`), as the list tells its owner. */
+static void ClickCell(CheckList *checks, HWND owner, int row, int column)
+{
+    NMITEMACTIVATE click;
+    RECT cell;
+    LRESULT result;
+    ZeroMemory(&click, sizeof click);
+    if (!ListView_GetSubItemRect(checks->list, row, column, LVIR_BOUNDS, &cell)) return;
+    if (!column) cell.right = cell.left + ListView_GetColumnWidth(checks->list, 0);
+    click.hdr.hwndFrom = checks->list;
+    click.hdr.code = NM_CLICK;
+    click.iItem = row;
+    click.iSubItem = column;
+    click.ptAction.x = cell.right - 4;
+    click.ptAction.y = (cell.top + cell.bottom) / 2;
+    CheckList_Notify(checks, owner, &click.hdr, &result);
+}
+
+/* A key on the list's focused row, as the list tells its owner. */
+static void ListKey(CheckList *checks, HWND owner, WORD key)
+{
+    NMLVKEYDOWN down;
+    LRESULT result;
+    ZeroMemory(&down, sizeof down);
+    down.hdr.hwndFrom = checks->list;
+    down.hdr.code = LVN_KEYDOWN;
+    down.wVKey = key;
+    CheckList_Notify(checks, owner, &down.hdr, &result);
+}
+
+static int CellImage(HWND list, int row, int column)
+{
+    LVITEMW cell;
+    ZeroMemory(&cell, sizeof cell);
+    cell.mask = LVIF_IMAGE;
+    cell.iItem = row;
+    cell.iSubItem = column;
+    cell.iImage = I_IMAGENONE;
+    ListView_GetItem(list, &cell);
+    return cell.iImage;
+}
+
+static int RowBox(HWND list, int row)
+{
+    return (int)((ListView_GetItemState(list, row, LVIS_STATEIMAGEMASK) & LVIS_STATEIMAGEMASK) >> 12);
+}
+
+/* The pane beside a property list (checklist.c), as the dialogs have it. */
+static void AddPane(HWND parent)
+{
+    CreateWindowExW(0, L"STATIC", L"Preview pane", WS_CHILD | WS_VISIBLE, 510, 0, 200, 20, parent, (HMENU)(INT_PTR)IDC_PANE_LABEL, g_hInst, NULL);
+    CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 510, 20, 200, 20, parent, (HMENU)(INT_PTR)IDC_PANE_TITLE, g_hInst, NULL);
+    CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 510, 40, 180, 20, parent, (HMENU)(INT_PTR)IDC_PANE_SEARCH, g_hInst, NULL);
+    CreateWindowExW(0, L"BUTTON", L"Search options", WS_CHILD | WS_VISIBLE, 690, 40, 20, 20, parent, (HMENU)(INT_PTR)IDC_PANE_FIND, g_hInst, NULL);
+    CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 510, 64, 200, 500,
+                    parent, (HMENU)(INT_PTR)IDC_PANE_LIST, g_hInst, NULL);
+}
+
+/* The indent of `row` in `list`. */
+static int RowIndent(HWND list, int row)
+{
+    LVITEMW item;
+    ZeroMemory(&item, sizeof item);
+    item.mask = LVIF_INDENT;
+    item.iItem = row;
+    item.iIndent = -1;
+    ListView_GetItem(list, &item);
+    return item.iIndent;
+}
+
+/* The first value with parts on a row of its own, -1 for none. */
+static int ValueWithParts(const CheckList *checks)
+{
+    int v;
+    for (v = 0; v + 1 < checks->valueCount; v++)
+        if (checks->values[v + 1].parent == v + 1 && !checks->values[v].merged) return v;
+    return -1;
+}
+
+/* The edit dialog's list (gui.c): no boxes; the profile's own under Profile,
+ * a text in place, a switch turned over by Space, the picture an action that
+ * tells the dialog; Sync's choice on its heading; the settings one by one
+ * under their groups, folded at first, one group's only value on its
+ * heading. The pane beside it shows what the row selected holds, as the list
+ * would below it, further out: a value alone itself, changed there, the list
+ * following, and the other way round; a heading its values; a setting its
+ * parts; a value's parts folding apart from the list's. */
+static void CheckProfileList(void)
+{
+    LayoutFixture fixture;
+    CheckList *checks, *pane = NULL;
+    HWND parent, list;
+    WCHAR text[64] = L"", sync[64] = L"", language[64] = L"", paneTitle[64] = L"";
+    int name, startup, picture, row, rows, settings = -1, languageRow = -1, changes, parts, at;
+    ZeroMemory(&fixture, sizeof fixture);
+    fixture.resource = IDD_PROFILE;
+    fixture.language = Language(L"en");
+    Localize_SetLanguage(fixture.language, FALSE);
+    Util_SetSettingList(L"ProfileOpened", NULL, 0);
+    parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 720, 700, NULL, NULL, g_hInst, NULL);
+    list = parent ? CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                    0, 0, 500, 600, parent, NULL, g_hInst, NULL)
+                  : NULL;
+    if (list) AddPane(parent);
+    checks = list ? Gui_FillProfileList(list) : NULL;
+    if (checks) SetWindowSubclass(parent, PropertyHost, 1, (DWORD_PTR)checks);
+    if (checks) pane = checks->pane;
+    Check(&fixture, NULL, "profile list: made, its pane beside it", checks != NULL && pane && pane->twin == checks && pane->list);
+    if (checks) {
+        name = RowOfParam(list, CHECK_VALUE_BASE + 0);
+        picture = RowOfParam(list, CHECK_VALUE_BASE + 3);
+        startup = RowOfParam(list, CHECK_VALUE_BASE + 6);
+        if (name >= 0) ListView_GetItemText(list, name, 1, text, ARRAYSIZE(text));
+        row = RowOfParam(list, THEME_HEADING_ROW(1));
+        if (row >= 0) ListView_GetItemText(list, row, 1, sync, ARRAYSIZE(sync));
+        rows = ListView_GetItemCount(list);
+        for (row = 0; row < rows; row++) {
+            WCHAR label[64] = L"";
+            ListView_GetItemText(list, row, 0, label, ARRAYSIZE(label));
+            if (wcscmp(label, L"Settings") == 0) settings = row;
+            if (wcscmp(label, L"Interface language") == 0) languageRow = row;
+        }
+        if (languageRow >= 0) ListView_GetItemText(list, languageRow, 1, language, ARRAYSIZE(language));
+        Check(&fixture, NULL, "profile list: no boxes, the profile's own open below its heading with their values",
+              name == 1 && picture > name && startup > picture && wcscmp(text, L"Work") == 0 && RowBox(list, name) == 0 && RowBox(list, 0) == 0);
+        Check(&fixture, NULL, "profile list: Sync's choice on its heading", wcscmp(sync, TR(L"Not synced")) == 0);
+        Check(&fixture, NULL, "profile list: the settings under their groups, folded at first, a group's only value on its heading",
+              settings > startup && RowOfParam(list, CHECK_VALUE_BASE + 9) < 0 && wcscmp(language, L"zh-CN") == 0);
+        if (name > 0) SelectValueRow(checks, parent, name);
+        Check(&fixture, NULL, "profile list: a text is changed in place",
+              checks->editor && checks->editing == 0 && GetWindowTextW(checks->editor, text, ARRAYSIZE(text)) && wcscmp(text, L"Work") == 0);
+        GetDlgItemTextW(parent, IDC_PANE_TITLE, paneTitle, ARRAYSIZE(paneTitle));
+        Check(&fixture, NULL, "pane: a value alone, itself, its editor open",
+              pane && wcscmp(paneTitle, L"Name") == 0 && ListView_GetItemCount(pane->list) == 1 && RowOfParam(pane->list, CHECK_VALUE_BASE + 0) == 0 &&
+              RowIndent(pane->list, 0) == 1 && pane->editor && pane->editing == 0 && GetWindowTextW(pane->editor, text, ARRAYSIZE(text)) &&
+              wcscmp(text, L"Work") == 0);
+        changes = g_valueChanges;
+        if (pane && pane->editor) SetWindowTextW(pane->editor, L"Home");
+        text[0] = 0;
+        if (name >= 0) ListView_GetItemText(list, name, 1, text, ARRAYSIZE(text));
+        Check(&fixture, NULL, "pane: typed there, the value, its row and the list's editor follow, the dialog told",
+              wcscmp(checks->values[0].text, L"Home") == 0 && wcscmp(text, L"Home") == 0 && g_valueChanges > changes && checks->editor &&
+              GetWindowTextW(checks->editor, text, ARRAYSIZE(text)) && wcscmp(text, L"Home") == 0);
+        if (checks->editor) SetWindowTextW(checks->editor, L"Home office");
+        text[0] = 0;
+        if (pane && pane->editor) GetWindowTextW(pane->editor, text, ARRAYSIZE(text));
+        Check(&fixture, NULL, "pane: typed in the list, the pane's editor follows", wcscmp(text, L"Home office") == 0);
+        if (startup > 0) SelectValueRow(checks, parent, startup);
+        ListKey(checks, parent, VK_SPACE);
+        Check(&fixture, NULL, "profile list: Space turns a switch over", startup > 0 && !checks->values[6].on && !checks->editor);
+        Check(&fixture, NULL, "pane: a switch, as the list has it", pane && CellImage(pane->list, 0, 1) == THEME_CELL_BOX);
+        changes = g_valueChanges;
+        if (pane) ClickCell(pane, parent, 0, 1);
+        Check(&fixture, NULL, "pane: turned over there, the list follows", checks->values[6].on && g_valueChanges == changes + 1 &&
+              CellImage(list, startup, 1) == (THEME_CELL_BOX + THEME_CELL_BOX_CHECKED));
+        SelectValueRow(checks, parent, 0);
+        GetDlgItemTextW(parent, IDC_PANE_TITLE, paneTitle, ARRAYSIZE(paneTitle));
+        text[0] = 0;
+        if (pane) ListView_GetItemText(pane->list, 0, 1, text, ARRAYSIZE(text));
+        Check(&fixture, NULL, "pane: a heading's values, further out, to change there",
+              pane && wcscmp(paneTitle, L"Profile") == 0 && RowOfParam(pane->list, CHECK_VALUE_BASE + 0) == 0 &&
+              RowOfParam(pane->list, CHECK_VALUE_BASE + 6) > 0 && RowIndent(pane->list, 0) == 1 && wcscmp(text, L"Home office") == 0 &&
+              ListView_GetItemCount(pane->list) == startup);
+        at = ValueWithParts(checks);
+        parts = 0;
+        for (row = at + 1; at >= 0 && row < checks->valueCount && checks->values[row].parent; row++) parts += checks->values[row].parent == at + 1;
+        if (at >= 0) CheckList_SelectValue(checks, at, FALSE);
+        row = pane && at >= 0 ? RowOfParam(pane->list, CHECK_VALUE_BASE + at) : -1;
+        {
+            WCHAR held[64] = L"", said[64] = L"";
+            int itemRow = at >= 0 && checks->values[at].item ? RowOfParam(list, (LPARAM)checks->values[at].item) : -1, n = 0, w;
+            for (w = 0; itemRow >= 0 && w < checks->valueCount; w++)
+                n += checks->values[w].item == checks->values[at].item && !checks->values[w].merged && !checks->values[w].parent;
+            if (n) StringCchPrintfW(held, ARRAYSIZE(held), TR(L"%d items"), n);
+            if (itemRow >= 0) ListView_GetItemText(list, itemRow, 1, said, ARRAYSIZE(said));
+            Check(&fixture, NULL, "overview: a setting's item says how many values it holds, its values not below it; selected, the pane shows them",
+                  pane && at >= 0 && parts > 0 && itemRow >= 0 && wcscmp(said, held) == 0 && RowOfParam(list, CHECK_VALUE_BASE + at) < 0 &&
+                  ListView_GetNextItem(list, -1, LVNI_SELECTED) == itemRow && row >= 0 && ListView_GetNextItem(pane->list, -1, LVNI_SELECTED) == row &&
+                  RowIndent(pane->list, row) == 1 && RowOfParam(pane->list, CHECK_VALUE_BASE + at + 1) < 0);
+        }
+        rows = pane ? ListView_GetItemCount(pane->list) : 0;
+        if (row >= 0) ListKey(pane, parent, VK_RIGHT);
+        Check(&fixture, NULL, "pane: a value's parts opened there, not in the list",
+              row >= 0 && ListView_GetItemCount(pane->list) == rows + parts && RowOfParam(pane->list, CHECK_VALUE_BASE + at + 1) == row + 1 &&
+              checks->values[at].paneOpen && !checks->values[at].open);
+        if (pane) SetWindowTextW(GetDlgItem(parent, IDC_PANE_SEARCH), checks->values[at + 1].label);
+        text[0] = 0;
+        if (pane && ListView_GetItemCount(pane->list) > 0) ListView_GetItemText(pane->list, ListView_GetItemCount(pane->list) - 1, 0, text, ARRAYSIZE(text));
+        Check(&fixture, NULL, "pane: its search keeps what matches and what holds it",
+              pane && pane->search && RowOfParam(pane->list, CHECK_VALUE_BASE + at) == 0 && RowOfParam(pane->list, CHECK_VALUE_BASE + at + 1) == 1 &&
+              wcscmp(text, checks->values[at + 1].label) == 0 && ListView_GetItemCount(pane->list) < rows + parts);
+        if (pane) SetWindowTextW(GetDlgItem(parent, IDC_PANE_SEARCH), L"");
+        Check(&fixture, NULL, "pane: an empty search keeps every row", pane && ListView_GetItemCount(pane->list) == rows + parts);
+        changes = g_valueChanges;
+        if (picture > 0) ClickCell(checks, parent, picture, 1);
+        Check(&fixture, NULL, "profile list: a click on the picture's action tells the dialog", picture > 0 && g_valueChanges == changes + 1);
+        CheckList_SelectValue(checks, 9, FALSE);
+        Check(&fixture, NULL, "profile list: a setting selected opens its group", RowOfParam(list, CHECK_VALUE_BASE + 9) > settings ||
+              RowOfParam(list, (LPARAM)checks->values[9].item) > 0);
+    }
+    if (parent) DestroyWindow(parent);
+    Util_SetSettingList(L"ProfileOpened", NULL, 0);
+}
+
+/* The dialog's font as it opens, its height into lParam's int; it closes at once, unseen. */
+static INT_PTR CALLBACK ZoomProbeProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    LOGFONTW font;
+    (void)wp;
+    if (message != WM_INITDIALOG) return FALSE;
+    ZeroMemory(&font, sizeof font);
+    GetObjectW((HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0), sizeof font, &font);
+    *(int *)lp = font.lfHeight;
+    EndDialog(dialog, IDOK);
+    return TRUE;
+}
+
+/* The windows' size (Settings' Zoom): a dialog opens with its font that
+ * much larger, its layout with it; an unknown size is 100%. */
+static void CheckZoom(void)
+{
+    LayoutFixture fixture;
+    int normal = 0, larger = 0, unknown = 0;
+    ZeroMemory(&fixture, sizeof fixture);
+    fixture.resource = IDD_SETTINGS;
+    fixture.language = Language(L"en");
+    Util_SetSetting(SETTING_ZOOM, 100);
+    Theme_DialogBox(IDD_SETTINGS, NULL, ZoomProbeProc, (LPARAM)&normal);
+    Util_SetSetting(SETTING_ZOOM, 200);
+    Check(&fixture, NULL, "zoom: 200% read back", Theme_Zoom() == 200);
+    Theme_DialogBox(IDD_SETTINGS, NULL, ZoomProbeProc, (LPARAM)&larger);
+    Util_SetSetting(SETTING_ZOOM, 1000);
+    Theme_DialogBox(IDD_SETTINGS, NULL, ZoomProbeProc, (LPARAM)&unknown);
+    Util_SetSetting(SETTING_ZOOM, 100);
+    Check(&fixture, NULL, "zoom: a dialog's font twice as large at 200%", normal < 0 && abs(larger - 2 * normal) <= 1);
+    Check(&fixture, NULL, "zoom: a size out of range is 100%", unknown == normal && Theme_Zoom() == 100);
+}
+
+/* The conflicts dialog's list (syncui.c): read-only, a heading per kind of
+ * what syncs, open; each element below it with a profile's version in each
+ * column, the latest kept; a click or Right keeps another. */
+static void CheckConflictsList(void)
+{
+    LayoutFixture fixture;
+    CheckList *checks;
+    HWND parent, list;
+    WCHAR first[64] = L"", second[64] = L"";
+    int heading, row = -1;
+    ZeroMemory(&fixture, sizeof fixture);
+    fixture.resource = IDD_CONFLICTS;
+    fixture.language = Language(L"en");
+    Localize_SetLanguage(fixture.language, FALSE);
+    parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 600, 500, NULL, NULL, g_hInst, NULL);
+    list = parent ? CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+                                    0, 0, 500, 300, parent, NULL, g_hInst, NULL)
+                  : NULL;
+    checks = list ? SyncUi_FillConflictsList(list, L"Work") : NULL;
+    if (checks) SetWindowSubclass(parent, PropertyHost, 1, (DWORD_PTR)checks);
+    Check(&fixture, NULL, "conflicts list: made", checks != NULL);
+    if (checks) {
+        heading = RowOfParam(list, THEME_HEADING_ROW(1));
+        row = RowOfParam(list, CHECK_VALUE_BASE + 0);
+        if (row >= 0) ListView_GetItemText(list, row, 1, first, ARRAYSIZE(first));
+        if (row >= 0) ListView_GetItemText(list, row, 2, second, ARRAYSIZE(second));
+        Check(&fixture, NULL, "conflicts list: no boxes, the elements open below their kind, a version per profile",
+              heading == 0 && row == 1 && RowOfParam(list, CHECK_VALUE_BASE + 1) == 2 && RowBox(list, row) == 0 &&
+              wcscmp(first, L"Work") == 0 && wcscmp(second, L"Personal work") == 0);
+        Check(&fixture, NULL, "conflicts list: the latest kept, the first element selected",
+              checks->values[0].pick == 0 && checks->values[1].pick == 1 && CellImage(list, row, 1) == checks->pickedImage &&
+              CellImage(list, row, 2) == checks->candidateImage && ListView_GetNextItem(list, -1, LVNI_SELECTED) == row);
+        ListKey(checks, parent, VK_RIGHT);
+        Check(&fixture, NULL, "conflicts list: Right keeps the next version", checks->values[0].pick == 1 && CellImage(list, row, 2) == checks->pickedImage);
+        ClickCell(checks, parent, row, 1);
+        Check(&fixture, NULL, "conflicts list: a click keeps a version", checks->values[0].pick == 0 && !checks->editor);
+    }
+    if (parent) DestroyWindow(parent);
+}
+
+/* The property list's own rules, on a list of its own: an item's only value
+ * on its row; values below their item, their switches check boxes in their
+ * cells, turned over by a click and by Space, and still while their item is
+ * not checked; an item whose values have boxes mixed when some are taken,
+ * all or none by its box; a pick list's versions side by side, the one kept
+ * clicked or stepped to, those it lacks skipped. Every change tells the
+ * owner. */
+static void CheckPropertyList(void)
+{
+    static const WCHAR opened[1][MAX_PATH] = { L"property-test" };
+    static const CheckGroup kGroups[] = { { 0x7, L"Settings", 0, L"property-test" } };
+    static const CheckItem kItems[] = { { 0x1, L"Archive when the PR closes", 0 }, { 0x2, L"Cowork", 0 }, { 0x4, L"New sessions", 0 } };
+    static const WCHAR kGlyphs[] = { 0xE713, 0xEC61, 0xEA3A };
+    static const ThemeTint kTints[] = { THEME_TINT_BLUE, THEME_TINT_GREEN, THEME_TINT_NONE };
+    static const WCHAR *const kBrowsers[] = { L"Chrome", L"Edge" };
+    static const WCHAR *const kTitles[] = { L"Changed", L"Main", L"Work", L"Test" };
+    static const WCHAR *const kFirst[] = { L"on", L"off", NULL }, *const kSecond[] = { L"a", NULL, L"c" };
+    LayoutFixture fixture;
+    CheckList checks, picks;
+    CheckValue values[5], versions[2];
+    HWND parent, list, pickList;
+    int merged, browser, search, sessions, a, b, i, changes;
+    ZeroMemory(&fixture, sizeof fixture);
+    fixture.resource = IDD_BACKUP;
+    fixture.language = Language(L"en");
+    Localize_SetLanguage(fixture.language, FALSE);
+    Util_SetSettingList(L"PropertyTestOpened", opened, 1);
+    ZeroMemory(&checks, sizeof checks);
+    ZeroMemory(values, sizeof values);
+    for (i = 0; i < (int)ARRAYSIZE(values); i++) {
+        values[i].group = 0;
+        values[i].image = -1;
+        values[i].pick = -1;
+    }
+    values[0].item = 0x1, values[0].kind = CHECK_VALUE_SWITCH, values[0].merged = TRUE, values[0].on = TRUE;
+    values[1].item = 0x2, values[1].kind = CHECK_VALUE_SWITCH, values[1].label = L"Cowork web search";
+    values[2].item = 0x2, values[2].kind = CHECK_VALUE_CHOICE, values[2].label = L"Cowork's browser", values[2].choices = kBrowsers, values[2].choiceCount = 2;
+    values[3].item = 0x4, values[3].boxed = TRUE, values[3].taken = TRUE, values[3].literal = TRUE, values[3].label = L"Session A";
+    StringCchCopyW(values[3].text, ARRAYSIZE(values[3].text), L"today");
+    values[4].item = 0x4, values[4].boxed = TRUE, values[4].literal = TRUE, values[4].label = L"Session B";
+    checks.groups = kGroups;
+    checks.groupCount = 1;
+    checks.items = kItems;
+    checks.itemCount = 3;
+    checks.values = values;
+    checks.valueCount = 5;
+    checks.openedSection = L"PropertyTestOpened";
+    checks.offered = 0x7;
+    checks.checked = 0x7;
+    parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 600, 500, NULL, NULL, g_hInst, NULL);
+    list = parent ? CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                    0, 0, 500, 400, parent, NULL, g_hInst, NULL)
+                  : NULL;
+    if (list) SetWindowSubclass(parent, PropertyHost, 1, (DWORD_PTR)&checks);
+    if (list) CheckList_Setup(&checks, list, kGlyphs, kTints, 3);
+    Check(&fixture, NULL, "property list: made", list != NULL);
+    if (list) {
+        merged = RowOfParam(list, 0x1);
+        browser = RowOfParam(list, CHECK_VALUE_BASE + 2);
+        search = RowOfParam(list, CHECK_VALUE_BASE + 1);
+        sessions = RowOfParam(list, 0x4);
+        a = RowOfParam(list, CHECK_VALUE_BASE + 3);
+        b = RowOfParam(list, CHECK_VALUE_BASE + 4);
+        Check(&fixture, NULL, "property list: an item's only value shows on its row, its switch a check box in its cell",
+              merged > 0 && RowOfParam(list, CHECK_VALUE_BASE + 0) < 0 && CellImage(list, merged, 1) == (THEME_CELL_BOX + THEME_CELL_BOX_CHECKED));
+        Check(&fixture, NULL, "property list: values below their item, in its order",
+              search > merged && browser == search + 1 && sessions > browser && a == sessions + 1 && b == a + 1 &&
+              CellImage(list, search, 1) == THEME_CELL_BOX);
+        Check(&fixture, NULL, "property list: an item whose values have boxes is mixed when some are taken, checked when one is",
+              RowBox(list, sessions) == 3 && RowBox(list, a) == 2 && RowBox(list, b) == 1 && (checks.checked & 0x4));
+        CheckList_Toggle(&checks, sessions);
+        Check(&fixture, NULL, "property list: its box takes all its values", values[3].taken && values[4].taken && RowBox(list, sessions) == 2);
+        CheckList_Toggle(&checks, sessions);
+        Check(&fixture, NULL, "property list: then none, the item unchecked", !values[3].taken && !values[4].taken && RowBox(list, sessions) == 1 &&
+              !(checks.checked & 0x4));
+        CheckList_Toggle(&checks, a);
+        Check(&fixture, NULL, "property list: a value's box checks its item again", values[3].taken && (checks.checked & 0x4) && RowBox(list, sessions) == 3);
+        changes = g_valueChanges;
+        ClickCell(&checks, parent, search, 1);
+        Check(&fixture, NULL, "property list: a click on a switch turns it over and tells the owner",
+              values[1].on && g_valueChanges == changes + 1 && CellImage(list, search, 1) == (THEME_CELL_BOX + THEME_CELL_BOX_CHECKED));
+        ListView_SetItemState(list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_SetItemState(list, search, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        SendMessageW(list, WM_KEYDOWN, VK_SPACE, 0);
+        SendMessageW(list, WM_CHAR, L' ', 0);
+        SendMessageW(list, WM_KEYUP, VK_SPACE, 0xC0000001);
+        PumpMessages();
+        Check(&fixture, NULL, "property list: Space turns a switch without a box over, once", !values[1].on && g_valueChanges == changes + 2);
+        CheckList_Toggle(&checks, RowOfParam(list, 0x2));
+        changes = g_valueChanges;
+        ClickCell(&checks, parent, search, 1);
+        Check(&fixture, NULL, "property list: the values of an item not checked stay as they are, shown so",
+              !(checks.checked & 0x2) && !values[1].on && g_valueChanges == changes &&
+              CellImage(list, search, 1) == (THEME_CELL_BOX + THEME_CELL_BOX_DISABLED));
+        CheckList_Toggle(&checks, RowOfParam(list, 0x2));
+        CheckList_CheckAll(&checks, CHECKLIST_NONE);
+        Check(&fixture, NULL, "property list: Select none unchecks every box, items and values",
+              !(checks.checked & 0x7) && !values[3].taken && !values[4].taken && RowBox(list, sessions) == 1 && RowBox(list, merged) == 1);
+        CheckList_Toggle(&checks, a);
+        CheckList_CheckAll(&checks, CHECKLIST_INVERT);
+        Check(&fixture, NULL, "property list: Invert turns each over: an item without boxed values its own box, values one by one",
+              (checks.checked & 0x7) == 0x7 && !values[3].taken && values[4].taken && RowBox(list, sessions) == 3 && RowBox(list, merged) == 2);
+        CheckList_CheckAll(&checks, CHECKLIST_ALL);
+        Check(&fixture, NULL, "property list: Select all checks every box",
+              (checks.checked & 0x7) == 0x7 && values[3].taken && values[4].taken && RowBox(list, sessions) == 2);
+    }
+    if (parent) {
+        RemoveWindowSubclass(parent, PropertyHost, 1);
+        DestroyWindow(parent);
+    }
+    /* A pick list: versions side by side, the one kept checked. */
+    ZeroMemory(&picks, sizeof picks);
+    ZeroMemory(versions, sizeof versions);
+    for (i = 0; i < 2; i++) {
+        versions[i].group = -1;
+        versions[i].kind = CHECK_VALUE_PICK;
+        versions[i].image = 0;
+        versions[i].literal = TRUE;
+    }
+    versions[0].label = L"Archive when the PR closes", versions[0].versions = kFirst, versions[0].pick = 0;
+    versions[1].label = L"Default model", versions[1].versions = kSecond, versions[1].pick = 2;
+    picks.values = versions;
+    picks.valueCount = 2;
+    picks.columns = kTitles;
+    picks.columnCount = 4;
+    picks.plain = TRUE;
+    picks.pickedImage = 1;
+    picks.candidateImage = 2;
+    parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 600, 500, NULL, NULL, g_hInst, NULL);
+    pickList = parent ? CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+                                        0, 0, 500, 300, parent, NULL, g_hInst, NULL)
+                      : NULL;
+    if (pickList) SetWindowSubclass(parent, PropertyHost, 1, (DWORD_PTR)&picks);
+    if (pickList) CheckList_Setup(&picks, pickList, kGlyphs, kTints, 3);
+    Check(&fixture, NULL, "pick list: made", pickList != NULL);
+    if (pickList) {
+        WCHAR text[32] = L"";
+        int first = RowOfParam(pickList, CHECK_VALUE_BASE + 0), second = RowOfParam(pickList, CHECK_VALUE_BASE + 1);
+        ListView_GetItemText(pickList, first, 3, text, ARRAYSIZE(text));
+        Check(&fixture, NULL, "pick list: a column per version, the one kept checked, a missing one a dash",
+              first == 0 && second == 1 && Header_GetItemCount(ListView_GetHeader(pickList)) == 4 && CellImage(pickList, first, 1) == 1 &&
+              CellImage(pickList, first, 2) == 2 && CellImage(pickList, first, 3) == I_IMAGENONE && wcscmp(text, L"\x2014") == 0 &&
+              !(ListView_GetExtendedListViewStyle(pickList) & LVS_EX_CHECKBOXES));
+        changes = g_valueChanges;
+        ClickCell(&picks, parent, first, 2);
+        Check(&fixture, NULL, "pick list: a click keeps another version and tells the owner",
+              versions[0].pick == 1 && CellImage(pickList, first, 2) == 1 && CellImage(pickList, first, 1) == 2 && g_valueChanges == changes + 1);
+        ClickCell(&picks, parent, first, 3);
+        Check(&fixture, NULL, "pick list: a version it lacks cannot be kept", versions[0].pick == 1);
+        ListView_SetItemState(pickList, second, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListKey(&picks, parent, VK_LEFT);
+        Check(&fixture, NULL, "pick list: Left keeps the version before, past those it lacks", versions[1].pick == 0);
+        ListKey(&picks, parent, VK_RIGHT);
+        Check(&fixture, NULL, "pick list: Right the one after", versions[1].pick == 2);
+        Check(&fixture, NULL, "pick list: the labels keep two fifths of the width at least",
+              ListView_GetColumnWidth(pickList, 0) * 5 >= 500 * 2);
+    }
+    if (parent) {
+        RemoveWindowSubclass(parent, PropertyHost, 1);
+        DestroyWindow(parent);
+    }
+    Util_SetSettingList(L"PropertyTestOpened", NULL, 0);
+}
+
 /* The dialogs other than the manager window, in every language and scale. */
 static void CheckDialogs(void)
 {
-    static const int kResources[] = { IDD_PROFILE, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE,
-                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_BACKUP_HUB, IDD_PREVIEW, IDD_SETTINGS, IDD_ABOUT, IDD_PASSWORD,
-                                      IDD_SIGNIN, IDD_HISTORY, IDD_TEXTVIEW, IDD_PROFILE_TOOLS, IDD_PT_PROGRESS, IDD_PT_MAPPING, IDD_PT_SNAPSHOTS, IDD_SESSIONTOOLS, IDD_SESSIONFILTER, IDD_SESSIONSEARCH, IDD_VAULT_PICK, IDD_PURGE_OPEN };
+    static const int kResources[] = { IDD_PROFILE, IDD_PROFILE_NEW, IDD_TITLE, IDD_MESSAGE, IDD_UNINSTALL, IDD_SYNC, IDD_LINK, IDD_BACKUP, IDD_RESTORE, IDD_PURGE,
+                                      IDD_SYNC_ITEMS, IDD_CONFLICTS, IDD_SYNC_SETUP, IDD_PREVIEW, IDD_SETTINGS, IDD_ABOUT, IDD_PASSWORD,
+                                      IDD_SIGNIN, IDD_TEXTVIEW, IDD_SESSIONTOOLS, IDD_SESSIONFILTER, IDD_SESSIONSEARCH, IDD_VAULT_PICK, IDD_PURGE_OPEN,
+                                      IDD_TRANSFER, IDD_SHIELD, IDD_SEARXNG, IDD_UPDATE };
     size_t resource, scale;
     int language;
     for (language = 0; language < Localize_LanguageCount(); language++)
@@ -2145,33 +2671,75 @@ static void ApplySettingsLanguage(int language)
     Localize_SetLanguage(language, FALSE);
 }
 
-/* Another language chosen in the Settings dialog and applied: Apply waits
- * for the change, gives the language to the program, and waits again; the
- * dialog speaks the new language, in its script's face, still laid out
- * whole. */
+/* The page's first setting is the language, showing `name`. */
+static BOOL PageLanguageIs(HWND page, const WCHAR *name)
+{
+    WCHAR title[128], shown[128];
+    return page && Settings_PageRow(page, 0, title, ARRAYSIZE(title), shown, ARRAYSIZE(shown)) && wcscmp(title, TR(L"Language")) == 0 &&
+           wcscmp(shown, name) == 0;
+}
+
+/* Another language chosen in the Settings dialog, its row stepped with the
+ * keyboard, and applied: Apply waits for the change, gives the language to
+ * the program, and waits again; the dialog speaks the new language, in its
+ * script's face, still laid out whole. */
 static void CheckSettingsApply(HWND dialog, SettingsCheck *check)
 {
-    HWND apply = GetDlgItem(dialog, IDC_G_APPLY), combo = GetDlgItem(dialog, IDC_G_LANGUAGE);
-    int target = Localize_EffectiveLanguage() == 0 ? 1 : 0;
-    WCHAR caption[64], heading[64];
+    HWND apply = GetDlgItem(dialog, IDC_G_APPLY), page = GetWindow(GetDlgItem(dialog, IDC_G_PAGE), GW_CHILD);   /* in its view */
+    int target = Localize_EffectiveLanguage() == 0 ? 1 : 0, steps;
+    WCHAR caption[64], title[128] = L"", name[128];
     FontState font;
+    StringCchCopyW(name, ARRAYSIZE(name), Localize_LanguageName(target));
     Check(&check->fixture, apply, "Apply waits for a change", !IsWindowEnabled(apply));
-    SendMessageW(combo, CB_SETCURSEL, (WPARAM)(target + 1), 0);
-    SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_G_LANGUAGE, CBN_SELCHANGE), (LPARAM)combo);
-    Check(&check->fixture, apply, "another language chosen enables Apply", IsWindowEnabled(apply));
+    if (page) {
+        SetFocus(page);
+        SendPlainKey(page, VK_HOME);
+        for (steps = 0; steps <= Localize_LanguageCount() && !PageLanguageIs(page, name); steps++) SendPlainKey(page, VK_RIGHT);
+        for (steps = 0; steps <= Localize_LanguageCount() && !PageLanguageIs(page, name); steps++) SendPlainKey(page, VK_LEFT);
+    }
+    Check(&check->fixture, page, "the language's row takes another language from the keyboard, and Apply waits no more",
+          PageLanguageIs(page, name) && IsWindowEnabled(apply));
     SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_G_APPLY, BN_CLICKED), (LPARAM)apply);
     PumpMessages();
     check->fixture.language = target;
     GetWindowTextW(dialog, caption, ARRAYSIZE(caption));
-    GetDlgItemTextW(dialog, IDC_G_LANGUAGE_LABEL, heading, ARRAYSIZE(heading));
+    if (page) Settings_PageRow(page, 0, title, ARRAYSIZE(title), NULL, 0);
     font = ReadFont(dialog, (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0));
     Check(&check->fixture, apply, "Apply gives the language chosen to the program", g_settingsApplied == 1 && g_settingsLanguage == target);
-    Check(&check->fixture, NULL, "the settings dialog follows the language applied: caption, headings",
-          wcscmp(caption, TR(L"Settings")) == 0 && wcscmp(heading, TR(L"&Language")) == 0);
+    Check(&check->fixture, NULL, "the settings dialog follows the language applied: caption, the page's rows",
+          wcscmp(caption, TR(L"Settings")) == 0 && wcscmp(title, TR(L"Language")) == 0);
     Check(&check->fixture, NULL, "the settings dialog's face covers the language applied",
           font.available && wcscmp(font.logical.lfFaceName, Localize_FontFace()) == 0);
-    Check(&check->fixture, combo, "the language box shows the language applied", SendMessageW(combo, CB_GETCURSEL, 0, 0) == target + 1);
+    Check(&check->fixture, page, "the language's row shows the language applied", PageLanguageIs(page, name));
     Check(&check->fixture, apply, "Apply waits again for a change once applied", !IsWindowEnabled(apply));
+    CheckGeometry(dialog, &check->fixture);
+}
+
+/* The settings' kinds on the left, the page of the one chosen on the right:
+ * General's first, the language its first setting; another kind chosen,
+ * that kind's page; a search, the settings that match, from every kind. */
+static void CheckSettingsList(HWND dialog, SettingsCheck *check)
+{
+    HWND kinds = GetDlgItem(dialog, IDC_G_LIST), page = GetWindow(GetDlgItem(dialog, IDC_G_PAGE), GW_CHILD);   /* the page in its view */
+    WCHAR title[128] = L"";
+    int matches = 0;
+    if (page) Settings_PageRow(page, 0, title, ARRAYSIZE(title), NULL, 0);
+    Check(&check->fixture, kinds, "Settings show their kinds, and the page General's settings, the language first",
+          kinds && page && wcscmp(title, TR(L"Language")) == 0);
+    if (kinds) {
+        SendPlainKey(kinds, VK_DOWN);   /* New profiles */
+        SendPlainKey(kinds, VK_DOWN);   /* Claude Code */
+    }
+    title[0] = 0;
+    if (page) Settings_PageRow(page, 0, title, ARRAYSIZE(title), NULL, 0);
+    Check(&check->fixture, page, "another kind chosen shows its page", wcscmp(title, TR(L"Days to keep conversations")) == 0);
+    SetDlgItemTextW(dialog, IDC_G_SEARCH, L"Cowork");
+    PumpMessages();
+    while (page && Settings_PageRow(page, matches, NULL, 0, NULL, 0)) matches++;
+    Check(&check->fixture, page, "a search shows the settings that match, from every kind", matches > 1 && matches < 20);
+    SetDlgItemTextW(dialog, IDC_G_SEARCH, L"");
+    if (kinds) SendPlainKey(kinds, VK_HOME);
+    PumpMessages();
     CheckGeometry(dialog, &check->fixture);
 }
 
@@ -2184,17 +2752,13 @@ static LRESULT CALLBACK CheckWaitingSettings(HWND owner, UINT message, WPARAM wp
     SettingsCheck *check = (SettingsCheck *)reference;
     (void)id;
     if (message == WM_ENTERIDLE && wp == MSGF_DIALOGBOX && (HWND)lp != check->seen) {
-        HWND dialog = (HWND)lp, combo = GetDlgItem(dialog, IDC_G_LANGUAGE);
-        WCHAR first[64];
+        HWND dialog = (HWND)lp, page = GetWindow(GetDlgItem(dialog, IDC_G_PAGE), GW_CHILD);   /* in its view */
         check->seen = dialog;
         check->checked++;
         CheckGeometry(dialog, &check->fixture);
-        first[0] = 0;
-        SendMessageW(combo, CB_GETLBTEXT, 0, (LPARAM)first);
-        Check(&check->fixture, combo, "the language box offers Windows' language, then each of the program's",
-              SendMessageW(combo, CB_GETCOUNT, 0, 0) == Localize_LanguageCount() + 1 &&
-              SendMessageW(combo, CB_GETLBTEXTLEN, 0, 0) < (LRESULT)ARRAYSIZE(first) && wcscmp(first, Localize_LanguageName(-1)) == 0);
-        Check(&check->fixture, combo, "the language box shows the language in use", SendMessageW(combo, CB_GETCURSEL, 0, 0) == check->chosen + 1);
+        Check(&check->fixture, page, "the language's row shows the language in use, Windows' as its own choice",
+              PageLanguageIs(page, Localize_LanguageName(check->chosen)));
+        CheckSettingsList(dialog, check);
         CheckSettingsApply(dialog, check);
         PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
     }
@@ -2285,7 +2849,7 @@ static void CheckSettingsDialog(void)
         check.chosen = language;
         g_settingsApplied = 0;
         SetWindowSubclass(owner, CheckWaitingSettings, SETTINGS_OWNER_SUBCLASS, (DWORD_PTR)&check);
-        Settings_Show(owner, ApplySettingsLanguage);
+        Settings_Show(owner, ApplySettingsLanguage, NULL);
         RemoveWindowSubclass(owner, CheckWaitingSettings, SETTINGS_OWNER_SUBCLASS);
         Check(&check.fixture, NULL, "the settings dialog waited for the user once, and was checked", check.checked == 1);
         Check(&check.fixture, NULL, "Cancel after Apply gives the program nothing more", g_settingsApplied == 1);
@@ -2546,7 +3110,7 @@ static void CheckReadingWidth(HWND dialog, const LayoutFixture *fixture, SIZE mi
 static void CheckMainFrameMessages(void)
 {
     static const int kActions[] = { IDC_OPEN, IDC_STOP, IDC_RESTART, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_SYNC, IDC_BACKUP,
-                                    IDC_REPAIR, IDC_SHORTCUTS, IDC_SETTINGS, IDC_ABOUT };
+                                    IDC_RESTORE_BACKUP, IDC_REPAIR, IDC_SHORTCUTS, IDC_SETTINGS, IDC_ABOUT };
     LayoutFixture fixture = MainFixture(Language(L"en"), 96, FALSE);
     HWND dialog, child;
     RECT saved, requested, actual, client, actionRects[ARRAYSIZE(kActions)];
@@ -2887,6 +3451,8 @@ static void CheckResponsiveMain(void)
 #define STARRED_ROW      7
 #define UNKNOWN_ROW      SESSION_ROWS   /* one more session, with no folder recorded */
 #define FIXTURE_TIME     1700000000000ULL
+#define FIXTURE_MORE_FIRST 5    /* a heading's sessions shown at first, as sessions.c shows them */
+#define FIXTURE_MORE_NEXT  10   /* those Show more adds */
 
 typedef struct SessionsFixture {
     LayoutFixture layout;
@@ -3088,6 +3654,14 @@ static void FoldFolder(HWND tree, HTREEITEM folder)
     SendMessageW(tree, WM_KEYUP, VK_LEFT, 0);
 }
 
+/* Opened as the user opens it, with the keyboard: the tree notifies, and the view keeps it open. */
+static void OpenFolder(HWND tree, HTREEITEM folder)
+{
+    TreeView_SelectItem(tree, folder);
+    SendMessageW(tree, WM_KEYDOWN, VK_RIGHT, 0);
+    SendMessageW(tree, WM_KEYUP, VK_RIGHT, 0);
+}
+
 static BOOL ItemTitle(HWND tree, HTREEITEM item, WCHAR *text, int cch)
 {
     TVITEMW query = { 0 };
@@ -3099,7 +3673,7 @@ static BOOL ItemTitle(HWND tree, HTREEITEM item, WCHAR *text, int cch)
     return item && TreeView_GetItem(tree, &query);
 }
 
-/* The roots of the fixture's tree: Starred (its node value), the two
+/* The roots of the fixture's tree: Pinned (its node value), the two
  * folders by name, and the sessions with no folder (named in the current
  * language). */
 typedef struct FixtureRoots { HTREEITEM starred, alpha, beta, unknown; } FixtureRoots;
@@ -3123,6 +3697,111 @@ static FixtureRoots ReadRoots(HWND tree)
         else if (wcscmp(text, TR(L"Unknown folder")) == 0) roots.unknown = item;
     }
     return roots;
+}
+
+/* A heading's Show more row: its node is sessions.c's NODE_MORE range. */
+static BOOL IsMoreRow(HWND tree, HTREEITEM item)
+{
+    TVITEMW query = { 0 };
+    query.mask = TVIF_PARAM;
+    query.hItem = item;
+    return item && TreeView_GetItem(tree, &query) && query.lParam <= -0x40000000 && query.lParam > -0x50000000;
+}
+
+static int ChildCount(HWND tree, HTREEITEM parent, HTREEITEM *last)
+{
+    HTREEITEM item;
+    int count = 0;
+    *last = NULL;
+    for (item = TreeView_GetChild(tree, parent); item; item = TreeView_GetNextSibling(tree, item)) {
+        *last = item;
+        count++;
+    }
+    return count;
+}
+
+/* Folder `which` (0 Workspace Alpha, 1 Workspace Beta), read again: a fill makes new rows. */
+static HTREEITEM FixtureFolder(HWND tree, int which)
+{
+    FixtureRoots roots = ReadRoots(tree);
+    return which ? roots.beta : roots.alpha;
+}
+
+/* A click on Show more row `more`, as the user's; FALSE when it is none. */
+static BOOL ClickMoreRow(HWND tree, HTREEITEM more)
+{
+    RECT rc;
+    if (!IsMoreRow(tree, more) || !TreeView_GetItemRect(tree, more, &rc, FALSE)) return FALSE;
+    SendMessageW(tree, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2));
+    SendMessageW(tree, WM_LBUTTONUP, 0, MAKELPARAM((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2));
+    PumpMessages();
+    return TRUE;
+}
+
+/* A click on heading `heading`'s Show more row; FALSE when it has none. */
+static BOOL ClickShowMore(HWND tree, HTREEITEM heading)
+{
+    HTREEITEM last;
+    ChildCount(tree, heading, &last);
+    return ClickMoreRow(tree, last);
+}
+
+/* The first Show more row from `item` on, its rows' rows included; NULL for none. */
+static HTREEITEM FindMoreRow(HWND tree, HTREEITEM item)
+{
+    for (; item; item = TreeView_GetNextSibling(tree, item)) {
+        HTREEITEM found;
+        if (IsMoreRow(tree, item)) return item;
+        if ((found = FindMoreRow(tree, TreeView_GetChild(tree, item))) != NULL) return found;
+    }
+    return NULL;
+}
+
+/* Each folder's sessions as Claude's sidebar shows a group's: five at
+ * first and Show more below them, ten more at a click, then Show all, which
+ * shows the rest. A click on Show more, as the user's, chooses nothing. */
+static void CheckShowMore(SessionsFixture *sessions, BOOL report)
+{
+    LayoutFixture *fixture = &sessions->layout;
+    HWND tree = sessions->tree;
+    WCHAR text[64];
+    int which, step;
+    for (which = 0; which < 2; which++) {
+        BOOL shown[3];
+        for (step = 0; step < 3; step++) {
+            HTREEITEM last, heading = FixtureFolder(tree, which);
+            int count = ChildCount(tree, heading, &last);
+            BOOL more = IsMoreRow(tree, last) && ItemTitle(tree, last, text, ARRAYSIZE(text));
+            shown[step] = step == 0 ? count == FIXTURE_MORE_FIRST + 1 && more && wcscmp(text, TR(L"Show more")) == 0
+                        : step == 1 ? count == FIXTURE_MORE_FIRST + FIXTURE_MORE_NEXT + 1 && more && wcscmp(text, TR(L"Show all")) == 0
+                                    : count == SESSION_ROWS / 2 && !more;
+            if (step < 2) ClickShowMore(tree, heading);
+        }
+        if (report) {
+            Check(fixture, tree, "a folder shows its first five sessions and Show more, as Claude's sidebar does", shown[0]);
+            Check(fixture, tree, "Show more shows ten more, and then says Show all", shown[1]);
+            Check(fixture, tree, "Show all shows the rest, and goes", shown[2]);
+        }
+    }
+    Check(fixture, tree, "every session shows once each folder is shown whole", TreeView_GetCount(tree) == SESSION_ROWS + 1 + 1 + 4);
+}
+
+/* Every heading opened and shown whole once the tree shows the sessions,
+ * whatever they are grouped and sorted by, as Expand all does: a session
+ * written below the others shows too. The pinned row shows first: Pinned
+ * holds all its sessions. Expand all is the fold button's while every
+ * heading is folded; one already open makes it Collapse all first. */
+static BOOL ShowEveryHeadingWhole(SessionsFixture *sessions)
+{
+    WCHAR title[64];
+    int clicks;
+    RowTitle(STARRED_ROW, title, ARRAYSIZE(title));
+    if (!AwaitTitle(sessions, title)) return FALSE;
+    for (clicks = 0; clicks < 2 && FindMoreRow(sessions->tree, TreeView_GetRoot(sessions->tree)); clicks++) {
+        SessionsView_Command(MAKEWPARAM(IDC_S_FOLD, BN_CLICKED));
+        PumpMessages();
+    }
+    return FindMoreRow(sessions->tree, TreeView_GetRoot(sessions->tree)) == NULL;
 }
 
 /* A posted mouse message sets GetMessagePos to its own coordinates: the
@@ -3361,9 +4040,9 @@ static void CheckSessionsUnderStream(SessionsFixture *sessions)
     Check(fixture, NULL, "every write of the stream is read", AwaitWritesRead(sessions, 2, L"Settled conversation C"));
 }
 
-/* A double-click opens the selected session only on its row: below the last
- * row it opens nothing. Without Claude, an open asks for it (a message box
- * the fixture closes) and starts nothing. */
+/* A double-click opens no session, on its row or below the last one: Enter
+ * and the menu's Open in do. Without Claude, an open would ask for it (a
+ * message box the fixture counts and closes). */
 static void CheckSessionsDoubleClick(SessionsFixture *sessions)
 {
     LayoutFixture *fixture = &sessions->layout;
@@ -3395,9 +4074,7 @@ static void CheckSessionsDoubleClick(SessionsFixture *sessions)
         SetWindowTextW(search, L"");
         return;
     }
-    Check(fixture, tree, "a double-click on the selected session's row opens it", fixture->openPrompts == prompts + 1 &&
-          wcscmp(fixture->promptText, TR(L"Claude Desktop is not installed.")) == 0);
-    prompts = fixture->openPrompts;
+    Check(fixture, tree, "a double-click on the selected session's row opens nothing", fixture->openPrompts == prompts && TreeView_GetSelection(tree) == row);
     point.y = (rowRect.bottom + client.bottom) / 2;
     DoubleClickTree(dialog, fixture, tree, point);
     Check(fixture, tree, "a double-click below the last row opens nothing", fixture->openPrompts == prompts && TreeView_GetSelection(tree) == row);
@@ -3632,11 +4309,11 @@ static void CheckCrossProfileSearch(void)
         WCHAR entries[MAX_PATH], path[MAX_PATH], shared[SESSION_ID_CCH], unique[SESSION_ID_CCH];
         char json[1024];
         CrossSearchCheck check = { &sessions.layout, FALSE };
-        BOOL ready;
+        BOOL ready = ShowEveryHeadingWhole(&sessions);   /* the marker written below the sessions shows */
         SessionId(0, shared, ARRAYSIZE(shared));
         SessionId(UNKNOWN_ROW + 30, unique, ARRAYSIZE(unique));
         StringCchPrintfW(entries, ARRAYSIZE(entries), L"%s\\claude-code-sessions\\account-ui\\organization-ui", sessions.profiles.items[1].storageDir);
-        ready = Util_EnsureDir(entries);
+        ready = ready && Util_EnsureDir(entries);
         StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\local_%s.json", entries, shared);
         StringCchPrintfA(json, sizeof json, "{\"sessionId\":\"local_%ls\",\"cliSessionId\":\"%ls\",\"title\":\"cross-needle shared\"}", shared, shared);
         ready = ready && SaveFixtureFile(sessions.root.path, path, json, FALSE);
@@ -3728,10 +4405,10 @@ static LRESULT CALLBACK InspectFilterMenu(HWND window, UINT message, WPARAM wp, 
     FilterMenuCheck *check = (FilterMenuCheck *)data;
     (void)id;
     if (message == WM_INITMENUPOPUP && !check->seen) {
-        HMENU menu = (HMENU)wp, group = GetSubMenu(menu, 4), sort = GetSubMenu(menu, 5), show = GetSubMenu(menu, 6);
+        HMENU menu = (HMENU)wp, group = GetSubMenu(menu, 0), sort = GetSubMenu(menu, 1), show = GetSubMenu(menu, 2);
         WCHAR text[160];
         check->seen = TRUE;
-        Check(check->fixture, NULL, "filter menu has grouping, sorting and Show submenus", group && sort && show && GetMenuItemCount(menu) == 10);
+        Check(check->fixture, NULL, "filter menu starts as Claude's: grouping, sorting and Show submenus", group && sort && show && GetMenuItemCount(menu) == 10);
         GetMenuStringW(group, 2, text, ARRAYSIZE(text), MF_BYPOSITION);
         Check(check->fixture, NULL, "environment grouping is visible and selected in the real menu",
               wcscmp(text, TR(L"Environment")) == 0 && (GetMenuState(group, 2, MF_BYPOSITION) & MF_CHECKED));
@@ -3749,14 +4426,26 @@ static LRESULT CALLBACK InspectFilterMenu(HWND window, UINT message, WPARAM wp, 
     return DefSubclassProc(window, message, wp, lp);
 }
 
+/* FIXTURE_TIME's day as the sessions view heads it in English: a date of another year. */
+static BOOL FixtureDay(WCHAR *text, int cch)
+{
+    FILETIME utc = Core_MsFileTime(FIXTURE_TIME), local;
+    SYSTEMTIME day;
+    return FileTimeToLocalFileTime(&utc, &local) && FileTimeToSystemTime(&local, &day) &&
+           GetDateFormatEx(L"en", 0, &day, L"MMM d, yyyy", text, cch, NULL) > 0;
+}
+
+#define DAY_HEADING (-2)   /* a case whose day heads the sessions */
+
 /* Persisted display choices are exercised through the real reader and tree. */
 static void CheckSessionDisplayChoices(void)
 {
-    static const WCHAR *const kSettings[] = { L"SessionsGroupBy", L"SessionsSortBy", L"SessionsSortDescending", L"SessionsEmptyGroups",
+    static const WCHAR *const kSettings[] = { L"SessionsGrouping", L"SessionsSortBy", L"SessionsSortDescending", L"SessionsEmptyGroups",
                                               L"SessionsEnvironments", L"SessionsStatus", L"SessionsResult" };
     static const struct { DWORD group, sort, descending, empty, environments; int first; } kCases[] = {
         { 5, 2, 0, 0, 0, UNKNOWN_ROW }, { 5, 2, 1, 0, 0, 0 },
-        { 4, 0, 0, 0, 0, 0 }, { 5, 2, 1, 0, SESSION_ENV_CLOUD, -1 }, { 5, 2, 1, 1, SESSION_ENV_CLOUD, -1 }
+        { 4, 0, 0, 0, 0, 0 }, { 5, 2, 1, 0, SESSION_ENV_CLOUD, -1 }, { 5, 2, 1, 1, SESSION_ENV_CLOUD, -1 },
+        { 0, 2, 1, 0, 0, DAY_HEADING }
     };
     DWORD saved[ARRAYSIZE(kSettings)];
     size_t i, setting;
@@ -3790,7 +4479,17 @@ static void CheckSessionDisplayChoices(void)
                 }
             }
             group = FindTitle(sessions.tree, TreeView_GetRoot(sessions.tree), TR(L"Local"));
-            if (kCases[i].first >= 0) {
+            if (kCases[i].first == DAY_HEADING) {
+                HTREEITEM day = NthChild(sessions.tree, NULL, 1);
+                Check(fixture, sessions.tree, "grouped by date, Pinned comes first, as Claude names it",
+                      ItemTitle(sessions.tree, TreeView_GetRoot(sessions.tree), actual, ARRAYSIZE(actual)) && wcscmp(actual, TR(L"Pinned")) == 0);
+                Check(fixture, sessions.tree, "a day of another year heads its sessions by its date and year",
+                      FixtureDay(expected, ARRAYSIZE(expected)) && ItemTitle(sessions.tree, day, actual, ARRAYSIZE(actual)) &&
+                      wcscmp(actual, expected) == 0);
+                RowTitle(0, expected, ARRAYSIZE(expected));
+                Check(fixture, sessions.tree, "the day's newest session comes first",
+                      ItemTitle(sessions.tree, TreeView_GetChild(sessions.tree, day), actual, ARRAYSIZE(actual)) && wcscmp(actual, expected) == 0);
+            } else if (kCases[i].first >= 0) {
                 first = kCases[i].group == 5 ? TreeView_GetChild(sessions.tree, group) : NthChild(sessions.tree, NULL, 1);
                 RowTitle(kCases[i].first, expected, ARRAYSIZE(expected));
                 Check(fixture, sessions.tree, "saved grouping and sorting direction determine the first session",
@@ -3809,7 +4508,10 @@ static void CheckPopulatedSessions(void)
 {
     static const WCHAR *const kLanguages[] = { L"en", L"zh-CN" };
     size_t language;
+    DWORD grouping;
     if (!NativeScaleFits("the populated sessions view")) return;
+    grouping = Util_GetSetting(L"SessionsGrouping", 0);
+    Util_SetSetting(L"SessionsGrouping", 1);   /* by folder: the fixture's sessions are told apart by theirs */
     for (language = 0; language < ARRAYSIZE(kLanguages); language++) {
         SessionsFixture sessions;
         TreeWait wait;
@@ -3817,13 +4519,18 @@ static void CheckPopulatedSessions(void)
             LayoutFixture *fixture = &sessions.layout;
             FixtureRoots roots;
             wait.tree = sessions.tree;
-            wait.count = SESSION_ROWS + 1 + 1 + 4;   /* every session, the starred one's second row, four roots */
+            wait.count = 4 + 1 + 2 * (FIXTURE_MORE_FIRST + 1) + 1;   /* four roots, the pinned row, each folder's first sessions and Show more, the session with no folder */
             wait.title = NULL;
             Check(fixture, sessions.tree, "event-driven private snapshot populates the native tree", PumpUntil(TreeShows, &wait, SNAPSHOT_TIMEOUT_MS));
             roots = ReadRoots(sessions.tree);
-            Check(fixture, sessions.tree, "native tree holds Starred, two folders and the sessions with no folder",
+            Check(fixture, sessions.tree, "native tree holds Pinned, two folders and the sessions with no folder",
                   roots.starred && roots.alpha && roots.beta && roots.unknown && roots.unknown != roots.beta &&
                   TreeView_GetCount(sessions.tree) == wait.count);
+            if (language == 0)
+                Check(fixture, sessions.tree, "headings start folded, until opened", Folded(sessions.tree, roots.alpha) && Folded(sessions.tree, roots.beta));
+            OpenFolder(sessions.tree, roots.alpha);
+            OpenFolder(sessions.tree, roots.beta);
+            CheckShowMore(&sessions, language == 0);
             CheckSessionsResize(&sessions);
             if (language == 0) {
                 CheckSessionsProfileNames(&sessions);
@@ -3838,6 +4545,7 @@ static void CheckPopulatedSessions(void)
         }
         CloseSessionsFixture(&sessions);
     }
+    Util_SetSetting(L"SessionsGrouping", grouping);
 }
 
 int wmain(void)
@@ -3872,6 +4580,11 @@ int wmain(void)
     CheckMessageBoxes();
     CheckSettingsDialog();
     CheckSharedItemLists();
+    CheckValueRows();
+    CheckPropertyList();
+    CheckProfileList();
+    CheckConflictsList();
+    CheckZoom();
     CheckAboutDialog();
     CheckHiddenRows();
     CheckMainStates();

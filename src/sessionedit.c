@@ -28,17 +28,12 @@
 #include <limits.h>
 
 #define COPY_CHUNK            (1024u * 1024u)
-#define WRITE_CHUNK_MAX       0x40000000u   /* bytes given to one WriteFile */
-#define TEMPORARY_SUFFIX      L".cdm-new"   /* a file written next to the one it replaces */
 #define EDIT_LOCK_WAIT_MS     5000
 #define LISTED_FILES_FIRST    64            /* paths a deletion list has room for at first */
 #define TOMBSTONE_PREFIX      L"deleted_"   /* Claude's mark of a session deleted from a profile */
 #define STAGING_DIR           L"imported-staging"   /* beside the entries: a transcript Claude takes in, before it is filed */
 #define CLAUDE_CODE_TEMP_DIR  L"claude"     /* in the temporary folder: Claude Code's, a folder per project, one per session in it */
-#define UNIX_EPOCH_TICKS      116444736000000000ULL   /* 1970-01-01 as a FILETIME */
-#define TICKS_PER_MILLISECOND (TICKS_PER_SECOND / 1000)
 #define JSON_MEMBER_SYNTAX    4             /* an added member besides its key and value: the comma, two quotes, the colon */
-#define GUID_TEXT_CCH         39            /* {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} */
 #define SCRATCH_NAME_CCH      32            /* scratch-yyyy-mm-dd-xxxxxx */
 #define RESUME_LINK_CCH       (ARRAYSIZE(L"claude://resume?session=") + SESSION_ID_CCH)
 /* A path shorter than MAX_PATH as a JSON string in UTF-8: at most 3 bytes a
@@ -61,58 +56,26 @@ HRESULT SessionEdit_Open(const ClaudePackage *pkg, const Profile *p, const WCHAR
 
 /* ----------------------------------------------------------- files */
 
-static BOOL WriteWhole(HANDLE file, const char *data, size_t length)
-{
-    while (length > 0) {
-        DWORD written = 0, chunk = length > WRITE_CHUNK_MAX ? WRITE_CHUNK_MAX : (DWORD)length;
-        if (!WriteFile(file, data, chunk, &written, NULL) || written == 0) return FALSE;
-        data += written;
-        length -= written;
-    }
-    return TRUE;
-}
-
 /* `path` replaced by `data` in one step: written next to it, flushed, then
  * put in its place. An entry file (`profile` given) is replaced only while
  * its profile is closed, and only when it is there (ReplaceFileW fails on a
  * missing file): a new entry is never written (rule 13). */
 static BOOL SaveFile(const WCHAR *path, const char *data, size_t length, const Profile *profile)
 {
-    WCHAR target[LONG_PATH_CCH], temporary[LONG_PATH_CCH];
-    HANDLE file;
-    DWORD error = ERROR_SUCCESS;
-    BOOL ok;
+    WCHAR temporary[LONG_PATH_CCH];
     if (profile && SessionLink_Busy(profile)) return FALSE;
-    if (!Util_ExtendedPath(path, target, ARRAYSIZE(target)) ||
-        FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" TEMPORARY_SUFFIX, target))) {
-        Util_Log(L"could not write %s: its path is too long", path);
-        return FALSE;
-    }
-    file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) {
+    if (!Util_WriteTemporary(path, data, length, temporary, ARRAYSIZE(temporary))) {
         Util_Log(L"could not write %s (error %lu)", path, GetLastError());
         return FALSE;
     }
-    ok = WriteWhole(file, data, length) && FlushFileBuffers(file);
-    if (!ok) error = GetLastError();
-    CloseHandle(file);
-    if (ok && profile && SessionLink_Busy(profile)) {
+    if (profile && SessionLink_Busy(profile)) {
         DeleteFileW(temporary);
         Util_Log(L"%s left as it was: its profile started", path);
         return FALSE;
     }
-    if (ok) {
-        ok = profile ? ReplaceFileW(target, temporary, NULL, REPLACEFILE_IGNORE_MERGE_ERRORS, NULL, NULL)
-                     : MoveFileExW(temporary, target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-        if (!ok) error = GetLastError();
-        /* ReplaceFileW took the entry away but could not put the new one in its place. */
-        if (!ok && error == ERROR_UNABLE_TO_MOVE_REPLACEMENT && MoveFileExW(temporary, target, MOVEFILE_WRITE_THROUGH)) ok = TRUE;
-    }
-    if (!ok) {
-        DeleteFileW(temporary);
-        Util_Log(L"could not write %s (error %lu)", path, error);
-    }
-    return ok;
+    if (Util_PutInPlace(temporary, path, profile ? UTIL_PUT_OVER : UTIL_PUT_REPLACE)) return TRUE;
+    Util_Log(L"could not write %s (error %lu)", path, GetLastError());
+    return FALSE;
 }
 
 /* Sets members of an entry file (`raws` are JSON values; NULL takes that member away). */
@@ -187,10 +150,17 @@ static BOOL SetInEntry(const Profile *profile, const WCHAR *file, const PendingE
 }
 
 /* A title or a star set in every entry of the session at row `row` of
- * `entries` (one closed profile's, SessionStore_LoadEntries). */
+ * `entries` (one closed profile's, SessionStore_LoadEntries); read or unread
+ * set in its web storage, by each entry's own id. */
 static BOOL SetInEntries(const Profile *profile, const SessionSet *entries, int row, const PendingEdit *edit)
 {
-    int entry;
+    const WCHAR *ids[8];
+    int entry, count = 0;
+    if (edit->op == PENDING_READ) {
+        for (entry = entries->rows[row].entry[0]; entry >= 0 && count < (int)ARRAYSIZE(ids); entry = entries->entries[entry].duplicate)
+            ids[count++] = entries->entries[entry].localId;
+        return SessionSync_SetUnread(profile, ids, count, edit->value[0] == L'0');
+    }
     for (entry = entries->rows[row].entry[0]; entry >= 0; entry = entries->entries[entry].duplicate)
         if (!SetInEntry(profile, entries->entries[entry].file, edit)) return FALSE;
     return TRUE;
@@ -219,7 +189,6 @@ static void MarkDeleted(const SessionSet *set, int row, int profile)
     const WCHAR **transcripts, **ids;
     WCHAR dir[LONG_PATH_CCH], *slash;
     char now[sizeof "18446744073709551615"];
-    FILETIME time;
     int entry, transcriptCount, entryCount = 0, count = 0, i, seen;
     if (session->entry[profile] < 0 || FAILED(StringCchCopyW(dir, ARRAYSIZE(dir), set->entries[session->entry[profile]].file)) ||
         (slash = wcsrchr(dir, L'\\')) == NULL || (transcripts = SessionStore_TranscriptIds(set, row, &transcriptCount)) == NULL)
@@ -232,9 +201,7 @@ static void MarkDeleted(const SessionSet *set, int row, int profile)
     }
     for (entry = session->entry[profile]; entry >= 0; entry = set->entries[entry].duplicate) ids[count++] = SessionStore_OwnId(&set->entries[entry]);
     for (i = 0; i < transcriptCount; i++) ids[count++] = transcripts[i];
-    GetSystemTimeAsFileTime(&time);
-    StringCchPrintfA(now, sizeof now, "%I64u",
-                     ((((ULONGLONG)time.dwHighDateTime << 32) | time.dwLowDateTime) - UNIX_EPOCH_TICKS) / TICKS_PER_MILLISECOND);
+    StringCchPrintfA(now, sizeof now, "%I64u", Util_NowMs());
     for (i = 0; i < count; i++) {
         for (seen = 0; seen < i && !Core_EqualsI(ids[seen], ids[i]); seen++) {}
         if (seen == i && Core_IsUuid(ids[i]) && !SessionStore_ClaimedByOther(set, row, profile, ids[i])) WriteTombstone(dir, ids[i], now);
@@ -428,6 +395,7 @@ static const WCHAR *ChangeName(PendingOp operation)
 {
     return operation == PENDING_TITLE || operation == PENDING_TITLE_AUTO ? L"title changed"
            : operation == PENDING_STAR                                    ? L"star changed"
+           : operation == PENDING_READ                                    ? L"read or unread"
            : operation == PENDING_UNREMOTE                                ? L"converted to a local session"
                                                                           : L"entry removed";
 }
@@ -604,18 +572,6 @@ static struct {
     WCHAR cwd[MAX_PATH];   /* the copy's own working folder, as Claude names it; "" when it works in the original's */
 } g_lastCopy;
 
-static BOOL NewSessionId(WCHAR *out, size_t cch, DWORD *random)
-{
-    GUID guid;
-    WCHAR text[GUID_TEXT_CCH];
-    size_t i;
-    if (FAILED(CoCreateGuid(&guid)) || StringFromGUID2(&guid, text, ARRAYSIZE(text)) != ARRAYSIZE(text)) return FALSE;
-    text[ARRAYSIZE(text) - 2] = 0;   /* the closing brace */
-    for (i = 1; text[i]; i++) text[i] = (WCHAR)towlower(text[i]);
-    *random = guid.Data1;
-    return SUCCEEDED(StringCchCopyW(out, cch, text + 1));
-}
-
 /* The transcript `from` copied to the new file `to` with `swaps` made,
  * through a file next to it moved in place at the end. A transcript in use
  * can end with a line still being written: the copy ends after the last
@@ -637,7 +593,7 @@ static BOOL CopyTranscript(const WCHAR *from, const WCHAR *to, const CoreSwap *s
     }
     if (count < 1 || shortest == 0 || !Util_ExtendedPath(from, source, ARRAYSIZE(source)) ||
         !Util_ExtendedPath(to, target, ARRAYSIZE(target)) ||
-        FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" TEMPORARY_SUFFIX, target)))
+        FAILED(StringCchPrintfW(temporary, ARRAYSIZE(temporary), L"%s" UTIL_TEMPORARY_SUFFIX, target)))
         goto done;
     /* A chunk, with what may start a swap kept from the one before. A swap
      * takes at least its `from` and adds at most its growth: the output
@@ -674,7 +630,7 @@ static BOOL CopyTranscript(const WCHAR *from, const WCHAR *to, const CoreSwap *s
         }
         last = got == 0;
         written = Core_ReplaceChunk(buffer, held + got, swaps, count, last, replaced, &used);
-        ok = WriteWhole(out, replaced, written);
+        ok = Util_WriteAll(out, replaced, written);
         for (lineEnd = written; lineEnd > 0 && replaced[lineEnd - 1] != '\n'; lineEnd--) {}
         if (lineEnd > 0) wholeLines = total + lineEnd;
         total += written;
@@ -787,6 +743,33 @@ static CopyResult CopyFolder(HWND owner, const WCHAR *from, const WCHAR *to)
     return operation.fAnyOperationsAborted || code == ERROR_CANCELLED ? COPY_CANCELLED : COPY_FAILED;
 }
 
+/* The text a copied transcript's lines have in place of the original's
+ * working folder (CwdSwaps). */
+typedef struct CwdSwapText {
+    char quotedSource[QUOTED_PATH_BYTES], quotedCopy[QUOTED_PATH_BYTES];
+    char fromCwd[CWD_MEMBER_BYTES], toCwd[CWD_MEMBER_BYTES], fromSubfolder[CWD_MEMBER_BYTES], toSubfolder[CWD_MEMBER_BYTES];
+} CwdSwapText;
+
+/* Every line's working folder `from`, or a subfolder of it (after a cd),
+ * made to point at `to`: the two swaps, their text in `text`. The subfolder
+ * form is the quoted path without its closing quote, then an escaped
+ * backslash. FALSE when a path is too long. */
+static BOOL CwdSwaps(const WCHAR *from, const WCHAR *to, CwdSwapText *text, CoreSwap *swaps)
+{
+    if (!Core_JsonQuote(from, text->quotedSource, sizeof text->quotedSource) || !Core_JsonQuote(to, text->quotedCopy, sizeof text->quotedCopy) ||
+        FAILED(StringCchPrintfA(text->fromCwd, sizeof text->fromCwd, "\"cwd\":%s", text->quotedSource)) ||
+        FAILED(StringCchPrintfA(text->toCwd, sizeof text->toCwd, "\"cwd\":%s", text->quotedCopy)) ||
+        FAILED(StringCchPrintfA(text->fromSubfolder, sizeof text->fromSubfolder, "\"cwd\":%.*s\\\\", (int)strlen(text->quotedSource) - 1,
+                                text->quotedSource)) ||
+        FAILED(StringCchPrintfA(text->toSubfolder, sizeof text->toSubfolder, "\"cwd\":%.*s\\\\", (int)strlen(text->quotedCopy) - 1, text->quotedCopy)))
+        return FALSE;
+    swaps[0].from = text->fromCwd;
+    swaps[0].to = text->toCwd;
+    swaps[1].from = text->fromSubfolder;
+    swaps[1].to = text->toSubfolder;
+    return TRUE;
+}
+
 /* A new conversation for profile `target`, copied from row `row`: a new id,
  * the transcript copied under it. A session without a folder gets its own
  * working folder in the target's "no folder" area (its files copied), so it
@@ -801,8 +784,8 @@ CopyResult SessionEdit_CopyConversation(HWND owner, const SessionSet *set, int r
     WCHAR cwd[MAX_PATH], scratchName[SCRATCH_NAME_CCH], sourceFiles[MAX_PATH], scratchFiles[MAX_PATH], copiedFiles[MAX_PATH];
     WCHAR projects[LONG_PATH_CCH], projectName[CORE_PROJECT_NAME_MAX + 1], projectDir[LONG_PATH_CCH];
     WCHAR transcriptDir[LONG_PATH_CCH], copy[LONG_PATH_CCH], extended[LONG_PATH_CCH], *slash;
-    char fromId[ID_MEMBER_BYTES], toId[ID_MEMBER_BYTES], quotedSource[QUOTED_PATH_BYTES], quotedCopy[QUOTED_PATH_BYTES];
-    char fromCwd[CWD_MEMBER_BYTES], toCwd[CWD_MEMBER_BYTES], fromSubfolder[CWD_MEMBER_BYTES], toSubfolder[CWD_MEMBER_BYTES];
+    char fromId[ID_MEMBER_BYTES], toId[ID_MEMBER_BYTES];
+    CwdSwapText cwdText;
     CoreSwap swaps[3];
     SYSTEMTIME today;
     DWORD random = 0;
@@ -817,7 +800,7 @@ CopyResult SessionEdit_CopyConversation(HWND owner, const SessionSet *set, int r
         StringCchCopyW(error, errorCch, TR(L"This session has no conversation on disk to copy."));
         return COPY_FAILED;
     }
-    if (!NewSessionId(newId, idCch, &random)) {
+    if (!Util_NewId(newId, idCch, &random)) {
         StringCchCopyW(error, errorCch, TR(L"A new session ID could not be made."));
         return COPY_FAILED;
     }
@@ -863,22 +846,11 @@ CopyResult SessionEdit_CopyConversation(HWND owner, const SessionSet *set, int r
     swaps[0].from = fromId;
     swaps[0].to = toId;
     if (scratch) {
-        /* Every line's working folder, or a subfolder of it (after a cd),
-         * points at the copy's: the copy would otherwise go on in the
-         * original's. The subfolder form is the quoted path without its
-         * closing quote, then an escaped backslash. */
-        if (!Core_JsonQuote(source->cwd, quotedSource, sizeof quotedSource) || !Core_JsonQuote(cwd, quotedCopy, sizeof quotedCopy) ||
-            FAILED(StringCchPrintfA(fromCwd, sizeof fromCwd, "\"cwd\":%s", quotedSource)) ||
-            FAILED(StringCchPrintfA(toCwd, sizeof toCwd, "\"cwd\":%s", quotedCopy)) ||
-            FAILED(StringCchPrintfA(fromSubfolder, sizeof fromSubfolder, "\"cwd\":%.*s\\\\", (int)strlen(quotedSource) - 1, quotedSource)) ||
-            FAILED(StringCchPrintfA(toSubfolder, sizeof toSubfolder, "\"cwd\":%.*s\\\\", (int)strlen(quotedCopy) - 1, quotedCopy))) {
+        /* The copy would otherwise go on in the original's working folder. */
+        if (!CwdSwaps(source->cwd, cwd, &cwdText, &swaps[1])) {
             StringCchCopyW(error, errorCch, TR(L"The path is too long."));
             goto failed;
         }
-        swaps[1].from = fromCwd;
-        swaps[1].to = toCwd;
-        swaps[2].from = fromSubfolder;
-        swaps[2].to = toSubfolder;
         count = 3;
     }
     if (!CopyTranscript(source->transcriptPath, copy, swaps, count)) {
@@ -1417,8 +1389,11 @@ RemoveResult SessionEdit_DeleteEverywhere(HWND owner, const SessionSet *set, int
     if (result != REMOVE_DONE) goto done;
     for (p = 0; p < set->profiles.count; p++) {
         int keyCount = 0;
-        PendingEdit *keys = SessionKeys(set, row, p, PENDING_REMOVE, &keyCount);
-        if (!keys) continue;
+        PendingEdit *keys;
+        /* A session sent to a profile and waiting for it to close would come back there. */
+        if (!SessionSync_Forget(&set->profiles.items[p], session->key))
+            Util_Log(L"session %s: what waits for %s could not be checked", session->key, set->profiles.items[p].folder);
+        if ((keys = SessionKeys(set, row, p, PENDING_REMOVE, &keyCount)) == NULL) continue;
         if (session->entry[p] >= 0 && Claude_IsRunning(&set->profiles.items[p])) {
             if (RewritePendingLocked(&set->profiles.items[p], &keys[0], NULL, 0, FALSE))
                 Util_Log(L"session %s in %s: removal waits, its Claude started", session->key, set->profiles.items[p].folder);

@@ -1,5 +1,5 @@
 /*
- * Claude Desktop Profiles Manager - run several Claude Desktop accounts side by side on Windows.
+ * Claude Delta - run several Claude Desktop accounts side by side on Windows.
  *
  * One executable, several roles (see main.c):
  *   (no arguments)      the profile manager window
@@ -36,7 +36,8 @@
 
 /* ------------------------------------------------------------------ names */
 
-#define APP_NAME           L"Claude Desktop Profiles Manager"
+#define APP_NAME           L"Claude Delta"   /* what the program is called wherever it shows */
+#define APP_FOLDER         L"Claude Desktop Profiles Manager"   /* its earlier name, kept where it is stored: its folders, its registry key, its Start menu folder */
 #define APP_EXE            L"ClaudeDesktopProfilesManager.exe"
 #define APP_AUMID_PREFIX   L"ClaudeDesktopProfilesManager."
 #define APP_DOWNLOAD_URL   L"https://claude.ai/download"
@@ -195,7 +196,8 @@ typedef struct LinkInfo {
 
 /* PENDING_TITLE_AUTO: a title Claude gave, put back (undone): titleSource "auto", so that Claude may name the
  * session again; an empty one takes the entry's title away. */
-typedef enum PendingOp { PENDING_TITLE, PENDING_STAR, PENDING_REMOVE, PENDING_TITLE_AUTO, PENDING_UNREMOTE } PendingOp;
+/* PENDING_READ: the session read ("1") or unread ("0") in Claude's sidebar, in the profile's web storage (Core_UnreadSet). */
+typedef enum PendingOp { PENDING_TITLE, PENDING_STAR, PENDING_REMOVE, PENDING_TITLE_AUTO, PENDING_UNREMOTE, PENDING_READ } PendingOp;
 
 typedef struct PendingEdit {   /* a change to a session entry, waiting for its profile to close */
     PendingOp op;
@@ -228,7 +230,9 @@ typedef struct SyncOp {
     ULONGLONG  seen;                        /* put, remove: the profile's own entry's last activity when sent, 0 for none */
     WCHAR      key[SESSION_ID_CCH];         /* the session's id; mark, unmark: the id marked */
     WCHAR      content[SYNC_CONTENT_CCH];   /* put, index, layout: the file of ours holding what is written */
+    DWORD      tries;                       /* times making it failed; it waits for the next try until SYNC_TRIES_MAX */
 } SyncOp;
+#define SYNC_TRIES_MAX 5
 
 typedef struct SyncProfileResult {
     WCHAR folder[FOLDER_CCH];
@@ -286,7 +290,11 @@ BOOL         Core_IsProfileFolder(const WCHAR *folder);
 BOOL         Core_SanitizeUrl(const WCHAR *in, WCHAR *out, size_t cch);
 BOOL         Core_IsSignInUrl(const WCHAR *url);
 BOOL         Core_PrivateSignInUrl(const WCHAR *raw, WCHAR *out, size_t cch);
-BOOL         Core_PrivateBrowserArgs(BOOL edge, const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch);
+#define CORE_BROWSER_CHROMIUM 0   /* Chrome, Brave: --incognito */
+#define CORE_BROWSER_EDGE     1   /* --inprivate */
+#define CORE_BROWSER_FIREFOX  2   /* -private-window, a profile of its own */
+BOOL         Core_MagicLink(const WCHAR *raw, WCHAR *url, size_t urlCch, WCHAR *email, size_t emailCch);   /* claude.ai/magic-link#<hex>:<address> */
+BOOL         Core_PrivateBrowserArgs(int family, const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch);
 BOOL         Core_BuildLaunchArgs(const WCHAR *dataDir, const WCHAR *url, WCHAR *out, size_t cch);
 BOOL         Core_LatestSignInStart(const char *text, size_t len, SYSTEMTIME *latest);
 BOOL         Core_LastQuit(const char *text, size_t len, SYSTEMTIME *when, BOOL *forUpdate);
@@ -322,6 +330,10 @@ BOOL         Core_ContainsI(const WCHAR *s, const WCHAR *needle);
 DWORD        Core_HashIgnoringCase(const WCHAR *text);
 void         Core_ProfileAumid(const WCHAR *folder, WCHAR *out, size_t cch);
 void         Core_ShortcutFileName(const WCHAR *label, int copyNumber, WCHAR *out, size_t cch);
+/* The file sessions dragged out of the sessions view are written to: one session's `title`, its characters a name
+ * cannot hold made "_", else `several` and the `day` ("Claude sessions 2026-10-05"), then " (n)" for copy
+ * `copyNumber` past the first, and ".zip". */
+void         Core_SessionsArchiveName(const WCHAR *title, const WCHAR *several, const SYSTEMTIME *day, int copyNumber, WCHAR *out, size_t cch);
 ULONGLONG    Core_SystemTimeTicks(const SYSTEMTIME *st);
 BOOL         Core_PathUnder(const WCHAR *path, const WCHAR *dir);
 BOOL         Core_ProfileFilePath(const Profile *p, const WCHAR *path, WCHAR *out, size_t cch);
@@ -329,6 +341,12 @@ BOOL         Core_PackageCachePath(const WCHAR *localAppData, const WCHAR *famil
                                    WCHAR *out, size_t cch);
 BOOL         Core_MovedStockDir(const WCHAR *localAppData, const WCHAR *family, WCHAR *out, size_t cch);
 BOOL         Core_ProfileHoldsPath(const Profile *p, const WCHAR *path);
+/* `hash` taken on through what a profile's icon shows: its name, color, badge and picture. */
+ULONGLONG    Core_ProfileLookHash(ULONGLONG hash, const Profile *p);
+int          Core_BitCount(DWORD bits);
+/* Times as Claude writes them, in ms since 1970: a FILETIME's (0 before 1970), and back. */
+ULONGLONG    Core_FileTimeMs(const FILETIME *time);
+FILETIME     Core_MsFileTime(ULONGLONG ms);
 BOOL         Core_SameFatTime(const FILETIME *a, const FILETIME *b);
 BOOL         Core_JsonMember(const char *json, size_t len, const char *key, const char **value, size_t *valueLen);
 /* Each member of the JSON object `json`, in order: its key's raw text (between
@@ -346,6 +364,11 @@ WCHAR       *Core_JsonStringList(const char *raw, size_t len); /* MULTI_SZ; Heap
 BOOL         Core_SafeHttpsUrl(const WCHAR *url); /* explicit HTTPS authority, no credentials/control/quotes */
 BOOL         Core_JsonNumber(const char *raw, size_t len, ULONGLONG *value);
 BOOL         Core_JsonTrue(const char *raw, size_t len);
+/* Member `key` of the JSON object `json`: as a string ("" and FALSE when it
+ * is none), a number (0 when none) or whether it is true. */
+BOOL         Core_JsonMemberString(const char *json, size_t len, const char *key, WCHAR *out, size_t cch);
+ULONGLONG    Core_JsonMemberNumber(const char *json, size_t len, const char *key);
+BOOL         Core_JsonMemberTrue(const char *json, size_t len, const char *key);
 SessionEntryKind Core_SessionEntryKind(const char *json, size_t len);
 /* Where a Code session runs, as Claude's sidebar filters sessions: one bit each. */
 #define SESSION_ENV_LOCAL  0x01u
@@ -396,12 +419,62 @@ size_t       Core_Base64Decode(const char *text, size_t length, BYTE *out, size_
  * AES-256-GCM text and its 16-byte tag, checked. The plain bytes in `out`
  * (`cap` at least `length` - 31); FALSE for anything else. */
 BOOL         Core_OpenSafeStorage(const BYTE *sealed, size_t length, const BYTE *key, size_t keyLength, BYTE *out, size_t cap, size_t *outLength);
+/* `text` sealed as Chromium's App-Bound "v10" cookie value with Local State's `key`: "v10", a random 12-byte
+ * nonce, the AES-256-GCM text and its 16-byte tag, into `out` (`cap` at least `length` + 31). FALSE when it
+ * cannot. The inverse of Core_OpenSafeStorage; Core_OpenSafeStorage opens what it seals. */
+BOOL         Core_SealSafeStorage(const BYTE *text, size_t length, const BYTE *key, size_t keyLength, BYTE *out, size_t cap, size_t *outLength);
 BOOL         Core_SealSecret(const BYTE *secret, size_t length, const WCHAR *password, ULONG iterations, char *out, size_t cch);
 BOOL         Core_OpenSecret(const char *json, size_t length, const WCHAR *password, BYTE *secret, size_t cap, size_t *secretLength);
 BOOL         Core_JsonSetMember(const char *json, size_t len, const char *key, const char *raw, char *out, size_t cap, size_t *outLen);
 BOOL         Core_JsonQuote(const WCHAR *text, char *out, size_t cap);
+/* SearXNG, as Claude Delta sets it up in a profile: mcp-searxng run by npx (SearXng_Set, windowsmcp.c).
+ * Core_SearXngUrl: an instance's address as typed, made the form the server takes (http or https, https for a bare host; a host, no spaces,
+ * quotes, backslashes, query or fragment; without the slashes it ends with, or a /search copied from a results page).
+ * Core_SearXngEntry: its mcpServers entry. Core_SearXngServer: whether an entry runs mcp-searxng, and its address and
+ * whether it may reach private addresses. */
+#define SEARXNG_PACKAGE "mcp-searxng"
+BOOL         Core_SearXngUrl(const WCHAR *text, WCHAR *out, size_t cch);
+BOOL         Core_SearXngEntry(const WCHAR *npx, const WCHAR *url, BOOL allowPrivate, char *out, size_t cap);
+BOOL         Core_SearXngServer(const char *server, size_t length, WCHAR *url, size_t cch, BOOL *allowPrivate);
+#define SEARXNG_DEFAULT_URL L"https://searxng.cheese.ink"   /* set up when no address is known or set in Settings */
+/* Cowork, Claude's agent mode, runs a virtual machine of its own in each profile that used it (vm_bundles, some
+ * 9 GB). The preference COWORK_PREFERENCE false turns it off: Claude then offers no Cowork ("Enable the
+ * secureVmFeaturesEnabled preference to use this feature") and fetches no virtual machine. Core_CoworkOff: the
+ * config (claude_desktop_config.json) turns it off. */
+#define COWORK_PREFERENCE "secureVmFeaturesEnabled"
+#define COWORK_VM_DIR     L"vm_bundles"
+BOOL         Core_CoworkOff(const char *json, size_t len);
+/* A release of main, as CI publishes it: one a day, tagged "v<APP_VERSION_DATE>" (v2026.10.26). Core_ReleaseVersion:
+ * such a tag's date (FALSE for any other tag). Core_NewestRelease: of the releases `gh release list --json
+ * tagName,isDraft,isLatest` lists, the one GitHub marks latest, else the newest day's, drafts left out: its tag.
+ * Core_NewestReleaseRef: the same from what `git ls-remote --tags` writes, with the commit its tag names (an
+ * annotated tag's "^{}" line). Core_SameCommit: two commit ids, either cut short (7 characters at least), alike. */
+BOOL         Core_ReleaseVersion(const WCHAR *tag, WCHAR *version, size_t cch);
+BOOL         Core_NewestRelease(const char *json, size_t length, WCHAR *tag, size_t cch);
+BOOL         Core_NewestReleaseRef(const char *text, size_t length, WCHAR *tag, size_t tagCch, WCHAR *commit, size_t commitCch);
+BOOL         Core_SameCommit(const WCHAR *a, const WCHAR *b);
 BOOL         Core_ProjectDirName(const WCHAR *cwd, WCHAR *out, size_t cch);
 #define UUID_TEXT_CCH 37   /* 8-4-4-4-12 hex digits and the terminator */
+/* What Claude's OAuth token cache (config.json's "oauth:tokenCache*", opened: Core_OpenSafeStorage) says of the
+ * sign-in, never a token: whose it is, its plan, and each token's scopes, until when, whether it renews itself. Its
+ * members are keyed "acct:<account>|<client>:<organization>:<API>:<scopes>". Core_ReadTokenCache adds to `signIn`
+ * what `json` holds (the account and the organization, the plan and its tier, when not known yet). */
+#define CORE_TOKENS 8
+typedef struct CoreToken {
+    WCHAR     scopes[160];
+    ULONGLONG expires;      /* ms since 1970, 0: unknown */
+    BOOL      renews;       /* it has a refresh token */
+} CoreToken;
+typedef struct CoreSignIn {
+    WCHAR     account[UUID_TEXT_CCH], organization[UUID_TEXT_CCH], plan[64], tier[64];
+    CoreToken tokens[CORE_TOKENS];
+    int       tokenCount;
+} CoreSignIn;
+void         Core_ReadTokenCache(const char *json, size_t length, CoreSignIn *signIn);
+void         Core_FormatSize(ULONGLONG bytes, WCHAR *out, size_t cch);   /* "3.2 MB", "12 KB" */
+/* A release's notes (tools/changelog.py's) in one language: where its English or its Chinese is, without the quotes
+ * before it or how to install; FALSE when they are not split so. */
+BOOL         Core_ReleaseNotesIn(const WCHAR *notes, BOOL chinese, size_t *start, size_t *length);
 BOOL         Core_IsUuid(const WCHAR *id);
 BOOL         Core_ResumeLink(const WCHAR *sessionId, WCHAR *out, size_t cch);
 void         Core_ScratchName(const SYSTEMTIME *day, DWORD random, WCHAR *out, size_t cch);
@@ -410,7 +483,12 @@ size_t       Core_ReplaceChunk(const char *in, size_t len, const CoreSwap *swaps
 BOOL         Core_PendingFormat(const PendingEdit *edit, WCHAR *out, size_t cch);
 BOOL         Core_PendingParse(const WCHAR *line, PendingEdit *edit);
 BOOL         Core_PendingReplaces(const PendingEdit *queued, const PendingEdit *added);
+BOOL         Core_UnreadHas(const char *json, size_t len, const WCHAR *id);   /* epitaxy-unread-v1 */
+char        *Core_UnreadSet(const char *json, size_t len, const WCHAR *id, BOOL unread, size_t *outLen);
 BOOL         Core_JsonRemoveMember(const char *json, size_t len, const char *key, char *out, size_t cap, size_t *outLen);
+/* A session entry made for a new session (a copy, a branch) without what tied
+ * it to the original's other transcripts, in place; FALSE when it is no object. */
+BOOL         Core_EntryDropHistory(char *entry, size_t *length);
 BOOL         Core_SyncOpFormat(const SyncOp *op, WCHAR *out, size_t cch);
 BOOL         Core_SyncOpParse(const WCHAR *line, SyncOp *op);
 BOOL         Core_SyncOpReplaces(const SyncOp *queued, const SyncOp *added);
@@ -430,6 +508,12 @@ BOOL         Core_CopyDay(const WCHAR *name, const WCHAR *copy, SYSTEMTIME *day,
 BOOL         Core_WeeklyCopyDue(const SYSTEMTIME *latest, const SYSTEMTIME *today);
 BOOL         Core_ScratchFolderName(const WCHAR *cwd, WCHAR *out, size_t cch);
 char        *Core_JsonSetNested(const char *json, size_t len, const char *const *keys, int depth, const char *raw, size_t *outLen);
+/* As Core_JsonSetNested; `raw` NULL removes the member instead, making nothing on the way (one missing leaves `json`
+ * as it is, an object emptied by it stays). */
+char        *Core_JsonSetPath(const char *json, size_t len, const char *const *keys, int depth, const char *raw, size_t *outLen);
+/* A JSON value read as an environment variable's switch, as Claude Code reads one: 1 for "1", "true", "yes" or "on"
+ * (any case; a string or a bare value), 0 for "0", "false", "no" or "off", -1 for anything else ("" too). */
+int          Core_EnvSwitch(const char *raw, size_t len);
 /* `base` (an object) with its array `key` given the elements of `other`'s
  * that it lacks, after its own: an element whose member `idKey` none of
  * its elements has the same, or one without it that none of them equals.
@@ -519,6 +603,67 @@ void         Core_CenterRect(const RECT *on, int width, int height, const RECT *
 BOOL         Core_ParseVersion(const WCHAR *text, DWORD parts[4]);
 int          Core_CompareVersions(const DWORD a[4], const DWORD b[4]);
 
+/* The shield's facts (shield.c): Claude's exit IP as Cloudflare's trace gives
+ * it, whether Claude works there (Anthropic's supported regions), what an IP
+ * service says of that IP, the UDP exit a STUN server sees, and what the
+ * rules make of them all. A three-way fact is 1 (yes), 0 (no) or -1 (not known). */
+typedef enum ShieldSource { SHIELD_SOURCE_NETCOFFEE, SHIELD_SOURCE_IPAPIIS, SHIELD_SOURCE_IPAPICOM, SHIELD_SOURCE_PROXYCHECK,
+                            SHIELD_SOURCES } ShieldSource;
+typedef struct CoreIpRisk {
+    int       source;                  /* the ShieldSource that answered */
+    WCHAR     country[64], countryCode[4], region[64], city[64], timezone[64], isp[128];
+    ULONGLONG asn;
+    int       trustScore;              /* 0 to 100, -1: not known (ip.net.coffee alone scores) */
+    int       datacenter, residential, mobile, vpn, proxy, tor, abuser;
+} CoreIpRisk;
+BOOL         Core_ParseTrace(const char *text, size_t len, WCHAR *ip, size_t ipCch, WCHAR *loc, size_t locCch);
+BOOL         Core_ClaudeRegionSupported(const WCHAR *countryCode, const WCHAR *region);
+/* `json` as source `source` answers for `ip` (proxycheck.io keys its answer by it). */
+BOOL         Core_ParseIpRisk(int source, const char *json, size_t len, const WCHAR *ip, CoreIpRisk *out);
+size_t       Core_StunRequest(BYTE *out, size_t cap, const BYTE *transaction);   /* a Binding request, 20 bytes; `transaction` 12 */
+BOOL         Core_StunMappedAddress(const BYTE *message, size_t len, const BYTE *transaction, WCHAR *ip, size_t cch);
+#define SHIELD_STOP_REGION     0x001u   /* Claude's exit is where Claude does not work */
+#define SHIELD_STOP_DATACENTER 0x002u
+#define SHIELD_STOP_SCORE      0x004u   /* under the lowest trust score allowed */
+#define SHIELD_STOP_DNS        0x008u   /* a DNS server in a region Claude does not serve */
+#define SHIELD_STOP_UDP        0x010u   /* UDP leaves by another IP than Claude's exit */
+#define SHIELD_STOP_UNKNOWN    0x020u   /* Claude's exit, or a fact a rule needs, could not be read */
+#define SHIELD_STOP_TUN        0x040u   /* no TUN adapter is up */
+#define SHIELD_STOP_PROXY_APP  0x080u   /* no proxy app runs */
+#define SHIELD_STOP_IPV6       0x100u   /* a public IPv6 that could leave Claude's proxy */
+#define SHIELD_STOP_PROFILE    0x200u   /* the exit is not a region this profile allows */
+#define SHIELD_CONCERN_TZ      0x400u   /* this PC's time zone does not match the exit's region */
+#define SHIELD_CONCERN_LANG    0x800u   /* this PC's language does not match the exit's region */
+#define SHIELD_CONCERN_SPLIT   0x1000u  /* the default (Cloudflare) exit is in another country than Claude's */
+#define SHIELD_LOW_SCORE       50       /* a trust score under this one is a concern, as ip.net.coffee rates it */
+typedef struct CoreShieldFacts {
+    BOOL exitKnown, supported, riskKnown;
+    int  trustScore;                   /* -1: not known */
+    int  datacenter, dnsLeak, udpLeak, tunUp, proxyApp, ipv6Leak;
+    int  tzMismatch, langMismatch, cfSplit;   /* concerns only (shown, never a stop by default) */
+    BOOL profileAllowed;               /* the exit is in a region this profile allows (TRUE when it has no list) */
+} CoreShieldFacts;
+typedef struct CoreShieldRules {
+    BOOL allowDatacenter, allowDnsLeak, allowUdpLeak, allowIpv6Leak;
+    BOOL stopWhenUnknown, stopWhenTunDown, stopWhenProxyAppStops;
+    BOOL warnOnly;                     /* never end Claude: a broken rule only shows red */
+    int  minScore;                     /* 0: none */
+} CoreShieldRules;
+DWORD        Core_ShieldVerdict(const CoreShieldFacts *facts, const CoreShieldRules *rules);   /* what makes the shield stop Claude */
+DWORD        Core_ShieldConcerns(const CoreShieldFacts *facts);   /* what is not as it should be, rules aside */
+/* The exit's time zone offset from UTC in minutes, DST aside, for an IANA
+ * name ("America/Los_Angeles") or a 2-letter country code; INT_MIN when not
+ * known. Multi-zone countries give their most populous zone. */
+int          Core_TimezoneOffsetMinutes(const WCHAR *ianaOrCode);
+/* `primary` (a language's first subtag, "en", "zh") is one the region of
+ * `countryCode` commonly uses; TRUE when the region is not known (no
+ * mismatch to claim). */
+BOOL         Core_RegionLanguageMatches(const WCHAR *countryCode, const WCHAR *primary);
+/* The exit is in one of `allowed` (comma- or space-separated 2-letter
+ * codes); TRUE when the list is empty (the profile allows any region). */
+BOOL         Core_RegionAllowed(const WCHAR *countryCode, const WCHAR *allowed);
+BOOL         Core_RegionCodes(const WCHAR *text);   /* two-letter codes only, between spaces, commas or semicolons; or none */
+
 /* --------------------------------------------------------------- util.c */
 
 extern HINSTANCE g_hInst;
@@ -533,6 +678,18 @@ BOOL      Util_StateDir(WCHAR *out, size_t cch);       /* %LOCALAPPDATA%\Claude 
 #define SETTING_VAULT_DAYS     L"VaultKeepDays"        /* days the vault keeps a list's versions; 0: all */
 #define SETTING_VAULT_DAYS_DEFAULT 30
 #define SETTING_WEEKLY_BACKUP  L"WeeklyClaudeBackup"   /* 1: .claude copied beside itself once a week */
+#define SETTING_REOPEN_AFTER_UPDATE L"ReopenAfterClaudeUpdate"   /* 0: a profile closed by a Claude update stays closed */
+#define SETTING_SIGNIN_BROWSER L"SignInBrowser"   /* the browser private sign-in starts with: a SIGNIN_BROWSER_* */
+#define SETTING_SIGNIN_DEVTOOLS L"SignInDevToolsPort"   /* a port: the sign-in window serves DevTools (CDP) on 127.0.0.1 there; 0, none */
+#define SETTING_ZOOM           L"Zoom"   /* the size of every window of the program, in percent (Theme_Zoom) */
+#define SETTING_MCP_ONLINE     L"WindowsMcpOnline"   /* 1: windows-mcp-delta may read and search chats on claude.ai */
+#define SETTING_SEARXNG_SECTION L"SearXNG"   /* a section whose one item is the SearXNG address set up last, or set in Settings; none: SEARXNG_DEFAULT_URL */
+#define SETTING_SEARXNG_PRIVATE L"SearXngPrivateUrls"   /* 1: SearXNG search set up last could reach private addresses */
+#define SETTING_NEW_WINDOWS_MCP L"NewProfileWindowsMcp"   /* 0: a new profile is made without Windows MCP; else with it, uv being there */
+#define SETTING_NEW_SEARXNG    L"NewProfileSearXng"   /* 0: a new profile is made without SearXNG search; else with it, Node.js being there */
+#define SETTING_NEW_COWORK_OFF L"NewProfileCoworkOff"   /* 0: a new profile keeps Cowork; else Cowork is off in it, and no virtual machine comes */
+#define SETTING_GH_LATER       L"GhBuildLater"   /* the release put off with Later (its commit's checksum): offered again only once another is out */
+#define SETTING_PANE_SEARCH    L"PaneSearch"   /* where a property list's pane searches, and how (CHECK_SEARCH_*) */
 DWORD     Util_GetSetting(const WCHAR *name, DWORD fallback);
 BOOL      Util_SetSetting(const WCHAR *name, DWORD value);
 /* A list kept in a section of its own of settings.ini: its items in order, at most `capacity`. */
@@ -564,11 +721,33 @@ void      Util_Log(const WCHAR *fmt, ...);
 BOOL      Util_LogDirectory(WCHAR *out, size_t cch);
 BOOL      Util_OpenUrl(const WCHAR *url);
 BOOL      Util_Spawn(const WCHAR *exe, const WCHAR *args, DWORD *pid);
+BOOL      Util_ClipboardText(WCHAR *out, size_t cch);   /* the clipboard's text, whole; FALSE when it holds none or a longer one */
 BOOL      Util_IsDirectoryLink(const WCHAR *path);     /* a junction or directory symlink */
 BOOL      Util_FitsRecycleBin(const WCHAR *path);
 RemoveResult Util_Recycle(HWND owner, const WCHAR *const *paths, int count);
 char     *Util_ReadFile(const WCHAR *path, DWORD maxBytes, BOOL tail, DWORD *len);
 BOOL      Util_ExtendedPath(const WCHAR *path, WCHAR *out, size_t cch);   /* the \\?\ form, for paths past MAX_PATH */
+ULONGLONG Util_NowMs(void);   /* the system clock, in ms since 1970 */
+/* A time in ms since 1970 as the user's short date and time (TIME_NOSECONDS in
+ * `timeFlags` leaves the seconds out); FALSE for 0 or one that cannot be shown. */
+BOOL      Util_FormatWhen(ULONGLONG ms, DWORD timeFlags, WCHAR *date, size_t dateCch, WCHAR *time, size_t timeCch);
+/* `items` with room for `need` of `size` bytes (the new ones zero), its
+ * `capacity` doubled as needed; NULL, `items` left as it was, without memory. */
+void     *Util_Grow(void *items, int *capacity, int need, size_t size);
+/* A new id as Claude names its sessions: a GUID in lower case without braces;
+ * `random` (optional) gets 32 of its random bits. */
+BOOL      Util_NewId(WCHAR *out, size_t cch, DWORD *random);
+void     *Util_Alloc(size_t bytes);                    /* zeroed, from the process heap; Util_Free */
+void      Util_Free(void *block);                      /* NULL does nothing */
+char     *Util_CopyBytes(const char *data, size_t length);   /* zero-terminated; Util_Free */
+BOOL      Util_JoinPath(const WCHAR *dir, const WCHAR *name, WCHAR *out, size_t cch);   /* dir\name */
+BOOL      Util_WriteAll(HANDLE file, const void *data, size_t length);   /* every byte, in chunks WriteFile takes */
+/* A file replaced in one step: written beside it, flushed, then put in place. */
+#define UTIL_TEMPORARY_SUFFIX L".cdm-new"
+typedef enum UtilPut { UTIL_PUT_NEW, UTIL_PUT_REPLACE, UTIL_PUT_OVER } UtilPut;
+BOOL      Util_WriteTemporary(const WCHAR *path, const char *data, size_t length, WCHAR *temporary, size_t cch);
+BOOL      Util_PutInPlace(const WCHAR *temporary, const WCHAR *path, UtilPut how);
+BOOL      Util_WriteFileAtomic(const WCHAR *path, const char *data, size_t length, UtilPut how);
 HANDLE    Util_FindFiles(const WCHAR *dir, const WCHAR *pattern, WIN32_FIND_DATAW *found, BOOL foldersOnly);
 BOOL      Util_CopyTree(const WCHAR *from, const WCHAR *to, BOOL replace, DWORD *error);
 BOOL      Util_DeleteTree(const WCHAR *path, DWORD *error);
@@ -576,8 +755,6 @@ BOOL      Ui_ReviewText(HWND owner, const WCHAR *title, const WCHAR *note, const
 void      Diagnostics_Show(HWND owner);
 void      Diagnostics_OpenLogs(HWND owner);
 BOOL      Diagnostics_Text(const ClaudePackage *pkg, const ProfileList *profiles, WCHAR *out, size_t cch);
-void      BackupHistory_Record(const Profile *profile, const WCHAR *path);
-void      BackupHistory_Show(HWND owner);
 
 /* -------------------------------------------------------------- claude.c */
 
@@ -585,6 +762,10 @@ BOOL    Claude_FindPackage(ClaudePackage *pkg);
 HRESULT Claude_Launch(const ClaudePackage *pkg, const Profile *profile, const WCHAR *url,
                       DWORD *pid, BOOL *withIdentity);
 void    Claude_UpdateRunning(ProfileList *list);
+/* The next window after `after` (NULL: the first) of a running Claude's
+ * single-instance lock, titled with its data folder (`title`); NULL after the last. */
+HWND    Claude_NextInstanceWindow(HWND after, WCHAR *title, int cch);
+BOOL    Claude_IsInstanceWindow(HWND window);   /* one of those, as made (a window event) */
 void    Claude_RefreshRunning(Profile *profile);
 BOOL    Claude_IsRunning(const Profile *profile);
 BOOL    Claude_LastSignInStart(const ClaudePackage *pkg, const Profile *profile, ULONGLONG *ticks);
@@ -595,12 +776,22 @@ int     Claude_TopmostProfile(const ProfileList *list);
  * then the programs it started that still run. TRUE when none runs any more;
  * blocks for seconds, so it runs off the window's thread. */
 BOOL    Claude_Quit(const Profile *profile, DWORD *error);
+/* Every process of what `what` names ended at once, nothing asked: Claude's
+ * app in any profile (its package's) with the programs it started, and
+ * Claude Code on its own (its claude.exe).
+ * `within`: only processes whose program is in that folder (tests), NULL: all.
+ * Returns how many ended; `*failed`: how many would not. */
+#define CLAUDE_END_DESKTOP 0x1u
+#define CLAUDE_END_CODE    0x2u
+int     Claude_EndAll(const ClaudePackage *pkg, DWORD what, const WCHAR *within, int *failed);
 
 /* ------------------------------------------------------------ profiles.c */
 
 void         Profiles_Load(ProfileList *list, const ClaudePackage *pkg);
 BOOL         Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, const WCHAR *family);
 int          Profiles_Find(const ProfileList *list, const WCHAR *folder);
+/* The profiles of `bits` by name: "Personal", "Personal and Work", "Personal, Work and Test". */
+void         Profiles_JoinNames(const ProfileList *list, DWORD bits, WCHAR *out, size_t cch);
 int          Profiles_DefaultIndex(const ProfileList *list);
 BOOL         Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t folderCch, WCHAR *error, size_t errorCch);
 /* The name, color, badge text (empty: the initial) and picture stamp (0: none). */
@@ -611,6 +802,83 @@ BOOL         Profiles_SetSyncItems(const WCHAR *folder, DWORD items);  /* SYNC_I
 BOOL         Profiles_SetWindowTitle(const WCHAR *folder, const WCHAR *title);   /* empty: the default title */
 BOOL         Profiles_SetNote(const WCHAR *folder, const WCHAR *note);
 void         SignIn_Open(HWND owner, const Profile *profile);
+/* The browsers a private sign-in can use: the program's own window (WebView2) when it can show, then those installed,
+ * each with its icon (SignIn_FreeBrowsers). */
+enum { SIGNIN_BROWSER_OWN, SIGNIN_BROWSER_EDGE, SIGNIN_BROWSER_CHROME, SIGNIN_BROWSER_BRAVE, SIGNIN_BROWSER_FIREFOX, SIGNIN_BROWSERS };
+typedef struct SignInBrowsers {
+    int   count;
+    int   kind[SIGNIN_BROWSERS];
+    WCHAR exe[SIGNIN_BROWSERS][MAX_PATH];   /* empty for the program's own */
+    HICON icon[SIGNIN_BROWSERS];
+} SignInBrowsers;
+void         SignIn_FindBrowsers(SignInBrowsers *found);
+const WCHAR *SignIn_BrowserName(int kind);   /* a SIGNIN_BROWSER_*'s name, in the interface's language */
+/* A Magic link on the clipboard (Core_MagicLink), offered to the person: TRUE, the link in `url`, once they chose to open it. */
+BOOL         SignIn_OfferMagicLink(HWND owner, WCHAR *url, size_t cch);
+/* windowsmcp.c: Windows-MCP in a profile's mcpServers (claude_desktop_config.json), run by uv's uvx. */
+/* A profile's Windows-MCP: none; one written without its transport (it can start as an HTTP server Claude cannot
+ * talk to: rewritten when added again); or one that starts (also the person's own, whatever it is). */
+enum { WINDOWS_MCP_NONE, WINDOWS_MCP_OUTDATED, WINDOWS_MCP_READY };
+int          WindowsMcp_State(const Profile *p);
+int          WindowsMcp_Leftovers(void);      /* servers whose Claude is gone, still running (an HTTP one holds its port) */
+int          WindowsMcp_EndLeftovers(void);   /* those ended: how many */
+BOOL         WindowsMcp_FindUvx(WCHAR *out, size_t cch);   /* its full path: Claude from the Store does not see PATH */
+BOOL         WindowsMcp_InstallUv(HWND owner);              /* uv's own installer, in a console, waited for */
+BOOL         WindowsMcp_Set(const Profile *p, const WCHAR *uvx);   /* windows-mcp-delta added with `uvx`; NULL takes it away */
+BOOL         WindowsMcp_Online(void);   /* whether the person lets Claude read claude.ai chats (SETTING_MCP_ONLINE) */
+void         WindowsMcp_RefreshOnline(void);   /* rewrite the env of profiles that have it, so the setting takes effect */
+void         WindowsMcp_UpdateEntries(void);   /* entries of ours from an older build pointed at this build's source */
+BOOL         WindowsMcp_PackageDir(WCHAR *out, size_t cch);   /* this build's source folder (version and checksum) */
+BOOL         WindowsMcp_HasExtension(const Profile *p);   /* Claude's own Windows-MCP extension is installed in it, or left there */
+BOOL         WindowsMcp_RemoveExtension(HWND owner, const Profile *p);   /* that extension deleted (its Claude closed); TRUE: all gone */
+/* SearXNG search set up in a profile: the entry "searxng", mcp-searxng run by npx (windowsmcp.c). */
+#define SEARXNG_KEY "searxng"
+BOOL         SearXng_FindNpx(WCHAR *out, size_t cch);   /* npx.cmd's full path: Node.js is installed */
+BOOL         SearXng_Get(const Profile *p, WCHAR *url, size_t cch, BOOL *allowPrivate);   /* it has ours: its address */
+BOOL         SearXng_Set(const Profile *p, const WCHAR *npx, const WCHAR *url, BOOL allowPrivate);   /* npx NULL: ours taken away */
+/* Cowork in a profile (windowsmcp.c): on unless its preferences turn it off (Core_CoworkOff); `vmBytes` (when not
+ * NULL) gets its virtual machine's size, 0 without one. Cowork_Set writes the preference (its Claude closed);
+ * Cowork_RemoveVm deletes the virtual machine, `freed` getting what went. */
+BOOL         Cowork_Get(const Profile *p, ULONGLONG *vmBytes);
+BOOL         Cowork_Set(const Profile *p, BOOL on);
+BOOL         Cowork_RemoveVm(const Profile *p, ULONGLONG *freed);
+/* Claude's preference `key` in a profile (claude_desktop_config.json, under "preferences"; windowsmcp.c): Prefs_Get
+ * copies its JSON value to `raw`, FALSE when the profile sets none (Claude's default) or it does not fit; Prefs_Set
+ * writes `raw`, or takes it out when NULL, its Claude closed (Claude keeps them in memory and writes them back). */
+BOOL         Prefs_Get(const Profile *p, const char *key, char *raw, size_t cap);
+BOOL         Prefs_Set(const Profile *p, const char *key, const char *raw);
+void         SignIn_FreeBrowsers(SignInBrowsers *found);
+/* `combo` lists them with their icons, `kind` chosen when it is there, else the first. */
+void         SignIn_FillBrowsers(HWND combo, const SignInBrowsers *found, int kind);
+/* webview.c: private sign-in in a WebView2 window of its own, its data folder `folder` (deleted after it). */
+BOOL         WebSignIn_Available(void);
+HRESULT      WebSignIn_Open(HWND owner, const Profile *profile, const WCHAR *url, const WCHAR *folder);
+HRESULT      WebView_ShowPage(HWND owner, const WCHAR *title, const WCHAR *path);   /* a page of ours, its links in the default browser */
+
+/* --------------------------------------------------------------- cookies.c */
+/* A cookie read from the sign-in window, in plain, to write into a profile's store. */
+#define COOKIE_NAME_CCH   256
+#define COOKIE_VALUE_CCH  4096
+#define COOKIE_HOST_CCH   256
+#define COOKIE_PATH_CCH   256
+typedef struct SignInCookie {
+    WCHAR     name[COOKIE_NAME_CCH];
+    WCHAR     value[COOKIE_VALUE_CCH];
+    WCHAR     host[COOKIE_HOST_CCH];     /* the cookie's domain, as Chromium keys it (".claude.ai") */
+    WCHAR     path[COOKIE_PATH_CCH];
+    ULONGLONG expires;                   /* Chromium's microseconds since 1601; 0: a session cookie */
+    int       secure, httpOnly, sameSite;   /* sameSite: 0 none, 1 lax, 2 strict (ICoreWebView2 order) */
+} SignInCookie;
+/* `cookies` written into profile `target`'s Claude cookie store (Network\Cookies), each value sealed with that
+ * profile's own Local State key (Core_SealSafeStorage), replacing any of the same name, host and path. The
+ * profile's Claude must be closed. TRUE when the store was written; `*wrote` the number put in. */
+BOOL         Cookies_Write(const Profile *target, const SignInCookie *cookies, int count, int *wrote);
+BOOL         Cookies_SignInHost(const WCHAR *host);   /* a .claude.ai host whose cookies a sign-in carries */
+/* The sign-in cookies in a WebView2 data folder (webview.c's, <folder>\EBWebView): read from its own cookie
+ * store, decrypted with its own Local State key, into `out` (`cap`), `*count` of them. TRUE when it could be read. */
+BOOL         Cookies_ReadWebView(const WCHAR *webViewFolder, SignInCookie *out, int cap, int *count);
+/* Whether that folder's store already holds a non-empty claude.ai session cookie: the sign-in is done. */
+BOOL         Cookies_WebViewSignedIn(const WCHAR *webViewFolder);
 DWORD        Profiles_SyncItems(const Profile *p);                    /* what it keeps the same, the default for none chosen */
 void         Profiles_CopySettings(const Profile *from, const Profile *to);
 RemoveResult Profiles_Delete(HWND owner, const Profile *profile);
@@ -633,38 +901,84 @@ void SessionLink_Read(const ProfileList *list, int index, LinkState *state);
 /* Its Claude runs, or the Claude of a profile sharing its entries folder:
  * the entries are not written then (Claude writes its own back). */
 BOOL SessionLink_Busy(const Profile *p);
+/* A batch of writes on this thread: SessionLink_Busy resolves each entries folder once until it ends (nested ones count). */
+void SessionLink_BeginBatch(void);
+void SessionLink_EndBatch(void);
 BOOL SessionLink_Remove(const ProfileList *list, int index, WCHAR *error, size_t errorCch);
 
 /* ----------------------------------------------------------------- zip.c */
 /* ZIP archives, files stored or deflated, names in UTF-8 with "/" between
  * folders; no ZIP64 (files and archive under 4 GB, 65535 files at most). A
- * file goes in whole: 512 MB at most. Zip_Close(zip, TRUE) puts the archive
- * in place (it was written next to it); FALSE, or a failure, removes it. */
+ * large file is copied in stored, a chunk at a time. Zip_Close(zip, TRUE) puts
+ * the archive in place (it was written next to it); FALSE, or a failure,
+ * removes it. A file taken out is written next to its place first too. */
 typedef struct ZipOut ZipOut;
 typedef struct ZipIn ZipIn;
 ZipOut     *Zip_Create(const WCHAR *path, DWORD *error);
 BOOL        Zip_AddData(ZipOut *zip, const char *name, const void *data, size_t size);
 BOOL        Zip_AddFile(ZipOut *zip, const char *name, const WCHAR *path);
+BOOL        Zip_Has(const ZipOut *zip, const char *name);   /* a file of that name went in already (case ignored) */
 DWORD       Zip_Error(const ZipOut *zip);   /* the first failure's Windows error */
 BOOL        Zip_Close(ZipOut *zip, BOOL keep);
 ZipIn      *Zip_Open(const WCHAR *path);   /* NULL: not a ZIP archive this module reads */
+ZipIn      *Zip_OpenItem(const ZipIn *zip, int index);   /* the archive item `index` holds, read where it lies when stored */
 void        Zip_Free(ZipIn *zip);
 int         Zip_Count(const ZipIn *zip);
 const char *Zip_Name(const ZipIn *zip, int index);
 DWORD       Zip_Size(const ZipIn *zip, int index);
 int         Zip_Find(const ZipIn *zip, const char *name);
 void       *Zip_Read(const ZipIn *zip, int index, DWORD maxBytes, DWORD *size);   /* checked by its CRC; HeapFree it, NUL after it */
-BOOL        Zip_Extract(const ZipIn *zip, int index, const WCHAR *path);
+BOOL        Zip_Extract(const ZipIn *zip, int index, const WCHAR *path);   /* over one there */
+BOOL        Zip_ExtractTo(const ZipIn *zip, int index, const WCHAR *path, UtilPut how);
 BOOL        Zip_Validate(const WCHAR *path, HANDLE cancel, int *files, WCHAR *error, size_t cch);
 BOOL        Zip_ValidateAll(const ZipIn *zip, HANDLE cancel, WCHAR *error, size_t cch);
-void        Backup_ValidateArchive(HWND owner, const WCHAR *path); /* NULL: choose archives */
 
 /* -------------------------------------------------------------- backup.c */
 /* A profile backed up to one archive, parts chosen (Code sessions, Cowork
  * sessions, settings, sign-in), and restored from one into a closed profile. */
 BOOL Backup_Create(HWND owner, const ClaudePackage *pkg, const ProfileList *list, DWORD profiles);   /* one bit per profile: an archive each */
 BOOL Backup_Restore(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index);
-void Backup_FillPartsList(HWND list, int sessions);   /* the parts a backup keeps, as its dialog shows them (tests) */
+/* A restore from the backups `paths` (dropped on the profile), as Backup_Restore. */
+BOOL Backup_RestoreFiles(HWND owner, const ClaudePackage *pkg, const ProfileList *list, int index, const WCHAR *const *paths, int pathCount);
+/* What the manager keeps of a profile, as a backup carries it (its name, note, color, badge, windows' title and
+ * picture): the parts it holds, and those taken, which an export writes and an import gives the profile. */
+#define PROFILE_OWN_NAME    0x01u
+#define PROFILE_OWN_NOTE    0x02u
+#define PROFILE_OWN_COLOR   0x04u
+#define PROFILE_OWN_BADGE   0x08u
+#define PROFILE_OWN_TITLE   0x10u
+#define PROFILE_OWN_PICTURE 0x20u
+typedef struct ProfileOwn {
+    DWORD held, parts;   /* PROFILE_OWN_*: those there are, those taken */
+    WCHAR name[LABEL_CCH], note[256], badge[BADGE_CCH], title[WINDOW_TITLE_CCH];
+    int   color;
+} ProfileOwn;
+/* The profile's own that backup `path` holds, every part taken; FALSE when it holds none (or is no backup). */
+BOOL Backup_ReadOwn(const WCHAR *path, ProfileOwn *own);
+/* A restore from `paths` into profile `index`, made just now for them with their own (Backup_ReadOwn): of
+ * that only the picture is offered again, and the restore is not asked twice. */
+BOOL Backup_RestoreNew(HWND owner, const ProfileList *list, int index, const WCHAR *const *paths, int pathCount);
+/* What an export takes, as the person chose it: its items; for one profile, its own as left (nothing held: each
+ * one's as it is) and the sessions kept, by key (NULL: every one; a heap block, which Backup_FreeChoice frees). */
+typedef struct BackupChoice {
+    DWORD        items;   /* BK_* and SYNC_ITEM_* */
+    ProfileOwn   own;
+    WCHAR      (*sessions)[SESSION_ID_CCH];
+    int          sessionCount;
+    char        *settings;   /* the settings the person changed, as a layout of those parts alone; NULL: none (a heap block) */
+    size_t       settingsLength;
+    DWORD        reopen;     /* the profiles closed for the export (their sign-in is in use while they run), to open again */
+} BackupChoice;
+void Backup_FreeChoice(BackupChoice *choice);
+void Backup_Reopen(const ProfileList *list, DWORD profiles);   /* those closed for an export, opened again */
+/* What a backup of `profiles` holds, as the person chooses it (everything at first); FALSE when cancelled. */
+BOOL Backup_ChooseItems(HWND owner, const ProfileList *list, DWORD profiles, BackupChoice *choice);
+BOOL Backup_Write(const ProfileList *list, int index, const BackupChoice *choice, const WCHAR *path, WCHAR *error, size_t errorCch);
+void Backup_ArchiveName(const WCHAR *profileName, WCHAR *name, size_t cch);   /* "<name> <date>.zip" */
+struct CheckList;
+struct CheckList *Backup_FillPartsList(HWND list, int sessions);   /* the parts a backup keeps as its dialog shows them, a profile's own as values (tests) */
+struct CheckList *Backup_FillImportList(HWND list);   /* an import's list: three sessions and some settings one by one (tests) */
+struct CheckList *Backup_FillLayoutList(HWND list, const char *layout, size_t length);   /* the same, with the settings of `layout` (tests) */
 /* Local State's os_crypt key in `storage`, opened with DPAPI for this Windows user; written protected again for it. */
 BOOL Backup_ReadAppKey(const WCHAR *storage, BYTE *key, size_t cap, size_t *length);
 BOOL Backup_WriteAppKey(const WCHAR *storage, const BYTE *key, size_t length);
@@ -687,7 +1001,7 @@ DWORD *Icons_ReadPicture(const WCHAR *path, HRESULT *hr);
 DWORD *Icons_LoadPicture(const Profile *profile);   /* the profile's own, NULL when it has none or it cannot be read */
 BOOL   Icons_SavePicture(const WCHAR *folder, const DWORD *pixels, DWORD *stamp);
 void   Icons_DeletePicture(const WCHAR *folder);
-HICON Icons_CreateBadge(int color, int size);
+BOOL   Icons_PicturePath(const WCHAR *folder, WCHAR *out, size_t cch);   /* where a profile's own picture is kept (a PNG) */
 HICON Icons_CreateTray(const ClaudePackage *pkg, const Profile *profile, int size, BOOL darkTaskbar);
 BOOL  Icons_IsStale(const ClaudePackage *pkg, const Profile *profile);
 void  Icons_DeleteStale(const Profile *profile, const WCHAR *keep);
@@ -709,6 +1023,8 @@ HRESULT Shortcut_RemoveFromStartMenu(const Profile *profile);
 HRESULT Shortcut_SetStartup(const ClaudePackage *pkg, const Profile *profile, BOOL on);
 HRESULT Shortcut_WriteForProfile(const ClaudePackage *pkg, const Profile *profile, const WCHAR *lnk);
 BOOL    Shortcut_DesktopPathFor(const Profile *profile, WCHAR *out, size_t cch);
+/* A free "Claude (<label>).lnk", else "Claude (<label>) (n).lnk", in `dir`. */
+BOOL    Shortcut_FreePath(const WCHAR *dir, const WCHAR *label, WCHAR *out, size_t cch);
 BOOL    Shortcut_IsOnDesktop(const Profile *profile);
 void    Shortcut_RemoveOurs(const Profile *profile);
 HRESULT Shortcut_Update(const WCHAR *lnk, const Profile *after, const WCHAR *icon);
@@ -738,6 +1054,39 @@ void         Update_Download(HWND notify, UINT message);   /* message: wParam an
 UpdateResult Update_Run(DWORD *error);
 void         Update_RemoveDownload(void);
 BOOL         Update_DownloadPath(WCHAR *out, size_t cch);
+
+/* ------------------------------------------------------------- ghupdate.c */
+/* Releases of main (CI's one a day, "v<date>", in the private repository) offered with what this PC signs in to
+ * GitHub with, gh or git's credential: found when the manager opens or when asked, downloaded with gh, run with
+ * --install. No sign-in at all: a copy brought from elsewhere (GH_COPIED, GhUpdate_Copied), offered nothing. */
+#define GH_TAG_CCH 32
+typedef enum GhStatus { GH_NEWER, GH_CURRENT, GH_NONE, GH_COPIED, GH_FAILED } GhStatus;
+typedef struct GhRelease {
+    GhStatus status;
+    BOOL     viaGit;                   /* found by git, no gh: Update opens its release page */
+    BOOL     local;                    /* this copy was built on this PC: offered a release only when asked */
+    WCHAR    tag[GH_TAG_CCH];          /* the newest release's, v2026.10.26 */
+    WCHAR    version[16];              /* its day, 2026.10.26 */
+    WCHAR    commit[48];               /* what it was built from */
+    WCHAR    title[256];               /* its name, "Claude Delta v2026.10.26" */
+    WCHAR   *notes;                    /* its Markdown; NULL: none */
+    WCHAR    message[256];             /* gh's first line, when it failed */
+} GhRelease;
+typedef struct GhDownload {
+    BOOL  ok;
+    WCHAR path[LONG_PATH_CCH];         /* the exe gh wrote */
+    WCHAR message[256];                /* why not, when it did not */
+} GhDownload;
+BOOL         GhUpdate_FindGh(WCHAR *out, size_t cch);
+int          GhUpdate_OwnBuild(void);         /* this copy's build number, 0 when built locally */
+const WCHAR *GhUpdate_OwnCommit(void);
+const WCHAR *GhUpdate_Repo(void);             /* "owner/repository" its builds come from */
+BOOL         GhUpdate_Copied(void);           /* the last check found no sign-in to GitHub on this PC */
+void         GhUpdate_ReleasePage(const WCHAR *tag, WCHAR *out, size_t cch);
+void         GhUpdate_Check(HWND notify, UINT message, BOOL asked);   /* message: wParam `asked`, lParam a GhRelease (GhUpdate_Free) */
+void         GhUpdate_Free(GhRelease *release);
+void         GhUpdate_Download(HWND notify, UINT message, const WCHAR *tag);   /* message: lParam a GhDownload (Util_Free) */
+BOOL         GhUpdate_Run(const GhDownload *download, DWORD *error);   /* it runs, and installs itself over this copy */
 
 /* --------------------------------------------------------- taskbar-pin.c */
 
@@ -846,6 +1195,7 @@ typedef struct SessionEntry {          /* one profile's entry for a session */
     BOOL      starred;
     BOOL      archived;
     BOOL      damaged;                 /* Claude's startup took it for a session whose transcript is gone (transcriptUnavailable) */
+    BOOL      unread;                  /* Claude's sidebar shows it unread (its web storage, Core_UnreadHas) */
     ULONGLONG lastActivity;            /* ms since 1970 */
     ULONGLONG created;                 /* ms since 1970; 0 when not known */
     DWORD     environment;             /* SESSION_ENV_*: where it runs */
@@ -857,6 +1207,7 @@ typedef struct SessionEntry {          /* one profile's entry for a session */
     BOOL      pending;
     WCHAR     pendingTitle[SESSION_TITLE_CCH];   /* "" when unchanged */
     int       pendingStar;             /* -1 unchanged, 0 or 1 */
+    int       pendingUnread;           /* -1 unchanged, 0 (read) or 1 */
     BOOL      pendingRemove;
     int       duplicate;               /* another entry of the session in the same profile, -1 when none */
     int       firstOtherTranscript, otherTranscriptCount;   /* the session's other transcripts, in SessionSet.otherTranscriptIds */
@@ -935,9 +1286,12 @@ void         SessionStore_GroupName(const SessionSet *set, int group, WCHAR *out
 BOOL SessionTools_OpenArtifact(HWND owner, const WCHAR *url, const WCHAR *title, const WCHAR *source);
 void SessionTools_Details(HWND owner, const WCHAR *file, int page);
 void SessionTools_Catalog(HWND owner, const Profile *profile, BOOL historical);
-void SessionTools_Export(HWND owner, const SessionSet *set, int row);
+/* A reading copy's format; READING_ORIGINAL: the session's own files (one copied, several in a ZIP archive). */
+enum { READING_TEXT, READING_MARKDOWN, READING_HTML, READING_JSON, READING_ORIGINAL };
+void SessionTools_Export(HWND owner, const SessionSet *set, int row, int format);
+BOOL SessionTools_PreviewPage(const SessionSet *set, int row, WCHAR *out, size_t cch);   /* the session as a web page, for the preview */
 WCHAR        *SessionTools_Context(const WCHAR *path, ULONGLONG offset, const WCHAR *query, BOOL regex, BOOL matchCase);
-BOOL SessionTools_ExportFile(const WCHAR *source, const WCHAR *target, BOOL markdown, DWORD *messages, DWORD *omitted);
+BOOL SessionTools_ExportFile(const WCHAR *source, const WCHAR *target, int format, DWORD *messages, DWORD *omitted);   /* READING_* but ORIGINAL */
 
 /* ---------------------------------------------------------- sessionedit.c */
 
@@ -1018,7 +1372,14 @@ typedef struct LayoutPart {
     DWORD        item;
     BOOL         byKey;
     BOOL         ownOnly;   /* written only over a value of the profile's own: one that shows none cannot take it */
+    BOOL         mergeOnly; /* merged into what each profile has, never taken away nor in conflict (SessionSync_MergePart) */
 } LayoutPart;
+/* A merge-only part's `other` merged into `base`: a heap block; NULL for another part or no memory. */
+char        *SessionSync_MergePart(const LayoutPart *part, const char *base, size_t baseLength, const char *other, size_t otherLength,
+                                   size_t *outLength);
+/* `json` (a heap block, freed) with its member `key` set to `raw` (`length`
+ * bytes); NULL, freed, when it cannot be. */
+char        *SessionSync_SetMember(char *json, size_t *used, const char *key, const char *raw, size_t length);
 BOOL         SessionSync_LayoutPart(int index, LayoutPart *part);
 /* A member showing `shown` of a part (NULL: none) already holds what `value`,
  * sent to it, would leave there. */
@@ -1043,6 +1404,8 @@ CopyResult   SessionSync_Copy(HWND owner, const SessionSet *set, int from, const
                               SyncReport *report);
 int          SessionSync_ApplyPending(const Profile *p, SyncReport *report);   /* report may be NULL */
 int          SessionSync_PendingCount(const Profile *p);
+BOOL         SessionSync_SetUnread(const Profile *p, const WCHAR *const *ids, int count, BOOL unread);   /* closed profile's web storage */
+BOOL         SessionSync_Forget(const Profile *p, const WCHAR *key);   /* the changes waiting for `p` on that session dropped */
 int          SessionSync_Queued(const Profile *p, SyncOp **ops);   /* its changes waiting, a heap block in *ops; -1 unreadable */
 WCHAR       *SessionSync_PendingText(const ProfileList *profiles); /* read-only, HeapFree */
 void         SyncUi_Pending(HWND owner, const ProfileList *profiles);
@@ -1050,9 +1413,24 @@ BOOL         SessionSync_PlanPath(const Profile *p, WCHAR *out, size_t cch);
 BOOL         SessionSync_Export(const SessionSet *set, int profile, const int *rows, int rowCount, const WCHAR *archive,
                                 int *exported, WCHAR *error, size_t errorCch);
 BOOL         SessionSync_IsArchive(const WCHAR *archive);   /* a session archive this version reads */
-/* A read-only preview of each selected target; a heap string, freed by the caller. */
-WCHAR       *SessionSync_ImportPreview(const SessionSet *set, const WCHAR *archive, DWORD targets, WCHAR *error, size_t errorCch);
 BOOL         SessionSync_Import(const SessionSet *set, const WCHAR *archive, DWORD targets, int *sessions, SyncReport *report);
+/* An archive's sessions, each its key (its transcript's id, or its entry's own), title and last activity: a heap
+ * block (Util_Free), their count; -1 when it is no archive of ours or cannot be read. */
+typedef struct ArchivedSession {
+    WCHAR     key[SESSION_ID_CCH];
+    WCHAR     own[SESSION_ID_CCH];   /* its entry's own id (local_<id>), as Claude's settings name it; "" unknown */
+    WCHAR     title[SESSION_TITLE_CCH];
+    ULONGLONG lastActivity;
+} ArchivedSession;
+int          SessionSync_ArchiveSessions(const ZipIn *zip, ArchivedSession **out);
+/* Some of an archive's sessions, by key: those imported, and only their conversations' files (an archive of an
+ * earlier version, which does not say which are whose, gives them all). NULL `keys`: every one. */
+typedef struct SessionPick {
+    const WCHAR (*keys)[SESSION_ID_CCH];
+    int          count;
+} SessionPick;
+BOOL         SessionSync_ImportPicked(const SessionSet *set, const WCHAR *archive, DWORD targets, const SessionPick *pick, int *sessions,
+                                      SyncReport *report);
 
 /* --------------------------------------------------------- sessionvault.c */
 /* Every list of sessions kept out of Claude's reach, and the profiles whose
@@ -1118,7 +1496,6 @@ void  SessionVault_AfterClose(const WCHAR *folder);   /* the watcher's call each
 char *SessionVault_ForProfile(const SessionSet *set, int target, const char *content, size_t length, size_t *outLength);
 int   SessionVault_Versions(const WCHAR *listName, VaultVersion *out, int capacity);   /* newest first */
 BOOL  SessionVault_Restore(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version, SyncReport *report);
-WCHAR *SessionVault_RestorePreview(const ProfileList *list, int index, const WCHAR *listName, const WCHAR *version);
 /* The ids of the sessions some kept list names (their transcripts too), and
  * of those deleted, which only undeleting them brings back. */
 BOOL  SessionVault_Ids(VaultIds *listed, VaultIds *deleted);
@@ -1126,7 +1503,6 @@ BOOL  SessionVault_HasId(const VaultIds *ids, const WCHAR *id);
 void  SessionVault_FreeIds(VaultIds *ids);
 BOOL  SessionVault_AddDeleted(const WCHAR *const *ids, int count);
 /* The keys of the sessions any version of any kept list names. */
-BOOL  SessionVault_EverListed(VaultIds *keys);
 BOOL  SessionVault_ListedIn(const ProfileList *list, int index, VaultIds *keys);   /* the keys profile `index`'s kept lists had */
 /* Deleted sessions (by key) put back in each profile whose kept list had them,
  * as that list last had them, at once where it is closed, else once it closes;
@@ -1175,8 +1551,60 @@ BOOL SyncUi_ShareOrCopy(HWND owner, const SessionSet *set, int from, const int *
 BOOL SyncUi_Export(HWND owner, const SessionSet *set, int profile, const int *rows, int rowCount);
 BOOL SyncUi_ExportProfiles(HWND owner, const ProfileList *profiles, DWORD chosen);
 BOOL SyncUi_Import(HWND owner, const ProfileList *profiles, DWORD chosen);
+BOOL SyncUi_ImportFile(HWND owner, const ProfileList *profiles, DWORD chosen, const WCHAR *file);   /* the session archive `file` (NULL: chosen) */
+/* ------------------------------------------------------------ transfer.c */
+
+typedef enum TransferResult { TRANSFER_DONE, TRANSFER_STOPPED, TRANSFER_FAILED } TransferResult;
+/* A copy's progress, `done` bytes of `total`: FALSE stops it (left for later, or cancelled). */
+typedef BOOL (*TransferStepProc)(void *context, ULONGLONG done, ULONGLONG total);
+/* `source` copied to `target` by way of "<target>.part", hidden, from what that part holds already when it is the
+ * file's beginning; named `target` once whole. */
+TransferResult Transfer_Copy(const WCHAR *source, const WCHAR *target, TransferStepProc step, void *context, DWORD *code);
+typedef struct TransferItem {
+    WCHAR name[MAX_PATH];          /* its file's name */
+    WCHAR folder[LONG_PATH_CCH];   /* where it goes */
+    WCHAR target[LONG_PATH_CCH];   /* its path there, a free name, once its copy begins */
+    WCHAR dir[MAX_PATH];           /* its own folder in the state folder's transfers\, its file and what it is there */
+    int   data;                    /* the caller's: what `make` makes */
+} TransferItem;
+/* Item `item`'s file made at `source`; FALSE, `error` saying why, when it cannot be. Called on the copy's thread. */
+typedef BOOL (*TransferMakeProc)(void *context, const TransferItem *item, const WCHAR *source, WCHAR *error, size_t cch);
+/* `items` made (`make`, NULL: made already) and copied where they go, in a window that shows how far, pauses, leaves
+ * them for later or cancels them: TRUE once all are there. */
+BOOL Transfer_Run(HWND owner, const WCHAR *title, TransferItem *items, int count, TransferMakeProc make, void *context);
+int  Transfer_Left(TransferItem *items, int cap);   /* what a close or an error left, made, to go on with */
+void Transfer_ResumeLeft(HWND owner);               /* those offered again: gone on with from where they stopped, or dropped */
+
+/* dragout.c: the profiles of `profiles` dragged out of the list `source` (from `start`, its client), as their backups.
+ * Once the shell tells where they were let go, `owner` gets `message`, which it answers with DragOut_Dropped: what they
+ * hold chosen, then they are written there. */
+typedef enum DragZone { DRAG_ZONE_EXPORT, DRAG_ZONE_COPY, DRAG_ZONE_SIGNIN, DRAG_ZONE_DELETE, DRAG_ZONES } DragZone;
+/* While they are dragged, tiles over the list's foot take them too: let go on one, `owner` gets `zoneMessage`,
+ * wParam the DragZone, and does what it says (an export: DragOut_Export, what they hold chosen, then where). */
+void DragOut_Profiles(HWND owner, UINT message, UINT zoneMessage, HWND source, const ProfileList *list, DWORD profiles, POINT start);
+void DragOut_Export(HWND owner, const ProfileList *list, DWORD profiles);
+void DragOut_Dropped(HWND owner, LPARAM lp);
+BOOL DragOut_IsMarker(const WCHAR *path);   /* the file a drag carries to find where it goes: no backup */
+/* Files dragged onto `window`, taken by an OLE drop target: one of them a drag's marker, it is refused, so that a drag
+ * of ours let go there is cancelled. Those dropped come to `window` as `message`, lParam a DroppedFiles (`at` on the
+ * screen), which it frees (Util_Free). DragOut_RefuseFiles revokes it before the window goes. */
+#define DROPPED_FILES_MAX 16
+typedef struct DroppedFiles {
+    POINT at;
+    int   count;
+    WCHAR paths[DROPPED_FILES_MAX][LONG_PATH_CCH];
+} DroppedFiles;
+struct IDropTarget;
+struct IDropTarget *DragOut_FileTarget(HWND window, UINT message);   /* the target itself, unregistered */
+BOOL DragOut_AcceptFiles(HWND window, UINT message);
+void DragOut_RefuseFiles(HWND window);
+/* Where a drag goes: its marker made (its path in `marker`) and the shell's notices watched for a copy of it; the
+ * folder that copy is in once it came (`ms` at most, the thread's messages handled), the copy taken away. */
+typedef struct DragDrop DragDrop;
+DragDrop *DragOut_Begin(WCHAR *marker, size_t cch);
+BOOL      DragOut_Wait(DragDrop *drop, DWORD ms, WCHAR *folder, size_t cch);
+void      DragOut_End(DragDrop *drop);
 BOOL SyncUi_Restore(HWND owner, const ProfileList *profiles, const WCHAR *selected);
-BOOL SyncUi_KeepSame(HWND owner, const ProfileList *profiles, int group);
 /* What `members` keep the same, chosen in a dialog (IDD_SYNC_ITEMS) from `*items`: FALSE when cancelled. */
 BOOL SyncUi_ChooseItems(HWND owner, const ProfileList *profiles, DWORD members, DWORD *items);
 /* What to sync, as a list whose groups fold (Theme_SetFoldingRows), `items` checked: each group, its items under it. */
@@ -1192,6 +1620,7 @@ typedef struct SyncSetup {
 /* `setup->profile` given, the rest filled from its group and the choice made:
  * FALSE when cancelled. */
 BOOL SyncUi_Setup(HWND owner, const ProfileList *profiles, SyncSetup *setup);
+void SyncUi_PartnerBoxes(HWND dialog, const WCHAR *const *names, const BOOL *checked, int count);   /* Sync settings' row of profiles */
 /* The conflicts syncs left to the person (SessionVault_Conflicts), one
  * dialog per group (IDD_CONFLICTS): the profiles of the groups settled. */
 DWORD SyncUi_SettleConflicts(HWND owner, const ProfileList *profiles);
@@ -1225,6 +1654,7 @@ void SessionSearch_Invalidate(void);   /* a watched file changed; cached matches
 void SessionUndo_Begin(const SessionSet *set);
 void SessionUndo_End(void);
 void SessionUndo_Star(const Profile *p, const WCHAR *key, BOOL before, BOOL after);
+void SessionUndo_Read(const Profile *p, const WCHAR *key, BOOL unreadBefore, BOOL unreadAfter);
 void SessionUndo_Title(const Profile *p, const WCHAR *key, const WCHAR *before, BOOL beforeAuto, const WCHAR *after);
 /* Session `key` listed by `p` from now on (`listed`), or taken away;
  * `content`: its entry, as it is or as it was (a heap block the undo keeps,
@@ -1247,13 +1677,84 @@ void SessionUndo_Clear(void);
 
 /* ------------------------------------------------------------ settings.c */
 
-/* The language, the vault's days, and help. Apply and OK save the days and
- * give a new language (-1: Windows') to `applyLanguage`, which puts it in
- * use; the dialog then follows it. */
+/* The language and the windows' size above, every other setting by its kind
+ * in a list beside: the program's own, what new profiles are made with,
+ * Claude Code's (its settings file, every profile's) and Claude's (each
+ * profile's preferences), each with what it reaches and how much it changes.
+ * Apply and OK save what changed and give a new language (-1: Windows') to
+ * `applyLanguage`, which puts it in use; the dialog then follows it. */
 typedef void (*SettingsLanguageProc)(int language);
-void Settings_Show(HWND owner, SettingsLanguageProc applyLanguage);
+/* One of Settings' Claude Code actions (IDC_G_PURGE, IDC_G_CODE_COPY), its dialog `owner`; IDC_G_ZOOM: the
+ * windows' size changed (saved), which the manager's window takes once it opens again. */
+typedef void (*SettingsActionProc)(HWND owner, int action);
+void Settings_Show(HWND owner, SettingsLanguageProc applyLanguage, SettingsActionProc act);
+/* The page's `index`-th setting, as it shows it: its name, and its value (a switch's "1" or "0"); FALSE past the last. */
+BOOL Settings_PageRow(HWND page, int index, WCHAR *title, size_t titleCch, WCHAR *shown, size_t shownCch);
+/* A change of Claude's preferences that Settings makes in every profile (Gui_SetPreferences): `raw` the JSON value,
+ * NULL for Claude's default. */
+typedef struct PreferenceChange { const char *key; const char *raw; } PreferenceChange;
+/* The profiles the manager shows (gui.c), and `changes` made in each of them: an open one is closed for it and
+ * opened again, asked first. FALSE when nothing was changed (cancelled, or the program busy); one that could not be
+ * made is said. */
+const ProfileList *Gui_Profiles(void);
+BOOL Gui_SetPreferences(HWND owner, const PreferenceChange *changes, int count);
 void About_Show(HWND owner);
 void About_Fill(HWND dialog);   /* IDD_ABOUT: the version, help's questions and the changelog's versions by month, the newest shown */
+
+/* --------------------------------------------------------------- shield.c */
+
+/* The shield watches Claude's exit IP and the network it goes through, and
+ * ends Claude when a rule says the exit is not safe (shield.c). The manager
+ * keeps it running while its window is open. */
+#define WM_APP_SHIELD (WM_APP + 25)   /* to the manager: the shield checked again, wParam its ShieldState */
+typedef enum ShieldState {
+    SHIELD_OFF,        /* the user turned it off */
+    SHIELD_CHECKING,   /* a check is under way, none finished yet */
+    SHIELD_SAFE,       /* nothing a rule or the defaults object to */
+    SHIELD_CONCERN,    /* something is not ideal, but no rule stops Claude */
+    SHIELD_STOPPED,    /* a rule's condition is met: Claude is kept ended */
+    SHIELD_STATES
+} ShieldState;
+typedef struct ShieldSnapshot {
+    ShieldState state;
+    ULONGLONG   checkedMs;             /* when the last check finished (Util_NowMs), 0: none */
+    BOOL        exitKnown;
+    WCHAR       exitIp[64], exitLoc[8];   /* Claude's exit IP and the country Cloudflare gives it */
+    CoreIpRisk  risk;                  /* what an IP service said of the exit, risk.source the one that answered */
+    BOOL        riskKnown;
+    int         tunUp, proxyApp, udpLeak, dnsLeak, ipv6Leak;   /* three-way facts */
+    int         tzMismatch, langMismatch, cfSplit;
+    WCHAR       udpIp[64], ipv6[64];   /* the UDP exit a STUN server saw, and the public IPv6 that could leak; "" when none */
+    WCHAR       cfIp[64], cfLoc[8];    /* the default (Cloudflare) exit, for the split check */
+    int         latencyClaude, latencyAnthropic;   /* ms to each, -1 when it did not answer */
+    WCHAR       statusText[64];        /* Anthropic's service status, "" when not read */
+    DWORD       stop, concerns;        /* SHIELD_STOP_* from the verdict and from the defaults */
+    int         endedDesktop, endedCode;   /* processes the last stop ended */
+} ShieldSnapshot;
+/* One line of the shield's log: when, what state it reached, and why. */
+typedef struct ShieldEvent { ULONGLONG whenMs; ShieldState state; DWORD reasons; int ended; } ShieldEvent;
+#define SHIELD_EVENTS_MAX 32
+void  Shield_Start(HWND manager, const ClaudePackage *pkg);   /* the window the check posts WM_APP_SHIELD to */
+void  Shield_Stop(void);
+void  Shield_Recheck(void);                 /* check again now when enabled (an event, a rule change) */
+void  Shield_CheckNow(void);                /* the "check now" button: read the exit and leaks once even while off */
+void  Shield_SetEnabled(BOOL on);           /* the shield on or off, kept */
+BOOL  Shield_IsEnabled(void);
+void  Shield_Snapshot(ShieldSnapshot *out); /* the latest, for the dialog */
+void  Shield_GetRules(CoreShieldRules *rules);
+void  Shield_SetRules(const CoreShieldRules *rules);   /* kept, and a check run with them */
+BOOL  Shield_Blocking(void);                /* SHIELD_STOPPED now: the manager opens no profile, routes no link */
+/* Of the profiles `bits` of `list`, those whose own regions leave out Claude's exit (its code in `exit`), while the
+ * shield is on and does more than warn. */
+DWORD Shield_ProfilesBlocked(const ProfileList *list, DWORD bits, WCHAR *exit, size_t cch);
+int   Shield_Events(ShieldEvent *out, int max);   /* the log, newest first; returns how many */
+void  Shield_GetProfileRegions(const WCHAR *folder, WCHAR *out, size_t cch);   /* the codes a profile's exit must be in, "" for any */
+void  Shield_SetProfileRegions(const WCHAR *folder, const WCHAR *codes);       /* kept, and a check run */
+BOOL  Shield_QuickBlock(const ClaudePackage *pkg, const Profile *profile);   /* a one-shot check for the router: TRUE when the exit is unsafe for `profile` */
+void  Shield_SetupButton(HWND dialog, int id);   /* the badge made an icon button, raised over the corner, its state shown */
+void  Shield_ShowState(HWND dialog, int id, ShieldState state);   /* the badge's glyph, color and tip for `state` */
+void  Shield_ShowDialog(HWND owner);        /* the shield's dialog */
+const WCHAR *Shield_ReasonText(DWORD reason);   /* a short line for one SHIELD_STOP_ or SHIELD_CONCERN_ bit */
 
 /* ------------------------------------------------------------- sessions.c */
 
@@ -1261,6 +1762,7 @@ void About_Fill(HWND dialog);   /* IDD_ABOUT: the version, help's questions and 
 #define WM_APP_SESSIONS_READY (WM_APP + 13) /* background session snapshot ready for the window */
 #define WM_APP_SYNC_PROGRESS (WM_APP + 20)  /* to the manager, from any process: wParam steps done of lParam; 0 of 0 once done */
 #define WM_APP_SYNC_CONFLICTS (WM_APP + 21) /* to the manager, from any process: a sync left conflicts to the person */
+#define WM_APP_SIGNIN_DONE (WM_APP + 23)   /* to the private sign-in dialog: wParam TRUE once its window handed Claude the link; lParam an HRESULT */
 #define WM_APP_SESSION_SEARCH (WM_APP + 22) /* to the manager: wParam search found lParam's session (-1: done; sessionsearch.c) */
 
 void         SessionsView_Init(HWND dlg);
@@ -1274,17 +1776,24 @@ void         SessionsView_Leave(void);
 BOOL         SessionsView_Shown(void);
 const WCHAR *SessionsView_Profile(void);
 void         SessionsView_Reload(void);
+void         SessionsView_Notified(void);   /* WM_APP_SESSIONS */
 /* The folder watch stopped while profile folders are moved or removed, and
  * started again after (calls pair up). */
 void         SessionsView_PauseWatching(void);
 void         SessionsView_ResumeWatching(void);
 BOOL         SessionsView_Command(WPARAM wp);
 BOOL         SessionsView_ClearSearch(void);
+void         SessionsView_ToggleSearch(void);   /* Ctrl+F: its search box shown and gone into, or hidden and emptied */
 BOOL         SessionsView_Notify(const NMHDR *header, LRESULT *result);
 BOOL         SessionsView_ContextMenu(HWND from, LPARAM pos);
 /* WM_CONTEXTMENU from the profiles' list: the row under `pos` (from the keyboard, the one selected) shown, as a
  * click shows it. 1: a profile's row, whose menu the manager shows; 0: the list, below its rows; -1: not the list. */
 int          SessionsView_ChooseProfileAt(HWND from, LPARAM pos);
+/* Sessions in the view can be dragged: within it onto another profile (copied, or moved with Shift), out to a
+ * folder (exported), and session archives dragged in onto a profile (imported). The side bar's own drop target
+ * takes them; `dropMessage` reaches the window once a drop is over (SessionsView_HandleDrop does the work). */
+void         SessionsView_AcceptDrops(UINT dropMessage);
+void         SessionsView_HandleDrop(WPARAM wp, LPARAM lp);
 BOOL         SessionsView_DrawItem(const DRAWITEMSTRUCT *item);
 void         SessionsView_Relayout(void);
 void         SessionsView_Destroy(void);
@@ -1327,6 +1836,7 @@ typedef enum ThemeColor {
     THEME_BRIGHT_BLUE,  /* a selected row's frame; a button under the mouse or pressed */
     THEME_PALE_BLUE,    /* a row or a button under the mouse */
     THEME_SEPARATOR,    /* a line between two parts of a window */
+    THEME_EDGE,         /* a menu's frame, a rule across a list: a quarter of the way from the field to the text */
     THEME_COLORS
 } ThemeColor;
 
@@ -1340,6 +1850,8 @@ typedef enum ThemeColor {
 #define THEME_MAIN_GAP_DIPS           9       /* between its neighboring buttons */
 #define THEME_MAIN_READING_WIDTH_DIPS 1200    /* a wider manager window centers its content */
 #define THEME_PROFILE_COLUMN_DIPS     180     /* the profile list's first column */
+#define THEME_SWITCH_HEIGHT_DIPS      20      /* an on-off switch (Theme_DrawSwitch), twice as wide */
+#define THEME_FIELD_PADDING_DIPS      8       /* inside a field's frame, before its text (Theme_DrawField) */
 
 /* A drop-down list item's data (CB_SETITEMDATA) can show a color swatch
  * beside its label, in the closed box and in its menu: the color in the low
@@ -1347,6 +1859,10 @@ typedef enum ThemeColor {
  * above the item in the menu. */
 #define THEME_CHOICE_SWATCH    0x01000000
 #define THEME_CHOICE_SEPARATED 0x02000000
+/* ...or THEME_CHOICE_ICON with an index in the low 16 bits: the icon at that index of the array Theme_SetChoiceIcons
+ * gave the drop-down (the caller's, kept while the drop-down lives), before its label. */
+#define THEME_CHOICE_ICON      0x04000000
+void     Theme_SetChoiceIcons(HWND combo, const HICON *icons, int count);
 
 #define THEME_BUTTON_HOT      0x1
 #define THEME_BUTTON_PRESSED  0x2
@@ -1381,6 +1897,9 @@ COLORREF Theme_RowMuted(UINT state);
 void     Theme_DrawTreeGlyph(HWND tree, HDC dc, const RECT *cell, UINT state, BOOL open);   /* a folder's arrow; state: THEME_ROW_* */
 void     Theme_DrawFocusCue(HWND owner, HDC dc, const RECT *row);   /* the keyboard's row, after keyboard use only */
 void     Theme_DrawButton(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state, UINT format);
+void     Theme_DrawSwitch(HWND owner, HDC dc, const RECT *rc, BOOL on, UINT state);   /* THEME_BUTTON_HOT, _DISABLED */
+void     Theme_DrawField(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, BOOL hint, HFONT font, UINT state);
+void     Theme_FieldText(HWND owner, const RECT *field, RECT *text);   /* where Theme_DrawField puts its text: an edit's place */
 void     Theme_DrawDropDown(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFONT font, UINT state);   /* THEME_BUTTON_* */
 int      Theme_DropDownWidth(HWND owner, HFONT font, const WCHAR *text);   /* fits `text` whole, in the current language */
 void     Theme_DropDownLabel(HWND owner, const RECT *box, RECT *label);   /* where Theme_DrawDropDown draws the label of `box` */
@@ -1390,6 +1909,11 @@ UINT     Theme_TrackDropDown(HWND owner, HMENU menu, const RECT *screenBox);
  * for a context menu): its strings, separators, checks and grayed items, no
  * submenus. The command chosen, 0 when dismissed. */
 UINT     Theme_TrackMenu(HWND owner, HMENU menu, const RECT *screenBox);
+/* An item of a menu Theme_TrackMenu shows: drawn red, it deletes; appended with `glyph` (Windows' icon
+ * font), its icon before its words. Both keep the item's data. */
+void     Theme_SetMenuDanger(HMENU menu, UINT id);
+void     Theme_TitleBar(HWND window);   /* a window of the program's own: its title bar in the system's mode */
+BOOL     Theme_AppendMenu(HMENU menu, UINT flags, UINT_PTR id, const WCHAR *text, WCHAR glyph);
 void     Theme_SetStrong(HWND control);   /* its text semibold, at the dialog's scale */
 /* The color of a button's icon, by what the button does, in a shade for each mode. */
 typedef enum ThemeTint {
@@ -1398,15 +1922,24 @@ typedef enum ThemeTint {
     THEME_TINTS
 } ThemeTint;
 void     Theme_SetGlyph(HWND button, WCHAR glyph, ThemeTint tint);   /* an icon before a push button's caption: a character of Windows' icon font, 0 for none */
+void     Theme_SetIconButton(HWND button, WCHAR glyph, ThemeTint tint);   /* that icon alone, the caption in a tip under the mouse */
 BOOL     Theme_IsIconButton(HWND button);   /* it shows its icon alone, its caption in a tip */
 /* A character of Windows' icon font beside text in `textFont` (a row's mark):
  * its width on `dc`, and drawn at the start of `rc`, vertically centered. */
 int      Theme_InlineGlyphWidth(HDC dc, WCHAR glyph, HFONT textFont);
 void     Theme_DrawInlineGlyph(HDC dc, const RECT *rc, WCHAR glyph, HFONT textFont, COLORREF color);
+void     Theme_DrawDot(HDC dc, const RECT *rc, int size, COLORREF color);   /* an unread mark */
+void     Theme_DrawDropZone(HWND owner, HDC dc, const RECT *rc, WCHAR glyph, ThemeTint tint, const WCHAR *text, HFONT font, BOOL hot);
 /* An image list of `count` characters of Windows' icon font, each in its tint
  * (THEME_TINT_NONE: muted), at the small icon size of `owner`'s monitor. */
 struct _IMAGELIST *Theme_GlyphImages(HWND owner, const WCHAR *glyphs, const ThemeTint *tints, int count);   /* an HIMAGELIST */
 COLORREF Theme_TintColor(ThemeTint tint);   /* in the current mode; the caption's color for none, and in a contrast theme */
+/* A report list's rows can end their first cell with marks, drawn by the theme's tables: `proc` gives a row's
+ * characters of Windows' icon font and their tints, the first rightmost, at most `cap` (THEME_ROW_MARKS), and
+ * returns how many (NULL: no marks). */
+#define THEME_ROW_MARKS 4
+typedef int (*ThemeRowMarkProc)(HWND list, int row, WCHAR *glyphs, ThemeTint *tints, int cap);
+void     Theme_SetRowMarks(HWND list, ThemeRowMarkProc proc);
 void     Theme_SetMainGlyph(HWND dialog, int id, int state);   /* the manager window's button `id` gets the icon of its caption in `state` */
 BOOL     Theme_CheckBoxSize(HWND control, SIZE *size);
 void     Theme_CreateFonts(HWND dialog, ThemeFonts *fonts);
@@ -1437,48 +1970,198 @@ void     Theme_SetFold(HWND list, int row, int fold);
 BOOL     Theme_OnFoldArrow(HWND list, int row, POINT pt);   /* heading `row`'s arrow under `pt` (the list's client) */
 void     Theme_DeleteFoldedRows(HWND list, int row);        /* heading `row` folds: its rows go */
 void     Theme_FocusRow(HWND list, int row);                /* the keyboard's row, alone selected, in sight */
+void     Theme_CheckRows(HWND list);   /* rows with check boxes, in one column as wide as the list */
+BOOL     Theme_CheckRowChanged(const NMHDR *header, HWND list);   /* `list`'s LVN_ITEMCHANGED that turned a row's box */
+WCHAR    Theme_ProfileOwnGlyph(DWORD part, ThemeTint *tint);   /* a profile's own field (PROFILE_OWN_*) as its row shows it */
+/* A table cell's image (LVS_EX_SUBITEMIMAGES) that is the theme's check box, drawn as a row's: a switch's value,
+ * THEME_CELL_BOX plus its flags, checked or not, enabled or not (a list keeps a cell's image in 16 bits). */
+#define THEME_CELL_BOX           (-100)
+#define THEME_CELL_BOX_CHECKED   0x1
+#define THEME_CELL_BOX_DISABLED  0x2
+#define THEME_IS_CELL_BOX(image) ((image) >= THEME_CELL_BOX && (image) <= THEME_CELL_BOX + 3)
+/* An editor of a list's cell, a child of the list (an edit, or a drop-down list): themed as a dialog's controls
+ * are, in the list's font, over cell (`row`, `column`) and as tall as its row, shown. */
+void     Theme_PlaceCellEditor(HWND list, int row, int column, HWND editor);
+/* A click (NM_CLICK, NM_DBLCLK) on a folding list: the heading row it folds or
+ * opens (its arrow, or a double-click off a check box), else -1; `hit` gets
+ * where it was. */
+struct tagLVHITTESTINFO;
+int      Theme_FoldClickRow(HWND list, const NMHDR *header, struct tagLVHITTESTINFO *hit);
+/* Left or Right (`key`) on a folding list: the focused heading's row, to fold
+ * (Left) or open (Right), else -1; Left on a row below a heading goes up to it. */
+int      Theme_FoldKeyRow(HWND list, WORD key);
 #define THEME_FOLD_MENU_EXPAND   1
 #define THEME_FOLD_MENU_COLLAPSE 2
 UINT     Theme_FoldMenu(HWND owner, HWND list, HWND from, LPARAM pos);   /* WM_CONTEXTMENU: Expand all, Collapse all, or 0 */
 
 /* ------------------------------------------------------------ checklist.c */
 
-/* A list whose groups fold, with check boxes (what to sync, what a backup keeps): each group a heading with its
- * image and its items below, a group without item rows a heading alone; a group's box checks all of it, mixed
- * when only some is. The groups opened are kept in settings.ini (`openedSection`, NULL: not kept). */
+/* A list whose groups fold, with check boxes and values: a property list (what to sync, what an export or an import
+ * holds, a profile's own and its settings, conflicts settled). Each group a heading with its image and its items
+ * and values below, a group without rows a heading alone; a group's box checks all of it, mixed when only some is.
+ * The groups opened are kept in settings.ini (`openedSection`, NULL: not kept). */
 #define CHECKLIST_GROUPS_MAX 16
+#define CHECKLIST_COLUMNS    (1 + MAX_PROFILES)   /* the labels' column and a pick list's versions, at most */
 typedef struct CheckGroup { DWORD mask; const WCHAR *heading; int image; const WCHAR *name; } CheckGroup;   /* name: as kept opened */
 typedef struct CheckItem { DWORD bit; const WCHAR *label; int image; } CheckItem;
 typedef const WCHAR *(*CheckLabelProc)(const CheckItem *item, void *context);   /* an item's text; NULL: TR(label) */
+/* A value of a group, or of one of its items (`item`: shown below it, or on its row when `merged`; a group's own
+ * `merged` on its heading): a box alone (its
+ * text beside it); a switch, a check box in the value's cell (its `text` beside the box); a choice or a text, changed in place in a drop-down or
+ * an edit box while its row is selected; an action, its text, which the dialog acts on when it is clicked (F2,
+ * Space); or a pick, versions side by side, one per value column, the one kept checked (clicked, or Left and
+ * Right). With a box of its own (`boxed`) it is taken or not, and an item's box
+ * follows its values'; without, it follows its item's. Read-only, it only shows. A change of its value tells the
+ * list's dialog (WM_CHECKLIST_VALUE); a value without a group (`group` -1) is a row of its own, above the groups. A
+ * value can be a part of another (`parent`: a list's element, an object's member), right after it in `values`, its
+ * row one step further in below the other's, shown while that one is open; a box of a value with parts takes them
+ * all, and shows mixed when only some are taken. */
+#define CHECK_VALUE_NONE   0
+#define CHECK_VALUE_SWITCH 1
+#define CHECK_VALUE_CHOICE 2
+#define CHECK_VALUE_TEXT   3
+#define CHECK_VALUE_PICK   4
+#define CHECK_VALUE_ACTION 5
+#define CHECK_VALUE_CCH    256
+#define CHECK_NAME_CCH     160
+typedef struct CheckValue {
+    int                 group;                /* the group it is under, -1: none */
+    DWORD               item;                 /* the item it belongs to, 0: its group's own */
+    int                 kind, image;          /* CHECK_VALUE_*, its image */
+    const WCHAR        *label;                /* a catalog key, or as it is shown when `literal` */
+    BOOL                literal, readOnly, merged;
+    BOOL                boxed, taken;         /* a box of its own, and whether it is checked */
+    BOOL                on;                   /* a switch's */
+    int                 choice;               /* a choice's: an index of `choices`, in the interface's language */
+    const WCHAR *const *choices;
+    const COLORREF     *swatches;             /* a choice's colors, shown beside them; NULL: none */
+    int                 choiceCount;
+    WCHAR               text[CHECK_VALUE_CCH];   /* a text's, an action's, or what a box alone says beside it */
+    int                 limit;                /* a text's length at most, 0: CHECK_VALUE_CCH - 1 */
+    const WCHAR        *hint;                 /* a text's, its edit box shows it while empty; NULL: none */
+    const WCHAR *const *versions;             /* a pick's text in each value column, NULL there: it has none */
+    int                 pick;                 /* the value column kept, -1: none */
+    LPARAM              data;                 /* the caller's */
+    int                 parent;               /* 1 + the value it is a part of; 0: none */
+    BOOL                open, paneOpen;       /* one with parts: they show below it, in the list, in its pane */
+    const char         *json;                 /* the JSON it was read from (CheckList_FromJson), the caller's; NULL: none */
+    size_t              jsonLength;
+    const char         *key;                  /* an object's member: its key as the JSON writes it (no quotes); NULL: none */
+    size_t              keyLength;
+    WCHAR               name[CHECK_NAME_CCH]; /* the label CheckList_AddParts gave it */
+} CheckValue;
+#define CHECK_VALUE_BASE ((LPARAM)0x100000000LL)   /* a value row's lParam, plus its index: past every item's bit */
 typedef struct CheckList {
     const CheckGroup *groups;
     int               groupCount;
     const CheckItem  *items;
     int               itemCount;
+    CheckValue       *values;             /* NULL: none */
+    int               valueCount;
+    const WCHAR *const *columns;          /* a pick list's column titles, the labels' first; NULL: one value column, untitled */
+    int               columnCount;
+    BOOL              plain;              /* no boxes: versions and values only */
+    int               pickedImage, candidateImage;   /* a pick's version kept, and the others it has */
     const WCHAR      *openedSection;
+    DWORD             openAtFirst;        /* the groups open (a bit each) while none were kept opened */
     DWORD             offered, checked;   /* the bits shown, those checked */
     CheckLabelProc    label;
     void             *context;
-    HWND              list;               /* CheckList_Setup's */
+    HWND              list, owner;        /* CheckList_Setup's: the list, and its dialog */
+    HWND              editor;             /* the selected value's, NULL: none */
+    int               editing;            /* its value, -1: none */
     BOOL              open[CHECKLIST_GROUPS_MAX];
-    BOOL              filling;
+    BOOL              filling, following;
+    /* The pane beside the list, when its dialog has one (IDC_PANE_*): what the row selected holds, a list of its own
+     * over the same values (`pane`, made and freed with it), whose `twin` is this one; each follows the other. The
+     * list beside a pane is an overview (`overview`): its items without their values, its values without their
+     * parts, which the pane shows; a group's own values stay below its heading. */
+    struct CheckList *pane, *twin;
+    BOOL              overview;
+    HWND              paneTitle;          /* the row's name */
+    LPARAM            scope;              /* the pane's: the row of the list it shows, 0: none */
+    int               indentLess;         /* the pane's: its rows that much further out than in the list */
+    DWORD             openItems;          /* the pane's: the items whose values show below them */
+    struct CheckSearch *search;           /* the pane's search (IDC_PANE_SEARCH), NULL: none */
+    HWND              changedIn;          /* the list a value was last changed in, the pane's or this one */
 } CheckList;
-#define WM_CHECKLIST_BOX (WM_APP + 0x100)   /* a box clicked: wParam its row; the dialog calls CheckList_Toggle */
+/* The pane's search options (CheckSearch.in): what it looks in, and how. */
+#define CHECK_SEARCH_NAMES  0x1u
+#define CHECK_SEARCH_VALUES 0x2u
+#define CHECK_SEARCH_REGEX  0x4u
+#define CHECK_SEARCH_CASE   0x8u
+#define WM_CHECKLIST_BOX   (WM_APP + 0x100)   /* a box clicked: wParam its row, lParam its list; the dialog calls CheckList_Message */
+#define WM_CHECKLIST_VALUE (WM_APP + 0x101)   /* sent to the list's dialog: value wParam changed */
 void CheckList_Setup(CheckList *checks, HWND list, const WCHAR *glyphs, const ThemeTint *tints, int images);
 void CheckList_Toggle(CheckList *checks, int row);
+#define CHECKLIST_ALL    0
+#define CHECKLIST_NONE   1
+#define CHECKLIST_INVERT 2
+void CheckList_CheckAll(CheckList *checks, int how);   /* every box checked (CHECKLIST_ALL), none, or each turned over */
 void CheckList_FoldAll(CheckList *checks, BOOL open);
+void CheckList_Relabel(CheckList *checks);   /* every row again in the interface's language, the list's and its pane's */
+void CheckList_Refresh(CheckList *checks);   /* the boxes and values shown again, as the caller changed them */
+void CheckList_ShowValue(CheckList *checks, int v);   /* value `v` shown again, as the caller changed it */
+void CheckList_SelectValue(CheckList *checks, int v, BOOL edit);   /* value `v`'s row selected, its group opened; `edit`: into its editor */
+/* A value as JSON `raw` shows it: true or false a switch, a number or a string a text (as long as it fits), anything
+ * else its count of items, read-only; FALSE for no value. Back: the JSON it now stands for, as the kind of value
+ * `raw` was (a number only while it is one), FALSE when it did not change or cannot be one. */
+BOOL CheckList_FromJson(CheckValue *value, const char *raw, size_t length);
+BOOL CheckList_ToJson(const CheckValue *value, const char *raw, size_t length, char *out, size_t cap);
+/* What value `v` (read by CheckList_FromJson, and its parts) stands for now: a heap block, NULL when nothing of it
+ * changed (or without memory). A part left out (its box) is not in it. */
+char *CheckList_JsonOf(const CheckList *checks, int v, size_t *length);
+/* A name for `text` (a session's title for its id): TRUE when it gives one. */
+typedef BOOL (*CheckNameProc)(void *context, const WCHAR *text, WCHAR *name, size_t cch);
+typedef struct CheckParts {
+    int           cap, depth;        /* values in the list at most; levels below the value at most */
+    CheckNameProc name;
+    void         *context;
+    int           named, folder, list, leaf;   /* the images: of a part `name` names, a folder's path, a list or an object, the rest */
+} CheckParts;
+/* The parts of value `v` (an object's members, a list's elements; its `json`) added right after it, a value each,
+ * each named by its key, or a list's element by its own text or name (`name` first); boxed as `v` is. None when they
+ * would not all fit in `cap`; past `depth`, a list or an object shows what it holds, read-only. */
+void CheckList_AddParts(CheckList *checks, int v, const CheckParts *parts);
+BOOL CheckList_IsLeftOut(const CheckList *checks, int v);   /* a value with a box, none of it taken */
 BOOL CheckList_Notify(CheckList *checks, HWND dialog, const NMHDR *header, LRESULT *result);   /* TRUE: the dialog answers `result` */
-/* WM_CHECKLIST_BOX (a box turned over) and WM_CONTEXTMENU (Expand/Collapse
- * all on the list) handled alike for every checked-list dialog: TRUE when it
- * was this list's, `*toggled` then TRUE for a box, so the dialog refreshes
- * what the choice drives. WM_NOTIFY stays the caller's (CheckList_Notify). */
+/* WM_NOTIFY (the list's and its pane's: CheckList_Notify, its answer set as
+ * the dialog's), WM_CHECKLIST_BOX (a box turned over) and WM_CONTEXTMENU
+ * (Expand/Collapse all on the list) handled alike for every checked-list
+ * dialog, the sync's, the export's and the import's, the profile's: TRUE
+ * when it was this list's, `*toggled` then TRUE for a box, so the dialog
+ * refreshes what the choice drives. */
 BOOL CheckList_Message(CheckList *checks, HWND dialog, UINT message, WPARAM wp, LPARAM lp, BOOL *toggled);
 /* The what-to-sync groups ([0] Sessions, then the layout groups), their
  * items, and the glyph set they draw with: a backup's list builds on them. */
 const CheckGroup *SyncUi_Groups(int *count);
 const CheckItem  *SyncUi_Items(int *count);
 const WCHAR      *SyncUi_Glyphs(const ThemeTint **tints, int *images);
+/* Sessions by their ids, for naming them in a list (a CheckNameProc's context). */
+typedef struct SessionNames {
+    const ArchivedSession *sessions;
+    int                    count;
+} SessionNames;
+BOOL              SyncUi_SessionName(void *names, const WCHAR *text, WCHAR *name, size_t cch);
+/* The settings of `layout` (SessionSync_ReadLayout) added one by one to the values of `checks` (room for `cap` in
+ * all), each part with a label whose item is in `items`: under the group of `checks` holding its item, below its
+ * item's row, or on it when it is the item's only value, else its group's own (on its heading when it is the only
+ * one); a switch, a text, or what it holds, a list's elements and an object's members one by one below it (sessions
+ * named by `names`, NULL: none), each with a box when `boxed`. Each one's `data` is its part (SessionSync_LayoutPart). */
+void              SyncUi_AddLayoutValues(CheckList *checks, int cap, const char *layout, size_t length, DWORD items, BOOL boxed,
+                                         const SessionNames *names);
+/* The conflicts dialog's list as a sync's conflicts fill it: two elements of a sidebar group that `name` and
+ * "Personal" each changed their own way (tests). */
+CheckList        *SyncUi_FillConflictsList(HWND list, const WCHAR *name);
+/* Those values from `first` on that were changed, as a layout of their parts alone, a part left out (its box) null:
+ * a heap block, NULL for none. */
+char             *SyncUi_LayoutChanges(const CheckList *checks, int first, const char *layout, size_t length, size_t *outLength);
 HWND     Theme_SmoothView(HWND control);   /* a list or tree scrolled by the pixel; returns the view, which has its place */
+/* A window of ours in a view that is no list or tree answers how tall what it shows is; it says when that changed, and
+ * asks for a band of itself in sight. */
+#define WM_THEME_CONTENT_HEIGHT (WM_APP + 0x3E1)
+void     Theme_ViewChanged(HWND control);
+void     Theme_ViewReveal(HWND control, int top, int bottom);
 void     Theme_Follow(HWND dialog, UINT msg, WPARAM wp, LPARAM lp);
 void     Theme_Apply(HWND dialog);   /* what it keeps on the dialog goes with the dialog */
 void     Theme_RememberLayout(HWND dialog);
@@ -1502,7 +2185,8 @@ const WCHAR *Theme_ProfileRole(BOOL stock, BOOL isDefault);
  * %s: Claude Desktop's version), the note under the column's actions (its
  * %s: the profile the regular Claude icon opens) and the sessions details'
  * captions, also measured with the window: catalog keys. */
-typedef enum MainVersion { MAIN_VERSION_BUILD, MAIN_VERSION_AVAILABLE, MAIN_VERSION_DOWNLOADING, MAIN_VERSION_INSTALLING, MAIN_VERSIONS } MainVersion;
+typedef enum MainVersion { MAIN_VERSION_BUILD, MAIN_VERSION_AVAILABLE, MAIN_VERSION_DOWNLOADING, MAIN_VERSION_INSTALLING,
+                           MAIN_VERSION_CHECKING, MAIN_VERSIONS } MainVersion;
 typedef enum MainStatus { MAIN_STATUS_NO_CLAUDE, MAIN_STATUS_NO_LINKS, MAIN_STATUS_ROUTED, MAIN_STATUSES } MainStatus;
 const WCHAR *Theme_MainVersion(MainVersion state);
 const WCHAR *Theme_MainStatus(MainStatus state);
@@ -1511,17 +2195,32 @@ const WCHAR *Theme_MainNote(void);
 BOOL     Theme_ColumnResizeIsManual(HWND list, int column);   /* the user sized it (a header divider dragged or double-clicked) */
 void     Theme_SetColumnWidth(HWND list, int column, int width);
 void     Theme_LayoutSidebarNote(HWND note, const WCHAR *format, const WCHAR *name);
+/* A static's text, `format` naming a profile in its one %s: a long name is
+ * cut (with an ellipsis) until the whole text fits the control. */
+void     Theme_FitName(HWND control, const WCHAR *format, const WCHAR *name, WCHAR *text, size_t cch);
+/* The program's icon at the window's scale, for its title bar and taskbar
+ * button; the icons it replaces in `*large` and `*little` are destroyed. */
+void     Theme_SetWindowIcons(HWND window, HICON *large, HICON *little);
+/* An icon of `instance` (NULL: one of Windows', IDI_*) at `width` x `height`, the caller's to destroy. */
+HICON    Theme_LoadIcon(HINSTANCE instance, LPCWSTR name, int width, int height);
 INT_PTR  Theme_CtlColor(UINT msg, WPARAM wp, LPARAM lp, int mutedId);
 BOOL     Ui_Ask(HWND owner, LPCWSTR icon, const WCHAR *text, const WCHAR *ok, const WCHAR *cancel, BOOL defaultCancel);
+/* The themed message box with two choices and Cancel: 1 for the first, 2 for the second, 0 for Cancel (or Esc). */
+int      Ui_Choose(HWND owner, LPCWSTR icon, const WCHAR *text, const WCHAR *first, const WCHAR *second, const WCHAR *cancel);
 int      Ui_Message(HWND owner, UINT flags, const WCHAR *format, ...);   /* MessageBox look-alike, `format` translated */
 INT_PTR  Ui_Dialog(HWND owner, int id, DLGPROC proc, LPARAM param);   /* every dialog opens here */
+/* The size of the program's windows, in percent of their resources' (SETTING_ZOOM): their font, and so all of them. */
+#define THEME_ZOOM_MIN 80
+#define THEME_ZOOM_MAX 200
+int      Theme_Zoom(void);
+INT_PTR  Theme_DialogBox(int id, HWND owner, DLGPROC proc, LPARAM param);   /* dialog `id` at Theme_Zoom's size */
 
 /* ------------------------------------------------ router.c / main.c / gui.c */
 
 int     Router_Run(const WCHAR *rawUrl);
 int     Router_ChooseNotification(const ClaudePackage *pkg, const ProfileList *list, int suggested);   /* IDD_LINK for a notification; -1: none */
 void    NotifyGuard_Start(void);   /* in a watcher: notifications clicked in the notification center go to their profile */
-int     Launcher_Run(const WCHAR *folder);
+int     Launcher_Run(const WCHAR *folder, const WCHAR *url);   /* url: NULL, or a claude:// link opened there */
 HRESULT Launcher_Open(const ClaudePackage *pkg, const Profile *p, const WCHAR *url, DWORD *pid, BOOL *identity);
 HRESULT Launcher_OpenSynced(const ClaudePackage *pkg, const Profile *p, DWORD *pid, BOOL *identity);   /* sessions already made the same */
 typedef enum GuiStart { GUI_MANAGER, GUI_SET_UP_LINKS, GUI_UNINSTALL } GuiStart;
@@ -1529,6 +2228,7 @@ int     Gui_Run(GuiStart start);
 BOOL    Gui_MainWindowGeometry(HWND dialog, UINT message, WPARAM wp, LPARAM lp);
 void    Gui_OrderProfileColumns(HWND list);   /* Status shown second */
 void    Gui_LayoutProfileColumns(HWND list);
+struct CheckList *Gui_FillProfileList(HWND list);   /* the edit dialog's list of a profile, its settings one by one (tests) */
 void    Gui_ShowSessions(HWND dialog, const ClaudePackage *package, BOOL showSessions, const WCHAR *folder);
 
 #endif
