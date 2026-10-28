@@ -3541,6 +3541,140 @@ ULONGLONG Core_HashText(ULONGLONG hash, const WCHAR *text)
     return Core_HashBytes(hash, text, (wcslen(text) + 1) * sizeof(WCHAR));
 }
 
+/* CityHash64, as libc++'s std::hash of a string computes it (its
+ * __murmur2_or_cityhash for 64 bits), over `size` bytes. */
+#define CITY_K0 0xc3a5c85c97cb3127ULL
+#define CITY_K1 0xb492b66fbe98f273ULL
+#define CITY_K2 0x9ae16a3b2f90404fULL
+#define CITY_K3 0xc949d7c7509e6557ULL
+
+static ULONGLONG CityWord(const unsigned char *s)
+{
+    ULONGLONG v;
+    memcpy(&v, s, sizeof v);
+    return v;
+}
+
+static ULONGLONG CityRotate(ULONGLONG v, int shift)
+{
+    return shift == 0 ? v : (v >> shift) | (v << (64 - shift));
+}
+
+static ULONGLONG CityShiftMix(ULONGLONG v)
+{
+    return v ^ (v >> 47);
+}
+
+static ULONGLONG CityHash16(ULONGLONG u, ULONGLONG v)
+{
+    const ULONGLONG mul = 0x9ddfea08eb382d69ULL;
+    ULONGLONG a = (u ^ v) * mul, b;
+    a ^= a >> 47;
+    b = (v ^ a) * mul;
+    b ^= b >> 47;
+    return b * mul;
+}
+
+static ULONGLONG CityHashTo16(const unsigned char *s, size_t n)
+{
+    if (n > 8) {
+        ULONGLONG a = CityWord(s), b = CityWord(s + n - 8);
+        return CityHash16(a, CityRotate(b + n, (int)n)) ^ b;
+    }
+    if (n >= 4) {
+        UINT32 a, b;
+        memcpy(&a, s, sizeof a);
+        memcpy(&b, s + n - 4, sizeof b);
+        return CityHash16(n + (UINT32)(a << 3), b);
+    }
+    if (n > 0) {
+        UINT32 y = (UINT32)s[0] + ((UINT32)s[n >> 1] << 8), z = (UINT32)n + ((UINT32)s[n - 1] << 2);
+        return CityShiftMix(y * CITY_K2 ^ z * CITY_K3) * CITY_K2;
+    }
+    return CITY_K2;
+}
+
+static ULONGLONG CityHashTo32(const unsigned char *s, size_t n)
+{
+    ULONGLONG a = CityWord(s) * CITY_K1, b = CityWord(s + 8), c = CityWord(s + n - 8) * CITY_K2, d = CityWord(s + n - 16) * CITY_K0;
+    return CityHash16(CityRotate(a - b, 43) + CityRotate(c, 30) + d, a + CityRotate(b ^ CITY_K3, 20) - c + n);
+}
+
+static void CityWeak(const unsigned char *s, ULONGLONG a, ULONGLONG b, ULONGLONG out[2])
+{
+    ULONGLONG w = CityWord(s), x = CityWord(s + 8), y = CityWord(s + 16), z = CityWord(s + 24), c;
+    a += w;
+    b = CityRotate(b + a + z, 21);
+    c = a;
+    a += x;
+    a += y;
+    b += CityRotate(a, 44);
+    out[0] = a + z;
+    out[1] = b + c;
+}
+
+static ULONGLONG CityHashTo64(const unsigned char *s, size_t n)
+{
+    ULONGLONG z = CityWord(s + 24), a = CityWord(s) + (n + CityWord(s + n - 16)) * CITY_K0, b, c, vf, vs, wf, ws, r;
+    b = CityRotate(a + z, 52);
+    c = CityRotate(a, 37);
+    a += CityWord(s + 8);
+    c += CityRotate(a, 7);
+    a += CityWord(s + 16);
+    vf = a + z;
+    vs = b + CityRotate(a, 31) + c;
+    a = CityWord(s + 16) + CityWord(s + n - 32);
+    z += CityWord(s + n - 8);
+    b = CityRotate(a + z, 52);
+    c = CityRotate(a, 37);
+    a += CityWord(s + n - 24);
+    c += CityRotate(a, 7);
+    a += CityWord(s + n - 16);
+    wf = a + z;
+    ws = b + CityRotate(a, 31) + c;
+    r = CityShiftMix((vf + ws) * CITY_K2 + (wf + vs) * CITY_K0);
+    return CityShiftMix(r * CITY_K0 + vs) * CITY_K2;
+}
+
+static ULONGLONG CityHash64(const unsigned char *s, size_t n)
+{
+    ULONGLONG x, y, z, v[2], w[2], t;
+    size_t left;
+    if (n <= 16) return CityHashTo16(s, n);
+    if (n <= 32) return CityHashTo32(s, n);
+    if (n <= 64) return CityHashTo64(s, n);
+    x = CityWord(s + n - 40);
+    y = CityWord(s + n - 16) + CityWord(s + n - 56);
+    z = CityHash16(CityWord(s + n - 48) + n, CityWord(s + n - 24));
+    CityWeak(s + n - 64, n, z, v);
+    CityWeak(s + n - 32, y + CITY_K1, x, w);
+    x = x * CITY_K1 + CityWord(s);
+    for (left = (n - 1) & ~(size_t)63; left; left -= 64, s += 64) {
+        x = CityRotate(x + y + v[0] + CityWord(s + 8), 37) * CITY_K1;
+        y = CityRotate(y + v[1] + CityWord(s + 48), 42) * CITY_K1;
+        x ^= w[1];
+        y += v[0] + CityWord(s + 40);
+        z = CityRotate(z + w[0], 33) * CITY_K1;
+        CityWeak(s, v[1] * CITY_K1, x + w[0], v);
+        CityWeak(s + 32, z + w[1], y + CityWord(s + 16), w);
+        t = z;
+        z = x;
+        x = t;
+    }
+    return CityHash16(CityHash16(v[0], w[0]) + CityShiftMix(y) * CITY_K1 + z, CityHash16(v[1], w[1]) + x);
+}
+
+/* The name Electron gives the zoom levels of a profile's pages in its
+ * Preferences (partition.per_host_zoom_levels): std::hash of the partition's
+ * full path, the profile's data folder, in decimal. A copied Preferences can
+ * hold another folder's too, which Claude no longer reads (measured on
+ * 3.6556: a profile at 100% beside a copied key at 110%). */
+BOOL Core_ZoomPartitionKey(const WCHAR *folder, char *out, size_t cch)
+{
+    return folder && folder[0] &&
+           SUCCEEDED(StringCchPrintfA(out, cch, "%I64u", CityHash64((const unsigned char *)folder, wcslen(folder) * sizeof(WCHAR))));
+}
+
 /* A `width` x `height` rectangle centered on `on`, then moved inside `work`
  * (its top left corner inside when it is bigger). */
 void Core_CenterRect(const RECT *on, int width, int height, const RECT *work, RECT *out)
@@ -4464,6 +4598,193 @@ BOOL Core_WebStorageText(const BYTE *value, size_t length, WCHAR *out, size_t cc
     out[n] = 0;
     *outLength = n;
     return TRUE;
+}
+
+/* ------------------------------------------------------------ IndexedDB */
+
+/* Chromium keeps an origin's IndexedDB in a LevelDB (its comparator,
+ * idb_cmp1, matters neither to reading every entry nor to adding a batch to
+ * the log), each key after a prefix naming a database, an object store and
+ * an index, 0 for none: the names of the databases under 0, 0, 0 (201, then
+ * the origin and the name, each a length and UTF-16BE; the value the
+ * database's id), an object store's metadata under <database>, 0, 0 (50,
+ * the store's id as a varint, then 0 and its name in UTF-16BE, or 4 and the
+ * last version a record took), and a record under <database>, <store>, 1
+ * (its key: a string is 1, its length, UTF-16BE), with its "exists" entry
+ * under index 2. A record's value is its version, a varint, then Blink's
+ * serialized value; the exists entry and the last version hold versions as
+ * Chromium's EncodeInt writes them: little-endian, up to the last byte not
+ * zero, one at least. */
+#define IDB_DATABASE_NAME  201
+#define IDB_STORE_META     50
+
+size_t Core_IdbPrefix(ULONGLONG database, ULONGLONG store, ULONGLONG index, BYTE *out, size_t capacity)
+{
+    const ULONGLONG ids[3] = { database, store, index };
+    static const int kMaxBytes[3] = { 8, 8, 4 };
+    int bytes[3], i, j;
+    size_t at = 1;
+    for (i = 0; i < 3; i++) {
+        for (bytes[i] = 1; bytes[i] < 8 && (ids[i] >> (8 * bytes[i])); bytes[i]++) {}
+        if (bytes[i] > kMaxBytes[i]) return 0;
+    }
+    if (capacity < 1 + (size_t)(bytes[0] + bytes[1] + bytes[2])) return 0;
+    out[0] = (BYTE)(((bytes[0] - 1) << 5) | ((bytes[1] - 1) << 2) | (bytes[2] - 1));
+    for (i = 0; i < 3; i++)
+        for (j = 0; j < bytes[i]; j++) out[at++] = (BYTE)(ids[i] >> (8 * j));
+    return at;
+}
+
+BOOL Core_IdbPrefixRead(const BYTE *key, size_t length, ULONGLONG ids[3], size_t *end)
+{
+    int bytes[3], i, j;
+    size_t at = 1;
+    if (length < 1) return FALSE;
+    bytes[0] = (key[0] >> 5) + 1;
+    bytes[1] = ((key[0] >> 2) & 7) + 1;
+    bytes[2] = (key[0] & 3) + 1;
+    for (i = 0; i < 3; i++) {
+        if (at + (size_t)bytes[i] > length) return FALSE;
+        for (ids[i] = 0, j = 0; j < bytes[i]; j++) ids[i] |= (ULONGLONG)key[at + j] << (8 * j);
+        at += (size_t)bytes[i];
+    }
+    *end = at;
+    return TRUE;
+}
+
+size_t Core_IdbInt(ULONGLONG value, BYTE *out)
+{
+    size_t n = 0;
+    do {
+        out[n++] = (BYTE)value;
+        value >>= 8;
+    } while (value);
+    return n;
+}
+
+ULONGLONG Core_IdbIntRead(const BYTE *data, size_t length)
+{
+    ULONGLONG value = 0;
+    size_t i;
+    for (i = 0; i < length && i < 8; i++) value |= (ULONGLONG)data[i] << (8 * i);
+    return value;
+}
+
+/* A length (a varint) and UTF-16BE, as IndexedDB writes a string; FALSE for more than `cch` - 1 characters. */
+static BOOL IdbStringAt(const BYTE *data, size_t end, size_t *at, WCHAR *out, size_t cch)
+{
+    ULONGLONG count;
+    size_t i;
+    if (!LevelVarint(data, end, at, &count) || count >= cch || count > (end - *at) / 2) return FALSE;
+    for (i = 0; i < (size_t)count; i++) out[i] = (WCHAR)((data[*at + 2 * i] << 8) | data[*at + 2 * i + 1]);
+    out[count] = 0;
+    *at += 2 * (size_t)count;
+    return TRUE;
+}
+
+static size_t IdbPutString(const WCHAR *text, BOOL withLength, BYTE *out, size_t capacity)
+{
+    size_t length = wcslen(text), at = 0, i;
+    if (capacity < 10 + 2 * length) return 0;
+    if (withLength) at = LevelPutVarint(out, length);
+    for (i = 0; i < length; i++) {
+        out[at++] = (BYTE)(text[i] >> 8);
+        out[at++] = (BYTE)text[i];
+    }
+    return at;
+}
+
+size_t Core_IdbStringKey(const WCHAR *text, BYTE *out, size_t capacity)
+{
+    size_t n;
+    if (capacity < 1 || (n = IdbPutString(text, TRUE, out + 1, capacity - 1)) == 0) return 0;
+    out[0] = 1;
+    return n + 1;
+}
+
+BOOL Core_IdbDatabaseName(const BYTE *key, size_t length, WCHAR *name, size_t cch)
+{
+    ULONGLONG ids[3];
+    WCHAR origin[256];
+    size_t at;
+    if (!Core_IdbPrefixRead(key, length, ids, &at) || ids[0] || ids[1] || ids[2] || at >= length || key[at] != IDB_DATABASE_NAME) return FALSE;
+    at++;
+    return IdbStringAt(key, length, &at, origin, ARRAYSIZE(origin)) && IdbStringAt(key, length, &at, name, cch) && at == length;
+}
+
+size_t Core_IdbStoreMetaKey(ULONGLONG database, ULONGLONG store, int kind, BYTE *out, size_t capacity)
+{
+    size_t at = Core_IdbPrefix(database, 0, 0, out, capacity);
+    if (!at || capacity < at + 12) return 0;
+    out[at++] = IDB_STORE_META;
+    at += LevelPutVarint(out + at, store);
+    out[at++] = (BYTE)kind;
+    return at;
+}
+
+BOOL Core_IdbStoreMeta(const BYTE *key, size_t length, ULONGLONG *database, ULONGLONG *store, int *kind)
+{
+    ULONGLONG ids[3];
+    size_t at;
+    if (!Core_IdbPrefixRead(key, length, ids, &at) || !ids[0] || ids[1] || ids[2] || at >= length || key[at] != IDB_STORE_META) return FALSE;
+    at++;
+    if (!LevelVarint(key, length, &at, store) || at + 1 != length) return FALSE;
+    *database = ids[0];
+    *kind = key[at];
+    return TRUE;
+}
+
+/* A record's value holding a string: its version, where Blink's and V8's
+ * headers start and end (`*header`, `*text`: the string's tag), and the
+ * string: Latin-1 (V8's one-byte tag '"'), UTF-16LE ('c'), or UTF-8 ('S').
+ * Blink's header is 0xFF and its version, then from version 21 0xFE and its
+ * trailer's offset and size (zero for a value without one); V8's is 0xFF and
+ * its version; V8 pads a string to align it with zeros before its tag. */
+BOOL Core_IdbValueString(const BYTE *value, size_t length, ULONGLONG *version, size_t *header, size_t *text, BYTE *tag, size_t *start,
+                         size_t *bytes)
+{
+    ULONGLONG count, skip;
+    size_t at = 0, i;
+    if (!LevelVarint(value, length, &at, version)) return FALSE;
+    *header = at;
+    while (at < length && (value[at] == 0xFF || value[at] == 0xFE)) {
+        if (value[at] == 0xFE) {
+            if (length - at < 13) return FALSE;
+            for (i = 1; i < 13; i++)
+                if (value[at + i]) return FALSE;   /* a trailer: objects beside the value */
+            at += 13;
+        } else {
+            at++;
+            if (!LevelVarint(value, length, &at, &skip)) return FALSE;
+        }
+    }
+    while (at < length && value[at] == 0) at++;
+    if (at >= length || (value[at] != '"' && value[at] != 'c' && value[at] != 'S')) return FALSE;
+    *text = at;
+    *tag = value[at++];
+    if (!LevelVarint(value, length, &at, &count) || count > length - at || (*tag == 'c' && count % 2)) return FALSE;
+    *start = at;
+    *bytes = (size_t)count;
+    return at + (size_t)count == length;
+}
+
+/* A record's value: `version`, the headers of the value it replaces
+ * (`header`, its padding left out), and `text`, Latin-1 only (V8's one-byte
+ * string); 0 when it does not fit or holds another character. */
+size_t Core_IdbValueWrite(ULONGLONG version, const BYTE *header, size_t headerLength, const WCHAR *text, size_t length, BYTE *out, size_t capacity)
+{
+    size_t at, i;
+    while (headerLength && header[headerLength - 1] == 0) headerLength--;
+    if (capacity < 10 + headerLength + 11 + length) return 0;
+    for (i = 0; i < length; i++)
+        if (text[i] > 0xFF) return 0;
+    at = LevelPutVarint(out, version);
+    memcpy(out + at, header, headerLength);
+    at += headerLength;
+    out[at++] = '"';
+    at += LevelPutVarint(out + at, length);
+    for (i = 0; i < length; i++) out[at++] = (BYTE)text[i];
+    return at;
 }
 
 /* ------------------------------------------------------- three-way merge */

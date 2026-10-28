@@ -30,6 +30,7 @@ static int g_checks, g_failures;
 static WCHAR g_root[MAX_PATH];
 static DWORD g_fixtureTag;
 static BOOL FileHas(const WCHAR *path, const char *text);
+static ULONGLONG SizeOf(const WCHAR *path);
 static const WCHAR *const g_family = L"Fixture_package";
 static const WCHAR *const g_scratchId = L"11111111-1111-4111-8111-111111111111";
 static const WCHAR *const g_projectId = L"22222222-2222-4222-8222-222222222222";
@@ -3832,31 +3833,64 @@ static BOOL SaveBytes(const WCHAR *path, const BYTE *data, size_t length)
 /* Claude's web storage in `storageDir` (Local Storage\leveldb), as LevelDB
  * leaves it: CURRENT, a manifest naming log 3, and that log, one write batch
  * of the claude.ai values `names` (`values`, UTF-8). */
-static BOOL MakeWebStorage(const WCHAR *storageDir, const WCHAR *const *names, const char *const *values, int count)
+/* The program's log in the tests' state folder: its size now, and whether it holds `text` past `from`. */
+static ULONGLONG LogSize(void)
 {
-    static const char kComparator[] = "leveldb.BytewiseComparator";
-    static BYTE keys[8][128], data[8][4096], batch[32768], record[40000];
-    WCHAR dir[MAX_PATH], path[MAX_PATH], text[2048];
+    WCHAR dir[MAX_PATH], path[MAX_PATH];
+    return Util_StateDir(dir, ARRAYSIZE(dir)) && Join(dir, L"claude-desktop-profiles-manager.log", path, ARRAYSIZE(path)) ? SizeOf(path) : 0;
+}
+
+static BOOL LoggedSince(ULONGLONG from, const char *text)
+{
+    WCHAR dir[MAX_PATH], path[MAX_PATH];
+    DWORD length = 0;
+    char *log;
+    BOOL has;
+    if (!Util_StateDir(dir, ARRAYSIZE(dir)) || !Join(dir, L"claude-desktop-profiles-manager.log", path, ARRAYSIZE(path)) ||
+        (log = Util_ReadFile(path, 64u * 1024u * 1024u, FALSE, &length)) == NULL)
+        return FALSE;
+    has = from < length && strstr(log + from, text) != NULL;
+    HeapFree(GetProcessHeap(), 0, log);
+    return has;
+}
+
+/* `path` written now, its bytes as they were. */
+static BOOL TouchFile(const WCHAR *path)
+{
+    HANDLE file = CreateFileW(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    FILETIME now;
+    BOOL ok;
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    GetSystemTimeAsFileTime(&now);
+    ok = SetFileTime(file, NULL, NULL, &now);
+    CloseHandle(file);
+    return ok;
+}
+
+/* When the sync of list `list` last left its fingerprint (the vault's read-<list>.txt), 0 for never. */
+static ULONGLONG KeptAt(const WCHAR *list)
+{
+    WCHAR dir[MAX_PATH], path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!Util_StateDir(dir, ARRAYSIZE(dir)) || FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\vault\\read-%s.txt", dir, list)) ||
+        !GetFileAttributesExW(path, GetFileExInfoStandard, &data))
+        return 0;
+    return ((ULONGLONG)data.ftLastWriteTime.dwHighDateTime << 32) | data.ftLastWriteTime.dwLowDateTime;
+}
+
+/* A LevelDB in `dir` (made) holding `ops` in its log, as LevelDB with `comparator` leaves one. */
+static BOOL MakeLevelDb(const WCHAR *dir, const char *comparator, const CoreLevelOp *ops, int count)
+{
+    static BYTE batch[32768], record[40000];
+    WCHAR path[MAX_PATH];
     BYTE edit[64];
-    CoreLevelOp ops[8];
-    size_t editLength = 0, length;
-    int i, chars;
-    if (count > 8 || !Join(storageDir, L"Local Storage\\leveldb", dir, ARRAYSIZE(dir)) || !MakeDir(dir)) return FALSE;
-    ZeroMemory(ops, sizeof ops);
-    for (i = 0; i < count; i++) {
-        if ((chars = MultiByteToWideChar(CP_UTF8, 0, values[i], -1, text, ARRAYSIZE(text)) - 1) < 0) return FALSE;
-        ops[i].put = TRUE;
-        ops[i].key = keys[i];
-        ops[i].keyLength = Core_WebStorageKey("https://claude.ai", names[i], keys[i], sizeof keys[i]);
-        ops[i].value = data[i];
-        ops[i].valueLength = Core_WebStorageValue(text, (size_t)chars, data[i], sizeof data[i]);
-        if (!ops[i].keyLength || !ops[i].valueLength) return FALSE;
-    }
+    size_t editLength = 0, length, comparatorLength = strlen(comparator);
+    if (!MakeDir(dir) || comparatorLength > 40) return FALSE;
     /* The manifest's edit: the comparator, log 3, next file 4, last sequence 0. */
     edit[editLength++] = 1;
-    edit[editLength++] = (BYTE)(sizeof kComparator - 1);
-    memcpy(edit + editLength, kComparator, sizeof kComparator - 1);
-    editLength += sizeof kComparator - 1;
+    edit[editLength++] = (BYTE)comparatorLength;
+    memcpy(edit + editLength, comparator, comparatorLength);
+    editLength += comparatorLength;
     edit[editLength++] = 2;
     edit[editLength++] = 3;
     edit[editLength++] = 3;
@@ -3869,6 +3903,97 @@ static BOOL MakeWebStorage(const WCHAR *storageDir, const WCHAR *const *names, c
     return (length = Core_LevelBatchWrite(1, ops, count, batch, sizeof batch)) != 0 &&
            (length = Core_LevelLogAppend(0, batch, length, record, sizeof record)) != 0 && Join(dir, L"000003.log", path, ARRAYSIZE(path)) &&
            SaveBytes(path, record, length);
+}
+
+/* Claude's web storage in `storageDir`: `names` holding `values`. */
+static BOOL MakeWebStorage(const WCHAR *storageDir, const WCHAR *const *names, const char *const *values, int count)
+{
+    static BYTE keys[8][128], data[8][4096];
+    WCHAR dir[MAX_PATH], text[2048];
+    CoreLevelOp ops[8];
+    int i, chars;
+    if (count > 8 || !Join(storageDir, L"Local Storage\\leveldb", dir, ARRAYSIZE(dir))) return FALSE;
+    ZeroMemory(ops, sizeof ops);
+    for (i = 0; i < count; i++) {
+        if ((chars = MultiByteToWideChar(CP_UTF8, 0, values[i], -1, text, ARRAYSIZE(text)) - 1) < 0) return FALSE;
+        ops[i].put = TRUE;
+        ops[i].key = keys[i];
+        ops[i].keyLength = Core_WebStorageKey("https://claude.ai", names[i], keys[i], sizeof keys[i]);
+        ops[i].value = data[i];
+        ops[i].valueLength = Core_WebStorageValue(text, (size_t)chars, data[i], sizeof data[i]);
+        if (!ops[i].keyLength || !ops[i].valueLength) return FALSE;
+    }
+    return MakeLevelDb(dir, "leveldb.BytewiseComparator", ops, count);
+}
+
+#define STARRED_KEY L"store:pin-state:dframe-starred-code"
+
+/* A database's name entry: 0, 0, 0, 201, the origin, the name (each a string key without its type). */
+static size_t IdbNameKey(const WCHAR *database, BYTE *out, size_t capacity)
+{
+    BYTE string[128];
+    size_t n = Core_IdbPrefix(0, 0, 0, out, capacity), at;
+    out[n++] = 201;
+    at = Core_IdbStringKey(L"https_claude.ai_0@1", string, sizeof string);
+    memcpy(out + n, string + 1, at - 1);
+    n += at - 1;
+    at = Core_IdbStringKey(database, string, sizeof string);
+    memcpy(out + n, string + 1, at - 1);
+    return n + at - 1;
+}
+
+/* Claude's IndexedDB in `storageDir`, as Chromium writes it: idb-keyval's "keyval-store" (id `database`, after
+ * another database holding the same key, "decoy") with its store "keyval" (last version 40), whose record of the
+ * starred sessions (version 37) holds `starred`. */
+static BOOL MakeIndexedDb(const WCHAR *storageDir, ULONGLONG database, const char *starred)
+{
+    static const BYTE kHeader[] = { 0xFF, 0x15, 0xFE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0x10 };
+    static const BYTE kStoreName[] = { 0, 'k', 0, 'e', 0, 'y', 0, 'v', 0, 'a', 0, 'l' };   /* UTF-16BE */
+    static BYTE keys[10][160], values[10][1024];
+    WCHAR dir[MAX_PATH], text[512];
+    const ULONGLONG ids[2] = { 1, database };
+    const char *records[2] = { "{\"state\":{\"starredIds\":[\"decoy\"]},\"version\":0,\"updatedAt\":1}", starred };
+    CoreLevelOp ops[10];
+    int i, count = 0, chars;
+    size_t at;
+    if (!Join(storageDir, L"IndexedDB\\https_claude.ai_0.indexeddb.leveldb", dir, ARRAYSIZE(dir))) return FALSE;
+    ZeroMemory(ops, sizeof ops);
+    for (i = 0; i < 10; i++) {
+        ops[i].put = TRUE;
+        ops[i].key = keys[i];
+        ops[i].value = values[i];
+    }
+    for (i = 0; i < 2; i++, count += 5) {
+        if ((chars = MultiByteToWideChar(CP_UTF8, 0, records[i], -1, text, ARRAYSIZE(text)) - 1) < 0) return FALSE;
+        ops[count].keyLength = IdbNameKey(i ? L"keyval-store" : L"other-store", keys[count], sizeof keys[count]);
+        ops[count].valueLength = Core_IdbInt(ids[i], values[count]);
+        ops[count + 1].keyLength = Core_IdbStoreMetaKey(ids[i], 1, 0, keys[count + 1], sizeof keys[count + 1]);
+        memcpy(values[count + 1], kStoreName, sizeof kStoreName);
+        ops[count + 1].valueLength = sizeof kStoreName;
+        ops[count + 2].keyLength = Core_IdbStoreMetaKey(ids[i], 1, 4, keys[count + 2], sizeof keys[count + 2]);
+        ops[count + 2].valueLength = Core_IdbInt(40, values[count + 2]);
+        at = Core_IdbPrefix(ids[i], 1, 1, keys[count + 3], sizeof keys[count + 3]);
+        ops[count + 3].keyLength = at + Core_IdbStringKey(STARRED_KEY, keys[count + 3] + at, sizeof keys[count + 3] - at);
+        ops[count + 3].valueLength = Core_IdbValueWrite(37, kHeader, sizeof kHeader, text, (size_t)chars, values[count + 3], sizeof values[count + 3]);
+        at = Core_IdbPrefix(ids[i], 1, 2, keys[count + 4], sizeof keys[count + 4]);
+        ops[count + 4].keyLength = at + Core_IdbStringKey(STARRED_KEY, keys[count + 4] + at, sizeof keys[count + 4] - at);
+        ops[count + 4].valueLength = Core_IdbInt(37, values[count + 4]);
+    }
+    for (i = 0; i < count; i++)
+        if (!ops[i].keyLength || !ops[i].valueLength) return FALSE;
+    return MakeLevelDb(dir, "idb_cmp1", ops, count);
+}
+
+/* The starred sessions' record of IndexedDB database `database` in `p` holds `text`. */
+static BOOL StarredHas(const Profile *p, const WCHAR *database, const char *text)
+{
+    WebStore *store = WebStore_OpenIndexed(p, database, L"keyval", STARRED_KEY);
+    size_t length = 0;
+    char *value = store ? WebStore_GetIndexed(store, &length) : NULL;
+    BOOL has = value && strstr(value, text) != NULL;
+    Util_Free(value);
+    WebStore_Free(store);
+    return has;
 }
 
 /* Conflict `part` of `item` is among `conflicts`, between the profiles of `members`. */
@@ -3931,19 +4056,83 @@ static ULONGLONG SizeOf(const WCHAR *path)
 /* The sidebar's groups, sections and settings, which Claude's web UI keeps in
  * its web storage: kept the same there, for each profile's own account and
  * organization, with Claude's copies of them alike; never while it runs. */
+/* The files of `dir` dated an hour ago: past the time an entry just written is read again for. */
+static BOOL AgeFiles(const WCHAR *dir)
+{
+    WCHAR path[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE find = Util_FindFiles(dir, L"*", &found, FALSE);
+    ULARGE_INTEGER then;
+    FILETIME now, old;
+    BOOL ok = TRUE;
+    if (find == INVALID_HANDLE_VALUE) return FALSE;
+    GetSystemTimeAsFileTime(&now);
+    then.LowPart = now.dwLowDateTime;
+    then.HighPart = now.dwHighDateTime;
+    then.QuadPart -= 3600ULL * 10000000ULL;
+    old.dwLowDateTime = then.LowPart;
+    old.dwHighDateTime = then.HighPart;
+    do {
+        HANDLE file;
+        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !Join(dir, found.cFileName, path, ARRAYSIZE(path))) continue;
+        file = CreateFileW(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE || !SetFileTime(file, NULL, NULL, &old)) ok = FALSE;
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    return ok;
+}
+
+/* The entries' cache kept on disk: a new process (here, the cache dropped and read again from its file) reads from
+ * it the entries that did not change, and a file another build laid out otherwise is not read. */
+static void TestEntryCacheFile(void)
+{
+    ProfileList profiles;
+    SessionSet set;
+    WCHAR entries[MAX_PATH], state[MAX_PATH], path[MAX_PATH];
+    LONG fresh;
+    int kept;
+    BOOL ready;
+    ZeroMemory(&profiles, sizeof profiles);
+    profiles.count = 1;
+    ready = PrepareProfile(&profiles.items[0], L"Cache-A", L"cache\\A", L"cache-a", L"cache-organization", entries, ARRAYSIZE(entries)) &&
+            WriteKeptEntry(entries, g_keptIds[0], "Cached one", L"C:\\Fixture", AtSecond(2)) &&
+            WriteKeptEntry(entries, g_keptIds[1], "Cached two", L"C:\\Fixture", AtSecond(3)) && AgeFiles(entries);
+    Check("entry cache: fixtures created", ready);
+    if (!ready) return;
+    ready = SessionStore_LoadProfiles(&set, &profiles);
+    if (ready) SessionStore_Free(&set);
+    SessionStore_SaveEntryCache(TRUE);
+    kept = SessionStore_ReadEntryCacheAgain();
+    fresh = SessionStore_FreshReads();
+    ready = ready && SessionStore_LoadProfiles(&set, &profiles);
+    Check("entry cache: a new process reads the entries that did not change from the file", ready && kept >= 2 && set.entryCount == 2 &&
+          SessionStore_FreshReads() == fresh &&
+          (wcscmp(set.entries[0].title, L"Cached one") == 0 || wcscmp(set.entries[1].title, L"Cached one") == 0));
+    if (ready) SessionStore_Free(&set);
+    /* Another layout (its magic or its EntryRead another): nothing read, every entry read again. */
+    ready = Util_StateDir(state, ARRAYSIZE(state)) && Join(state, L"entry-cache.bin", path, ARRAYSIZE(path)) && Save(path, "XXXXXXXXXXXXXXXXXXXXXXXX");
+    Check("entry cache: a file not laid out as this build lays it out is not read", ready && SessionStore_ReadEntryCacheAgain() == 0);
+    fresh = SessionStore_FreshReads();
+    ready = ready && SessionStore_LoadProfiles(&set, &profiles);
+    Check("entry cache: ...and the entries are read from their files", ready && set.entryCount == 2 && SessionStore_FreshReads() == fresh + 2);
+    if (ready) SessionStore_Free(&set);
+}
+
 static void TestWebLayout(void)
 {
     static const WCHAR *const labels[2] = { L"Web-A", L"Web-B" };
     static const WCHAR *const leaves[2] = { L"web\\A", L"web\\B" };
     static const WCHAR *const accounts[2] = { L"web-a", L"web-b" };
-    static const WCHAR *const namesA[3] = { L"dframe-store", L"LSS-persisted.dframe-group-scopes", L"epitaxy-editor-prefs" };
+    static const WCHAR *const namesA[4] = { L"dframe-store", L"LSS-persisted.dframe-group-scopes", L"epitaxy-editor-prefs",
+                                            L"epitaxy.sidePaneStore.v1" };
     static const WCHAR *const namesB[2] = { L"dframe-store", L"LSS-persisted.dframe-group-scopes" };
     ProfileList profiles;
     SyncReport report;
     WCHAR entries[2][MAX_PATH], configs[2][MAX_PATH], logs[2][MAX_PATH], list[FOLDER_CCH], backup[MAX_PATH], copied[MAX_PATH];
-    char storeA[2048], copyA[1024], groups[512];
-    const char *valuesA[3], *valuesB[2];
-    ULONGLONG sizes[2];
+    char storeA[2048], copyA[1024], groups[512], sliceA[384], pins[128], starredA[160], stars[96];
+    const char *valuesA[4], *valuesB[2];
+    ULONGLONG sizes[2], logged;
     static VaultConflict conflicts[32];
     HWND window;
     int i, count;
@@ -3968,12 +4157,22 @@ static void TestWebLayout(void)
     valuesA[0] = storeA;
     valuesA[1] = copyA;
     valuesA[2] = "{\"state\":{\"editorFont\":\"Consolas\",\"chatTextSize\":\"l\"},\"version\":0}";
+    valuesA[3] = "{\"state\":{\"tileLayout\":{\"root\":\"a\"}},\"version\":6}";   /* B never opened a side pane: has none */
     valuesB[0] = "{\"state\":{\"collapsed\":true,\"customGroupsByScope\":{\"web-b/web-organization\":{\"groups\":[],\"assignments\":{},\"order\":{}}},"
                  "\"navPinnedIds\":null,\"groupByByMode\":{},\"sidebarRowCountsByScope\":{\"b\":2}},\"version\":1}";
     valuesB[1] = "{\"value\":{},\"tabId\":\"\",\"timestamp\":5}";
+    StringCchPrintfA(sliceA, sizeof sliceA,
+        "{\"preferences\":{\"epitaxyPrefs\":{\"dframe-local-slice\":{\"pinnedOrder\":[\"code:local_%ls\"],\"homeProjectsPinnedOrder\":[]},"
+        "\"starred-local-code-sessions\":[\"local_%ls\"]}}}",
+        g_keptIds[0], g_keptIds[0]);
+    StringCchPrintfA(pins, sizeof pins, "\"pinnedOrder\":[\"code:local_%ls\"],\"homeProjectsPinnedOrder\":[]", g_keptIds[0]);
+    StringCchPrintfA(starredA, sizeof starredA, "{\"state\":{\"starredIds\":[\"local_%ls\"]},\"version\":0,\"updatedAt\":1}", g_keptIds[0]);
+    StringCchPrintfA(stars, sizeof stars, "\"starredIds\":[\"local_%ls\"]", g_keptIds[0]);
     ready = ready && WriteKeptEntry(entries[0], g_keptIds[0], "Web one", L"C:\\Fixture", AtSecond(2)) &&
-            MakeWebStorage(profiles.items[0].storageDir, namesA, valuesA, 3) && MakeWebStorage(profiles.items[1].storageDir, namesB, valuesB, 2) &&
-            Save(configs[1], "{\"preferences\":{\"epitaxyPrefs\":{\"dframe-group-scopes\":{}}},\"other\":true}") &&
+            MakeWebStorage(profiles.items[0].storageDir, namesA, valuesA, 4) && MakeWebStorage(profiles.items[1].storageDir, namesB, valuesB, 2) &&
+            MakeIndexedDb(profiles.items[0].storageDir, 5, starredA) &&
+            MakeIndexedDb(profiles.items[1].storageDir, 5, "{\"state\":{\"starredIds\":[]},\"version\":0,\"updatedAt\":1}") &&
+            Save(configs[0], sliceA) && Save(configs[1], "{\"preferences\":{\"epitaxyPrefs\":{\"dframe-group-scopes\":{}}},\"other\":true}") &&
             SessionVault_GroupListName(4, list, ARRAYSIZE(list)) && Join(g_root, L"web-backup", backup, ARRAYSIZE(backup));
     Check("web layouts: fixtures created", ready);
     if (!ready) return;
@@ -3999,6 +4198,16 @@ static void TestWebLayout(void)
           !WebHas(&profiles.items[1], L"dframe-store", "web-a/web-organization"));
     Check("web layouts: the sections went across",
           WebHas(&profiles.items[1], L"dframe-store", "\"codeSidebarByScope\":{\"web-b/web-organization\":{\"sections\":[{\"id\":\"cg-1\""));
+    Check("web layouts: the pins went to the sidebar's store too, which Claude writes their copy from at its start",
+          FileHas(configs[1], pins) && WebHas(&profiles.items[1], L"dframe-store", pins));
+    Check("web layouts: the stars went to Claude's IndexedDB, its own database's record found by name, the other left",
+          StarredHas(&profiles.items[1], L"keyval-store", stars) && StarredHas(&profiles.items[1], L"other-store", "decoy") &&
+          StarredHas(&profiles.items[0], L"keyval-store", stars));
+    Check("web layouts: Claude sends the stores the sync changed to its server at its next start, for the profile's account",
+          WebHas(&profiles.items[1], L"ccd-sync-pending:ccd/dframe-starred-code", "web-b/web-organization") &&
+          WebHas(&profiles.items[1], L"ccd-sync-pending:ccd/dframe-store", "web-b/web-organization") &&
+          WebHas(&profiles.items[1], L"ccd-sync-pending:ccd/epitaxy-editor-prefs", "web-b/web-organization") &&
+          !WebHas(&profiles.items[0], L"ccd-sync-pending:ccd/dframe-starred-code", "web"));
     Check("web layouts: the Edit sidebar choices and the grouping went across",
           WebHas(&profiles.items[1], L"dframe-store", "\"navPinnedIds\":[\"projects\",\"artifacts\"]") &&
           WebHas(&profiles.items[1], L"dframe-store", "\"groupByByMode\":{\"code\":\"custom\"}"));
@@ -4018,9 +4227,22 @@ static void TestWebLayout(void)
 
     sizes[0] = SizeOf(logs[0]);
     sizes[1] = SizeOf(logs[1]);
+    logged = LogSize();
     ZeroMemory(&report, sizeof report);
     Check("web layouts: kept again, nothing is written", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
           SizeOf(logs[0]) == sizes[0] && SizeOf(logs[1]) == sizes[1]);
+    Check("web layouts: ...nor sent: a side pane B has none of (it cannot take one) is sent once, not at every sync",
+          !LoggedSince(logged, "change(s) sent to"));
+    /* Nothing changed since the last sync: the next reads nothing, the fingerprint it left the same; a change, and it does. */
+    sizes[0] = KeptAt(list);
+    Sleep(30);
+    ZeroMemory(&report, sizeof report);
+    Check("web layouts: a sync with nothing changed since the last is not made", sizes[0] && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) &&
+          report.failed == 0 && KeptAt(list) == sizes[0]);
+    ready = TouchFile(configs[1]);   /* written again as it was: Claude saving its settings */
+    ZeroMemory(&report, sizeof report);
+    Check("web layouts: ...and one is once a profile changed", ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
+          KeptAt(list) != sizes[0]);
 
     /* A group renamed in the other profile goes to the first. */
     Sleep(30);
@@ -4130,10 +4352,10 @@ static void TestSyncItems(void)
     SyncReport report;
     WCHAR entries[2][MAX_PATH], configs[2][MAX_PATH], apps[2][MAX_PATH], chromium[2][MAX_PATH], logs[2][MAX_PATH];
     WCHAR list[FOLDER_CCH], backup[MAX_PATH];
-    char paneA[1024], paneB[1024], part[256];
+    char paneA[1024], paneB[1024], part[256], prefs[512];
     const char *valuesA[4], *valuesB[3], *copyValue[1];
     const char *pane[3] = { "state", "tileLayoutBySession", NULL };
-    char id0[64], id1[64];
+    char id0[64], id1[64], ownB[24];
     ULONGLONG sizes[2];
     static VaultConflict conflicts[32];
     int count;
@@ -4229,6 +4451,23 @@ static void TestSyncItems(void)
     ZeroMemory(&report, sizeof report);
     Check("sync items: kept again, nothing is written", SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0 &&
           SizeOf(logs[0]) == sizes[0] && SizeOf(logs[1]) == sizes[1]);
+
+    /* B's Preferences holds two other folders' zoom (a copy): none of it is B's, nothing is read or written there. Then
+     * Claude makes B's own key, empty (100%): no change of B's, the group's zoom goes there and the copies stay. */
+    ready = Core_ZoomPartitionKey(profiles.items[1].storageDir, ownB, sizeof ownB) &&
+            Save(chromium[1], "{\"partition\":{\"per_host_zoom_levels\":{\"222\":{\"claude.ai\":0.75},\"333\":{}}},"
+                              "\"spellcheck\":{\"dictionaries\":[\"en-US\",\"fr\"]}}");
+    ZeroMemory(&report, sizeof report);
+    ready = ready && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0;
+    Check("sync items: zoom keys of other folders alone are no zoom of the profile's", ready &&
+          FileHas(chromium[1], "\"333\":{}") && FileHas(chromium[0], "\"111\":{\"claude.ai\":0.75}"));
+    StringCchPrintfA(prefs, sizeof prefs, "{\"partition\":{\"per_host_zoom_levels\":{\"222\":{\"claude.ai\":0.75},\"333\":{},\"%s\":{}}},"
+                     "\"spellcheck\":{\"dictionaries\":[\"en-US\",\"fr\"]}}", ownB);
+    ZeroMemory(&report, sizeof report);
+    ready = Save(chromium[1], prefs) && SessionVault_Keep(&profiles, 0x3, list, TRUE, &report) && report.failed == 0;
+    StringCchPrintfA(part, sizeof part, "\"%s\":{\"claude.ai\":0.75}", ownB);
+    Check("sync items: the profile's own zoom key, read first time empty, takes the group's; the copies stay", ready &&
+          FileHas(chromium[1], part) && FileHas(chromium[1], "\"333\":{}") && FileHas(chromium[0], "\"111\":{\"claude.ai\":0.75}"));
 
     /* Two sessions' panes changed at once, one in each profile: both changes kept. */
     Sleep(30);
@@ -5672,6 +5911,7 @@ int wmain(int argc, WCHAR **argv)
             TestSettingList();
             TestVault(projects);
             TestKeptGroups(projects);
+            TestEntryCacheFile();
             TestWebLayout();
             TestSyncItems();
             TestUnreadMarks();

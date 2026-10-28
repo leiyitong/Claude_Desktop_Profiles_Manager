@@ -45,14 +45,21 @@ int main(void)
         merged = own ? Presets_MergeAccount(own, ownLength, different, sizeof different - 1, &mergedLength) : NULL;
         Check("an account's merge with presets it already took leaves it as it is",
               merged && mergedLength == ownLength && memcmp(merged, own, ownLength) == 0);
-        Check("... so sending them again is no change", own && SessionSync_PartHolds(&presets, own, ownLength, different, sizeof different - 1));
+        Check("... so sending them again is no change", own && SessionSync_PartHolds(&presets, NULL, 0, own, ownLength, different, sizeof different - 1));
         static const char added[] = "{\"presets\":[{\"id\":\"p9\",\"name\":\"New\",\"target\":{\"kind\":\"local\",\"cwd\":\"E:\\\\New\"}}]}";
-        Check("... unlike presets it does not have", own && !SessionSync_PartHolds(&presets, own, ownLength, added, sizeof added - 1) &&
-              !SessionSync_PartHolds(&presets, NULL, 0, added, sizeof added - 1));
+        Check("... unlike presets it does not have", own && !SessionSync_PartHolds(&presets, NULL, 0, own, ownLength, added, sizeof added - 1) &&
+              !SessionSync_PartHolds(&presets, NULL, 0, NULL, 0, added, sizeof added - 1));
         Check("a value only the profile's own can take is no change where it has none",
-              SessionSync_PartHolds(&zoom, NULL, 0, "{\"a\":1}", 7) && !SessionSync_PartHolds(&zoom, "{\"a\":2}", 7, "{\"a\":1}", 7));
-        Check("any other part differing is a change", !SessionSync_PartHolds(&other, "\"en-US\"", 7, "\"zh-CN\"", 7) &&
-              !SessionSync_PartHolds(&other, NULL, 0, "\"zh-CN\"", 7));
+              SessionSync_PartHolds(&zoom, NULL, 0, NULL, 0, "{\"a\":1}", 7) && !SessionSync_PartHolds(&zoom, NULL, 0, "{\"a\":2}", 7, "{\"a\":1}", 7));
+        Check("any other part differing is a change", !SessionSync_PartHolds(&other, NULL, 0, "\"en-US\"", 7, "\"zh-CN\"", 7) &&
+              !SessionSync_PartHolds(&other, NULL, 0, NULL, 0, "\"zh-CN\"", 7));
+        {
+            static const char cannot[] = "{\"cannotTake\":{\"appLocale\":1}}", others[] = "{\"cannotTake\":{\"pageZoom\":1}}";
+            Check("a part the profile cannot take (a value Claude has not made there) is no change where it has none",
+                  SessionSync_PartHolds(&other, cannot, sizeof cannot - 1, NULL, 0, "\"zh-CN\"", 7) &&
+                  !SessionSync_PartHolds(&other, others, sizeof others - 1, NULL, 0, "\"zh-CN\"", 7) &&
+                  !SessionSync_PartHolds(&other, cannot, sizeof cannot - 1, "\"en-US\"", 7, "\"zh-CN\"", 7));
+        }
         Free(merged); Free(own);
     }
     source = again ? Presets_Account(again, m, "target", &k) : NULL;

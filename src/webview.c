@@ -143,6 +143,8 @@ typedef struct WebSignIn {
     BOOL          preview;       /* a page of ours: `url` alone loads, its links open in the default browser; `folder` is kept */
     ULONGLONG     offered;       /* the Magic link last offered from the clipboard (its hash): not asked again */
     ULONGLONG     settleAt;      /* a session cookie was seen: when its fellows have had time to be written (0: not yet) */
+    ULONGLONG     onboardingDeadline;  /* when the onboarding patch's wait ends even without the page's answer */
+    BYTE          onboarding;    /* the onboarding skip: 0 idle, 1 waiting for the page, 2 answered */
 } WebSignIn;
 
 /* One of the handlers WebView2 calls back: its Invoke takes two pointers.
@@ -235,6 +237,44 @@ static void PageOf(const WCHAR *uri, WCHAR *out, size_t cch)
 
 #define SIGNIN_POLL_TIMER 0x5C01
 #define SIGNIN_SETTLE_MS  800   /* once a session cookie appears, give the rest a moment to be written */
+#define SIGNIN_ONBOARDING_WAIT_MS 25000   /* the onboarding patch's answer, then the window goes on anyway */
+
+/* Tell claude.ai the account's onboarding is finished — the call the wizard's last step makes — and read it
+ * back from the account. The flag alone decides whether claude.ai routes to the form: a sign-in that never
+ * walked the form is taken as finished, and an account left inside the form would be asked again (and, in
+ * Claude's own apps, locked out of the web) until some window finishes it. The write lands on the server a
+ * moment after the answer says accepted, hence the read-back. Runs in the signed-in page. */
+static const WCHAR ONBOARDING_PATCH[] =
+    L"(async () => {"
+    L" try {"
+    L"  const patch = await fetch('/api/account/settings', { method: 'PATCH', credentials: 'include',"
+    L"   headers: { 'Content-Type': 'application/json' }, body: '{\"has_finished_claudeai_onboarding\":true}' });"
+    L"  const status = patch.status;"
+    L"  for (let i = 0; i < 15; i++) {"
+    L"   await new Promise(r => setTimeout(r, 1000));"
+    L"   try {"
+    L"    const account = await (await fetch('/api/account', { credentials: 'include' })).json();"
+    L"    if (account.settings && account.settings.has_finished_claudeai_onboarding === true) return 'done ' + status;"
+    L"   } catch (e) {}"
+    L"  }"
+    L"  return 'sent ' + status;"
+    L" } catch (e) { return 'error ' + e; }"
+    L"})()";
+
+/* The onboarding patch's answer: the script's returned text, as JSON. Logged, and the poll's next tick
+ * goes on to the cookies whether or not it arrived. */
+static HRESULT STDMETHODCALLTYPE OnOnboarding(WvHandler *self, void *errorPointer, void *json)
+{
+    WebSignIn *state = StateOf(self);
+    HRESULT hr = (HRESULT)(INT_PTR)errorPointer;
+    const WCHAR *result = (const WCHAR *)json;
+    if (state->onboarding == 1) {
+        state->onboarding = 2;
+        if (FAILED(hr) || !result) Util_Log(L"sign-in window: the onboarding patch did not answer (0x%08lX)", (unsigned long)hr);
+        else Util_Log(L"sign-in window: the onboarding patch answered: %s", result);
+    }
+    return S_OK;
+}
 
 /* The sign-in is done (claude.ai set a session cookie): read the cookies from this window's store, write them
  * into the profile that asked, open it, and close the window. The profile's Claude is closed first if it runs. */
@@ -436,6 +476,17 @@ static LRESULT CALLBACK WebProc(HWND window, UINT msg, WPARAM wp, LPARAM lp)
             if (!state->settleAt) {
                 if (Cookies_WebViewSignedIn(state->folder)) state->settleAt = GetTickCount64() + SIGNIN_SETTLE_MS;
             } else if (GetTickCount64() >= state->settleAt) {
+                if (state->onboarding == 0 && !state->preview && state->view && Util_GetSetting(SETTING_SIGNIN_SKIP_ONBOARDING, 0)) {
+                    HRESULT (STDMETHODCALLTYPE *execute)(WvView *, LPCWSTR, IUnknown *) =
+                        (HRESULT (STDMETHODCALLTYPE *)(WvView *, LPCWSTR, IUnknown *))(void *)state->view->lpVtbl->ExecuteScript;
+                    IUnknown *handler = NewHandler(state, OnOnboarding);
+                    state->onboarding = 1;
+                    state->onboardingDeadline = GetTickCount64() + SIGNIN_ONBOARDING_WAIT_MS;
+                    if (handler && execute) execute(state->view, ONBOARDING_PATCH, handler);
+                    else state->onboarding = 2;
+                    if (handler) handler->lpVtbl->Release(handler);
+                }
+                if (state->onboarding == 1 && GetTickCount64() < state->onboardingDeadline) return 0;
                 SaveCookiesAndOpen(state);
             }
         }

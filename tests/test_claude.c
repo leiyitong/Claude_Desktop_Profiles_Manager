@@ -257,12 +257,11 @@ static void CheckMovedStock(const ClaudePackage *pkg)
                 L"the stock profile resolves to the folder Claude moved it to", L"%s resolved, not %s", stock.storageDir, moved);
 }
 
-/* A running profile's Claude holds "lockfile" in its data folder, created
- * right before its Chrome_MessageWindow: without the process, the watcher sees
- * the profile start that way. Only reads. */
-static void CheckLockFiles(const ClaudePackage *pkg)
+/* Each profile whose Claude of `pkg` runs, `each` called with it (its data
+ * folder resolved) and its window's title; how many. Only reads. */
+static int EachRunningProfile(const ClaudePackage *pkg, void (*each)(const Profile *profile, const WCHAR *title))
 {
-    WCHAR title[MAX_PATH], family[ARRAYSIZE(pkg->family)], localAppData[MAX_PATH], path[MAX_PATH], what[LINE_CCH];
+    WCHAR title[MAX_PATH], family[ARRAYSIZE(pkg->family)], localAppData[MAX_PATH];
     HWND window = NULL;
     int running = 0;
     if (!Util_LocalAppData(localAppData, ARRAYSIZE(localAppData))) localAppData[0] = 0;
@@ -282,14 +281,75 @@ static void CheckLockFiles(const ClaudePackage *pkg)
         StringCchCopyW(profile.dataDir, ARRAYSIZE(profile.dataDir), title);
         name = wcsrchr(title, L'\\');
         profile.isStock = name && Core_EqualsI(name + 1, STOCK_FOLDER);
-        if (!Profiles_ResolveStorage(&profile, localAppData, pkg->family) ||
-            FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\lockfile", profile.storageDir)))
-            continue;
+        if (!Profiles_ResolveStorage(&profile, localAppData, pkg->family)) continue;
         running++;
-        StringCchPrintfW(what, ARRAYSIZE(what), L"the running Claude of %s holds lockfile in its data folder", title);
-        ReportCheck(Util_FileExists(path), what, L"%s not found", path);
+        each(&profile, title);
     }
-    if (!running) wprintf(L"  skip  lockfile checks: no profile's Claude is running\n");
+    return running;
+}
+
+/* A running profile's Claude holds "lockfile" in its data folder, created
+ * right before its Chrome_MessageWindow: without the process, the watcher sees
+ * the profile start that way. */
+static void CheckLockFile(const Profile *profile, const WCHAR *title)
+{
+    WCHAR path[MAX_PATH], what[LINE_CCH];
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\lockfile", profile->storageDir))) return;
+    StringCchPrintfW(what, ARRAYSIZE(what), L"the running Claude of %s holds lockfile in its data folder", title);
+    ReportCheck(Util_FileExists(path), what, L"%s not found", path);
+}
+
+/* Where a running profile's Claude keeps what the sync writes: its pages'
+ * zoom in its Preferences under Electron's hash of its folder
+ * (Core_ZoomPartitionKey; a copied Preferences holds other folders' too), and
+ * the sidebar's pins in its store (dframe-store's state), from which it writes
+ * their copy in its settings at each start. */
+static void CheckLayoutPlaces(const Profile *profile, const WCHAR *title)
+{
+    WCHAR path[MAX_PATH], what[LINE_CCH];
+    char key[24], *text;
+    const char *levels, *found;
+    size_t levelsLength, foundLength, length = 0;
+    DWORD size = 0;
+    WebStore *store;
+    if (SUCCEEDED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\Preferences", profile->storageDir)) &&
+        (text = Util_ReadFile(path, 16u * 1024u * 1024u, FALSE, &size)) != NULL) {
+        if (Core_JsonMember(text, size, "partition", &levels, &levelsLength) &&
+            Core_JsonMember(levels, levelsLength, "per_host_zoom_levels", &levels, &levelsLength) &&
+            Core_ZoomPartitionKey(profile->storageDir, key, sizeof key)) {
+            StringCchPrintfW(what, ARRAYSIZE(what), L"the running Claude of %s keeps its zoom under the hash of its folder", title);
+            ReportCheck(Core_JsonMember(levels, levelsLength, key, &found, &foundLength), what, L"no member %S in %s", key, path);
+        }
+        Util_Free(text);
+    }
+    if ((store = WebStore_Open(profile)) != NULL) {
+        if ((text = WebStore_Get(store, L"dframe-store", &length)) != NULL) {
+            StringCchPrintfW(what, ARRAYSIZE(what), L"the running Claude of %s keeps its sidebar's pins in its store", title);
+            ReportCheck(Core_JsonMember(text, length, "state", &levels, &levelsLength) &&
+                        Core_JsonMember(levels, levelsLength, "pinnedOrder", &found, &foundLength), what, L"no state.pinnedOrder in dframe-store");
+            Util_Free(text);
+        }
+        WebStore_Free(store);
+    }
+    /* Which sessions are starred: its IndexedDB's record (idb-keyval's), {"state":{"starredIds":[...]},...}. */
+    if ((store = WebStore_OpenIndexed(profile, L"keyval-store", L"keyval", L"store:pin-state:dframe-starred-code")) != NULL) {
+        if ((text = WebStore_GetIndexed(store, &length)) != NULL) {
+            StringCchPrintfW(what, ARRAYSIZE(what), L"the running Claude of %s keeps its starred sessions in its IndexedDB", title);
+            ReportCheck(Core_JsonMember(text, length, "state", &levels, &levelsLength) &&
+                        Core_JsonMember(levels, levelsLength, "starredIds", &found, &foundLength), what, L"no state.starredIds in the record");
+            Util_Free(text);
+        }
+        WebStore_Free(store);
+    }
+}
+
+static void CheckRunningProfiles(const ClaudePackage *pkg)
+{
+    if (!EachRunningProfile(pkg, CheckLockFile)) {
+        wprintf(L"  skip  lockfile, zoom and pin checks: no profile's Claude is running\n");
+        return;
+    }
+    EachRunningProfile(pkg, CheckLayoutPlaces);
 }
 
 /* Claude Code binaries under the profile folders of one Roaming root. */
@@ -493,7 +553,7 @@ int wmain(int argc, WCHAR **argv)
     else ReportUnreadable(pkg.exe);
     CheckTrayIcons(&pkg);
     CheckMovedStock(&pkg);
-    CheckLockFiles(&pkg);
+    CheckRunningProfiles(&pkg);
     if (FindClaudeCode(&pkg, code, ARRAYSIZE(code))) {
         wprintf(L"Claude Code %s\n", code);
         if (ScanFileForFacts(code, cli, ARRAYSIZE(cli))) ReportFacts(code, cli, ARRAYSIZE(cli));

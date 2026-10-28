@@ -281,14 +281,25 @@ BOOL Shortcut_StartMenuDir(WCHAR *out, size_t cch)
            SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_FOLDER, programs));
 }
 
-/* The manager's shortcut under its earlier name, in `dir`, gone: the one under its name takes its place. */
+/* The manager's shortcut under its earlier name (APP_EARLIER_NAME, never
+ * its own: the earlier name once read the same as its own, and the manager
+ * deleted its own shortcut each time it opened) gone, from `dir` and from
+ * the Start menu folder of that name, which goes too once nothing else is in
+ * it: the one under its name takes its place. */
 static void RemoveEarlierLink(const WCHAR *dir)
 {
-    WCHAR lnk[MAX_PATH];
+    WCHAR programs[MAX_PATH], earlier[MAX_PATH], lnk[MAX_PATH];
+    const WCHAR *folders[2] = { dir, NULL };
     LinkInfo info;
-    if (SUCCEEDED(StringCchPrintfW(lnk, ARRAYSIZE(lnk), L"%s\\" APP_FOLDER L".lnk", dir)) && Shortcut_Read(lnk, &info) &&
-        Core_IsOurExe(info.target) && !info.args[0])
-        DeleteLink(lnk);
+    int i;
+    if (Util_KnownFolder(&FOLDERID_Programs, programs, ARRAYSIZE(programs)) &&
+        SUCCEEDED(StringCchPrintfW(earlier, ARRAYSIZE(earlier), L"%s\\" APP_EARLIER_NAME, programs)) && !Core_PathEquals(earlier, dir))
+        folders[1] = earlier;
+    for (i = 0; i < 2 && folders[i]; i++)
+        if (SUCCEEDED(StringCchPrintfW(lnk, ARRAYSIZE(lnk), L"%s\\" APP_EARLIER_NAME L".lnk", folders[i])) && Shortcut_Read(lnk, &info) &&
+            Core_IsOurExe(info.target) && !info.args[0])
+            DeleteLink(lnk);
+    if (folders[1] && RemoveDirectoryW(folders[1])) SHChangeNotify(SHCNE_RMDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, folders[1], NULL);
 }
 
 /* The manager's own shortcut, and the folder it is in. */

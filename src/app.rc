@@ -167,7 +167,7 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 200, 50, 15
 END
 
-IDD_SIGNIN DIALOGEX 0, 0, 410, 262
+IDD_SIGNIN DIALOGEX 0, 0, 410, 292
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Private sign-in"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -179,10 +179,11 @@ BEGIN
     LTEXT           "&Browser:", IDC_SIGNIN_BROWSER_LABEL, 10, 116, 60, 10
     COMBOBOX        IDC_SIGNIN_BROWSER, 74, 113, 200, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
     LTEXT           "Each opening uses a separate browser folder. The sign-in window's goes once it closes. Edge's and Chrome's stay: close their windows, then use Open browser folders to remove them.", IDC_SIGNIN_CLEANUP, 10, 136, 390, 40, SS_NOPREFIX
-    LTEXT           "", IDC_SIGNIN_STATUS, 10, 182, 390, 40, SS_NOPREFIX
-    PUSHBUTTON      "Open browser &folders", IDC_SIGNIN_FOLDERS, 10, 237, 124, 15
-    DEFPUSHBUTTON   "&Open private browser", IDC_SIGNIN_OPEN, 176, 237, 166, 15
-    PUSHBUTTON      "Close", IDCANCEL, 350, 237, 50, 15
+    AUTOCHECKBOX    "&Skip Claude's onboarding after signing in", IDC_SIGNIN_SKIP, 10, 182, 390, 12
+    LTEXT           "", IDC_SIGNIN_STATUS, 10, 198, 390, 40, SS_NOPREFIX
+    PUSHBUTTON      "Open browser &folders", IDC_SIGNIN_FOLDERS, 10, 267, 124, 15
+    DEFPUSHBUTTON   "&Open private browser", IDC_SIGNIN_OPEN, 176, 267, 166, 15
+    PUSHBUTTON      "Close", IDCANCEL, 350, 267, 50, 15
 END
 
 IDD_TITLE DIALOGEX 0, 0, 268, 68
@@ -214,9 +215,8 @@ BEGIN
     EDITTEXT        IDC_G_SEARCH, 10, 10, 140, 14, ES_AUTOHSCROLL | WS_TABSTOP
     LTEXT           "", IDC_G_LIST, 10, 30, 140, 262, SS_NOPREFIX
     LTEXT           "", IDC_G_PAGE, 160, 10, 350, 282, SS_NOPREFIX
-    DEFPUSHBUTTON   "OK", IDOK, 352, 300, 50, 15
     PUSHBUTTON      "Cancel", IDCANCEL, 406, 300, 50, 15
-    PUSHBUTTON      "&Apply", IDC_G_APPLY, 460, 300, 50, 15, WS_DISABLED
+    DEFPUSHBUTTON   "Save", IDOK, 460, 300, 50, 15
 END
 
 IDD_PASSWORD DIALOGEX 0, 0, 268, 110

@@ -6,6 +6,39 @@
 
 Every version of Claude Desktop Profiles Manager, newest first. A day's updates make one version, named after that day, which is the version the program shows; **About**, the icon right of Settings, shows this list too: a version chosen on the left, or **Changelog** for all of it. Each build of `main` is also published as an unsigned pre-release (`build-<number>`), which an installed copy does not update to.
 
+## v2026.10.28
+
+Starred sessions stay the same in synced profiles, now that Claude keeps them in its own database and on its server; private sign-in can skip Claude's onboarding; after a start the manager lists sessions faster, and it syncs only what changed.
+
+### New features
+
+1. **Skip Claude's onboarding after signing in** — a checkbox in Private sign-in, off at first and remembered: once the sign-in is done, the manager tells claude.ai the account's onboarding is finished (the same call the form's last step makes) and reads it back, so a profile signed in for the first time opens the chats, not the usage/plans/name form. It also frees an account the onboarding form is holding (its flag says unfinished, so every web login lands there)
+
+### Improvements
+
+1. A profile that lacks a part of Claude's window (a side pane it never opened) is no longer sent the layout at every sync, which changed nothing there
+2. A sync is no longer made when nothing changed since the last one: restarting two profiles synced four times over, now once
+3. The first session list after the manager starts takes a fraction of a second, not up to four: the sessions read before are kept on disk, and only those that changed are read again, also when a sync reads the same sessions at the same moment (it used to make both read them all)
+4. An update that leaves Windows MCP's source as it was no longer rewrites it in every profile, nor makes uv build it again
+5. A shorter log: a profile's sessions folder is noted once, not again by every process of the manager; a sync is one line per profile with its counts, not one per session; a change a newer one replaced is no longer noted as removed
+
+### Bug fixes
+
+1. **Starred sessions** stay the same in synced profiles: Claude 3.6556 keeps which sessions are starred in its own database (IndexedDB) and on its server, per account, and put each profile's own back at every start; the sync now writes them there and has Claude send them to its server
+2. **The editor's settings** and **the projects chosen** in the sessions' filter stay the same too: Claude keeps them on its server as well, and put the server's back at its start
+3. **Claude Delta in the Start menu** is no longer deleted at every start; the shortcut left by its earlier name, Claude Desktop Profiles Manager, is removed instead
+4. **Windows MCP** starts again in a profile that was open during an update: its Claude wrote the folder it had started with back into its settings, a folder the update had removed. A running profile's entry is now written once it closes, and no older folder goes while one runs
+5. The program keeps its folders under their earlier name, as the rename to Claude Delta meant to: it is installed in `%LOCALAPPDATA%\Programs\Claude Desktop Profiles Manager` and keeps its session vault, settings, waiting changes, backups and log in `%LOCALAPPDATA%\Claude Desktop Profiles Manager`, so an installed copy finds them again instead of starting over in a folder named Claude Delta
+
+## v2026.10.27
+
+Pinned sessions and the interface's size stay the same again in profiles kept the same, with Claude 3.6556.
+
+### Bug fixes
+
+1. **Pinned sessions** stay the same in synced profiles again: Claude now keeps its pins in a second place too and put a profile's earlier pins back each time it started, which the next sync then took for a change and sent to the others
+2. **The interface's size** (Ctrl + and Ctrl -) stays the same in synced profiles again: a profile whose Claude settings came from another folder keeps that folder's size beside its own, and the sync read and wrote the wrong one, so the profile stayed at 100% and its size went to the others
+
 ## v2026.10.26
 
 Claude can search the web through your own SearXNG instance, and the manager no longer stalls while Claude works: sessions are read again only where they changed. Settings are sorted by kind and hold Claude Code's and Claude's own switches, each saying how far it reaches and how much it changes.
@@ -24,6 +57,7 @@ Claude can search the web through your own SearXNG instance, and the manager no 
 10. Claude's own preferences in **Settings**, set in every profile at once: Cowork web search and browser tools, Claude in Chrome, all browser actions allowed, Cowork and Code scheduled tasks, bypass permissions mode allowed, prompt suggestions, archive when the PR closes, keeping the computer awake while Claude works (on battery too) and the notification sound. Open profiles are closed for it and opened again, asked first; a switch on in some profiles only says in how many
 11. **Settings** are laid out as Claude lays out its own: the kinds on the left under a search box, and on the right a row for each setting, with its name, what it does, how far it reaches and how much, and its switch, drop-down, field or button at the right end. The language and the size of the windows are settings of General; a search shows the settings that match from every kind
 12. **Settings** read closer to Claude's: each kind on the left is a tall row with its icon, a setting's row is shorter, how far it reaches and how much on its name's line after its impact's icon, and each section's name has its icon again
+13. **Settings** are plainer, as Claude's own: the kinds on the left in two groups, Preferences and Claude, with one-color icons, the kind open on a gray row; each setting says what it does, and "Large impact" beside its name only where it changes much; the switches are drawn as Claude draws them; Save keeps the changes and closes the window, and Apply is gone
 
 ### Improvements
 
@@ -46,7 +80,6 @@ Claude can search the web through your own SearXNG instance, and the manager no 
 2. The shield's window no longer says Claude's exit IP could not be read, with 0 ms latency and every check "no", before any check was made: opened, it reads the exit at once (with the shield off too, ending nothing) and says it is reading until the result comes, and it changes when a check ends instead of every second. A check asked for while the shield is off no longer turns the badge to "Shield on · checking the exit…"
 3. The shield's badge at the main window's bottom right shows whole: the version's line, painted over it, cut off its lower half; it now stands at the end of that line
 4. A profile whose shield regions leave out Claude's exit no longer stops every profile: it alone is closed, and stays closed (Open and Restart say why), and the badge turns amber, not red
-5. The program keeps its folders under their earlier name, as the rename to Claude Delta meant to: it is installed in `%LOCALAPPDATA%\Programs\Claude Desktop Profiles Manager` and keeps its session vault, settings, waiting changes, backups and log in `%LOCALAPPDATA%\Claude Desktop Profiles Manager`, so an installed copy finds them again instead of starting over in a folder named Claude Delta
 
 ## v2026.10.25
 

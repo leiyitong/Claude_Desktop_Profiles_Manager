@@ -277,6 +277,7 @@ static INT_PTR CALLBACK SignInProc(HWND dialog, UINT message, WPARAM wp, LPARAM 
         RemoveOldWebFolders(state->root);
         EnableWindow(GetDlgItem(dialog, IDC_SIGNIN_FOLDERS), state->root[0] && Util_DirExists(state->root));
         FillBrowsers(dialog, state);
+        CheckDlgButton(dialog, IDC_SIGNIN_SKIP, Util_GetSetting(SETTING_SIGNIN_SKIP_ONBOARDING, 0) ? BST_CHECKED : BST_UNCHECKED);
         return TRUE;
     }
     case WM_COMMAND:
@@ -284,6 +285,9 @@ static INT_PTR CALLBACK SignInProc(HWND dialog, UINT message, WPARAM wp, LPARAM 
         switch (LOWORD(wp)) {
         case IDC_SIGNIN_OPEN:
             OpenBrowser(dialog, state);
+            return TRUE;
+        case IDC_SIGNIN_SKIP:
+            Util_SetSetting(SETTING_SIGNIN_SKIP_ONBOARDING, IsDlgButtonChecked(dialog, IDC_SIGNIN_SKIP) == BST_CHECKED);
             return TRUE;
         case IDC_SIGNIN_FOLDERS:
             if (state->root[0] && (INT_PTR)ShellExecuteW(dialog, L"open", state->root, NULL, NULL, SW_SHOWNORMAL) <= 32)

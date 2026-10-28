@@ -17,6 +17,13 @@ static BOOL RunningFromInstallFolder(void)
            Core_EqualsI(self, installed);
 }
 
+/* The watcher's call each time the profile's Claude has closed. */
+static void ClaudeClosed(const WCHAR *folder)
+{
+    WindowsMcp_AfterClose(folder);
+    SessionVault_AfterClose(folder);
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR cmdLine, int show)
 {
     LPWSTR *argv;
@@ -67,11 +74,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR cmdLine, int s
     } else if (Core_EqualsI(command, L"--set-up-links")) {
         rc = Gui_Run(GUI_SET_UP_LINKS);
     } else if (Core_EqualsI(command, L"--watch") && argument) {
-        /* Each time the profile's Claude closes, the session changes that
-         * waited for it are made, and its list of sessions kept (made the
-         * same in the profiles that keep the same sessions). */
+        /* Each time the profile's Claude closes, its Windows MCP entry is
+         * brought up to date, the session changes that waited for it are
+         * made, and its list of sessions kept (made the same in the profiles
+         * that keep the same sessions). */
         NotifyGuard_Start();
-        rc = Taskbar_WatchRun(argument, argc >= 4 ? (DWORD)wcstoul(argv[3], NULL, 10) : 0, SessionVault_AfterClose);
+        rc = Taskbar_WatchRun(argument, argc >= 4 ? (DWORD)wcstoul(argv[3], NULL, 10) : 0, ClaudeClosed);
     } else if (command[0] == L'-') {
         /* Not a request for the window: never open it for an unknown switch or one without its folder. */
         BOOL needsFolder = Core_EqualsI(command, L"--launch") || Core_EqualsI(command, L"--watch");

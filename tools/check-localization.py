@@ -70,8 +70,8 @@ NONLITERAL_CALLS = {
     "sessions.c": ["Theme_MainCaption"],
     "dragout.c": ["kZones[i].text"],
     "signin.c": ["name"],
-    "settings.c": ["kScopeNames[def->scope]", "kImpactNames[def->impact]", "kModeNames[i]", "def->effect", "def->label",
-                   "kKinds[state->kind].name", "kKinds[g].name", "kSections[s].name", "kSettings[state->rows[i].v].label"],
+    "settings.c": ["kModeNames[i]", "def->effect", "def->label",
+                   "kKinds[state->kind].name", "kKinds[g].name", "kKinds[g].group", "kSections[s].name", "kSettings[state->rows[i].v].label"],
 }
 # Keys the code translates through a variable, by the source file that spells
 # them: the color names (g_ColorNames), the main window's captions, column
@@ -87,9 +87,9 @@ TRANSLATED_THROUGH_VARIABLES = {
                "Use letters, digits, spaces, \u201c-\u201d, \u201c_\u201d or \u201c.\u201d."],
     "gui.c": ["A profile folder with this name already exists.", "Open at Windows sign-in"],
     "dragout.c": ["Copy profile", "Private sign-in"],
-    "settings.c": ["This program", "Sign-in window", "New profiles", "Windows MCP", "Claude Code", "Interface", "Language", "Zoom",
+    "settings.c": ["Preferences", "Claude", "New profiles", "Windows MCP", "Claude Code", "Interface", "Language", "Zoom",
                    "The language of this program's windows.",
-                   "How large this program's windows are; the main window takes it once Settings closes.", "minimal", "small", "medium", "large", "General", "Claude Desktop", "Claude updates",
+                   "How large this program's windows are; the main window takes it once Settings closes.", "General", "Claude Desktop", "Claude updates",
                    "Private sign-in", "Session vault", "SearXNG search", "Cowork", "Conversations", "Privacy and network", "Features",
                    "Git and pull requests", "Permissions", "Cowork and the browser", "Code tab", "Power and notifications",
                    "Open profiles again after a Claude update", "A profile that a Claude update closed opens again once the update is in.",
@@ -196,7 +196,6 @@ ACCESS_KEY_GROUPS = {
     "export dialog": ["Search o&ptions", "Select &all", "Select &none", "&Invert"],
     "new build dialog": ["&Update now", "&Later"],
     "clean-up dialog": ["&Show:", "Select &all", "&Back up .claude first", "&Restore"],
-    "settings dialog": ["&Apply"],
 }
 # Choices made in the same place: a key of one choice never shows with a key of another.
 ALTERNATIVES = [

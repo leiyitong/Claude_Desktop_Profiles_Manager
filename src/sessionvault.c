@@ -2199,11 +2199,16 @@ static void DraftPart(LayoutDraft *draft, const char *name, const char *value, s
 }
 
 /* Whether `member` changed part `p`, which it shows as `current`, since the
- * sync last read it there (ResolveLayout). */
-static BOOL ChangedPart(const Member *member, int p, ULONGLONG current, BOOL hasBase, ULONGLONG baseHash, BOOL waits)
+ * sync last read it there (ResolveLayout). A value of the profile's own the
+ * sync could not read there before (its page's zoom beside a copied one) is
+ * no change, while the group has one. */
+static BOOL ChangedPart(const Member *member, const LayoutPart *part, int p, ULONGLONG current, BOOL hasBase, ULONGLONG baseHash, BOOL waits)
 {
     if (!member->taker || !current) return FALSE;
-    if (member->had && member->had->seen) return current != member->had->seen[p];
+    if (member->had && member->had->seen) {
+        if (!member->had->seen[p] && part->ownOnly && hasBase && baseHash) return FALSE;
+        return current != member->had->seen[p];
+    }
     /* No record yet (a version before them): changed against the base, unless something waits for it. */
     if (hasBase && baseHash) return member->state == MEMBER_KEPT && !waits && current != baseHash;
     return !hasBase || member->state == MEMBER_KEPT;   /* the part kept for the first time */
@@ -2249,7 +2254,7 @@ static BOOL HoldsLayout(const char *content, size_t length, const ULONGLONG *has
         if (has && part.byKey) has = KeyedHash(shown, shownLength);
         if (has == hashes[p]) continue;
         if (!PartOf(layout, used, part.name, &value, &valueLength) ||
-            !SessionSync_PartHolds(&part, has ? shown : NULL, has ? shownLength : 0, value, valueLength))
+            !SessionSync_PartHolds(&part, content, length, has ? shown : NULL, has ? shownLength : 0, value, valueLength))
             return FALSE;
     }
     return TRUE;
@@ -2309,7 +2314,7 @@ static BOOL ResolveLayout(const SessionSet *set, const Member *members, const Va
             shownLength[m] = 0;
             current[m] = PartOf(contents[m], lengths[m], part.name, &shown[m], &shownLength[m]);
             if (current[m] && part.byKey) current[m] = KeyedHash(shown[m], shownLength[m]);
-            say[m] = ChangedPart(&members[m], p, current[m], baseContent != NULL, baseHash, waits[m]);
+            say[m] = ChangedPart(&members[m], &part, p, current[m], baseContent != NULL, baseHash, waits[m]);
         }
         if (part.byKey) {
             char *merged = MergeByKey(part.name, contents, lengths, written, say, preferred, n, baseContent, baseLength, &valueLength);
@@ -2591,17 +2596,123 @@ static BOOL KeepLocked(const ProfileList *list, DWORD profiles, const WCHAR *lis
     return ok;
 }
 
+/* `hash` going on with the name, size and time of each file of `dir` (not
+ * its folders), in the order the file system lists them. */
+static ULONGLONG HashFiles(ULONGLONG hash, const WCHAR *dir)
+{
+    WIN32_FIND_DATAW found;
+    HANDLE find = Util_FindFiles(dir, L"*", &found, FALSE);
+    if (find == INVALID_HANDLE_VALUE) return Core_HashBytes(hash, "-", 1);
+    do {
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        hash = Core_HashText(hash, found.cFileName);
+        hash = Core_HashBytes(hash, &found.ftLastWriteTime, sizeof found.ftLastWriteTime);
+        hash = Core_HashBytes(hash, &found.nFileSizeLow, sizeof found.nFileSizeLow);
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    return hash;
+}
+
+static ULONGLONG HashFile(ULONGLONG hash, const WCHAR *dir, const WCHAR *name)
+{
+    WCHAR path[LONG_PATH_CCH];
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", dir, name)) || !GetFileAttributesExW(path, GetFileExInfoStandard, &data))
+        return Core_HashBytes(hash, "-", 1);
+    hash = Core_HashBytes(hash, &data.ftLastWriteTime, sizeof data.ftLastWriteTime);
+    return Core_HashBytes(hash, &data.nFileSizeLow, sizeof data.nFileSizeLow);
+}
+
+/* What a sync of `profiles` reads, as a hash: each member's entries, its
+ * settings and the files of its window it takes parts of, whether its
+ * Claude runs, the changes waiting for it; the list's versions and the
+ * person's choices. The same after a sync as before the next one: nobody
+ * changed anything since, so the next one would change nothing (a restart
+ * of two profiles once synced four times over). */
+static ULONGLONG KeepFingerprint(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same)
+{
+    static const WCHAR *const kFiles[] = { CLAUDE_DESKTOP_SETTINGS, CLAUDE_APP_SETTINGS, L"Preferences", L"ccd-session-presets.json" };
+    WCHAR dir[LONG_PATH_CCH], state[MAX_PATH], name[MAX_PATH];
+    ULONGLONG hash = Core_HashText(CORE_HASH_START, listName);
+    size_t f;
+    int i;
+    if (!Util_StateDir(state, ARRAYSIZE(state))) return 0;
+    hash = Core_HashBytes(hash, &same, sizeof same);
+    for (i = 0; i < list->count; i++) {
+        const Profile *p = &list->items[i];
+        BOOL running;
+        if (!(profiles & (1u << i))) continue;
+        running = Claude_IsRunning(p);
+        hash = Core_HashText(hash, p->folder);
+        hash = Core_HashBytes(hash, &p->syncItems, sizeof p->syncItems);
+        hash = Core_HashBytes(hash, &running, sizeof running);
+        hash = SessionStore_EntriesDir(p, dir, ARRAYSIZE(dir), NULL) ? HashFiles(hash, dir) : Core_HashBytes(hash, "-", 1);
+        for (f = 0; f < ARRAYSIZE(kFiles); f++) hash = HashFile(hash, p->storageDir, kFiles[f]);
+        if (SUCCEEDED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\" CLAUDE_WEB_STORAGE, p->storageDir))) hash = HashFiles(hash, dir);
+        if (SUCCEEDED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\" CLAUDE_INDEXED_DB, p->storageDir))) hash = HashFiles(hash, dir);
+        if (SUCCEEDED(StringCchPrintfW(name, ARRAYSIZE(name), L"pending-sync-%s.txt", p->folder))) hash = HashFile(hash, state, name);
+        if (SUCCEEDED(StringCchPrintfW(name, ARRAYSIZE(name), L"pending-sessions-%s.txt", p->folder))) hash = HashFile(hash, state, name);
+    }
+    if (ListDir(listName, dir, ARRAYSIZE(dir))) hash = HashFiles(hash, dir);
+    if (SUCCEEDED(StringCchPrintfW(name, ARRAYSIZE(name), L"%s" VERSION_EXTENSION, listName))) {
+        if (VaultPath(DECISIONS_DIR, dir, ARRAYSIZE(dir))) hash = HashFile(hash, dir, name);
+        if (VaultPath(CONFLICTS_DIR, dir, ARRAYSIZE(dir))) hash = HashFile(hash, dir, name);
+    }
+    return hash ? hash : 1;
+}
+
+#define FINGERPRINT_PREFIX L"read-"   /* in the vault: read-<list>.txt, the fingerprint the last sync left */
+
+static ULONGLONG LastFingerprint(const WCHAR *listName)
+{
+    WCHAR sub[MAX_PATH], path[MAX_PATH];
+    DWORD length = 0;
+    char *text;
+    ULONGLONG value = 0;
+    if (SUCCEEDED(StringCchPrintfW(sub, ARRAYSIZE(sub), FINGERPRINT_PREFIX L"%s" VERSION_EXTENSION, listName)) && VaultPath(sub, path, ARRAYSIZE(path)) &&
+        (text = Util_ReadFile(path, 64, FALSE, &length)) != NULL) {
+        value = _strtoui64(text, NULL, 16);
+        Util_Free(text);
+    }
+    return value;
+}
+
+static void SaveFingerprint(const WCHAR *listName, ULONGLONG value)
+{
+    WCHAR sub[MAX_PATH], path[MAX_PATH];
+    char text[24];
+    if (SUCCEEDED(StringCchPrintfW(sub, ARRAYSIZE(sub), FINGERPRINT_PREFIX L"%s" VERSION_EXTENSION, listName)) && VaultPath(sub, path, ARRAYSIZE(path)) &&
+        SUCCEEDED(StringCchPrintfA(text, sizeof text, "%016I64x", value)))
+        WriteWhole(path, text, strlen(text), TRUE);
+}
+
 /* One sync at a time: another one reading a profile half written makes what
- * it had there look like a change. */
+ * it had there look like a change. One that would read what the last read,
+ * as it left it, is not made. */
 static BOOL Keep(const ProfileList *list, DWORD profiles, const WCHAR *listName, BOOL same, SyncReport *report, Progress *progress)
 {
     HANDLE lock = Util_SyncLock();
+    ULONGLONG before;
     BOOL ok;
     if (!lock) {
         report->failed++;
         return FALSE;
     }
-    ok = KeepLocked(list, profiles, listName, same, report, progress);
+    before = KeepFingerprint(list, profiles, listName, same);
+    if (!before || before != LastFingerprint(listName)) {
+        ok = KeepLocked(list, profiles, listName, same, report, progress);
+        SaveFingerprint(listName, ok && !report->failed ? KeepFingerprint(list, profiles, listName, same) : 0);
+    } else if (same) {
+        /* What waits for the person still does, as a sync made would say. */
+        PartChoices conflicts;
+        LoadChoices(CONFLICTS_DIR, listName, &conflicts);
+        report->conflicts += conflicts.count;
+        if (conflicts.count) TellConflicts();
+        FreeChoices(&conflicts);
+        ok = TRUE;
+    } else {
+        ok = TRUE;
+    }
     Util_SyncUnlock(lock);
     return ok;
 }

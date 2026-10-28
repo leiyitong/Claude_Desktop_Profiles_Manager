@@ -59,6 +59,7 @@
 #define IDC_SIGNIN_STATUS        2807
 #define IDC_SIGNIN_FOLDERS       2808
 #define IDC_SIGNIN_CLEANUP       2809
+#define IDC_SIGNIN_SKIP          2810
 
 /* the changelogs, embedded (RCDATA): CHANGELOG.md and CHANGELOG.zh-CN.md */
 #define IDR_CHANGELOG_EN  200
@@ -220,7 +221,6 @@
 #define IDC_G_PAGE        2631   /* the page of the kind chosen (settings.c draws it; the template holds its place) */
 #define IDC_G_SEARCH      2632   /* above the kinds: the page shows the settings that match instead */
 #define IDC_G_ZOOM        2615   /* SETTING_ZOOM changed: what the dialog's owner does then */
-#define IDC_G_APPLY       2609
 
 /* a password: a backup's sign-in for any PC */
 #define IDC_K_TEXT        2800

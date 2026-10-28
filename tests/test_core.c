@@ -2714,6 +2714,77 @@ static void TestShieldFacts(void)
           !Core_RegionCodes(L"USA") && !Core_RegionCodes(L"US, J") && !Core_RegionCodes(L"\x7F8E\x56FD") && !Core_RegionCodes(L"U1"));
 }
 
+/* Electron's name for a profile's zoom levels: libc++'s CityHash64 of its folder, each length's branch. */
+static BOOL ZoomKeyIs(const WCHAR *folder, const char *expected)
+{
+    char key[24];
+    return Core_ZoomPartitionKey(folder, key, sizeof key) && strcmp(key, expected) == 0;
+}
+
+/* IndexedDB's coding, as Claude's Chromium writes it: a record of idb-keyval's store (measured on 3.6556). */
+static void TestIndexedDbCoding(void)
+{
+    static const BYTE kRecord[] = { 0xCB, 0x09, 0xFF, 0x15, 0xFE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0x10, '"', 0x0B,
+                                    '{', '"', 's', 't', 'a', 't', 'e', '"', ':', '1', '}' };
+    static const BYTE kKey[] = { 0x01, 0x02, 0x00, 'a', 0x00, 'b' };
+    static const BYTE kPrefix[] = { 0x00, 0x01, 0x01, 0x01 }, kWide[] = { 0x20, 0x34, 0x12, 0x05, 0x02 };
+    BYTE out[128], header[32], string[64];
+    WCHAR name[64], text[64];
+    ULONGLONG ids[3], version, database, store;
+    size_t at, headerAt, textAt, start, bytes, n;
+    int kind;
+    BYTE tag;
+    Check("indexeddb: a prefix, each id in as few bytes as it takes",
+          Core_IdbPrefix(1, 1, 1, out, sizeof out) == sizeof kPrefix && memcmp(out, kPrefix, sizeof kPrefix) == 0 &&
+          Core_IdbPrefix(0x1234, 5, 2, out, sizeof out) == sizeof kWide && memcmp(out, kWide, sizeof kWide) == 0 &&
+          Core_IdbPrefixRead(out, sizeof kWide, ids, &at) && ids[0] == 0x1234 && ids[1] == 5 && ids[2] == 2 && at == sizeof kWide &&
+          !Core_IdbPrefix(1, 1, 0x100000000ULL, out, sizeof out));
+    Check("indexeddb: a string key, and versions little-endian", Core_IdbStringKey(L"ab", out, sizeof out) == sizeof kKey &&
+          memcmp(out, kKey, sizeof kKey) == 0 && Core_IdbInt(1227, out) == 2 && out[0] == 0xCB && out[1] == 0x04 &&
+          Core_IdbInt(0, out) == 1 && out[0] == 0 && Core_IdbIntRead((const BYTE *)"\xCB\x04", 2) == 1227);
+    /* A database's name: 0, 0, 0, 201, the origin, the name (each a string key without its type). */
+    n = Core_IdbPrefix(0, 0, 0, out, sizeof out);
+    out[n++] = 201;
+    at = Core_IdbStringKey(L"https_claude.ai_0@1", string, sizeof string);
+    memcpy(out + n, string + 1, at - 1);
+    n += at - 1;
+    at = Core_IdbStringKey(L"keyval-store", string, sizeof string);
+    memcpy(out + n, string + 1, at - 1);
+    n += at - 1;
+    Check("indexeddb: a database's name", Core_IdbDatabaseName(out, n, name, ARRAYSIZE(name)) && wcscmp(name, L"keyval-store") == 0 &&
+          !Core_IdbDatabaseName(out, n - 1, name, ARRAYSIZE(name)));
+    n = Core_IdbStoreMetaKey(5, 1, 4, out, sizeof out);
+    Check("indexeddb: an object store's metadata", n == 7 && Core_IdbStoreMeta(out, n, &database, &store, &kind) && database == 5 && store == 1 &&
+          kind == 4 && !Core_IdbStoreMeta(kPrefix, sizeof kPrefix, &database, &store, &kind));
+    Check("indexeddb: a record's string read, past Blink's and V8's headers",
+          Core_IdbValueString(kRecord, sizeof kRecord, &version, &headerAt, &textAt, &tag, &start, &bytes) && version == 1227 && headerAt == 2 &&
+          textAt == 19 && tag == '"' && bytes == 11 && memcmp(kRecord + start, "{\"state\":1}", 11) == 0 &&
+          !Core_IdbValueString(kRecord, sizeof kRecord - 1, &version, &headerAt, &textAt, &tag, &start, &bytes));
+    memcpy(header, kRecord + headerAt, textAt - headerAt);
+    header[textAt - headerAt] = 0;   /* a padding byte, left out */
+    StringCchCopyW(text, ARRAYSIZE(text), L"{\"state\":1}");
+    n = Core_IdbValueWrite(1227, header, textAt - headerAt + 1, text, wcslen(text), out, sizeof out);
+    Check("indexeddb: a record written as Chromium writes it, Latin-1 only", n == sizeof kRecord && memcmp(out, kRecord, n) == 0 &&
+          !Core_IdbValueWrite(1, header, textAt - headerAt, L"\x5DE5", 1, out, sizeof out));
+}
+
+/* The manager's shortcut under its earlier name, which the manager deletes, is never its own. */
+static void TestEarlierName(void)
+{
+    Check("the manager's earlier name is not its name (the shortcut deleted would be its own)", _wcsicmp(APP_EARLIER_NAME, APP_NAME) != 0);
+}
+
+static void TestZoomPartitionKey(void)
+{
+    char key[24];
+    Check("zoom key: up to 16 bytes", ZoomKeyIs(L"a", "9382670497875102604") && ZoomKeyIs(L"ab", "3838761676342601430") &&
+          ZoomKeyIs(L"abcdef", "9245708179745019710"));
+    Check("zoom key: 17 to 64 bytes", ZoomKeyIs(L"Claude-Work1", "16790056513377664451") && ZoomKeyIs(L"Profiles\\Claude-Work", "14762905009297811195"));
+    Check("zoom key: a profile's folder", ZoomKeyIs(L"C:\\Users\\User\\AppData\\Roaming\\Claude-Work", "472582469390467225") &&
+          ZoomKeyIs(L"D:\\Data\\Claude\\\x5DE5\x4F5C\\Claude-\x5DE5\x4F5C-Profile-With-A-Long-Name-0123456789", "341076873408563783"));
+    Check("zoom key: no folder, none", !Core_ZoomPartitionKey(L"", key, sizeof key) && !Core_ZoomPartitionKey(NULL, key, sizeof key));
+}
+
 int wmain(void)
 {
     Check("session order: natural names ascend", Core_CompareSessionOrder(L"Chat 2", 100, L"Chat 10", 200, TRUE, FALSE) < 0);
@@ -2769,6 +2840,9 @@ int wmain(void)
     TestProfileFilePaths();
     TestJsonAndVersions();
     TestShieldFacts();
+    TestZoomPartitionKey();
+    TestIndexedDbCoding();
+    TestEarlierName();
     TestSearXng();
     TestCowork();
     TestReleases();

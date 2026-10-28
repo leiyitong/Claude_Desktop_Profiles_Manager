@@ -38,6 +38,7 @@
 
 #define APP_NAME           L"Claude Delta"   /* what the program is called wherever it shows */
 #define APP_FOLDER         L"Claude Desktop Profiles Manager"   /* its earlier name, kept where it is stored: its folders, its registry key, its Start menu folder */
+#define APP_EARLIER_NAME   L"Claude Desktop Profiles Manager"   /* its name until 2026.10.24: its Start menu folder and shortcut then */
 #define APP_EXE            L"ClaudeDesktopProfilesManager.exe"
 #define APP_AUMID_PREFIX   L"ClaudeDesktopProfilesManager."
 #define APP_DOWNLOAD_URL   L"https://claude.ai/download"
@@ -81,6 +82,7 @@
 #define CLAUDE_ENTRIES_DIR  L"claude-code-sessions"             /* ...its Claude Code sessions' entries */
 #define CLAUDE_SCRATCH_DIR  L"scratch-workspaces"               /* ...the working folders of its sessions without a folder */
 #define CLAUDE_WEB_STORAGE  L"Local Storage\\leveldb"           /* ...its web UI's storage (webstore.c) */
+#define CLAUDE_INDEXED_DB   L"IndexedDB\\https_claude.ai_0.indexeddb.leveldb"   /* ...its web UI's IndexedDB */
 #define CLAUDE_MOVED_DATA   L"Claude-Data"   /* in %LOCALAPPDATA%: where Claude moves the stock folder out of its package */
 
 #define MAX_PROFILES       32
@@ -583,6 +585,19 @@ BOOL         Core_LevelManifestEdit(const BYTE *edit, size_t length, CoreLevelMa
 size_t       Core_WebStorageKey(const char *origin, const WCHAR *name, BYTE *out, size_t capacity);   /* Local Storage's key */
 size_t       Core_WebStorageValue(const WCHAR *text, size_t length, BYTE *out, size_t capacity);
 BOOL         Core_WebStorageText(const BYTE *value, size_t length, WCHAR *out, size_t cch, size_t *outLength);
+/* IndexedDB's keys and values, as Chromium codes them in its LevelDB (core.c). */
+size_t       Core_IdbPrefix(ULONGLONG database, ULONGLONG store, ULONGLONG index, BYTE *out, size_t capacity);
+BOOL         Core_IdbPrefixRead(const BYTE *key, size_t length, ULONGLONG ids[3], size_t *end);
+size_t       Core_IdbInt(ULONGLONG value, BYTE *out);   /* at most 8 bytes */
+ULONGLONG    Core_IdbIntRead(const BYTE *data, size_t length);
+size_t       Core_IdbStringKey(const WCHAR *text, BYTE *out, size_t capacity);
+BOOL         Core_IdbDatabaseName(const BYTE *key, size_t length, WCHAR *name, size_t cch);   /* a database's name entry */
+size_t       Core_IdbStoreMetaKey(ULONGLONG database, ULONGLONG store, int kind, BYTE *out, size_t capacity);
+BOOL         Core_IdbStoreMeta(const BYTE *key, size_t length, ULONGLONG *database, ULONGLONG *store, int *kind);
+BOOL         Core_IdbValueString(const BYTE *value, size_t length, ULONGLONG *version, size_t *header, size_t *text, BYTE *tag,
+                                 size_t *start, size_t *bytes);
+size_t       Core_IdbValueWrite(ULONGLONG version, const BYTE *header, size_t headerLength, const WCHAR *text, size_t length, BYTE *out,
+                                size_t capacity);
 /* A process of a snapshot: its id, its parent's, and when it started (0: unknown). */
 typedef struct CoreProcess {
     DWORD     pid, parent;
@@ -599,6 +614,7 @@ int          Core_ScrollStep(int pending, int elapsedMs);
 int          Core_WheelPixels(int delta, int notchPx, int *rest);
 ULONGLONG    Core_HashBytes(ULONGLONG hash, const void *data, size_t size);
 ULONGLONG    Core_HashText(ULONGLONG hash, const WCHAR *text);
+BOOL         Core_ZoomPartitionKey(const WCHAR *folder, char *out, size_t cch);   /* Electron's name for a profile's zoom levels */
 void         Core_CenterRect(const RECT *on, int width, int height, const RECT *work, RECT *out);
 BOOL         Core_ParseVersion(const WCHAR *text, DWORD parts[4]);
 int          Core_CompareVersions(const DWORD a[4], const DWORD b[4]);
@@ -681,6 +697,7 @@ BOOL      Util_StateDir(WCHAR *out, size_t cch);       /* %LOCALAPPDATA%\Claude 
 #define SETTING_REOPEN_AFTER_UPDATE L"ReopenAfterClaudeUpdate"   /* 0: a profile closed by a Claude update stays closed */
 #define SETTING_SIGNIN_BROWSER L"SignInBrowser"   /* the browser private sign-in starts with: a SIGNIN_BROWSER_* */
 #define SETTING_SIGNIN_DEVTOOLS L"SignInDevToolsPort"   /* a port: the sign-in window serves DevTools (CDP) on 127.0.0.1 there; 0, none */
+#define SETTING_SIGNIN_SKIP_ONBOARDING L"SignInSkipOnboarding"   /* 1: once signed in, tell claude.ai the account's onboarding is finished, so it does not ask; 0, off */
 #define SETTING_ZOOM           L"Zoom"   /* the size of every window of the program, in percent (Theme_Zoom) */
 #define SETTING_MCP_ONLINE     L"WindowsMcpOnline"   /* 1: windows-mcp-delta may read and search chats on claude.ai */
 #define SETTING_SEARXNG_SECTION L"SearXNG"   /* a section whose one item is the SearXNG address set up last, or set in Settings; none: SEARXNG_DEFAULT_URL */
@@ -828,6 +845,7 @@ BOOL         WindowsMcp_Set(const Profile *p, const WCHAR *uvx);   /* windows-mc
 BOOL         WindowsMcp_Online(void);   /* whether the person lets Claude read claude.ai chats (SETTING_MCP_ONLINE) */
 void         WindowsMcp_RefreshOnline(void);   /* rewrite the env of profiles that have it, so the setting takes effect */
 void         WindowsMcp_UpdateEntries(void);   /* entries of ours from an older build pointed at this build's source */
+void         WindowsMcp_AfterClose(const WCHAR *folder);   /* the watcher's: what those two leave while a profile runs */
 BOOL         WindowsMcp_PackageDir(WCHAR *out, size_t cch);   /* this build's source folder (version and checksum) */
 BOOL         WindowsMcp_HasExtension(const Profile *p);   /* Claude's own Windows-MCP extension is installed in it, or left there */
 BOOL         WindowsMcp_RemoveExtension(HWND owner, const Profile *p);   /* that extension deleted (its Claude closed); TRUE: all gone */
@@ -1275,6 +1293,12 @@ BOOL         SessionStore_SessionsDir(const Profile *p, WCHAR *out, size_t cch);
 /* The folder of the entries Claude shows for `p`: claude-code-sessions\<account>\<organization>.
  * FALSE when there is none; `signedIn` then says whether an account is known. */
 BOOL         SessionStore_EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn);
+/* The entries' cache on disk (entry-cache.bin, which a new process reads first): written now (`now`) or once its
+ * last write is old enough; for tests, the cache dropped and read again from it (how many it holds), and how many
+ * entries were read from their files since the process started. */
+void         SessionStore_SaveEntryCache(BOOL now);
+int          SessionStore_ReadEntryCacheAgain(void);
+LONG         SessionStore_FreshReads(void);
 BOOL         SessionStore_WorkingDir(const SessionSet *set, const WCHAR *cwd, WCHAR *out, size_t cch);
 BOOL         SessionStore_WatchDir(const Profile *p, WCHAR *out, size_t cch);
 BOOL         SessionStore_PendingPath(const Profile *p, WCHAR *out, size_t cch);
@@ -1333,6 +1357,11 @@ WebStore *WebStore_Open(const Profile *p);   /* NULL when it has none, or it can
 char     *WebStore_Get(const WebStore *store, const WCHAR *name, size_t *length);   /* a heap block; NULL when absent */
 BOOL      WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, size_t length);   /* waits for the commit */
 BOOL      WebStore_Commit(WebStore *store, const WCHAR *backup);
+/* One record of claude.ai's IndexedDB in the profile's folder, a string under string key `key` of object store
+   `objectStore` in database `database`: read, and set where Claude put one (WebStore_Commit writes it). */
+WebStore *WebStore_OpenIndexed(const Profile *p, const WCHAR *database, const WCHAR *objectStore, const WCHAR *key);
+char     *WebStore_GetIndexed(const WebStore *store, size_t *length);   /* UTF-8, a heap block; NULL when there is none */
+BOOL      WebStore_SetIndexed(WebStore *store, const char *utf8, size_t length);   /* Latin-1 text only */
 ULONGLONG WebStore_Written(const WebStore *store);   /* when its newest file was written, ms since 1970 */
 void      WebStore_Free(WebStore *store);
 /* Each value whose name starts with `prefix` (Latin-1 names only), in no order. */
@@ -1353,7 +1382,10 @@ DWORD        SessionSync_Takers(const SessionSet *set);   /* the profiles whose 
  * claude_desktop_config.json and its web storage), for the account and
  * organization of `entriesDir`, as a layout of ours: a heap block (HeapFree
  * it), NULL when it has none. `written`: when they were last written, in ms
- * since 1970. */
+ * since 1970. Its member LAYOUT_CANNOT_TAKE (an object, each member a part's
+ * name) names the parts the profile could not take as sent: one of a value
+ * Claude has not made there, or of a file it has not. */
+#define LAYOUT_CANNOT_TAKE "cannotTake"
 char        *SessionSync_ReadLayout(const Profile *p, const WCHAR *entriesDir, size_t *length, ULONGLONG *written);
 /* A layout (SessionSync_ReadLayout) with only the parts whose item is in
  * `items` (SYNC_ITEM_*): the others removed. A heap block (HeapFree it),
@@ -1381,9 +1413,10 @@ char        *SessionSync_MergePart(const LayoutPart *part, const char *base, siz
  * bytes); NULL, freed, when it cannot be. */
 char        *SessionSync_SetMember(char *json, size_t *used, const char *key, const char *raw, size_t length);
 BOOL         SessionSync_LayoutPart(int index, LayoutPart *part);
-/* A member showing `shown` of a part (NULL: none) already holds what `value`,
- * sent to it, would leave there. */
-BOOL         SessionSync_PartHolds(const LayoutPart *part, const char *shown, size_t shownLength, const char *value, size_t valueLength);
+/* A member showing `shown` of a part (NULL: none) in its `layout` already
+ * holds what `value`, sent to it, would leave there. */
+BOOL         SessionSync_PartHolds(const LayoutPart *part, const char *layout, size_t layoutLength, const char *shown, size_t shownLength,
+                                   const char *value, size_t valueLength);
 /* From now on, each change this thread makes in a profile calls `step` (a
  * progress bar's); NULL for none. */
 void         SessionSync_OnEachChange(void (*step)(void *context), void *context);
@@ -1842,6 +1875,7 @@ typedef enum ThemeColor {
 
 #define THEME_ROW_SELECTED 0x1
 #define THEME_ROW_HOT      0x2
+#define THEME_ROW_PLAIN    0x4   /* a side list's row: a gray, not the blues, selected or under the mouse */
 
 /* Geometry the theme draws and places with, which the tests check too. */
 #define THEME_CORNER_RADIUS_DIPS      4       /* buttons, selected rows, views and edits */
@@ -1850,7 +1884,7 @@ typedef enum ThemeColor {
 #define THEME_MAIN_GAP_DIPS           9       /* between its neighboring buttons */
 #define THEME_MAIN_READING_WIDTH_DIPS 1200    /* a wider manager window centers its content */
 #define THEME_PROFILE_COLUMN_DIPS     180     /* the profile list's first column */
-#define THEME_SWITCH_HEIGHT_DIPS      20      /* an on-off switch (Theme_DrawSwitch), twice as wide */
+#define THEME_SWITCH_HEIGHT_DIPS      20      /* an on-off switch (Theme_DrawSwitch), nine fifths as wide */
 #define THEME_FIELD_PADDING_DIPS      8       /* inside a field's frame, before its text (Theme_DrawField) */
 
 /* A drop-down list item's data (CB_SETITEMDATA) can show a color swatch

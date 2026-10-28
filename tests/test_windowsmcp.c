@@ -107,14 +107,14 @@ int wmain(void)
     Check("it reads back as ready", WindowsMcp_State(&p) == WINDOWS_MCP_READY);
 
     {
-        /* This build's folder: the version and the source's checksum, so that every build gets its own (one per day
-         * kept the first build's code), with the modules the server needs. */
+        /* This build's folder: the source's checksum alone, so that a source that changed gets its own and builds
+         * of the same source share one (an update leaves the entries alone), with the modules the server needs. */
         WCHAR package[LONG_PATH_CCH];
         const WCHAR *modules[] = { L"pyproject.toml", L"src\\windows_mcp_delta\\online.py", L"src\\windows_mcp_delta\\esc.py",
                                    L"src\\windows_mcp_delta\\tools\\desktop.py", L"src\\windows_mcp_delta\\tools\\idle.py" };
         size_t m;
-        Check("this build's folder names the version and a checksum", WindowsMcp_PackageDir(package, ARRAYSIZE(package)) &&
-              wcsstr(package, L"\\windows-mcp-delta\\" APP_VERSION_DATE_W L"-") != NULL && wcslen(wcsrchr(package, L'-') + 1) == 8);
+        Check("this build's folder names the source's checksum", WindowsMcp_PackageDir(package, ARRAYSIZE(package)) &&
+              wcsstr(package, L"\\windows-mcp-delta\\") != NULL && wcslen(wcsrchr(package, L'\\') + 1) == 8);
         for (m = 0; m < ARRAYSIZE(modules); m++) {
             StringCchPrintfW(extracted, ARRAYSIZE(extracted), L"%s\\%s", package, modules[m]);
             Check("the source was extracted from the embedded ZIP, every module", Util_FileExists(extracted));
@@ -161,8 +161,13 @@ int wmain(void)
             Check("a folder of the same day without the checksum is outdated", WindowsMcp_State(&p) == WINDOWS_MCP_OUTDATED);
             WriteConfig(&p, json);
         }
-        Check("Set points it at this build's folder", WindowsMcp_Set(&p, uvx) && WindowsMcp_State(&p) == WINDOWS_MCP_READY &&
-              Holds(&p, "\\\\windows-mcp-delta\\\\" APP_VERSION_DATE));
+        {
+            WCHAR current[LONG_PATH_CCH];
+            char quotedCurrent[LONG_PATH_CCH * 3 + 2];
+            Check("Set points it at this build's folder", WindowsMcp_Set(&p, uvx) && WindowsMcp_State(&p) == WINDOWS_MCP_READY &&
+                  WindowsMcp_PackageDir(current, ARRAYSIZE(current)) && Core_JsonQuote(current, quotedCurrent, sizeof quotedCurrent) &&
+                  Holds(&p, quotedCurrent));
+        }
         Check("the older build's folder goes once no entry runs from it", !Util_DirExists(older));
     }
 

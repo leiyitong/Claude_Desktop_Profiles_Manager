@@ -12,6 +12,11 @@
  * it takes in its own last writes after a crash. The folder is copied to the
  * backup first. Nothing is written while Claude runs (it holds the database
  * open), and LevelDB's own LOCK file is never opened.
+ *
+ * Claude's IndexedDB is a LevelDB too (core.c has its coding): one record of
+ * one object store is read and written there the same way, with what
+ * Chromium writes beside a record it puts (its "exists" entry and its
+ * store's last version, both the record's new version).
  */
 #include "app.h"
 
@@ -19,6 +24,9 @@
 #define WEB_FILE_MAX    (64u * 1024u * 1024u)
 #define WEB_KEY_MAX     1024
 #define WEB_VALUE_MAX   (16u * 1024u * 1024u)
+#define IDB_NAME_CCH    128
+#define IDB_STORE_NAME          0
+#define IDB_STORE_LAST_VERSION  4
 
 typedef struct WebEntry {
     BYTE     *key, *value;
@@ -42,6 +50,12 @@ struct WebStore {
     ULONGLONG logFile;                /* its number */
     size_t    logLength, logClean;    /* its size; where its last whole record ends */
     ULONGLONG written;                /* the newest file's time, ms since 1970 */
+    /* An IndexedDB: the databases' names and stores' metadata are kept, and the entries of the record `target`. */
+    BOOL      indexed;
+    BYTE      target[WEB_KEY_MAX];    /* its key, encoded */
+    size_t    targetLength;
+    BYTE      dataKey[WEB_KEY_MAX], existsKey[WEB_KEY_MAX], versionKey[64];   /* found once read; 0 long: not there */
+    size_t    dataKeyLength, existsKeyLength, versionKeyLength;
 };
 
 static BYTE *Copy(const BYTE *data, size_t length)
@@ -59,14 +73,28 @@ static int FindEntry(const WebStore *store, const BYTE *key, size_t keyLength)
     return -1;
 }
 
-/* An entry of a table or a batch: kept when it is claude.ai's and newer than what was read before. */
+/* Whether an entry is one the store keeps: claude.ai's in Local Storage; in
+ * an IndexedDB, a database's name, a store's metadata, or the target's. */
+static BOOL Wanted(const WebStore *store, const BYTE *key, size_t length)
+{
+    WCHAR name[IDB_NAME_CCH];
+    ULONGLONG database, objectStore, ids[3];
+    size_t end;
+    int kind;
+    if (!store->indexed) return length >= store->prefixLength && memcmp(key, store->prefix, store->prefixLength) == 0;
+    if (Core_IdbDatabaseName(key, length, name, ARRAYSIZE(name)) || Core_IdbStoreMeta(key, length, &database, &objectStore, &kind)) return TRUE;
+    return Core_IdbPrefixRead(key, length, ids, &end) && ids[0] && ids[1] && (ids[2] == 1 || ids[2] == 2) && length - end == store->targetLength &&
+           memcmp(key + end, store->target, store->targetLength) == 0;
+}
+
+/* An entry of a table or a batch: kept when it is wanted and newer than what was read before. */
 static BOOL TakeEntry(void *context, ULONGLONG sequence, const CoreLevelOp *op)
 {
     WebStore *store = (WebStore *)context;
     WebEntry *entry;
     int at;
     store->lastSequence = max(store->lastSequence, sequence);
-    if (op->keyLength < store->prefixLength || memcmp(op->key, store->prefix, store->prefixLength) != 0) return TRUE;
+    if (!Wanted(store, op->key, op->keyLength)) return TRUE;
     if ((at = FindEntry(store, op->key, op->keyLength)) >= 0) {
         entry = &store->entries[at];
         if (entry->sequence > sequence) return TRUE;
@@ -249,22 +277,79 @@ static BOOL ReadTables(WebStore *store)
     return TRUE;
 }
 
+/* `store` with the database of `p` in `folder` read; NULL when there is none (Claude makes it at its first start), or
+ * it cannot be read. */
+static WebStore *ReadStore(WebStore *store, const Profile *p, const WCHAR *folder)
+{
+    const WCHAR *root = p->storageDir[0] ? p->storageDir : p->dataDir;
+    if (FAILED(StringCchPrintfW(store->dir, ARRAYSIZE(store->dir), L"%s\\%s", root, folder)) || !Util_DirExists(store->dir)) {
+        WebStore_Free(store);
+        return NULL;
+    }
+    if (!ReadManifest(store) || !ReadTables(store) || !ReadLogs(store)) {
+        Util_Log(L"web storage %s of %s not read (error %lu)", folder, p->folder, GetLastError());
+        WebStore_Free(store);
+        return NULL;
+    }
+    return store;
+}
+
 WebStore *WebStore_Open(const Profile *p)
 {
     WebStore *store;
-    const WCHAR *root = p->storageDir[0] ? p->storageDir : p->dataDir;
     if ((store = (WebStore *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *store)) == NULL) return NULL;
     store->prefix[0] = '_';
     memcpy(store->prefix + 1, WEB_ORIGIN, sizeof WEB_ORIGIN);   /* with its zero */
     store->prefixLength = sizeof WEB_ORIGIN + 1;
-    if (FAILED(StringCchPrintfW(store->dir, ARRAYSIZE(store->dir), L"%s\\" CLAUDE_WEB_STORAGE, root)) || !Util_DirExists(store->dir)) {
-        WebStore_Free(store);   /* none yet: Claude makes it at its first start */
-        return NULL;
-    }
-    if (!ReadManifest(store) || !ReadTables(store) || !ReadLogs(store)) {
-        Util_Log(L"web storage of %s not read (error %lu)", p->folder, GetLastError());
+    return ReadStore(store, p, CLAUDE_WEB_STORAGE);
+}
+
+/* An object store's name (its metadata's value, UTF-16BE) is `name`. */
+static BOOL StoreNamed(const WebEntry *entry, const WCHAR *name)
+{
+    size_t length = wcslen(name), i;
+    if (entry->valueLength != 2 * length) return FALSE;
+    for (i = 0; i < length; i++)
+        if ((WCHAR)((entry->value[2 * i] << 8) | entry->value[2 * i + 1]) != name[i]) return FALSE;
+    return TRUE;
+}
+
+WebStore *WebStore_OpenIndexed(const Profile *p, const WCHAR *database, const WCHAR *objectStore, const WCHAR *key)
+{
+    WebStore *store;
+    ULONGLONG databaseId = 0, storeId = 0;
+    int i;
+    if ((store = (WebStore *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *store)) == NULL) return NULL;
+    store->indexed = TRUE;
+    if ((store->targetLength = Core_IdbStringKey(key, store->target, sizeof store->target)) == 0) {
         WebStore_Free(store);
         return NULL;
+    }
+    if ((store = ReadStore(store, p, CLAUDE_INDEXED_DB)) == NULL) return NULL;
+    /* The database by its name, then its object store by its name: their ids differ from profile to profile. */
+    for (i = 0; i < store->count && !databaseId; i++) {
+        const WebEntry *entry = &store->entries[i];
+        WCHAR name[IDB_NAME_CCH];
+        if (entry->put && Core_IdbDatabaseName(entry->key, entry->keyLength, name, ARRAYSIZE(name)) && wcscmp(name, database) == 0)
+            databaseId = Core_IdbIntRead(entry->value, entry->valueLength);
+    }
+    for (i = 0; databaseId && i < store->count && !storeId; i++) {
+        const WebEntry *entry = &store->entries[i];
+        ULONGLONG db, id;
+        int kind;
+        if (entry->put && Core_IdbStoreMeta(entry->key, entry->keyLength, &db, &id, &kind) && db == databaseId && kind == IDB_STORE_NAME &&
+            StoreNamed(entry, objectStore))
+            storeId = id;
+    }
+    if (storeId && (store->dataKeyLength = Core_IdbPrefix(databaseId, storeId, 1, store->dataKey, sizeof store->dataKey - store->targetLength)) &&
+        (store->existsKeyLength = Core_IdbPrefix(databaseId, storeId, 2, store->existsKey, sizeof store->existsKey - store->targetLength)) &&
+        (store->versionKeyLength = Core_IdbStoreMetaKey(databaseId, storeId, IDB_STORE_LAST_VERSION, store->versionKey, sizeof store->versionKey))) {
+        memcpy(store->dataKey + store->dataKeyLength, store->target, store->targetLength);
+        store->dataKeyLength += store->targetLength;
+        memcpy(store->existsKey + store->existsKeyLength, store->target, store->targetLength);
+        store->existsKeyLength += store->targetLength;
+    } else {
+        store->dataKeyLength = store->existsKeyLength = store->versionKeyLength = 0;
     }
     return store;
 }
@@ -331,37 +416,125 @@ void WebStore_EachName(const WebStore *store, const WCHAR *prefix, void (*each)(
     }
 }
 
-BOOL WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, size_t length)
+/* `key` set to `value`, to be written by the commit. */
+static BOOL SetEntry(WebStore *store, const BYTE *key, size_t keyLength, const BYTE *value, size_t valueLength)
 {
-    BYTE key[WEB_KEY_MAX], *value;
-    WCHAR *text;
-    size_t keyLength = KeyOf(name, key, sizeof key), valueLength;
     CoreLevelOp op;
-    int chars, at;
-    if (!store || !keyLength || length > WEB_VALUE_MAX) return FALSE;
-    chars = length ? MultiByteToWideChar(CP_UTF8, 0, utf8, (int)length, NULL, 0) : 0;
-    if (length && chars <= 0) return FALSE;
-    if ((text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, ((size_t)chars + 1) * sizeof(WCHAR))) == NULL) return FALSE;
-    if (length) MultiByteToWideChar(CP_UTF8, 0, utf8, (int)length, text, chars);
-    if ((value = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 1 + 2 * (size_t)chars)) == NULL) {
-        Util_Free(text);
-        return FALSE;
-    }
-    valueLength = Core_WebStorageValue(text, (size_t)chars, value, 1 + 2 * (size_t)chars);
-    Util_Free(text);
+    int at;
     ZeroMemory(&op, sizeof op);
     op.put = TRUE;
     op.key = key;
     op.keyLength = keyLength;
     op.value = value;
     op.valueLength = valueLength;
-    if (!valueLength || !TakeEntry(store, store->lastSequence, &op) || (at = FindEntry(store, key, keyLength)) < 0) {
-        Util_Free(value);
-        return FALSE;
-    }
-    Util_Free(value);
+    if (!TakeEntry(store, store->lastSequence, &op) || (at = FindEntry(store, key, keyLength)) < 0) return FALSE;
     store->entries[at].changed = TRUE;
     return TRUE;
+}
+
+/* `utf8` as UTF-16, a heap block (`*chars` long, a zero after); NULL when it is not UTF-8. */
+static WCHAR *Wide(const char *utf8, size_t length, int *chars)
+{
+    WCHAR *text;
+    *chars = length ? MultiByteToWideChar(CP_UTF8, 0, utf8, (int)length, NULL, 0) : 0;
+    if (length && *chars <= 0) return NULL;
+    if ((text = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, ((size_t)*chars + 1) * sizeof(WCHAR))) == NULL) return NULL;
+    if (length) MultiByteToWideChar(CP_UTF8, 0, utf8, (int)length, text, *chars);
+    text[*chars] = 0;
+    return text;
+}
+
+BOOL WebStore_Set(WebStore *store, const WCHAR *name, const char *utf8, size_t length)
+{
+    BYTE key[WEB_KEY_MAX], *value;
+    WCHAR *text;
+    size_t keyLength, valueLength;
+    int chars;
+    BOOL ok;
+    if (!store || store->indexed || (keyLength = KeyOf(name, key, sizeof key)) == 0 || length > WEB_VALUE_MAX) return FALSE;
+    if ((text = Wide(utf8, length, &chars)) == NULL) return FALSE;
+    if ((value = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 1 + 2 * (size_t)chars)) == NULL) {
+        Util_Free(text);
+        return FALSE;
+    }
+    valueLength = Core_WebStorageValue(text, (size_t)chars, value, 1 + 2 * (size_t)chars);
+    Util_Free(text);
+    ok = valueLength && SetEntry(store, key, keyLength, value, valueLength);
+    Util_Free(value);
+    return ok;
+}
+
+/* The record's entry, when it holds a string Claude's window put. */
+static const WebEntry *IndexedRecord(const WebStore *store, ULONGLONG *version, size_t *header, size_t *text, BYTE *tag, size_t *start,
+                                     size_t *bytes)
+{
+    int at;
+    if (!store || !store->indexed || !store->dataKeyLength || (at = FindEntry(store, store->dataKey, store->dataKeyLength)) < 0 ||
+        !store->entries[at].put ||
+        !Core_IdbValueString(store->entries[at].value, store->entries[at].valueLength, version, header, text, tag, start, bytes))
+        return NULL;
+    return &store->entries[at];
+}
+
+char *WebStore_GetIndexed(const WebStore *store, size_t *length)
+{
+    ULONGLONG version;
+    size_t header, text, start, bytes, i, chars;
+    BYTE tag;
+    const WebEntry *entry = IndexedRecord(store, &version, &header, &text, &tag, &start, &bytes);
+    WCHAR *wide;
+    char *utf8 = NULL;
+    int size;
+    *length = 0;
+    if (!entry) return NULL;
+    if (tag == 'S') {
+        if ((utf8 = (char *)HeapAlloc(GetProcessHeap(), 0, bytes + 1)) == NULL) return NULL;
+        memcpy(utf8, entry->value + start, bytes);
+        utf8[bytes] = 0;
+        *length = bytes;
+        return utf8;
+    }
+    chars = tag == 'c' ? bytes / 2 : bytes;
+    if ((wide = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, (chars + 1) * sizeof(WCHAR))) == NULL) return NULL;
+    for (i = 0; i < chars; i++)
+        wide[i] = tag == 'c' ? (WCHAR)(entry->value[start + 2 * i] | (entry->value[start + 2 * i + 1] << 8)) : (WCHAR)entry->value[start + i];
+    if ((size = chars ? WideCharToMultiByte(CP_UTF8, 0, wide, (int)chars, NULL, 0, NULL, NULL) : 0) >= 0 &&
+        (utf8 = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)size + 1)) != NULL) {
+        if (size) WideCharToMultiByte(CP_UTF8, 0, wide, (int)chars, utf8, size, NULL, NULL);
+        utf8[size] = 0;
+        *length = (size_t)size;
+    }
+    Util_Free(wide);
+    return utf8;
+}
+
+BOOL WebStore_SetIndexed(WebStore *store, const char *utf8, size_t length)
+{
+    ULONGLONG version, next;
+    size_t header, text, start, bytes, valueLength;
+    BYTE tag, *value, number[8];
+    const WebEntry *entry = IndexedRecord(store, &version, &header, &text, &tag, &start, &bytes);
+    WCHAR *wide;
+    int chars, at;
+    BOOL ok;
+    if (!entry || length > WEB_VALUE_MAX || (wide = Wide(utf8, length, &chars)) == NULL) return FALSE;
+    /* The record's next version, as Chromium gives one: its store's last, plus one. */
+    next = version;
+    if ((at = FindEntry(store, store->versionKey, store->versionKeyLength)) >= 0 && store->entries[at].put)
+        next = max(next, Core_IdbIntRead(store->entries[at].value, store->entries[at].valueLength));
+    next++;
+    valueLength = 10 + (text - header) + 11 + (size_t)chars;
+    if ((value = (BYTE *)HeapAlloc(GetProcessHeap(), 0, valueLength)) == NULL) {
+        Util_Free(wide);
+        return FALSE;
+    }
+    valueLength = Core_IdbValueWrite(next, entry->value + header, text - header, wide, (size_t)chars, value, valueLength);
+    Util_Free(wide);
+    ok = valueLength && SetEntry(store, store->dataKey, store->dataKeyLength, value, valueLength) &&
+         SetEntry(store, store->existsKey, store->existsKeyLength, number, Core_IdbInt(next, number)) &&
+         SetEntry(store, store->versionKey, store->versionKeyLength, number, Core_IdbInt(next, number));
+    Util_Free(value);
+    return ok;
 }
 
 /* The database's files copied to `backup` (made), LOCK aside. */
@@ -449,11 +622,13 @@ BOOL WebStore_Commit(WebStore *store, const WCHAR *backup)
             ops[count].valueLength = store->entries[i].valueLength;
             count++;
         }
-    ops[count].put = TRUE;
-    ops[count].key = kMetaKey;
-    ops[count].keyLength = sizeof kMetaKey - 1;
-    ops[count].value = meta;
-    ops[count++].valueLength = OriginMeta(store, meta);
+    if (!store->indexed) {   /* Local Storage's record of the origin; an IndexedDB keeps none */
+        ops[count].put = TRUE;
+        ops[count].key = kMetaKey;
+        ops[count].keyLength = sizeof kMetaKey - 1;
+        ops[count].value = meta;
+        ops[count++].valueLength = OriginMeta(store, meta);
+    }
     if ((batchLength = Core_LevelBatchWrite(store->lastSequence + 1, ops, count, batch, capacity)) == 0) goto done;
     /* Right after the last whole record when the log ends there; else in the
      * next block: LevelDB reads nothing more of a block after zeros (padding)

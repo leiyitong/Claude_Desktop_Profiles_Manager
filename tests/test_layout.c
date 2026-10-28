@@ -2642,7 +2642,7 @@ static void CheckMessageBoxes(void)
 #define SETTINGS_ANSWERS_MAX 16
 #define SETTINGS_ANSWER_CCH  1024
 
-typedef struct SettingsCheck { LayoutFixture fixture; int chosen; HWND seen; int checked; } SettingsCheck;
+typedef struct SettingsCheck { LayoutFixture fixture; int chosen, target; HWND seen; int checked; } SettingsCheck;
 
 static int g_settingsApplied, g_settingsLanguage;
 
@@ -2680,39 +2680,23 @@ static BOOL PageLanguageIs(HWND page, const WCHAR *name)
 }
 
 /* Another language chosen in the Settings dialog, its row stepped with the
- * keyboard, and applied: Apply waits for the change, gives the language to
- * the program, and waits again; the dialog speaks the new language, in its
- * script's face, still laid out whole. */
-static void CheckSettingsApply(HWND dialog, SettingsCheck *check)
+ * keyboard, and saved: Save gives the language to the program and closes
+ * the dialog (CheckSettingsDialog reads what the program was given). */
+static void CheckSettingsSave(HWND dialog, SettingsCheck *check)
 {
-    HWND apply = GetDlgItem(dialog, IDC_G_APPLY), page = GetWindow(GetDlgItem(dialog, IDC_G_PAGE), GW_CHILD);   /* in its view */
-    int target = Localize_EffectiveLanguage() == 0 ? 1 : 0, steps;
-    WCHAR caption[64], title[128] = L"", name[128];
-    FontState font;
-    StringCchCopyW(name, ARRAYSIZE(name), Localize_LanguageName(target));
-    Check(&check->fixture, apply, "Apply waits for a change", !IsWindowEnabled(apply));
+    HWND page = GetWindow(GetDlgItem(dialog, IDC_G_PAGE), GW_CHILD);   /* in its view */
+    int steps;
+    WCHAR name[128];
+    check->target = Localize_EffectiveLanguage() == 0 ? 1 : 0;
+    StringCchCopyW(name, ARRAYSIZE(name), Localize_LanguageName(check->target));
     if (page) {
         SetFocus(page);
         SendPlainKey(page, VK_HOME);
         for (steps = 0; steps <= Localize_LanguageCount() && !PageLanguageIs(page, name); steps++) SendPlainKey(page, VK_RIGHT);
         for (steps = 0; steps <= Localize_LanguageCount() && !PageLanguageIs(page, name); steps++) SendPlainKey(page, VK_LEFT);
     }
-    Check(&check->fixture, page, "the language's row takes another language from the keyboard, and Apply waits no more",
-          PageLanguageIs(page, name) && IsWindowEnabled(apply));
-    SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_G_APPLY, BN_CLICKED), (LPARAM)apply);
-    PumpMessages();
-    check->fixture.language = target;
-    GetWindowTextW(dialog, caption, ARRAYSIZE(caption));
-    if (page) Settings_PageRow(page, 0, title, ARRAYSIZE(title), NULL, 0);
-    font = ReadFont(dialog, (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0));
-    Check(&check->fixture, apply, "Apply gives the language chosen to the program", g_settingsApplied == 1 && g_settingsLanguage == target);
-    Check(&check->fixture, NULL, "the settings dialog follows the language applied: caption, the page's rows",
-          wcscmp(caption, TR(L"Settings")) == 0 && wcscmp(title, TR(L"Language")) == 0);
-    Check(&check->fixture, NULL, "the settings dialog's face covers the language applied",
-          font.available && wcscmp(font.logical.lfFaceName, Localize_FontFace()) == 0);
-    Check(&check->fixture, page, "the language's row shows the language applied", PageLanguageIs(page, name));
-    Check(&check->fixture, apply, "Apply waits again for a change once applied", !IsWindowEnabled(apply));
-    CheckGeometry(dialog, &check->fixture);
+    Check(&check->fixture, page, "the language's row takes another language from the keyboard", PageLanguageIs(page, name));
+    SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), (LPARAM)GetDlgItem(dialog, IDOK));
 }
 
 /* The settings' kinds on the left, the page of the one chosen on the right:
@@ -2744,9 +2728,9 @@ static void CheckSettingsList(HWND dialog, SettingsCheck *check)
 }
 
 /* The Settings dialog's owner: once the dialog waits for the user, its
- * language box is read; another language is chosen and applied, which the
- * dialog follows, Apply waiting for a change before and after; then Cancel
- * closes it. The vault's days stay as they are: nothing is written. */
+ * language row is read, its kinds and its search walked; another language is
+ * chosen and saved, which closes it (Cancel would, had Save not). The vault's
+ * days stay as they are: nothing else is written. */
 static LRESULT CALLBACK CheckWaitingSettings(HWND owner, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR reference)
 {
     SettingsCheck *check = (SettingsCheck *)reference;
@@ -2759,7 +2743,7 @@ static LRESULT CALLBACK CheckWaitingSettings(HWND owner, UINT message, WPARAM wp
         Check(&check->fixture, page, "the language's row shows the language in use, Windows' as its own choice",
               PageLanguageIs(page, Localize_LanguageName(check->chosen)));
         CheckSettingsList(dialog, check);
-        CheckSettingsApply(dialog, check);
+        CheckSettingsSave(dialog, check);
         PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
     }
     return DefSubclassProc(owner, message, wp, lp);
@@ -2852,7 +2836,8 @@ static void CheckSettingsDialog(void)
         Settings_Show(owner, ApplySettingsLanguage, NULL);
         RemoveWindowSubclass(owner, CheckWaitingSettings, SETTINGS_OWNER_SUBCLASS);
         Check(&check.fixture, NULL, "the settings dialog waited for the user once, and was checked", check.checked == 1);
-        Check(&check.fixture, NULL, "Cancel after Apply gives the program nothing more", g_settingsApplied == 1);
+        Check(&check.fixture, NULL, "Save gives the language chosen to the program, once",
+              g_settingsApplied == 1 && g_settingsLanguage == check.target);
     }
     DestroyWindow(owner);
 }

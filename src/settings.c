@@ -16,9 +16,8 @@
  *     its folder copied (sessionpurge.c), by hand or once a week;
  *   - Claude's preferences in every profile, written while its Claude is
  *     closed, as Claude keeps them in memory (Gui_SetPreferences).
- * Each row also says how far the setting reaches and how much it changes.
- * What changes is kept with OK or Apply. Help and the changelog are in
- * About (about.c).
+ * A setting that changes much says so beside its name. What changes is kept
+ * with Save. Help and the changelog are in About (about.c).
  */
 #include "app.h"
 #include "resource.h"
@@ -39,20 +38,22 @@
 /* The page, and the kinds beside it, in DIPs. */
 #define PAGE_CLASS              L"ClaudeDelta.SettingsPage"
 #define KINDS_CLASS             L"ClaudeDelta.SettingsKinds"
-#define PAGE_MARGIN_DIPS        14    /* around what the page shows */
+#define PAGE_MARGIN_DIPS        16    /* around what the page shows */
 #define PAGE_ROW_INSET_DIPS     6     /* a row's box past the margin, for its focus cue */
-#define PAGE_ROW_PAD_DIPS       7     /* above and below a setting's texts */
-#define PAGE_LINE_GAP_DIPS      1     /* between a setting's name and what it does */
-#define PAGE_CONTROL_GAP_DIPS   16    /* between a setting's texts and its control */
-#define PAGE_CONTROL_PAD_DIPS   10    /* a control's height past its text's */
-#define PAGE_TITLE_GAP_DIPS     2     /* below the page's title */
-#define PAGE_SECTION_DIPS       14    /* above a section's name */
-#define PAGE_SECTION_GAP_DIPS   2     /* below it */
-#define PAGE_NOTE_GAP_DIPS      12    /* between a setting's name and its note, on one line */
-#define PAGE_ICON_GAP_DIPS      6     /* after an icon */
-#define KIND_ROW_DIPS           40    /* a kind's row */
+#define PAGE_ROW_PAD_DIPS       12    /* above and below a setting's texts */
+#define PAGE_LINE_GAP_DIPS      3     /* between a setting's name and what it does */
+#define PAGE_CONTROL_GAP_DIPS   24    /* between a setting's texts and its control */
+#define PAGE_CONTROL_PAD_DIPS   12    /* a control's height past its text's */
+#define PAGE_TITLE_GAP_DIPS     10    /* below the page's title */
+#define PAGE_SECTION_DIPS       20    /* above a section's name */
+#define PAGE_SECTION_GAP_DIPS   0     /* below it */
+#define PAGE_BADGE_GAP_DIPS     8     /* between a setting's name and "Large impact" */
+#define KIND_ROW_DIPS           36    /* a kind's row */
 #define KIND_ROW_GAP_DIPS       2     /* between two kinds' rows */
-#define KIND_PAD_DIPS           12    /* before a kind's icon */
+#define KIND_GROUP_DIPS         26    /* a group's name, above its kinds */
+#define KIND_GROUP_GAP_DIPS     10    /* above a group's name but the first */
+#define KIND_PAD_DIPS           10    /* before a kind's icon */
+#define KIND_ICON_GAP_DIPS      12    /* after it */
 #define PAGE_CHOICE_MAX_DIPS    220   /* a drop-down, at most */
 #define PAGE_FIELD_DIPS         200   /* a text's field */
 #define PAGE_DAYS_DIPS          80    /* a number of days' field */
@@ -81,41 +82,36 @@ enum { SG_GENERAL, SG_NEW, SG_CODE, SG_DESKTOP, SG_COUNT };
 #define SI_POWER       0x2000u
 #define SI_INTERFACE   0x4000u
 
-typedef struct SettingsKind { DWORD items; const WCHAR *name; WCHAR glyph; ThemeTint tint; } SettingsKind;
+/* Each kind after its icon (in the text's own color), under the name of the group it starts, if any. */
+typedef struct SettingsKind { DWORD items; const WCHAR *name, *group; WCHAR glyph; } SettingsKind;
 static const SettingsKind kKinds[SG_COUNT] = {
-    { SI_INTERFACE | SI_UPDATES | SI_SIGNIN | SI_VAULT, L"General", 0xE713, THEME_TINT_BLUE },
-    { SI_MCP | SI_SEARXNG | SI_COWORK, L"New profiles", 0xE710, THEME_TINT_GREEN },
-    { SI_SESSIONS | SI_PRIVACY | SI_FEATURES | SI_GIT | SI_PERMISSIONS, L"Claude Code", 0xE943, THEME_TINT_PURPLE },
-    { SI_BROWSER | SI_CODE_TAB | SI_POWER, L"Claude Desktop", 0xE7F4, THEME_TINT_TEAL },
+    { SI_INTERFACE | SI_UPDATES | SI_SIGNIN | SI_VAULT, L"General", L"Preferences", 0xE713 },
+    { SI_MCP | SI_SEARXNG | SI_COWORK, L"New profiles", NULL, 0xE710 },
+    { SI_SESSIONS | SI_PRIVACY | SI_FEATURES | SI_GIT | SI_PERMISSIONS, L"Claude Code", L"Claude", 0xE943 },
+    { SI_BROWSER | SI_CODE_TAB | SI_POWER, L"Claude Desktop", NULL, 0xE7F4 },
 };
-/* The sections, in the order the pages show them, each under its icon and name. */
-typedef struct SettingsSection { DWORD item; const WCHAR *name; WCHAR glyph; ThemeTint tint; } SettingsSection;
+/* The sections, in the order the pages show them. */
+typedef struct SettingsSection { DWORD item; const WCHAR *name; } SettingsSection;
 static const SettingsSection kSections[] = {
-    { SI_INTERFACE, L"Interface", 0xE771, THEME_TINT_BLUE },
-    { SI_UPDATES, L"Claude updates", 0xE777, THEME_TINT_BLUE },
-    { SI_SIGNIN, L"Private sign-in", 0xE72E, THEME_TINT_TEAL },
-    { SI_VAULT, L"Session vault", 0xE81C, THEME_TINT_AMBER },
-    { SI_MCP, L"Windows MCP", 0xE7F8, THEME_TINT_BLUE },
-    { SI_SEARXNG, L"SearXNG search", 0xE721, THEME_TINT_TEAL },
-    { SI_COWORK, L"Cowork", 0xE716, THEME_TINT_PURPLE },
-    { SI_SESSIONS, L"Conversations", 0xE8BD, THEME_TINT_AMBER },
-    { SI_PRIVACY, L"Privacy and network", 0xEA18, THEME_TINT_GREEN },
-    { SI_FEATURES, L"Features", 0xE945, THEME_TINT_GOLD },
-    { SI_GIT, L"Git and pull requests", 0xE8AB, THEME_TINT_PURPLE },
-    { SI_PERMISSIONS, L"Permissions", 0xE8D7, THEME_TINT_RED },
-    { SI_BROWSER, L"Cowork and the browser", 0xE774, THEME_TINT_BLUE },
-    { SI_CODE_TAB, L"Code tab", 0xE756, THEME_TINT_PURPLE },
-    { SI_POWER, L"Power and notifications", 0xE7E8, THEME_TINT_GREEN },
+    { SI_INTERFACE, L"Interface" },
+    { SI_UPDATES, L"Claude updates" },
+    { SI_SIGNIN, L"Private sign-in" },
+    { SI_VAULT, L"Session vault" },
+    { SI_MCP, L"Windows MCP" },
+    { SI_SEARXNG, L"SearXNG search" },
+    { SI_COWORK, L"Cowork" },
+    { SI_SESSIONS, L"Conversations" },
+    { SI_PRIVACY, L"Privacy and network" },
+    { SI_FEATURES, L"Features" },
+    { SI_GIT, L"Git and pull requests" },
+    { SI_PERMISSIONS, L"Permissions" },
+    { SI_BROWSER, L"Cowork and the browser" },
+    { SI_CODE_TAB, L"Code tab" },
+    { SI_POWER, L"Power and notifications" },
 };
 
-/* How far a setting reaches, and how much it changes: each impact's icon before its note. */
-enum { SCOPE_PROGRAM, SCOPE_SIGNIN, SCOPE_NEW, SCOPE_MCP, SCOPE_CODE, SCOPE_DESKTOP, SCOPES };
-enum { IMPACT_MINIMAL, IMPACT_SMALL, IMPACT_MEDIUM, IMPACT_LARGE, IMPACTS };
-static const WCHAR kImpactGlyphs[IMPACTS] = { 0xE946, 0xE946, 0xE7BA, 0xE7BA };
-static const ThemeTint kImpactTints[IMPACTS] = { THEME_TINT_GREEN, THEME_TINT_TEAL, THEME_TINT_AMBER, THEME_TINT_RED };
-static const WCHAR *const kScopeNames[SCOPES] = { L"This program", L"Sign-in window", L"New profiles", L"Windows MCP", L"Claude Code",
-                                                  L"All profiles" };
-static const WCHAR *const kImpactNames[IMPACTS] = { L"minimal", L"small", L"medium", L"large" };
+/* How much a setting changes: a large impact is said beside its name. */
+enum { IMPACT_MINIMAL, IMPACT_SMALL, IMPACT_MEDIUM, IMPACT_LARGE };
 
 /* Where a setting is kept. */
 typedef enum SettingStore {
@@ -141,7 +137,7 @@ typedef struct SettingDef {
     DWORD        item;
     SettingStore store;
     const WCHAR *label, *effect;   /* catalog keys: its name, and what it does */
-    int          scope, impact;
+    int          impact;
     const WCHAR *name;             /* STORE_INI's */
     const char  *key;              /* the member, variable or preference, a member's path with dots */
     const char  *on, *off;         /* the JSON written: on (STORE_ENV's: EnvOn), and off (NULL: taken out) */
@@ -150,46 +146,43 @@ typedef struct SettingDef {
     int          action;           /* STORE_ACTION's: IDC_G_* */
 } SettingDef;
 
-#define INI(item, label, effect, scope, impact, name, fallback) \
-    { item, STORE_INI, label, effect, scope, impact, name, NULL, NULL, NULL, 0, fallback, 0 }
-#define OWN(item, store, label, effect, scope, impact) { item, store, label, effect, scope, impact, NULL, NULL, NULL, NULL, 0, 0, 0 }
-#define ACT(item, label, effect, scope, impact, action) \
-    { item, STORE_ACTION, label, effect, scope, impact, NULL, NULL, NULL, NULL, 0, 0, action }
-#define ENV(item, label, effect, impact, key, match) \
-    { item, STORE_ENV, label, effect, SCOPE_CODE, impact, NULL, "env." key, NULL, NULL, match, 0, 0 }
-#define CODE(item, store, label, effect, impact, key, on) { item, store, label, effect, SCOPE_CODE, impact, NULL, key, on, NULL, 0, 0, 0 }
+#define INI(item, label, effect, impact, name, fallback) { item, STORE_INI, label, effect, impact, name, NULL, NULL, NULL, 0, fallback, 0 }
+#define OWN(item, store, label, effect, impact)           { item, store, label, effect, impact, NULL, NULL, NULL, NULL, 0, 0, 0 }
+#define ACT(item, label, effect, impact, action)          { item, STORE_ACTION, label, effect, impact, NULL, NULL, NULL, NULL, 0, 0, action }
+#define ENV(item, label, effect, impact, key, match)      { item, STORE_ENV, label, effect, impact, NULL, "env." key, NULL, NULL, match, 0, 0 }
+#define CODE(item, store, label, effect, impact, key, on) { item, store, label, effect, impact, NULL, key, on, NULL, 0, 0, 0 }
 #define PREF(item, label, effect, impact, key, on, off, fallback) \
-    { item, STORE_DESKTOP, label, effect, SCOPE_DESKTOP, impact, NULL, key, on, off, 0, fallback, 0 }
+    { item, STORE_DESKTOP, label, effect, impact, NULL, key, on, off, 0, fallback, 0 }
 
 static const SettingDef kSettings[] = {
-    OWN(SI_INTERFACE, STORE_LANGUAGE, L"Language", L"The language of this program's windows.", SCOPE_PROGRAM, IMPACT_MINIMAL),
+    OWN(SI_INTERFACE, STORE_LANGUAGE, L"Language", L"The language of this program's windows.", IMPACT_MINIMAL),
     OWN(SI_INTERFACE, STORE_ZOOM, L"Zoom", L"How large this program's windows are; the main window takes it once Settings closes.",
-        SCOPE_PROGRAM, IMPACT_SMALL),
+        IMPACT_SMALL),
     INI(SI_UPDATES, L"Open profiles again after a Claude update", L"A profile that a Claude update closed opens again once the update is in.",
-        SCOPE_PROGRAM, IMPACT_SMALL, SETTING_REOPEN_AFTER_UPDATE, 1),
+        IMPACT_SMALL, SETTING_REOPEN_AFTER_UPDATE, 1),
     OWN(SI_SIGNIN, STORE_BROWSER, L"Browser", L"Where private sign-in opens claude.ai: the program's own window, or a browser in private mode.",
-        SCOPE_SIGNIN, IMPACT_SMALL),
+        IMPACT_SMALL),
     OWN(SI_SIGNIN, STORE_DEVTOOLS, L"DevTools port (CDP)", L"The sign-in window serves DevTools on port 9222 of this PC only, so that tools can drive it.",
-        SCOPE_SIGNIN, IMPACT_MINIMAL),
+        IMPACT_MINIMAL),
     OWN(SI_VAULT, STORE_VAULT_DAYS, L"Days to keep versions", L"How long the vault keeps the earlier versions of each list of sessions. 0 keeps them all.",
-        SCOPE_PROGRAM, IMPACT_SMALL),
+        IMPACT_SMALL),
     INI(SI_MCP, L"Set up in new profiles", L"New profiles get Windows MCP, which lets Claude see and use this PC's desktop. It needs uv.",
-        SCOPE_NEW, IMPACT_MEDIUM, SETTING_NEW_WINDOWS_MCP, 1),
-    INI(SI_MCP, L"Read and search claude.ai chats", L"Windows MCP may read and search this account's chats on claude.ai.",
-        SCOPE_MCP, IMPACT_MEDIUM, SETTING_MCP_ONLINE, 0),
-    INI(SI_SEARXNG, L"Set up in new profiles", L"New profiles search the web through SearXNG. It needs Node.js.",
-        SCOPE_NEW, IMPACT_SMALL, SETTING_NEW_SEARXNG, 1),
-    OWN(SI_SEARXNG, STORE_SEARXNG, L"Address", L"The SearXNG instance new profiles search with. Empty: searxng.cheese.ink.", SCOPE_NEW, IMPACT_SMALL),
+        IMPACT_MEDIUM, SETTING_NEW_WINDOWS_MCP, 1),
+    INI(SI_MCP, L"Read and search claude.ai chats", L"Windows MCP may read and search this account's chats on claude.ai.", IMPACT_MEDIUM,
+        SETTING_MCP_ONLINE, 0),
+    INI(SI_SEARXNG, L"Set up in new profiles", L"New profiles search the web through SearXNG. It needs Node.js.", IMPACT_SMALL,
+        SETTING_NEW_SEARXNG, 1),
+    OWN(SI_SEARXNG, STORE_SEARXNG, L"Address", L"The SearXNG instance new profiles search with. Empty: searxng.cheese.ink.", IMPACT_SMALL),
     INI(SI_COWORK, L"Turn off in new profiles", L"New profiles start without Cowork, and its virtual machine (several GB) is never downloaded.",
-        SCOPE_NEW, IMPACT_MEDIUM, SETTING_NEW_COWORK_OFF, 1),
+        IMPACT_MEDIUM, SETTING_NEW_COWORK_OFF, 1),
     CODE(SI_SESSIONS, STORE_CODE_DAYS, L"Days to keep conversations",
          L"Claude Code deletes conversations older than this when it starts, without asking. Empty: its default, 30.",
          IMPACT_LARGE, "cleanupPeriodDays", NULL),
-    ACT(SI_SESSIONS, L"Clean up sessions", L"Pick sessions of Claude Code to delete, or bring back those deleted.", SCOPE_CODE, IMPACT_MEDIUM,
+    ACT(SI_SESSIONS, L"Clean up sessions", L"Pick sessions of Claude Code to delete, or bring back those deleted.", IMPACT_MEDIUM,
         IDC_G_PURGE),
-    ACT(SI_SESSIONS, L"Back up .claude", L"Copies Claude Code's .claude folder beside it now.", SCOPE_CODE, IMPACT_MINIMAL, IDC_G_CODE_COPY),
-    INI(SI_SESSIONS, L"Back up once a week", L"Once a week, the program copies the .claude folder beside it.",
-        SCOPE_PROGRAM, IMPACT_MINIMAL, SETTING_WEEKLY_BACKUP, 0),
+    ACT(SI_SESSIONS, L"Back up .claude", L"Copies Claude Code's .claude folder beside it now.", IMPACT_MINIMAL, IDC_G_CODE_COPY),
+    INI(SI_SESSIONS, L"Back up once a week", L"Once a week, the program copies the .claude folder beside it.", IMPACT_MINIMAL,
+        SETTING_WEEKLY_BACKUP, 0),
     ENV(SI_PRIVACY, L"Turn off telemetry", L"Claude Code stops sending usage data. Features it turns on step by step may stay off.",
         IMPACT_LARGE, "DISABLE_TELEMETRY", ENV_SET),
     ENV(SI_PRIVACY, L"Turn off error reporting", L"Claude Code stops sending crash and error reports.", IMPACT_SMALL, "DISABLE_ERROR_REPORTING",
@@ -266,7 +259,8 @@ typedef struct PageRow {
     int          v;                             /* ROW_SETTING: its value; ROW_SECTION: its section; else -1 */
     const WCHAR *text;                          /* the title's, the section's or the empty page's words, translated */
     RECT         box;                           /* in the page */
-    RECT         name, effect, note, control;   /* ROW_SETTING's texts (its note after its icon) and its control */
+    RECT         name, badge, effect, note;     /* ROW_SETTING's texts: "Large impact" and its note, empty when it has none */
+    RECT         control;
 } PageRow;
 
 /* The dialog's state, in DWLP_USER; the page's too. */
@@ -661,22 +655,17 @@ static void ValueText(const SettingsDialog *state, int v, WCHAR *out, size_t cch
     }
 }
 
-/* Below what setting `v` does: how far it reaches and how much it changes, and how it stands where that is not plain. */
+/* Below what setting `v` does: how it stands, where that is not plain; empty for most. */
 static void NoteOf(const SettingsDialog *state, int v, WCHAR *out, size_t cch)
 {
     const SettingDef *def = &kSettings[v];
-    WCHAR more[256] = L"";
-    StringCchPrintfW(out, cch, TR(L"%s \x00B7 %s impact"), TR(kScopeNames[def->scope]), TR(kImpactNames[def->impact]));
+    out[0] = 0;
     if (def->store == STORE_DESKTOP && state->profiles == 0)
-        StringCchCopyW(more, ARRAYSIZE(more), TR(L"There is no profile yet."));
+        StringCchCopyW(out, cch, TR(L"There is no profile yet."));
     else if (def->store == STORE_DESKTOP && state->onIn[v] > 0 && state->onIn[v] < state->profiles && !state->touched[v])
-        StringCchPrintfW(more, ARRAYSIZE(more), TR(L"On now in %d of %d profiles."), state->onIn[v], state->profiles);
+        StringCchPrintfW(out, cch, TR(L"On now in %d of %d profiles."), state->onIn[v], state->profiles);
     else if (InCode(def) && state->codeLocked)
-        StringCchCopyW(more, ARRAYSIZE(more), TR(L"Claude Code's settings.json cannot be read: it is left as it is."));
-    if (more[0]) {
-        StringCchCatW(out, cch, L" \x00B7 ");
-        StringCchCatW(out, cch, more);
-    }
+        StringCchCopyW(out, cch, TR(L"Claude Code's settings.json cannot be read: it is left as it is."));
 }
 
 /* ---------------------------------------------------------------- the page */
@@ -778,15 +767,12 @@ static void PageLayout(SettingsDialog *state)
             SetRect(&row->box, margin, y, right, y + height);
             y += height + Px(page, PAGE_TITLE_GAP_DIPS);
             break;
-        case ROW_SECTION: {
-            HFONT strong = Font(state, THEME_FONT_STRONG);
-            int icon = Theme_InlineGlyphWidth(dc, kSections[row->v].glyph, strong) + Px(page, PAGE_ICON_GAP_DIPS);
+        case ROW_SECTION:
             if (i > 0 && state->rows[i - 1].kind != ROW_TITLE) y += Px(page, PAGE_SECTION_DIPS);
-            height = TextHeight(dc, strong, row->text, right - margin - icon);
+            height = TextHeight(dc, Font(state, THEME_FONT_STRONG), row->text, right - margin);
             SetRect(&row->box, margin, y, right, y + height);
             y += height + Px(page, PAGE_SECTION_GAP_DIPS);
             break;
-        }
         case ROW_EMPTY:
             height = TextHeight(dc, Font(state, THEME_FONT_TEXT), row->text, right - margin);
             SetRect(&row->box, margin, y, right, y + height);
@@ -794,27 +780,36 @@ static void PageLayout(SettingsDialog *state)
             break;
         default: {
             const SettingDef *def = &kSettings[row->v];
-            WCHAR note[512];
+            const WCHAR *badge = def->impact == IMPACT_LARGE ? TR(L"Large impact") : NULL;
+            WCHAR note[256];
             int width = ControlWidth(state, dc, row->v), textRight = max(margin + Px(page, PAGE_TEXT_MIN_DIPS), right - width - gap);
-            int nameWidth, noteWidth, nameHeight, effectHeight, noteHeight, inner, top, room = textRight - margin;
+            int nameWidth, badgeWidth, nameHeight, effectHeight, inner, top, below, room = textRight - margin;
             HFONT text = Font(state, THEME_FONT_TEXT);
             BOOL beside;
             NoteOf(state, row->v, note, ARRAYSIZE(note));
-            /* The note (its impact's icon first) on the name's line when both fit there; else below what it does. */
+            /* "Large impact" on the name's line when both fit there; else below what it does, and the note below that. */
             nameWidth = TextWidth(dc, text, TR(def->label));
-            noteWidth = Theme_InlineGlyphWidth(dc, kImpactGlyphs[def->impact], text) + Px(page, PAGE_ICON_GAP_DIPS) + TextWidth(dc, text, note);
-            beside = nameWidth + Px(page, PAGE_NOTE_GAP_DIPS) + noteWidth <= room;
+            badgeWidth = badge ? TextWidth(dc, text, badge) : 0;
+            beside = !badge || nameWidth + Px(page, PAGE_BADGE_GAP_DIPS) + badgeWidth <= room;
             nameHeight = TextHeight(dc, text, TR(def->label), room);
             effectHeight = TextHeight(dc, text, TR(def->effect), room);
-            noteHeight = beside ? 0 : TextHeight(dc, text, note, room - (noteWidth - TextWidth(dc, text, note)));
-            inner = nameHeight + line + effectHeight + (beside ? 0 : line + noteHeight);
+            inner = nameHeight + line + effectHeight + (beside ? 0 : line + TextHeight(dc, text, badge, room)) +
+                    (note[0] ? line + TextHeight(dc, text, note, room) : 0);
             height = max(inner, state->controlHeight) + 2 * pad;
             SetRect(&row->box, margin - inset, y, right + inset, y + height);
             top = y + (height - inner) / 2;
             SetRect(&row->name, margin, top, textRight, top + nameHeight);
             SetRect(&row->effect, margin, row->name.bottom + line, textRight, row->name.bottom + line + effectHeight);
-            if (beside) SetRect(&row->note, margin + nameWidth + Px(page, PAGE_NOTE_GAP_DIPS), top, textRight, top + nameHeight);
-            else SetRect(&row->note, margin, row->effect.bottom + line, textRight, row->effect.bottom + line + noteHeight);
+            below = row->effect.bottom;
+            SetRectEmpty(&row->badge);
+            SetRectEmpty(&row->note);
+            if (badge && beside) {
+                SetRect(&row->badge, margin + nameWidth + Px(page, PAGE_BADGE_GAP_DIPS), top, textRight, top + nameHeight);
+            } else if (badge) {
+                SetRect(&row->badge, margin, below + line, textRight, below + line + TextHeight(dc, text, badge, room));
+                below = row->badge.bottom;
+            }
+            if (note[0]) SetRect(&row->note, margin, below + line, textRight, below + line + TextHeight(dc, text, note, room));
             SetRect(&row->control, right - width, y + (height - state->controlHeight) / 2, right, y + (height + state->controlHeight) / 2);
             y += height;
             break;
@@ -850,21 +845,14 @@ static void PagePaint(SettingsDialog *state, HDC target, const RECT *update)
         if (row->kind == ROW_TITLE) {
             PageText(dc, Font(state, THEME_FONT_HEADING), row->text, &row->box, text);
         } else if (row->kind == ROW_SECTION) {
-            /* Its icon, in its tint, then its name. */
-            HFONT strong = Font(state, THEME_FONT_STRONG);
-            RECT icon = row->box, name = row->box;
-            icon.right = icon.left + Theme_InlineGlyphWidth(dc, kSections[row->v].glyph, strong);
-            icon.bottom = icon.top + TextHeight(dc, strong, L"Ag", 1000);
-            Theme_DrawInlineGlyph(dc, &icon, kSections[row->v].glyph, strong, Theme_TintColor(kSections[row->v].tint));
-            name.left = icon.right + Px(page, PAGE_ICON_GAP_DIPS);
-            PageText(dc, strong, row->text, &name, text);
+            PageText(dc, Font(state, THEME_FONT_STRONG), row->text, &row->box, muted);
         } else if (row->kind == ROW_EMPTY) {
             PageText(dc, Font(state, THEME_FONT_TEXT), row->text, &row->box, muted);
         } else {
             const SettingDef *def = &kSettings[row->v];
             const CheckValue *value = &state->values[row->v];
             HFONT font = Font(state, THEME_FONT_TEXT);
-            WCHAR note[512], shown[CHECK_VALUE_CCH];
+            WCHAR note[256], shown[CHECK_VALUE_CCH];
             UINT look = (value->readOnly ? THEME_BUTTON_DISABLED : 0) | (state->hot == i ? THEME_BUTTON_HOT : 0);
             BOOL hint;
             /* A rule between two settings of a section. */
@@ -873,17 +861,12 @@ static void PagePaint(SettingsDialog *state, HDC target, const RECT *update)
                 SetRect(&between, row->name.left, row->box.top, row->control.right, row->box.top + rule);
                 FillRect(dc, &between, Theme_Brush(THEME_SEPARATOR));
             }
-            NoteOf(state, row->v, note, ARRAYSIZE(note));
             PageText(dc, font, TR(def->label), &row->name, value->readOnly ? muted : text);
+            if (!IsRectEmpty(&row->badge)) PageText(dc, font, TR(L"Large impact"), &row->badge, Theme_TintColor(THEME_TINT_AMBER));
             PageText(dc, font, TR(def->effect), &row->effect, muted);
-            {
-                /* The note after its impact's icon. */
-                RECT icon = row->note, words = row->note;
-                icon.right = icon.left + Theme_InlineGlyphWidth(dc, kImpactGlyphs[def->impact], font);
-                icon.bottom = icon.top + TextHeight(dc, font, L"Ag", 1000);
-                Theme_DrawInlineGlyph(dc, &icon, kImpactGlyphs[def->impact], font, Theme_TintColor(kImpactTints[def->impact]));
-                words.left = icon.right + Px(page, PAGE_ICON_GAP_DIPS);
-                PageText(dc, font, note, &words, muted);
+            if (!IsRectEmpty(&row->note)) {
+                NoteOf(state, row->v, note, ARRAYSIZE(note));
+                PageText(dc, font, note, &row->note, muted);
             }
             ValueText(state, row->v, shown, ARRAYSIZE(shown), &hint);
             switch (value->kind) {
@@ -992,15 +975,12 @@ static int PageStep(const SettingsDialog *state, int step)
     return found;
 }
 
-static void UpdateApply(HWND dialog, const SettingsDialog *state);
-
-/* Value `v` changed in the page: its row drawn again, Apply as it now stands. */
+/* Value `v` changed in the page: its row drawn again. */
 static void PageChanged(SettingsDialog *state, int i)
 {
     int v = state->rows[i].v;
     if (kSettings[v].store == STORE_DESKTOP && state->onIn[v] > 0 && state->onIn[v] < state->profiles) state->touched[v] = TRUE;
     PageRedrawRow(state, i);
-    UpdateApply(state->dialog, state);
 }
 
 static void PageCloseEditor(SettingsDialog *state)
@@ -1247,13 +1227,17 @@ static LRESULT CALLBACK PageProc(HWND page, UINT msg, WPARAM wp, LPARAM lp)
 
 /* ------------------------------------------------------------ the kinds */
 
-/* Kind `g`'s row in the kinds' window. */
+/* Kind `g`'s row in the kinds' window, below its group's name when it starts one. */
 static void KindRect(HWND kinds, int g, RECT *rc)
 {
     RECT client;
-    int height = Px(kinds, KIND_ROW_DIPS), step = height + Px(kinds, KIND_ROW_GAP_DIPS);
+    int height = Px(kinds, KIND_ROW_DIPS), y = 0, k;
     GetClientRect(kinds, &client);
-    SetRect(rc, 0, g * step, client.right, g * step + height);
+    for (k = 0; k <= g && k < SG_COUNT; k++) {
+        if (k > 0) y += height + Px(kinds, KIND_ROW_GAP_DIPS);
+        if (kKinds[k].group) y += Px(kinds, KIND_GROUP_DIPS) + (k > 0 ? Px(kinds, KIND_GROUP_GAP_DIPS) : 0);
+    }
+    SetRect(rc, 0, y, client.right, y + height);
 }
 
 static int KindAt(HWND kinds, POINT pt)
@@ -1267,36 +1251,44 @@ static int KindAt(HWND kinds, POINT pt)
     return -1;
 }
 
-/* Each kind a row as tall as Claude's: its icon in its tint, its name; the page's selected while no search shows. */
+/* Each kind a row, its icon and its name, under its group's name in the muted color; the page's kind a gray row
+ * while no search shows, its icon then in the text's color too. */
 static void KindsPaint(SettingsDialog *state, HDC target, const RECT *update)
 {
     ThemeBuffer buffer;
     HWND kinds = state->kinds;
     HDC dc = Theme_BufferBegin(&buffer, target, update);
-    HFONT font = Font(state, THEME_FONT_HEADING);
-    int g;
+    HFONT font = Font(state, THEME_FONT_TEXT);
+    UINT flags = DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | Localize_ReadingFlags();
+    int pad = Px(kinds, KIND_PAD_DIPS), g;
+    HGDIOBJ old;
     FillRect(dc, update, Theme_Brush(THEME_FACE));
     SetBkMode(dc, TRANSPARENT);
+    old = SelectObject(dc, font);
     for (g = 0; g < SG_COUNT; g++) {
         RECT row, icon, label;
-        UINT look = (g == state->kind && !state->search[0] ? THEME_ROW_SELECTED : 0) | (g == state->hotKind ? THEME_ROW_HOT : 0);
+        BOOL chosen = g == state->kind && !state->search[0];
+        UINT look = THEME_ROW_PLAIN | (chosen ? THEME_ROW_SELECTED : 0) | (g == state->hotKind ? THEME_ROW_HOT : 0);
         COLORREF color;
-        HGDIOBJ old;
         KindRect(kinds, g, &row);
+        if (kKinds[g].group) {
+            SetRect(&label, row.left + pad, row.top - Px(kinds, KIND_GROUP_DIPS), row.right - pad, row.top - Px(kinds, 4));
+            SetTextColor(dc, Theme_Color(THEME_MUTED));
+            DrawTextW(dc, TR(kKinds[g].group), -1, &label, flags | DT_BOTTOM);
+        }
         color = Theme_DrawRow(kinds, dc, &row, look, Theme_Color(THEME_FACE));
         icon = row;
-        icon.left += Px(kinds, KIND_PAD_DIPS);
+        icon.left += pad;
         icon.right = icon.left + Theme_InlineGlyphWidth(dc, kKinds[g].glyph, font);
-        Theme_DrawInlineGlyph(dc, &icon, kKinds[g].glyph, font, Theme_TintColor(kKinds[g].tint));
+        Theme_DrawInlineGlyph(dc, &icon, kKinds[g].glyph, font, chosen ? color : Theme_Color(THEME_MUTED));
         label = row;
-        label.left = icon.right + Px(kinds, PAGE_ICON_GAP_DIPS);
-        label.right -= Px(kinds, KIND_PAD_DIPS);
-        old = SelectObject(dc, font);
+        label.left = icon.right + Px(kinds, KIND_ICON_GAP_DIPS);
+        label.right -= pad;
         SetTextColor(dc, color);
-        DrawTextW(dc, TR(kKinds[g].name), -1, &label, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | Localize_ReadingFlags());
-        SelectObject(dc, old);
+        DrawTextW(dc, TR(kKinds[g].name), -1, &label, flags | DT_VCENTER);
         if (g == state->kind && GetFocus() == kinds) Theme_DrawFocusCue(kinds, dc, &row);
     }
+    SelectObject(dc, old);
     Theme_BufferEnd(&buffer);
 }
 
@@ -1436,15 +1428,6 @@ static BOOL Changed(const SettingsDialog *state)
     for (v = 0; v < SETTINGS_COUNT; v++)
         if (ValueChanged(state, v)) return TRUE;
     return FALSE;
-}
-
-/* Apply only while there is something to apply; the focus it had goes to OK. */
-static void UpdateApply(HWND dialog, const SettingsDialog *state)
-{
-    HWND apply = GetDlgItem(dialog, IDC_G_APPLY);
-    BOOL changed = Changed(state);
-    if (!changed && GetFocus() == apply) SendMessageW(dialog, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(dialog, IDOK), TRUE);
-    EnableWindow(apply, changed);
 }
 
 /* Setting `v` shown, in sight and the keyboard's: its kind's page, the search left; a text's field typed in. */
@@ -1677,6 +1660,8 @@ static BOOL ApplySettings(HWND dialog, SettingsDialog *state)
     }
     if (language >= 0 && ValueChanged(state, language) && state->applyLanguage) state->applyLanguage(state->values[language].choice - 1);
     if (language >= 0) ReadValue(state, language);   /* one not taken goes back */
+    if (ok) return TRUE;
+    /* The dialog stays: in the language now in use, the values as they now stand. */
     if (Localize_EffectiveLanguage() != languageBefore) {
         FollowLanguage(dialog, state);
     } else {
@@ -1686,8 +1671,7 @@ static BOOL ApplySettings(HWND dialog, SettingsDialog *state)
         Theme_ViewChanged(state->page);
         InvalidateRect(state->page, NULL, FALSE);
     }
-    UpdateApply(dialog, state);
-    return ok;
+    return FALSE;
 }
 
 /* A window of `className` in place of the template's placeholder `id`, in its place in the tab order too. */
@@ -1727,7 +1711,6 @@ static void InitSettings(HWND dialog, SettingsDialog *state)
             Theme_SetScrollRow(state->page, Px(state->page, 24));   /* a wheel's line */
         }
     }
-    UpdateApply(dialog, state);
 }
 
 static INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
@@ -1770,9 +1753,6 @@ static INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wp, LPARA
                     PageBuild(state);
                 }
             }
-            return TRUE;
-        case IDC_G_APPLY:
-            if (HIWORD(wp) == BN_CLICKED) ApplySettings(dialog, state);
             return TRUE;
         case IDOK:
             if (state->editor) PageCloseEditor(state);

@@ -217,16 +217,17 @@ static BOOL EmbeddedSource(const void **data, DWORD *size)
     return *data && *size;
 }
 
-/* This build's source folder, named for the version and the source's checksum: several builds of one day each
- * get their own (the first one unpacked would otherwise stay), and uv, which keeps what it built from a folder by
- * its path, builds each one anew. */
+/* This build's source folder, named for the source's checksum alone: a source that changed gets a folder of its
+ * own, which uv (it keeps what it built from a folder by its path) builds anew; builds whose source is the same
+ * (pack-delta.ps1 writes the same ZIP for it) share one, so an update that leaves it alone rewrites no
+ * profile's entry. */
 static BOOL PackageDir(WCHAR *out, size_t cch)
 {
     WCHAR root[LONG_PATH_CCH];
     const void *data;
     DWORD size;
     if (!PackageRoot(root, ARRAYSIZE(root)) || !EmbeddedSource(&data, &size)) return FALSE;
-    return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" APP_VERSION_DATE_W L"-%08lx", root, (unsigned long)Core_Crc32(0, data, size)));
+    return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\%08lx", root, (unsigned long)Core_Crc32(0, data, size)));
 }
 
 BOOL WindowsMcp_PackageDir(WCHAR *out, size_t cch)
@@ -246,7 +247,10 @@ static BOOL SafePath(const char *name, WCHAR *out, size_t cch)
 }
 
 /* The older versions' folders removed, so they do not pile up; one a profile's entry still runs from stays
- * (uvx reads it at each start of that profile's Claude) until Repair points that entry at this build's. */
+ * (uvx reads it at each start of that profile's Claude) until Repair points that entry at this build's. None goes
+ * while a profile with an entry of ours runs: its Claude writes its settings back as it read them at its start,
+ * the folder it started with again (seen on 3.6556), and starts from it should it restart before the watcher
+ * points it at this build's (WindowsMcp_AfterClose). */
 static void RemoveOldPackages(const WCHAR *keep)   /* `keep`: this build's folder */
 {
     WCHAR root[LONG_PATH_CCH], pattern[LONG_PATH_CCH], path[LONG_PATH_CCH], used[LONG_PATH_CCH];
@@ -259,6 +263,12 @@ static void RemoveOldPackages(const WCHAR *keep)   /* `keep`: this build's folde
     if (!PackageRoot(root, ARRAYSIZE(root)) || FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\*", root))) return;
     if ((list = (ProfileList *)HeapAlloc(GetProcessHeap(), 0, sizeof *list)) == NULL) return;
     Profiles_Load(list, NULL);
+    for (i = 0; i < list->count && !(EntryFolder(&list->items[i], used, ARRAYSIZE(used)) && Core_PathUnder(used, root) &&
+                                     Claude_IsRunning(&list->items[i])); i++) {}
+    if (i < list->count) {
+        HeapFree(GetProcessHeap(), 0, list);
+        return;
+    }
     search = FindFirstFileExW(pattern, FindExInfoBasic, &found, FindExSearchLimitToDirectories, NULL, 0);
     if (search != INVALID_HANDLE_VALUE) {
         do {
@@ -466,8 +476,9 @@ BOOL WindowsMcp_Set(const Profile *p, const WCHAR *uvx)
 
 /* Every entry of ours run from another build's folder (or under the earlier name, or by a uvx that is gone) pointed
  * at this build's and the uvx found now, as the manager opens: an update, or uv in a new place, reaches each
- * profile's Windows MCP at its Claude's next start, nothing asked. The person's own servers, and the plain
- * windows-mcp (Repair's), are left alone. */
+ * profile's Windows MCP at its Claude's next start, nothing asked. A running Claude would write its own back over
+ * it: its profile's entry is written once it has closed (WindowsMcp_AfterClose). The person's own servers, and
+ * the plain windows-mcp (Repair's), are left alone. */
 void WindowsMcp_UpdateEntries(void)
 {
     ProfileList *list;
@@ -478,14 +489,15 @@ void WindowsMcp_UpdateEntries(void)
     Profiles_Load(list, NULL);
     for (i = 0; i < list->count; i++)
         if (WindowsMcp_State(&list->items[i]) == WINDOWS_MCP_OUTDATED && EntryFolder(&list->items[i], from, ARRAYSIZE(from)) &&
-            WindowsMcp_Set(&list->items[i], uvx))
+            !Claude_IsRunning(&list->items[i]) && WindowsMcp_Set(&list->items[i], uvx))
             Util_Log(L"windows-mcp: %s now runs this build's windows-mcp-delta", list->items[i].folder);
     HeapFree(GetProcessHeap(), 0, list);
 }
 
 /* The profiles that have windows-mcp-delta written again, so a change to the online setting reaches their env
  * (Claude reads it at its next start); one run from an older build's folder is pointed at this build's too.
- * Those without it, the plain windows-mcp (Repair's), and the person's own servers are left alone. */
+ * A running one's once it has closed (WindowsMcp_AfterClose). Those without it, the plain windows-mcp (Repair's),
+ * and the person's own servers are left alone. */
 void WindowsMcp_RefreshOnline(void)
 {
     ProfileList list;
@@ -498,9 +510,48 @@ void WindowsMcp_RefreshOnline(void)
     for (i = 0; i < list.count; i++) {
         WCHAR from[LONG_PATH_CCH];
         int state = WindowsMcp_State(&list.items[i]);
-        if (state == WINDOWS_MCP_READY || (state == WINDOWS_MCP_OUTDATED && EntryFolder(&list.items[i], from, ARRAYSIZE(from))))
+        if ((state == WINDOWS_MCP_READY || (state == WINDOWS_MCP_OUTDATED && EntryFolder(&list.items[i], from, ARRAYSIZE(from)))) &&
+            !Claude_IsRunning(&list.items[i]))
             WindowsMcp_Set(&list.items[i], uvx);
     }
+}
+
+/* Whether profile `p`'s entry lets Claude read claude.ai chats as the setting says (its env). */
+static BOOL OnlineAsSet(const Profile *p)
+{
+    WCHAR path[LONG_PATH_CCH];
+    DWORD length = 0;
+    const char *server, *env;
+    size_t serverLength, envLength;
+    char *json;
+    BOOL online = FALSE;
+    if (!ConfigPath(p, path, ARRAYSIZE(path)) || (json = Util_ReadFile(path, CONFIG_MAX, FALSE, &length)) == NULL) return TRUE;
+    if (ServerAt(json, length, WINDOWS_MCP_KEY, &server, &serverLength) && Core_JsonMember(server, serverLength, "env", &env, &envLength))
+        online = Contains(env, envLength, "\"WINDOWS_MCP_DELTA_ONLINE\"");
+    Util_Free(json);
+    return online == WindowsMcp_Online();
+}
+
+/* The watcher's call each time profile `folder`'s Claude has closed: its entry of ours written as the manager
+ * would have while it ran (WindowsMcp_UpdateEntries, WindowsMcp_RefreshOnline), over what that Claude wrote back,
+ * before its next start reads it; the older builds' folders no entry runs from go. */
+void WindowsMcp_AfterClose(const WCHAR *folder)
+{
+    ProfileList *list;
+    WCHAR uvx[MAX_PATH], from[LONG_PATH_CCH], pkg[LONG_PATH_CCH];
+    int i, state;
+    if (!WindowsMcp_FindUvx(uvx, ARRAYSIZE(uvx))) return;   /* no uvx: nothing we wrote runs */
+    if ((list = (ProfileList *)HeapAlloc(GetProcessHeap(), 0, sizeof *list)) == NULL) return;
+    Profiles_Load(list, NULL);
+    if ((i = Profiles_Find(list, folder)) >= 0 && EntryFolder(&list->items[i], from, ARRAYSIZE(from)) && !Claude_IsRunning(&list->items[i])) {
+        state = WindowsMcp_State(&list->items[i]);
+        if (state == WINDOWS_MCP_OUTDATED || (state == WINDOWS_MCP_READY && !OnlineAsSet(&list->items[i]))) {
+            if (WindowsMcp_Set(&list->items[i], uvx)) Util_Log(L"windows-mcp: %s now runs this build's windows-mcp-delta", folder);
+        } else if (PackageDir(pkg, ARRAYSIZE(pkg))) {
+            RemoveOldPackages(pkg);
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, list);
 }
 
 /* ------------------------------------------------------------- left behind */

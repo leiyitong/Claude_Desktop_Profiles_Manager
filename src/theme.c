@@ -188,6 +188,13 @@ static void ReadSystemTheme(void)
     g_dark = !g_highContrast && light == 0;
 }
 
+/* `a` taken `percent` of the way to `b`. */
+static COLORREF Mix(COLORREF a, COLORREF b, int percent)
+{
+    return RGB(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * percent / 100, GetGValue(a) + (GetGValue(b) - GetGValue(a)) * percent / 100,
+               GetBValue(a) + (GetBValue(b) - GetBValue(a)) * percent / 100);
+}
+
 static void FillSolid(HDC dc, const RECT *rc, COLORREF color)
 {
     SetDCBrushColor(dc, color);
@@ -436,6 +443,12 @@ COLORREF Theme_DrawRow(HWND owner, HDC dc, const RECT *rc, UINT state, COLORREF 
 {
     int radius = min(CornerRadius(owner), min(rc->right - rc->left, rc->bottom - rc->top) / 2);
     FillSolid(dc, rc, around);
+    if ((state & THEME_ROW_PLAIN) && !g_highContrast && (state & (THEME_ROW_SELECTED | THEME_ROW_HOT))) {
+        /* A side list's row (Settings' kinds): a gray a little lighter than `around`, the text's own color on it. */
+        COLORREF text = g_palette.color[THEME_TEXT];
+        RoundedBox(dc, rc, 2 * radius, Mix(around, text, (state & THEME_ROW_SELECTED) ? 9 : 5), 0, 0);
+        return text;
+    }
     if (state & THEME_ROW_SELECTED) {
         if (g_highContrast) FillSolid(dc, rc, GetSysColor(COLOR_HIGHLIGHT));
         else RoundedBox(dc, rc, radius, g_palette.color[THEME_MAIN_BLUE], g_palette.color[THEME_BRIGHT_BLUE], LineWidth(owner));
@@ -863,37 +876,33 @@ void Theme_DrawButton(HWND owner, HDC dc, const RECT *rc, const WCHAR *text, HFO
     DrawLabel(dc, text, font, &label, format);
 }
 
-/* An on-off switch, as Windows 11 and Claude draw theirs: a pill, its knob
- * at the right on a bright blue fill when on, at the left in a gray outline
- * when off; muted while it cannot change. Centered in `rc`, as tall as
- * THEME_SWITCH_HEIGHT_DIPS and twice as wide. */
+/* An on-off switch as Claude draws its own: a filled pill, the accent's blue
+ * when on and gray when off, a white knob at its right or left end; muted
+ * while it cannot change. Centered in `rc`, THEME_SWITCH_HEIGHT_DIPS tall and
+ * nine fifths as wide. */
 void Theme_DrawSwitch(HWND owner, HDC dc, const RECT *rc, BOOL on, UINT state)
 {
     BOOL enabled = !(state & THEME_BUTTON_DISABLED), hot = enabled && (state & THEME_BUTTON_HOT);
-    int height = ScaleForWindow(owner, THEME_SWITCH_HEIGHT_DIPS), width = 2 * height, line = LineWidth(owner), knob, inset;
+    int height = ScaleForWindow(owner, THEME_SWITCH_HEIGHT_DIPS), width = MulDiv(height, 9, 5), inset = max(1, ScaleForWindow(owner, 2)), knob;
     RECT pill, dot;
-    COLORREF fill, frame, center;
+    COLORREF fill, center;
     pill.left = rc->left + (rc->right - rc->left - width) / 2;
     pill.top = rc->top + (rc->bottom - rc->top - height) / 2;
     pill.right = pill.left + width;
     pill.bottom = pill.top + height;
     if (g_highContrast) {
-        fill = on ? GetSysColor(enabled ? COLOR_HIGHLIGHT : COLOR_GRAYTEXT) : GetSysColor(COLOR_WINDOW);
-        frame = on ? fill : GetSysColor(enabled ? COLOR_WINDOWTEXT : COLOR_GRAYTEXT);
-        center = on ? GetSysColor(COLOR_HIGHLIGHTTEXT) : frame;
-    } else if (on) {
-        fill = enabled ? g_palette.color[hot ? THEME_BRIGHT_BLUE : THEME_MAIN_BLUE] : g_palette.color[THEME_EDGE];
-        frame = enabled ? g_palette.color[THEME_BRIGHT_BLUE] : fill;
-        center = enabled ? (g_dark ? g_palette.color[THEME_TEXT] : g_palette.color[THEME_FIELD]) : g_palette.color[THEME_FIELD];
+        fill = on ? GetSysColor(enabled ? COLOR_HIGHLIGHT : COLOR_GRAYTEXT) : GetSysColor(enabled ? COLOR_WINDOWTEXT : COLOR_GRAYTEXT);
+        center = GetSysColor(on ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOW);
+    } else if (!enabled) {
+        fill = Mix(g_palette.color[THEME_FIELD], g_palette.color[THEME_EDGE], on ? 100 : 50);
+        center = Mix(g_palette.color[THEME_FIELD], g_palette.color[THEME_EDGE], on ? 40 : 100);
     } else {
-        fill = hot ? g_palette.color[THEME_PALE_BLUE] : g_palette.color[THEME_FIELD];
-        frame = enabled ? g_palette.color[THEME_MUTED] : g_palette.color[THEME_EDGE];
-        center = frame;
+        fill = on ? g_palette.color[THEME_BRIGHT_BLUE] : Mix(g_palette.color[THEME_EDGE], g_palette.color[THEME_TEXT], hot ? 12 : 0);
+        if (on && hot) fill = Mix(fill, RGB(0xFF, 0xFF, 0xFF), 12);
+        center = RGB(0xFF, 0xFF, 0xFF);
     }
-    RoundedBox(dc, &pill, height / 2, fill, frame, line);
-    /* The knob: a dot inset from the pill's end, smaller when off, as Windows draws it. */
-    knob = MulDiv(height, on ? 60 : 50, 100);
-    inset = (height - knob) / 2;
+    RoundedBox(dc, &pill, height / 2, fill, fill, 0);
+    knob = height - 2 * inset;
     dot.top = pill.top + inset;
     dot.bottom = dot.top + knob;
     dot.left = on ? pill.right - inset - knob : pill.left + inset;

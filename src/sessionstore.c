@@ -696,21 +696,50 @@ static BOOL HasClaudeCodeEnvironment(const Profile *p)
     return set;
 }
 
+/* The states logged, kept in the state folder: the watcher, the manager and
+ * every claude:// link start a process of their own, and each logged every
+ * profile's source again. */
+static BOOL SourcesLoggedPath(WCHAR *path, size_t cch)
+{
+    WCHAR dir[MAX_PATH];
+    return Util_StateDir(dir, ARRAYSIZE(dir)) && SUCCEEDED(StringCchPrintfW(path, cch, L"%s\\sources-logged.txt", dir));
+}
+
 /* Logs a profile's resolved source once per state, not on every reload. */
 static void LogSource(const Profile *p, const SessionSource *source)
 {
     static struct { ULONGLONG folder, state; } logged[MAX_PROFILES * 2];
     static int next;
+    static BOOL read;
     static SRWLOCK lock = SRWLOCK_INIT;
     ULONGLONG folder = Core_HashText(CORE_HASH_START, p->folder), state;
     BOOL environment = HasClaudeCodeEnvironment(p);
     const WCHAR *reason;
+    WCHAR path[MAX_PATH];
+    char text[ARRAYSIZE(logged) * 34 + 1];
+    size_t used = 0;
     int i;
     state = Core_HashText(folder, p->storageDir);
     state = Core_HashText(state, source->entriesDir);
     state = Core_HashBytes(state, &source->signedIn, sizeof source->signedIn);
     state = Core_HashBytes(state, &environment, sizeof environment);
     AcquireSRWLockExclusive(&lock);
+    if (!read) {
+        DWORD length;
+        char *saved;
+        read = TRUE;
+        if (SourcesLoggedPath(path, ARRAYSIZE(path)) && (saved = Util_ReadFile(path, sizeof text, FALSE, &length)) != NULL) {
+            const char *at = saved;
+            while (next < (int)ARRAYSIZE(logged) &&
+                   sscanf_s(at, "%16llx %16llx", &logged[next].folder, &logged[next].state) == 2) {
+                next++;
+                if ((at = strchr(at, '\n')) == NULL) break;
+                at++;
+            }
+            next %= (int)ARRAYSIZE(logged);
+            HeapFree(GetProcessHeap(), 0, saved);
+        }
+    }
     for (i = 0; i < (int)ARRAYSIZE(logged) && logged[i].folder != folder; i++) {}
     if (i < (int)ARRAYSIZE(logged) && logged[i].state == state) {
         ReleaseSRWLockExclusive(&lock);
@@ -722,6 +751,12 @@ static void LogSource(const Profile *p, const SessionSource *source)
     }
     logged[i].folder = folder;
     logged[i].state = state;
+    for (i = 0; i < (int)ARRAYSIZE(logged); i++) {
+        if (logged[i].folder &&
+            SUCCEEDED(StringCchPrintfA(text + used, ARRAYSIZE(text) - used, "%016llx %016llx\n", logged[i].folder, logged[i].state)))
+            used += strlen(text + used);
+    }
+    if (SourcesLoggedPath(path, ARRAYSIZE(path))) Util_WriteFileAtomic(path, text, used, UTIL_PUT_REPLACE);
     ReleaseSRWLockExclusive(&lock);
     if (!p->storageDir[0]) reason = L"profile storage could not be resolved";
     else if (source->entriesDir[0]) reason = source->signedIn ? L"account entries resolved" : L"stored entries found without an account in config.json";
@@ -752,6 +787,8 @@ static CachedEntry *g_entryCache[ENTRY_CACHE_BUCKETS];
 static int          g_entryCacheCount;
 static LONG         g_entryLoads;
 static SRWLOCK      g_entryCacheLock = SRWLOCK_INIT;
+static BOOL         g_entryCacheDirty;     /* changed since the file was last written (SaveEntryCache) */
+static LONG         g_entryFreshReads;     /* entries read from their files, not the cache */
 
 /* A copy of what file `path` said when it was as it is now (Util_Free); NULL when not kept. */
 static EntryRead *CachedRead(ULONGLONG path, ULONGLONG size, ULONGLONG written, LONG load)
@@ -783,9 +820,11 @@ static void KeepRead(ULONGLONG path, ULONGLONG dir, ULONGLONG size, ULONGLONG wr
     item->load = load;
     item->read = read;
     AcquireSRWLockExclusive(&g_entryCacheLock);
+    g_entryCacheDirty = TRUE;
     for (at = &g_entryCache[path % ENTRY_CACHE_BUCKETS]; *at && (*at)->path != path; at = &(*at)->next) {}
     if (*at) {
         old = *at;
+        if (old->load > item->load) item->load = old->load;   /* listed by a later load too (ForgetUnlisted) */
         item->next = old->next;
         *at = item;
     } else if (g_entryCacheCount < ENTRY_CACHE_MAX) {
@@ -801,7 +840,9 @@ static void KeepRead(ULONGLONG path, ULONGLONG dir, ULONGLONG size, ULONGLONG wr
     }
 }
 
-/* Forgets the files of folder `dir` that load `load`, which listed it whole, did not list. */
+/* Forgets the files of folder `dir` that load `load`, which listed it whole, did not list,
+ * nor a later one: the manager's list and a sync read the same folders at once, and the
+ * one ending first took the files the other had just listed for gone. */
 static void ForgetUnlisted(ULONGLONG dir, LONG load)
 {
     CachedEntry *gone = NULL, **at, *item;
@@ -809,11 +850,12 @@ static void ForgetUnlisted(ULONGLONG dir, LONG load)
     AcquireSRWLockExclusive(&g_entryCacheLock);
     for (b = 0; b < ENTRY_CACHE_BUCKETS; b++)
         for (at = &g_entryCache[b]; (item = *at) != NULL;) {
-            if (item->dir == dir && item->load != load) {
+            if (item->dir == dir && item->load < load) {
                 *at = item->next;
                 item->next = gone;
                 gone = item;
                 g_entryCacheCount--;
+                g_entryCacheDirty = TRUE;
             } else {
                 at = &item->next;
             }
@@ -830,6 +872,160 @@ static void ForgetUnlisted(ULONGLONG dir, LONG load)
 static BOOL KeptRead(const EntryRead *read)
 {
     return read->kind == ENTRY_ELSEWHERE || (read->kind == ENTRY_LOCAL && EntryText(read)[0]);
+}
+
+/* The cache on disk, for the next process (a watcher, the manager opened
+ * again), which then reads only the entries that changed, where reading
+ * every one took a few seconds: ENTRY_CACHE_FILE in the state folder, the
+ * cache as a load left it, each entry checked as the cache checks it (its
+ * file's size and time). Written after a load that changed the cache, at
+ * most once in ENTRY_CACHE_SAVE_MS; read once a process. */
+#define ENTRY_CACHE_FILE     L"entry-cache.bin"
+#define ENTRY_CACHE_MAGIC    0x31434E45u   /* "ENC1" */
+#define ENTRY_CACHE_SAVE_MS  60000
+#define ENTRY_CACHE_FILE_MAX (64u * 1024u * 1024u)
+#define ENTRY_CACHE_HEAD     (3 * sizeof(DWORD))                     /* magic, sizeof(EntryRead), count */
+#define ENTRY_CACHE_RECORD   (4 * sizeof(ULONGLONG) + sizeof(DWORD))  /* path, dir, size, written; bytes */
+
+static INIT_ONCE g_entryCacheRead = INIT_ONCE_STATIC_INIT;
+static ULONGLONG g_entryCacheSaved;   /* when it was last written, ms */
+
+static BOOL EntryCachePath(WCHAR *out, size_t cch)
+{
+    WCHAR state[MAX_PATH];
+    return Util_StateDir(state, ARRAYSIZE(state)) && SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" ENTRY_CACHE_FILE, state));
+}
+
+/* `count` strings from `*at` (a MULTI_SZ when `count` is 0: to its empty one), each ending before `end`. */
+static BOOL StringsWithin(const WCHAR **at, const WCHAR *end, int count)
+{
+    int i;
+    for (i = 0; count ? i < count : TRUE; i++) {
+        const WCHAR *start = *at;
+        while (*at < end && **at) (*at)++;
+        if (*at >= end) return FALSE;
+        (*at)++;
+        if (!count && *at - start == 1) return TRUE;   /* the empty one that ends the list */
+    }
+    return TRUE;
+}
+
+/* A block read back from the file holds what an EntryRead holds, its strings within it. */
+static BOOL SoundRead(const EntryRead *read, size_t bytes)
+{
+    const WCHAR *at = EntryText(read), *end = (const WCHAR *)((const BYTE *)read + bytes);
+    if (bytes < sizeof *read || read->bytes != bytes || (bytes - sizeof *read) % sizeof(WCHAR)) return FALSE;
+    return StringsWithin(&at, end, ENTRY_STRINGS) && StringsWithin(&at, end, 0) && (!read->previousTitles || StringsWithin(&at, end, 0));
+}
+
+static BOOL CALLBACK ReadEntryCache(PINIT_ONCE once, void *parameter, void **context)
+{
+    WCHAR path[MAX_PATH];
+    DWORD length = 0, magic, readSize, count, i;
+    char *data;
+    size_t at = ENTRY_CACHE_HEAD;
+    (void)once;
+    (void)parameter;
+    (void)context;
+    if (!EntryCachePath(path, ARRAYSIZE(path)) || (data = Util_ReadFile(path, ENTRY_CACHE_FILE_MAX, FALSE, &length)) == NULL) return TRUE;
+    if (length >= ENTRY_CACHE_HEAD) {
+        memcpy(&magic, data, sizeof magic);
+        memcpy(&readSize, data + 4, sizeof readSize);
+        memcpy(&count, data + 8, sizeof count);
+        /* Another build's (its EntryRead laid out otherwise) is not read. */
+        for (i = 0; magic == ENTRY_CACHE_MAGIC && readSize == sizeof(EntryRead) && i < count && length - at >= ENTRY_CACHE_RECORD; i++) {
+            ULONGLONG keys[4];
+            DWORD bytes;
+            EntryRead *read;
+            memcpy(keys, data + at, sizeof keys);
+            memcpy(&bytes, data + at + sizeof keys, sizeof bytes);
+            at += ENTRY_CACHE_RECORD;
+            if (bytes > length - at) break;
+            if ((read = (EntryRead *)Util_Alloc(max(bytes, sizeof *read))) == NULL) break;
+            memcpy(read, data + at, bytes);
+            at += bytes;
+            if (SoundRead(read, bytes)) KeepRead(keys[0], keys[1], keys[2], keys[3], 0, read);
+            else Util_Free(read);
+        }
+    }
+    Util_Free(data);
+    AcquireSRWLockExclusive(&g_entryCacheLock);
+    g_entryCacheDirty = FALSE;   /* the file holds what was just read from it */
+    g_entryCacheSaved = Util_NowMs();
+    ReleaseSRWLockExclusive(&g_entryCacheLock);
+    return TRUE;
+}
+
+/* The cache written to its file, when it changed and the last write is old enough. */
+static void SaveEntryCache(void)
+{
+    WCHAR path[MAX_PATH];
+    CachedEntry *item;
+    char *data = NULL;
+    size_t total = ENTRY_CACHE_HEAD, at;
+    DWORD magic = ENTRY_CACHE_MAGIC, readSize = sizeof(EntryRead), count = 0;
+    ULONGLONG now = Util_NowMs();
+    int b;
+    AcquireSRWLockExclusive(&g_entryCacheLock);
+    if (g_entryCacheDirty && now - g_entryCacheSaved >= ENTRY_CACHE_SAVE_MS) {
+        for (b = 0; b < ENTRY_CACHE_BUCKETS; b++)
+            for (item = g_entryCache[b]; item; item = item->next) total += ENTRY_CACHE_RECORD + item->read->bytes;
+        if (total <= ENTRY_CACHE_FILE_MAX && (data = (char *)Util_Alloc(total)) != NULL) {
+            at = ENTRY_CACHE_HEAD;
+            for (b = 0; b < ENTRY_CACHE_BUCKETS; b++)
+                for (item = g_entryCache[b]; item; item = item->next) {
+                    ULONGLONG keys[4] = { item->path, item->dir, item->size, item->written };
+                    DWORD bytes = (DWORD)item->read->bytes;
+                    memcpy(data + at, keys, sizeof keys);
+                    memcpy(data + at + sizeof keys, &bytes, sizeof bytes);
+                    at += ENTRY_CACHE_RECORD;
+                    memcpy(data + at, item->read, bytes);
+                    at += bytes;
+                    count++;
+                }
+            memcpy(data, &magic, sizeof magic);
+            memcpy(data + 4, &readSize, sizeof readSize);
+            memcpy(data + 8, &count, sizeof count);
+            g_entryCacheDirty = FALSE;
+            g_entryCacheSaved = now;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_entryCacheLock);
+    if (data && EntryCachePath(path, ARRAYSIZE(path)) && !Util_WriteFileAtomic(path, data, total, UTIL_PUT_REPLACE))
+        Util_Log(L"sessions: the entries' cache could not be written (error %lu)", GetLastError());
+    Util_Free(data);
+}
+
+void SessionStore_SaveEntryCache(BOOL now)
+{
+    if (now) {
+        AcquireSRWLockExclusive(&g_entryCacheLock);
+        g_entryCacheSaved = 0;
+        ReleaseSRWLockExclusive(&g_entryCacheLock);
+    }
+    SaveEntryCache();
+}
+
+int SessionStore_ReadEntryCacheAgain(void)
+{
+    CachedEntry *item;
+    int b;
+    AcquireSRWLockExclusive(&g_entryCacheLock);
+    for (b = 0; b < ENTRY_CACHE_BUCKETS; b++)
+        while ((item = g_entryCache[b]) != NULL) {
+            g_entryCache[b] = item->next;
+            Util_Free(item->read);
+            Util_Free(item);
+        }
+    g_entryCacheCount = 0;
+    ReleaseSRWLockExclusive(&g_entryCacheLock);
+    ReadEntryCache(NULL, NULL, NULL);
+    return g_entryCacheCount;
+}
+
+LONG SessionStore_FreshReads(void)
+{
+    return g_entryFreshReads;
 }
 
 /* One profile's entries. Complete when an entries folder was found and
@@ -859,6 +1055,7 @@ static EntriesRead LoadProfileEntries(SessionSet *set, int profile, const Transc
     if (!p->formerDir[0] ||
         !Core_ScratchDirFor(p->formerDir, source->entriesDir, source->formerScratchDir, ARRAYSIZE(source->formerScratchDir)))
         source->formerScratchDir[0] = 0;
+    InitOnceExecuteOnce(&g_entryCacheRead, ReadEntryCache, NULL, NULL);
     load = InterlockedIncrement(&g_entryLoads);
     started = Util_NowMs();
     dir = Core_HashText(CORE_HASH_START, source->entriesDir);
@@ -892,6 +1089,7 @@ static EntriesRead LoadProfileEntries(SessionSet *set, int profile, const Transc
         entry = CachedRead(file, size, written, load);
         fresh = entry == NULL;
         if (fresh) {
+            InterlockedIncrement(&g_entryFreshReads);
             if ((json = Util_ReadFile(path, SESSION_ENTRY_MAX_BYTES, FALSE, &length)) == NULL) {
                 source->unreadable++;
                 read = ENTRIES_PARTIAL;
@@ -1433,6 +1631,7 @@ BOOL SessionStore_LoadProfilesCancel(SessionSet *set, const ProfileList *profile
     }
     if (enough) AddOtherTranscriptBytes(set, &transcripts, cancel);
     if (transcripts.items) HeapFree(GetProcessHeap(), 0, transcripts.items);
+    if (enough) SaveEntryCache();
     if (!enough) Util_Log(L"sessions could not be read whole: not enough memory");
     if (!enough || !GroupRows(set, cancel)) {
         SessionStore_Free(set);
